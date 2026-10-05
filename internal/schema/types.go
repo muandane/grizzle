@@ -33,6 +33,7 @@ type Index struct {
 	TableName  string `json:"table_name"`
 	IsUnique   bool   `json:"is_unique"`
 	Definition string `json:"definition"`
+	IsValid    bool   `json:"is_valid"`
 }
 
 // ForeignKey represents a foreign key constraint on a table.

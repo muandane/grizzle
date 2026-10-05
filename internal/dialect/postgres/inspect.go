@@ -185,6 +185,7 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 			t.relname AS table_name,
 			i.relname AS index_name,
 			ix.indisunique AS is_unique,
+			ix.indisvalid AS is_valid,
 			pg_get_indexdef(ix.indexrelid) AS index_def
 		FROM pg_index ix
 		JOIN pg_class t ON t.oid = ix.indrelid
@@ -205,9 +206,10 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 			tableName string
 			indexName string
 			isUnique  bool
+			isValid   bool
 			indexDef  string
 		)
-		if err := idxRows.Scan(&tableName, &indexName, &isUnique, &indexDef); err != nil {
+		if err := idxRows.Scan(&tableName, &indexName, &isUnique, &isValid, &indexDef); err != nil {
 			return nil, fmt.Errorf("scanning index in schema %q: %w", schemaName, err)
 		}
 
@@ -217,6 +219,7 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 				TableName:  tableName,
 				IsUnique:   isUnique,
 				Definition: indexDef,
+				IsValid:    isValid,
 			}
 		}
 	}

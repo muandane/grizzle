@@ -190,6 +190,7 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX) (*schema.Schema, error) {
 				TableName:  tblName,
 				IsUnique:   uniqueMap[name],
 				Definition: indexSql,
+				IsValid:    true,
 			}
 		}
 		_ = idxRows.Close()

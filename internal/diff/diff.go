@@ -241,12 +241,13 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 				})
 			} else {
 				normLive := schema.NormalizeDefinition(lIdx.Definition, shadowSchema, targetSchema)
-				if normDef != normLive {
+				isInvalid := !lIdx.IsValid
+				if normDef != normLive || isInvalid {
 					changes = append(changes, Change{
 						Type:        plan.ChangeDropIndex,
 						Table:       tblName,
 						Index:       lIdx,
-						Destructive: true,
+						Destructive: !isInvalid,
 					})
 					idxCopy := *dIdx
 					idxCopy.Definition = normDef
@@ -266,7 +267,7 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 					Type:        plan.ChangeDropIndex,
 					Table:       tblName,
 					Index:       lIdx,
-					Destructive: true,
+					Destructive: lIdx.IsValid,
 				})
 			}
 		}
