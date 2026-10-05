@@ -185,3 +185,122 @@ func TestHistory_PostgresRecording(t *testing.T) {
 		t.Errorf("expected non-empty applied_by")
 	}
 }
+
+func TestHistory_PartialOnKilledNonTxStep(t *testing.T) {
+	connStr := os.Getenv("DATABASE_URL")
+	if connStr == "" {
+		connStr = os.Getenv("POSTGRES_DSN")
+	}
+	if connStr == "" {
+		connStr = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable"
+	}
+
+	db, err := sql.Open("pgx", connStr)
+	if err != nil {
+		t.Fatalf("failed opening pg: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Ping(); err != nil {
+		t.Skipf("skipping postgres history test, database not reachable: %v", err)
+	}
+
+	schema := fmt.Sprintf("test_hist_part_%d", time.Now().UnixNano())
+	_, err = db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema))
+	if err != nil {
+		t.Fatalf("failed creating schema: %v", err)
+	}
+	defer func() {
+		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schema))
+	}()
+
+	initSQL := `CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT);`
+	err = grizzle.Sync(context.Background(), db, grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: schema,
+		SchemaSQL:    initSQL,
+	})
+	if err != nil {
+		t.Fatalf("initial sync failed: %v", err)
+	}
+
+	// Desired schema adds an index (which postgres planner emits as CREATE INDEX CONCURRENTLY - non-tx)
+	desiredSQL := `
+		CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT);
+		CREATE INDEX idx_items_name ON items (name);
+	`
+	plan, err := grizzle.PlanDiff(context.Background(), db, grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: schema,
+		SchemaSQL:    desiredSQL,
+	})
+	if err != nil {
+		t.Fatalf("PlanDiff failed: %v", err)
+	}
+
+	// Assert the plan has a non-tx step
+	var hasNonTx bool
+	for _, s := range plan.Steps {
+		if s.NonTx {
+			hasNonTx = true
+			break
+		}
+	}
+	if !hasNonTx {
+		t.Fatalf("expected plan to have a non-tx step, got: %+v", plan.Steps)
+	}
+
+	// Hold a conflicting lock on items table so CREATE INDEX CONCURRENTLY will block
+	lockConn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("failed acquiring lock conn: %v", err)
+	}
+	defer lockConn.Close()
+
+	_, err = lockConn.ExecContext(context.Background(), fmt.Sprintf("SET search_path TO %q, public;", schema))
+	if err != nil {
+		t.Fatalf("failed setting search_path on lock conn: %v", err)
+	}
+	_, err = lockConn.ExecContext(context.Background(), "BEGIN; LOCK TABLE items IN SHARE UPDATE EXCLUSIVE MODE;")
+	if err != nil {
+		t.Fatalf("failed acquiring conflicting lock: %v", err)
+	}
+
+	// Execute Apply with a short cancel
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		cancel()
+	}()
+
+	applyErr := grizzle.Apply(ctx, db, plan, grizzle.ApplyOpts{})
+	if applyErr == nil {
+		t.Fatalf("expected Apply to fail when cancelled mid non-tx step, got nil")
+	}
+
+	// Release conflicting lock
+	_, _ = lockConn.ExecContext(context.Background(), "ROLLBACK;")
+
+	// Query grizzle_history using a fresh context
+	latest, err := history.GetLatest(context.Background(), db, "postgres", schema)
+	if err != nil {
+		t.Fatalf("failed fetching latest history: %v", err)
+	}
+	if latest == nil {
+		t.Fatalf("expected history record to be written on partial/failed non-tx run, but got nil")
+	}
+
+	if latest.Status != "partial" {
+		t.Errorf("expected history status 'partial', got %q", latest.Status)
+	}
+	if latest.FailedStep <= 0 {
+		t.Errorf("expected failed_step > 0, got %d", latest.FailedStep)
+	}
+	if latest.PlanHash != plan.Hash() {
+		t.Errorf("expected plan hash %s, got %s", plan.Hash(), latest.PlanHash)
+	}
+	if latest.Error == "" {
+		t.Errorf("expected non-empty error in history record")
+	}
+}
+

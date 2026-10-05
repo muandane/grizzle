@@ -246,6 +246,22 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) e
 	// 7. Apply DDL statements split into transactional and non-transactional groups
 	groups := GroupSteps(steps)
 	stepIdx := 0
+	committedSteps := 0
+
+	recordFailureHistory := func(failedStep int, execErr error, isNonTx bool) {
+		status := "failed"
+		if committedSteps > 0 || isNonTx {
+			status = "partial"
+		}
+		// Write using fresh connection and detached context not cancelled by the failure
+		histCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		histConn, err := db.Conn(histCtx)
+		if err == nil {
+			defer histConn.Close()
+			_ = history.RecordProgress(histCtx, histConn, "postgres", cfg.TargetSchema, p, status, failedStep, execErr, time.Since(start))
+		}
+	}
 
 	for groupIdx, group := range groups {
 		isLastGroup := groupIdx == len(groups)-1
@@ -258,8 +274,10 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) e
 					if logger != nil {
 						logger.ErrorContext(ctx, "grizzle: failed executing non-tx step", "step_index", stepIdx, "sql", s.SQL, "error", err)
 					}
+					recordFailureHistory(stepIdx, err, true)
 					return fmt.Errorf("%w: failed executing non-tx [%s]: %v", plan.ErrExecutionFailed, s.SQL, err)
 				}
+				committedSteps++
 				if logger != nil {
 					logger.DebugContext(ctx, "grizzle: executed non-tx step", "step_index", stepIdx, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
 				}
@@ -290,6 +308,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) e
 					if logger != nil {
 						logger.ErrorContext(ctx, "grizzle: failed executing step in tx", "step_index", stepIdx, "sql", s.SQL, "error", err)
 					}
+					recordFailureHistory(stepIdx, err, false)
 					return fmt.Errorf("%w: failed executing [%s]: %v", plan.ErrExecutionFailed, s.SQL, err)
 				}
 				if logger != nil {
@@ -307,8 +326,10 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) e
 			}
 
 			if err := tx.Commit(); err != nil {
+				recordFailureHistory(stepIdx, err, false)
 				return fmt.Errorf("grizzle: failed committing step transaction: %w", err)
 			}
+			committedSteps += len(group.Steps)
 		}
 	}
 
@@ -466,9 +487,13 @@ func SyncSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) error {
 			continue
 		}
 		if _, err := tx.ExecContext(ctx, sqlToExec); err != nil {
+			_ = tx.Rollback()
 			if logger != nil {
 				logger.ErrorContext(ctx, "sqlite: failed executing step", "step_index", i+1, "sql", sqlToExec, "error", err)
 			}
+			histCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = history.RecordProgress(histCtx, db, "sqlite", "", p, "failed", i+1, err, time.Since(start))
 			return fmt.Errorf("%w: failed executing [%s]: %v", plan.ErrExecutionFailed, sqlToExec, err)
 		}
 		if logger != nil {
