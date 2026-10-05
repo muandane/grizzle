@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@v2.14.0
+
+      - name: Run golangci-lint
+        run: golangci-lint run ./...
+
+  unit:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Go Vet
+        run: go vet ./...
+
+      - name: Run Unit Tests
+        run: go test -race -count=1 ./...
+
+  integration:
+    name: Integration Tests (PostgreSQL ${{ matrix.postgres-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres-version: ['15', '16', '17']
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres-version }}
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: grizzle_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Run Integration Tests
+        env:
+          DATABASE_URL: postgres://postgres:password@localhost:5432/grizzle_test?sslmode=disable
+          POSTGRES_DSN: postgres://postgres:password@localhost:5432/grizzle_test?sslmode=disable
+        run: |
+          echo "Running integration tests against PostgreSQL ${{ matrix.postgres-version }}..."
+          out=$(go test -tags integration -race -count=3 -v ./...)
+          echo "$out"
+          pass_count=$(echo "$out" | grep -c "^--- PASS" || true)
+          echo "Executed passing integration tests: $pass_count"
+          if [ "$pass_count" -eq 0 ]; then
+            echo "Error: No integration tests were executed! Count is 0."
+            exit 1
+          fi
