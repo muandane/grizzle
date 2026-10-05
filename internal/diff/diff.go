@@ -166,13 +166,15 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 					delete(addedCols, mappedNew)
 
 					if filters.ExpandContract {
-						// Staged Expand phase: add new column, keep old column in place
+						// Staged Expand phase: add new column (forced nullable during expand), keep old column in place
+						expandedCol := *dCol
+						expandedCol.IsNullable = true
 						changes = append(changes, Change{
 							Type:             plan.ChangeAddColumn,
 							Table:            tblName,
-							Column:           dCol,
+							Column:           &expandedCol,
 							Destructive:      false,
-							ColumnNotNull:    !dCol.IsNullable,
+							ColumnNotNull:    false,
 							ColumnHasDefault: dCol.DefaultValue != "",
 						})
 					} else {

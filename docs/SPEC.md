@@ -101,6 +101,9 @@ type Options struct {
     // ExpandContract enables staged expand-and-contract zero-downtime migrations.
     ExpandContract bool
 
+    // Backfill hook is executed during staged expand migration outside the DDL lock window in batches.
+    Backfill func(ctx context.Context, tx *sql.Tx, table, oldCol, newCol string) error
+
     // LockID is a 64-bit integer for pg_advisory_xact_lock. Defaults to stable hash of TargetSchema.
     LockID int64
 
@@ -114,6 +117,7 @@ type Options struct {
 type ApplyOpts struct {
     ExpectedHash  string
     AcceptHazards []HazardCode
+    Backfill      func(ctx context.Context, tx *sql.Tx, table, oldCol, newCol string) error
 }
 ```
 

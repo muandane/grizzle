@@ -230,3 +230,352 @@ func TestExpandContract_PostgresStagedExpand(t *testing.T) {
 		t.Fatalf("expected both email_address and email to exist during expand phase, count=%d, err=%v", colCount, err)
 	}
 }
+
+func TestExpandContract_StagedPlansAndBackfill(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("failed opening sqlite: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Initial table with rows
+	initSQL := `CREATE TABLE members (id INTEGER PRIMARY KEY, email_address TEXT);`
+	err = grizzle.Sync(ctx, db, grizzle.Options{
+		Dialect:   grizzle.DialectSQLite,
+		SchemaSQL: initSQL,
+	})
+	if err != nil {
+		t.Fatalf("initial sync failed: %v", err)
+	}
+
+	_, err = db.Exec(`INSERT INTO members (id, email_address) VALUES (1, 'alice@example.com'), (2, 'bob@example.com');`)
+	if err != nil {
+		t.Fatalf("failed inserting test data: %v", err)
+	}
+
+	// Desired schema has "email" column instead of "email_address"
+	desiredSQL := `CREATE TABLE members (id INTEGER PRIMARY KEY, email TEXT NOT NULL);`
+
+	// ==========================================
+	// PLAN 1: Staged Expand
+	// ==========================================
+	plan1, err := grizzle.PlanDiff(ctx, db, grizzle.Options{
+		Dialect:        grizzle.DialectSQLite,
+		SchemaSQL:      desiredSQL,
+		ExpandContract: true,
+		Renames: map[string]string{
+			"members.email_address": "email",
+		},
+	})
+	if err != nil {
+		t.Fatalf("PlanDiff for plan 1 failed: %v", err)
+	}
+
+	// Confirm:
+	// 1. Plan 1 adds email column (nullable).
+	// 2. Contract step (DROP COLUMN email_address) is NOT in plan 1.
+	var hasAddEmail, hasDropEmailAddress bool
+	for _, s := range plan1.Steps {
+		if strings.Contains(s.SQL, "email_address") && (s.Type == grizzle.ChangeDropColumn || strings.Contains(s.SQL, "DROP")) {
+			hasDropEmailAddress = true
+		}
+		if s.Type == grizzle.ChangeAddColumn && strings.Contains(s.SQL, "email") {
+			hasAddEmail = true
+			if strings.Contains(s.SQL, "NOT NULL") {
+				t.Fatalf("staged expand add column must be nullable, got SQL: %s", s.SQL)
+			}
+		}
+	}
+
+	if !hasAddEmail {
+		t.Fatalf("expected plan 1 to add email column, got steps: %+v", plan1.Steps)
+	}
+	if hasDropEmailAddress {
+		t.Fatalf("contract step (drop old column) must NOT be in plan 1, got steps: %+v", plan1.Steps)
+	}
+
+	plan1Hash := plan1.Hash()
+
+	// Apply Plan 1 with Options.Backfill hook
+	var backfillBatches int
+	err = grizzle.Sync(ctx, db, grizzle.Options{
+		Dialect:        grizzle.DialectSQLite,
+		SchemaSQL:      desiredSQL,
+		ExpandContract: true,
+		Renames: map[string]string{
+			"members.email_address": "email",
+		},
+		Backfill: func(ctx context.Context, tx *sql.Tx, table, oldCol, newCol string) error {
+			backfillBatches++
+			_, err := tx.ExecContext(ctx, fmt.Sprintf("UPDATE %s SET %s = %s WHERE %s IS NULL", table, newCol, oldCol, newCol))
+			return err
+		},
+	})
+	if err != nil {
+		t.Fatalf("apply plan 1 with backfill failed: %v", err)
+	}
+
+	if backfillBatches == 0 {
+		t.Fatalf("expected Options.Backfill hook to be called, got 0 calls")
+	}
+
+	// Verify both columns exist and data was backfilled
+	rows, err := db.Query("SELECT id, email_address, email FROM members ORDER BY id ASC")
+	if err != nil {
+		t.Fatalf("failed querying members after expand: %v", err)
+	}
+	defer rows.Close()
+
+	type memberRow struct {
+		id   int
+		oldE string
+		newE string
+	}
+	var data []memberRow
+	for rows.Next() {
+		var r memberRow
+		if err := rows.Scan(&r.id, &r.oldE, &r.newE); err != nil {
+			t.Fatalf("scan failed: %v", err)
+		}
+		data = append(data, r)
+	}
+	if len(data) != 2 || data[0].newE != "alice@example.com" || data[1].newE != "bob@example.com" {
+		t.Fatalf("unexpected data after backfill: %+v", data)
+	}
+
+	// ==========================================
+	// PLAN 2: Contract (separate, separately hashed/approved)
+	// ==========================================
+	trueVal := true
+	plan2, err := grizzle.PlanDiff(ctx, db, grizzle.Options{
+		Dialect:         grizzle.DialectSQLite,
+		SchemaSQL:       desiredSQL,
+		AllowDropColumn: &trueVal,
+		Renames: map[string]string{
+			"members.email_address": "email",
+		},
+	})
+	if err != nil {
+		t.Fatalf("PlanDiff for plan 2 failed: %v", err)
+	}
+
+	plan2Hash := plan2.Hash()
+	if plan2Hash == plan1Hash {
+		t.Fatalf("plan 2 hash (%s) must differ from plan 1 hash (%s)", plan2Hash, plan1Hash)
+	}
+
+	var plan2HasDrop bool
+	for _, s := range plan2.Steps {
+		if s.Type == grizzle.ChangeDropColumn || strings.Contains(s.SQL, "email_address") || s.IsTableRebuild {
+			plan2HasDrop = true
+		}
+	}
+	if !plan2HasDrop {
+		t.Fatalf("expected plan 2 to drop old column, got steps: %+v", plan2.Steps)
+	}
+
+	// Apply Plan 2 (contract)
+	err = grizzle.Apply(ctx, db, plan2, grizzle.ApplyOpts{
+		ExpectedHash: plan2Hash,
+		AcceptHazards: []grizzle.HazardCode{
+			grizzle.HazardDropColumn,
+		},
+	})
+	if err != nil {
+		t.Fatalf("apply plan 2 failed: %v", err)
+	}
+
+	// Verify old column is gone and new column remains
+	var count int
+	err = db.QueryRow("SELECT COUNT(*) FROM members WHERE email IS NOT NULL").Scan(&count)
+	if err != nil {
+		t.Fatalf("failed querying members after contract: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("expected 2 members with email, got %d", count)
+	}
+}
+
+func TestExpandContract_PostgresStagedPlansAndBackfill(t *testing.T) {
+	connStr := os.Getenv("DATABASE_URL")
+	if connStr == "" {
+		connStr = os.Getenv("POSTGRES_DSN")
+	}
+	if connStr == "" {
+		connStr = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable"
+	}
+
+	db, err := sql.Open("pgx", connStr)
+	if err != nil {
+		t.Fatalf("failed opening pg: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Ping(); err != nil {
+		t.Skipf("skipping postgres expand-contract staged test, database not reachable: %v", err)
+	}
+
+	schema := fmt.Sprintf("test_staged_expand_%d", time.Now().UnixNano())
+	_, err = db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema))
+	if err != nil {
+		t.Fatalf("failed creating schema: %v", err)
+	}
+	defer func() {
+		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schema))
+	}()
+
+	ctx := context.Background()
+
+	initSQL := `CREATE TABLE members (id BIGINT PRIMARY KEY, email_address TEXT);`
+	err = grizzle.Sync(ctx, db, grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: schema,
+		SchemaSQL:    initSQL,
+	})
+	if err != nil {
+		t.Fatalf("initial sync failed: %v", err)
+	}
+
+	_, err = db.Exec(fmt.Sprintf(`INSERT INTO %s.members (id, email_address) VALUES (1, 'alice@example.com'), (2, 'bob@example.com');`, schema))
+	if err != nil {
+		t.Fatalf("failed inserting test data: %v", err)
+	}
+
+	desiredSQL := `CREATE TABLE members (id BIGINT PRIMARY KEY, email TEXT NOT NULL);`
+
+	// PLAN 1: Staged Expand
+	plan1, err := grizzle.PlanDiff(ctx, db, grizzle.Options{
+		Dialect:        grizzle.DialectPostgres,
+		TargetSchema:   schema,
+		SchemaSQL:      desiredSQL,
+		ExpandContract: true,
+		Renames: map[string]string{
+			"members.email_address": "email",
+		},
+	})
+	if err != nil {
+		t.Fatalf("PlanDiff for plan 1 failed: %v", err)
+	}
+
+	var hasAddEmail, hasDropEmailAddress bool
+	for _, s := range plan1.Steps {
+		if strings.Contains(s.SQL, "email_address") && (s.Type == grizzle.ChangeDropColumn || strings.Contains(s.SQL, "DROP")) {
+			hasDropEmailAddress = true
+		}
+		if s.Type == grizzle.ChangeAddColumn && strings.Contains(s.SQL, "email") {
+			hasAddEmail = true
+			if strings.Contains(s.SQL, "NOT NULL") {
+				t.Fatalf("staged expand add column must be nullable, got SQL: %s", s.SQL)
+			}
+		}
+	}
+
+	if !hasAddEmail {
+		t.Fatalf("expected plan 1 to add email column, got steps: %+v", plan1.Steps)
+	}
+	if hasDropEmailAddress {
+		t.Fatalf("contract step (drop old column) must NOT be in plan 1, got steps: %+v", plan1.Steps)
+	}
+
+	plan1Hash := plan1.Hash()
+
+	var backfillBatches int
+	err = grizzle.Sync(ctx, db, grizzle.Options{
+		Dialect:        grizzle.DialectPostgres,
+		TargetSchema:   schema,
+		SchemaSQL:      desiredSQL,
+		ExpandContract: true,
+		Renames: map[string]string{
+			"members.email_address": "email",
+		},
+		Backfill: func(ctx context.Context, tx *sql.Tx, table, oldCol, newCol string) error {
+			backfillBatches++
+			_, err := tx.ExecContext(ctx, fmt.Sprintf("UPDATE %s.%s SET %s = %s WHERE %s IS NULL", schema, table, newCol, oldCol, newCol))
+			return err
+		},
+	})
+	if err != nil {
+		t.Fatalf("apply plan 1 with backfill failed: %v", err)
+	}
+
+	if backfillBatches == 0 {
+		t.Fatalf("expected Backfill hook to be called, got 0 calls")
+	}
+
+	// Verify both columns exist and data was backfilled
+	rows, err := db.Query(fmt.Sprintf("SELECT id, email_address, email FROM %s.members ORDER BY id ASC", schema))
+	if err != nil {
+		t.Fatalf("failed querying members after expand: %v", err)
+	}
+	defer rows.Close()
+
+	type memberRow struct {
+		id   int64
+		oldE string
+		newE string
+	}
+	var data []memberRow
+	for rows.Next() {
+		var r memberRow
+		if err := rows.Scan(&r.id, &r.oldE, &r.newE); err != nil {
+			t.Fatalf("scan failed: %v", err)
+		}
+		data = append(data, r)
+	}
+	if len(data) != 2 || data[0].newE != "alice@example.com" || data[1].newE != "bob@example.com" {
+		t.Fatalf("unexpected data after backfill: %+v", data)
+	}
+
+	// PLAN 2: Contract
+	trueVal := true
+	plan2, err := grizzle.PlanDiff(ctx, db, grizzle.Options{
+		Dialect:         grizzle.DialectPostgres,
+		TargetSchema:    schema,
+		SchemaSQL:       desiredSQL,
+		AllowDropColumn: &trueVal,
+		Renames: map[string]string{
+			"members.email_address": "email",
+		},
+	})
+	if err != nil {
+		t.Fatalf("PlanDiff for plan 2 failed: %v", err)
+	}
+
+	plan2Hash := plan2.Hash()
+	if plan2Hash == plan1Hash {
+		t.Fatalf("plan 2 hash (%s) must differ from plan 1 hash (%s)", plan2Hash, plan1Hash)
+	}
+
+	var plan2HasDrop bool
+	for _, s := range plan2.Steps {
+		if s.Type == grizzle.ChangeDropColumn && strings.Contains(s.SQL, "email_address") {
+			plan2HasDrop = true
+		}
+	}
+	if !plan2HasDrop {
+		t.Fatalf("expected plan 2 to drop old column, got steps: %+v", plan2.Steps)
+	}
+
+	err = grizzle.Apply(ctx, db, plan2, grizzle.ApplyOpts{
+		ExpectedHash: plan2Hash,
+		AcceptHazards: []grizzle.HazardCode{
+			grizzle.HazardDropColumn,
+		},
+	})
+	if err != nil {
+		t.Fatalf("apply plan 2 failed: %v", err)
+	}
+
+	var count int
+	err = db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s.members WHERE email IS NOT NULL", schema)).Scan(&count)
+	if err != nil {
+		t.Fatalf("failed querying members after contract: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("expected 2 members with email, got %d", count)
+	}
+}
+
+

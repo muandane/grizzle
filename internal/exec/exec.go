@@ -36,6 +36,7 @@ type PostgresExecConfig struct {
 	RandFloat            func() float64
 	Logger               *slog.Logger
 	DryRun               bool
+	Backfill             BackfillFunc
 }
 
 // DiffPostgres computes the diff and renders the sequenced migration steps for PostgreSQL.
@@ -85,6 +86,11 @@ func SyncPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) error
 	for {
 		committed, err := syncPostgresOnce(ctx, db, cfg)
 		if err == nil {
+			if cfg.Backfill != nil && cfg.Filters.ExpandContract {
+				if err := RunBackfill(ctx, db, cfg.TargetSchema, cfg.Filters.Renames, nil, cfg.Backfill, cfg.Logger); err != nil {
+					return err
+				}
+			}
 			return nil
 		}
 
@@ -386,6 +392,7 @@ type SQLiteExecConfig struct {
 	ExpectedHash  string
 	Logger        *slog.Logger
 	DryRun        bool
+	Backfill      BackfillFunc
 }
 
 // SyncSQLite synchronizes SQLite in a single transaction with foreign keys handling.
@@ -518,6 +525,12 @@ func SyncSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) error {
 
 	if err := tx.Commit(); err != nil {
 		return err
+	}
+
+	if cfg.Backfill != nil && cfg.Filters.ExpandContract {
+		if err := RunBackfill(ctx, db, "main", cfg.Filters.Renames, steps, cfg.Backfill, cfg.Logger); err != nil {
+			return err
+		}
 	}
 
 	if logger != nil {

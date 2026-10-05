@@ -202,9 +202,9 @@ Dropping and re-adding columns of the same type is an ambiguous operation that c
    ```
 3. **Single-Step Atomic Rename**: By default, explicit renames generate `ALTER TABLE ... RENAME COLUMN`.
 4. **Staged Expand and Contract**: For zero-downtime rolling deployments, enabling `Options.ExpandContract: true` executes the expand phase:
-   - Adds the new column alongside the existing column without dropping the old column.
-   - The application can dual-write and backfill data while both old and new application versions run.
-   - The destructive contract step (dropping the old column) is deferred to a subsequent, separately approved plan.
+   - Adds the new column (forced nullable during expand) alongside the existing column without dropping the old column.
+   - Executes `Options.Backfill` hook outside the DDL lock window in batches to backfill data while old and new application versions run concurrently.
+   - The destructive contract step (dropping the old column) is deferred to a subsequent, separately approved and hashed plan.
 
 ### Invariant 9: Migration history and read-only drift detection
 

@@ -184,6 +184,23 @@ func Diff(live, desired *schema.Schema, filters scope.Filters) []plan.Step {
 			continue
 		}
 
+		var stagedExpandCols map[string]bool
+		if filters.ExpandContract && len(mappedRenames) > 0 {
+			stagedExpandCols = make(map[string]bool)
+			mappedOld := make(map[string]bool)
+			for _, pair := range mappedRenames {
+				mappedOld[pair[0]] = true
+				stagedExpandCols[pair[1]] = true
+			}
+			var newDropped []string
+			for _, c := range droppedCols {
+				if !mappedOld[c] {
+					newDropped = append(newDropped, c)
+				}
+			}
+			droppedCols = newDropped
+		}
+
 		if len(droppedCols) > 0 {
 			// Check for ambiguous candidates
 			for _, dColName := range droppedCols {
@@ -255,7 +272,8 @@ func Diff(live, desired *schema.Schema, filters scope.Filters) []plan.Step {
 			for colName, dCol := range dTable.Columns {
 				if _, inLive := lTable.Columns[colName]; !inLive {
 					clause := fmt.Sprintf("%q %s", dCol.Name, dCol.DataType)
-					if !dCol.IsNullable {
+					isStaged := stagedExpandCols != nil && stagedExpandCols[colName]
+					if !dCol.IsNullable && !isStaged {
 						clause += " NOT NULL"
 					}
 					if dCol.DefaultValue != "" {
@@ -266,7 +284,7 @@ func Diff(live, desired *schema.Schema, filters scope.Filters) []plan.Step {
 						Table:            tblName,
 						SQL:              fmt.Sprintf("ALTER TABLE %q ADD COLUMN %s;", tblName, clause),
 						Destructive:      false,
-						ColumnNotNull:    !dCol.IsNullable,
+						ColumnNotNull:    !dCol.IsNullable && !isStaged,
 						ColumnHasDefault: dCol.DefaultValue != "",
 					})
 				}

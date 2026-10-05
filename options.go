@@ -2,6 +2,8 @@ package grizzle
 
 import (
 	"cmp"
+	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -92,12 +94,18 @@ type Options struct {
 	// delaying destructive drops to a later, separately approved plan.
 	ExpandContract bool
 
+	// Backfill hook function run outside the DDL lock window in batches during staged expand migration.
+	Backfill BackfillFunc
+
 	// DryRun returns the planned SQL statements without executing them on the live database.
 	DryRun bool
 
 	// Logger accepts a structured logger (*slog.Logger) for migration events.
 	Logger *slog.Logger
 }
+
+// BackfillFunc defines the hook function signature for batch backfilling columns outside the DDL lock window.
+type BackfillFunc func(ctx context.Context, tx *sql.Tx, table, oldCol, newCol string) error
 
 // Option represents a functional option for configuring Options.
 type Option func(*Options)
@@ -251,6 +259,13 @@ func WithRenames(renames map[string]string) Option {
 func WithExpandContract(expand bool) Option {
 	return func(o *Options) {
 		o.ExpandContract = expand
+	}
+}
+
+// WithBackfill configures the batch backfill hook function for staged expand migrations.
+func WithBackfill(fn BackfillFunc) Option {
+	return func(o *Options) {
+		o.Backfill = fn
 	}
 }
 

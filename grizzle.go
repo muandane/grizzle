@@ -170,6 +170,7 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error {
 			AcceptHazards: opts.AcceptHazards,
 			Logger:        opts.Logger,
 			DryRun:        opts.DryRun,
+			Backfill:      toExecBackfill(opts.Backfill),
 		})
 	}
 
@@ -188,6 +189,7 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error {
 		RandFloat:            opts.RandFloat,
 		Logger:               opts.Logger,
 		DryRun:               opts.DryRun,
+		Backfill:             toExecBackfill(opts.Backfill),
 	})
 }
 
@@ -236,6 +238,9 @@ type ApplyOpts struct {
 
 	// AcceptHazards specifies explicitly accepted critical hazards.
 	AcceptHazards []HazardCode
+
+	// Backfill hook function run outside the DDL lock window in batches during staged expand migration.
+	Backfill BackfillFunc
 }
 
 // Apply applies an approved migration plan to the database.
@@ -264,6 +269,7 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 			AllowDropIndex:  &p.Policy.AllowIndex,
 			AllowDropFK:     &p.Policy.AllowFK,
 			AcceptHazards:   opts.AcceptHazards,
+			Backfill:        opts.Backfill,
 		}
 		if err := prepareOptions(ctx, db, &syncOpts); err != nil {
 			return err
@@ -280,6 +286,7 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 				ExpectedHash:  opts.ExpectedHash,
 				Logger:        syncOpts.Logger,
 				DryRun:        syncOpts.DryRun,
+				Backfill:      toExecBackfill(opts.Backfill),
 			})
 		}
 
@@ -299,6 +306,7 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 			RandFloat:            syncOpts.RandFloat,
 			Logger:               syncOpts.Logger,
 			DryRun:               syncOpts.DryRun,
+			Backfill:             toExecBackfill(opts.Backfill),
 		})
 	}
 
@@ -391,4 +399,11 @@ func normalizeDefault(raw string) string {
 // normalizeDefinition is an internal test helper preserving backward compatibility.
 func normalizeDefinition(def, shadowSchema, targetSchema string) string {
 	return schema.NormalizeDefinition(def, shadowSchema, targetSchema)
+}
+
+func toExecBackfill(fn BackfillFunc) exec.BackfillFunc {
+	if fn == nil {
+		return nil
+	}
+	return exec.BackfillFunc(fn)
 }
