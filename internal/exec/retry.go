@@ -45,10 +45,7 @@ func ComputeBackoff(attempt int, randFn func() float64) time.Duration {
 	maxBackoff := 2 * time.Second
 
 	factor := 1 << min(attempt, 6)
-	backoff := base * time.Duration(factor)
-	if backoff > maxBackoff {
-		backoff = maxBackoff
-	}
+	backoff := min(base*time.Duration(factor), maxBackoff)
 
 	var r float64
 	if randFn != nil {

@@ -36,7 +36,7 @@ func TestPlan_Hash_Stability(t *testing.T) {
 	}
 
 	// 1. Verify 100 consecutive runs yield identical hash
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		if p1.Hash() != hash1 {
 			t.Fatalf("hash non-deterministic on iteration %d: got %s, want %s", i, p1.Hash(), hash1)
 		}
@@ -371,4 +371,3 @@ func TestPlan_Hash_ExcludesOperationalFields(t *testing.T) {
 		}
 	})
 }
-

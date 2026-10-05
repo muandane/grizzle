@@ -84,10 +84,7 @@ func GroupSteps(steps []plan.Step) []StepGroup {
 
 // SyncPostgres synchronizes PostgreSQL with session-level advisory locking, timeouts, and retry logic.
 func SyncPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) error {
-	maxRetries := cfg.MaxRetries
-	if maxRetries < 0 {
-		maxRetries = 0
-	}
+	maxRetries := max(cfg.MaxRetries, 0)
 
 	attempt := 0
 	for {
@@ -588,4 +585,3 @@ func GateHazards(p *plan.Plan, accept []plan.HazardCode) error {
 	}
 	return nil
 }
-

@@ -94,8 +94,8 @@ func RunBackfill(ctx context.Context, db *sql.DB, targetSchema string, renames m
 }
 
 func parseRenameTarget(key string) (table, oldCol string) {
-	if dot := strings.Index(key, "."); dot != -1 {
-		return key[:dot], key[dot+1:]
+	if before, after, ok := strings.Cut(key, "."); ok {
+		return before, after
 	}
 	return "", key
 }
