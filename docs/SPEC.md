@@ -23,6 +23,14 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error
 
 // PlanDiff computes the migration plan without executing any changes on the target database.
 func PlanDiff(ctx context.Context, db *sql.DB, opts Options) (*Plan, error)
+
+// Apply applies an approved migration plan to the database.
+// If ExpectedHash is provided and the plan recomputed post-lock differs, Apply aborts with ErrPlanDrift.
+func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error
+
+// Check inspects the live database and returns ErrDrift if the schema differs from opts.SchemaSQL.
+// It is strictly read-only and never modifies the database.
+func Check(ctx context.Context, db *sql.DB, opts Options) error
 ```
 
 ### 2.2 Configuration options
@@ -53,16 +61,47 @@ type Options struct {
     AllowDropIndex  *bool
     AllowDropFK     *bool
 
+    // AcceptHazards specifies explicitly accepted critical hazards.
+    // Unaccepted critical hazards block execution with ErrHazardBlocked.
+    AcceptHazards []HazardCode
+
+    // ExpectedHash is an optional plan hash expected at apply time.
+    // If the recomputed post-lock plan hash differs, Apply aborts with ErrPlanDrift.
+    ExpectedHash string
+
     // ExcludeTables defines table names or glob patterns (e.g. "spatial_ref_sys", "asynq_*")
     // that Grizzle will never alter, diff, or drop.
     ExcludeTables []string
 
     // IncludeTables restricts management scope to only the specified tables or patterns.
-    // If empty, Grizzle manages all tables declared in SchemaSQL while respecting ExcludeTables.
     IncludeTables []string
 
-    // LockID is a 64-bit integer for pg_advisory_xact_lock.
-    // Defaults to a stable hash of TargetSchema.
+    // StrictScope requires IncludeTables to be non-empty when true, preventing accidental unmanaged operations.
+    StrictScope bool
+
+    // NonConcurrentIndexes forces PostgreSQL index creations to run transactionally without CONCURRENTLY.
+    NonConcurrentIndexes bool
+
+    // LockTimeout sets the maximum duration to wait for acquiring the advisory lock (defaults to 5s).
+    LockTimeout time.Duration
+
+    // StatementTimeout sets the maximum duration for any individual DDL statement (defaults to 5m).
+    StatementTimeout time.Duration
+
+    // MaxRetries specifies maximum retry attempts when encountering lock_timeout (defaults to 5).
+    MaxRetries int
+
+    // RandFloat provides an optional random source func returning in [0.0, 1.0) for deterministic jitter in tests.
+    RandFloat func() float64
+
+    // Renames maps old column names to new column names (e.g. "users.old_col": "new_col")
+    // to disambiguate renames instead of treating them as DROP + ADD.
+    Renames map[string]string
+
+    // ExpandContract enables staged expand-and-contract zero-downtime migrations.
+    ExpandContract bool
+
+    // LockID is a 64-bit integer for pg_advisory_xact_lock. Defaults to stable hash of TargetSchema.
     LockID int64
 
     // DryRun outputs planned statements without executing them.
@@ -71,35 +110,59 @@ type Options struct {
     // Logger accepts a structured logger (*slog.Logger) for migration events.
     Logger *slog.Logger
 }
+
+type ApplyOpts struct {
+    ExpectedHash  string
+    AcceptHazards []HazardCode
+}
 ```
 
 ### 2.3 Plan, hazard analysis, and visualization
 
 ```go
 type Plan struct {
-    TargetSchema string
-    Steps        []Step
-    Policy       DropPolicy
+    TargetSchema   string
+    Steps          []Step
+    Policy         DropPolicy
+    IncludeTables  []string
+    ExcludeTables  []string
+    Renames        map[string]string
+    ExpandContract bool
+    SchemaSQL      string
 }
 
+func (p *Plan) Hash() string
+func (p *Plan) Hazards() []Hazard
 func (p *Plan) Additions() int
 func (p *Plan) Modifications() int
 func (p *Plan) Deletions() int
 func (p *Plan) Blocked() int
 func (p *Plan) Summary() (adds, alters, drops, blocked int)
-func (p *Plan) Hazards() []Hazard
 func (p *Plan) Format(w io.Writer, useColor bool) error
 func (p *Plan) String() string
 
 type HazardLevel string
 
 const (
-    HazardLevelCritical HazardLevel = "CRITICAL" // Data destruction (DROP TABLE, DROP COLUMN)
+    HazardLevelCritical HazardLevel = "CRITICAL" // Data destruction (DROP TABLE, DROP COLUMN, TYPE_NARROW, RENAME_AMBIGUOUS)
     HazardLevelWarning  HazardLevel = "WARNING"  // Execution risk (NOT NULL without DEFAULT)
-    HazardLevelNotice   HazardLevel = "NOTICE"   // Locking or performance impact (INDEX creation/drop)
+    HazardLevelNotice   HazardLevel = "NOTICE"   // Locking or performance impact (INDEX creation/drop, FK drop)
+)
+
+type HazardCode string
+
+const (
+    HazardDropTable         HazardCode = "DROP_TABLE"
+    HazardDropColumn        HazardCode = "DROP_COLUMN"
+    HazardTypeNarrow        HazardCode = "TYPE_NARROW"
+    HazardNotNullNoDefault  HazardCode = "NOT_NULL_NO_DEFAULT"
+    HazardDropIndex         HazardCode = "DROP_INDEX"
+    HazardDropFK            HazardCode = "DROP_FK"
+    HazardRenameAmbiguous   HazardCode = "RENAME_AMBIGUOUS"
 )
 
 type Hazard struct {
+    Code        HazardCode  `json:"code"`
     Level       HazardLevel `json:"level"`
     Type        ChangeType  `json:"type"`
     Table       string      `json:"table"`
@@ -115,15 +178,16 @@ type Hazard struct {
 | Construct | Supported | Notes |
 | :--- | :---: | :--- |
 | `CREATE TABLE` | Yes | Composite primary keys, unlogged tables |
-| `DROP TABLE` | Yes | Guarded by `AllowDropTable` |
+| `DROP TABLE` | Yes | Guarded by `AllowDropTable` and `HazardDropTable` |
 | `ADD COLUMN` | Yes | Default expressions, nullability, generated columns |
-| `DROP COLUMN` | Yes | Guarded by `AllowDropColumn` |
-| `ALTER COLUMN TYPE` | Yes | Automatic `USING` cast generation |
-| `ALTER COLUMN SET/DROP NOT NULL` | Yes | Fully supported |
+| `DROP COLUMN` | Yes | Guarded by `AllowDropColumn` and `HazardDropColumn` |
+| `RENAME COLUMN` | Yes | Atomic rename via `ALTER TABLE ... RENAME COLUMN` or staged expand |
+| `ALTER COLUMN TYPE` | Yes | Automatic `USING` cast; guarded by `HazardTypeNarrow` if narrowed |
+| `ALTER COLUMN SET/DROP NOT NULL` | Yes | Guarded by `HazardNotNullNoDefault` if non-null without default |
 | `ALTER COLUMN SET/DROP DEFAULT` | Yes | Literal, function, and interval defaults |
-| `CREATE INDEX` | Yes | B-tree, GIN, GiST, BRIN, unique, partial (`WHERE`), expressions |
-| `DROP INDEX` | Yes | Guarded by `AllowDropIndex` |
-| `FOREIGN KEY` | Yes | `ON DELETE` / `ON UPDATE` actions (CASCADE, SET NULL, RESTRICT) |
+| `CREATE INDEX` | Yes | Emitted as `CONCURRENTLY` by default; B-tree, GIN, GiST, BRIN, unique, partial |
+| `DROP INDEX` | Yes | Guarded by `AllowDropIndex` and `HazardDropIndex` |
+| `FOREIGN KEY` | Yes | Split into `ADD CONSTRAINT ... NOT VALID` and `VALIDATE CONSTRAINT` |
 | `ENUM Types` | Yes | `CREATE TYPE ... AS ENUM`, `ALTER TYPE ... ADD VALUE` |
 | `Native Types` | Yes | UUID, JSONB, Arrays, Timestamps, Numerics |
 
@@ -134,6 +198,7 @@ type Hazard struct {
 | `CREATE TABLE` | Yes | Primary keys, autoincrement, column constraints |
 | `DROP TABLE` | Yes | Guarded by `AllowDropTable` |
 | `ADD COLUMN` | Yes | Direct `ALTER TABLE ... ADD COLUMN` when constraints permit |
+| `RENAME COLUMN` | Yes | Direct `ALTER TABLE ... RENAME COLUMN` when mapped explicitly |
 | `DROP COLUMN` | Yes | Handled via SQLite 12-step table rebuild |
 | `ALTER COLUMN TYPE` | Yes | Handled via SQLite 12-step table rebuild |
 | `CREATE INDEX` | Yes | Direct `CREATE INDEX` and `CREATE UNIQUE INDEX` |
@@ -145,35 +210,55 @@ type Hazard struct {
 ### Invariant 1: Non-destructive by default
 If `AllowDrop` is false (the default), Grizzle refuses to execute any plan containing table or column deletions. It returns a `*DestructiveViolationError` detailing the blocked operations.
 
-### Invariant 2: Distributed mutual exclusion
-PostgreSQL migrations acquire `pg_advisory_xact_lock(lock_id)` inside the active transaction. Concurrent pod boots queue behind the lock and resume only after the first transaction commits. Subsequent pods detect zero pending changes and start immediately.
+### Invariant 2: Distributed mutual exclusion with post-lock re-diffing
+PostgreSQL migrations acquire advisory locks (`pg_advisory_xact_lock` or session lock for concurrent indexes). Grizzle recomputes the diff post-lock to avoid TOCTOU races.
 
-### Invariant 3: Pre-flight shadow validation
-`SchemaSQL` is validated in an isolated shadow schema (`_grizzle_shadow` or an in-memory SQLite database) before inspecting or touching the live schema. SQL errors stop execution without altering live tables.
+### Invariant 3: Hazard gating
+Critical hazards (`DROP_TABLE`, `DROP_COLUMN`, `TYPE_NARROW`, `RENAME_AMBIGUOUS`) fail execution unless accepted via `AcceptHazards`.
 
-### Invariant 4: Third-party table preservation
-Tables matching `ExcludeTables` or known extension patterns (`spatial_ref_sys`, `geometry_columns`) are excluded from diffing, drop detection, and modification. Whitelisting with `IncludeTables` restricts Grizzle exclusively to named tables.
+### Invariant 4: Plan/Apply approval hash
+`Plan.Hash()` provides a deterministic digest. `Apply` verifies the post-lock hash against `ExpectedHash`, aborting with `ErrPlanDrift` on mismatch.
 
-### Invariant 5: Transactional atomicity
-All migration statements run in a single transaction. If any statement fails, the entire transaction rolls back.
+### Invariant 5: Timeouts and retry
+`LockTimeout` and `StatementTimeout` protect production availability. PostgreSQL `lock_timeout` conflicts are retried with exponential backoff and randomized jitter.
 
-## 5. Performance standards
+### Invariant 6: Strict scope protection
+`StrictScope` ensures `IncludeTables` is provided, preventing accidental mutations in shared databases.
 
-* **Warm boot (0 pending diffs)**: `< 15ms` execution time.
-* **Cold boot (initial schema creation)**: `< 80ms`.
-* **Memory usage**: `< 10MB` heap allocations during diffing.
-* **Database connections**: Uses 1 connection from the pool during migration.
+### Invariant 7: Expand and contract
+Ambiguous column renames are blocked. Explicit mappings can execute as atomic renames or staged dual-column expansions for zero downtime.
 
-## 6. Error taxonomy
+### Invariant 8: History and drift detection
+Applied plans are audited in `grizzle_history`. `Check()` provides read-only schema drift verification.
+
+## 5. Error taxonomy
 
 ```go
 var (
-    ErrEmptySchema         = errors.New("grizzle: schema SQL cannot be empty")
-    ErrDestructiveBlocked  = errors.New("grizzle: destructive change rejected by policy")
-    ErrLockAcquisition     = errors.New("grizzle: failed to acquire advisory lock")
-    ErrCompilationFailed   = errors.New("grizzle: schema compilation in shadow schema failed")
-    ErrExecutionFailed     = errors.New("grizzle: applying DDL to live schema failed")
-    ErrInspectionFailed    = errors.New("grizzle: inspecting schema failed")
-    ErrUnsupportedDialect  = errors.New("grizzle: unsupported database dialect")
+    ErrEmptySchema        = errors.New("grizzle: schema SQL cannot be empty")
+    ErrDestructiveBlocked = errors.New("grizzle: destructive change rejected by policy")
+    ErrLockAcquisition    = errors.New("grizzle: failed to acquire advisory lock")
+    ErrCompilationFailed  = errors.New("grizzle: schema compilation in shadow schema failed")
+    ErrExecutionFailed    = errors.New("grizzle: applying DDL to live schema failed")
+    ErrInspectionFailed   = errors.New("grizzle: inspecting schema failed")
+    ErrUnsupportedDialect = errors.New("grizzle: unsupported database dialect")
+    ErrHazardBlocked      = errors.New("grizzle: migration blocked by unaccepted critical hazards")
+    ErrPlanDrift          = errors.New("grizzle: plan drifted from approved state")
+    ErrDrift              = errors.New("grizzle: live database schema has drifted from desired schema")
+    ErrLockTimeout        = errors.New("grizzle: lock acquisition timed out")
+    ErrInvalidOptions     = errors.New("grizzle: invalid options")
+    ErrStrictScope        = errors.New("grizzle: strict scope requires non-empty IncludeTables")
 )
+
+type HazardError struct {
+    Hazards []Hazard
+}
+
+type DriftError struct {
+    Plan *Plan
+}
+
+type DestructiveViolationError struct {
+    Violations []Step
+}
 ```
