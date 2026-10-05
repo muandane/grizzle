@@ -242,7 +242,7 @@ func Diff(live, desired *schema.Schema, filters scope.Filters) []plan.Step {
 		if needsRebuild {
 			rebuildSQL, destructive := GenerateSQLiteRebuildPlan(lTable, dTable)
 			changeType := plan.ChangeAlterColumn
-			if isDestructive || destructive {
+			if len(droppedCols) > 0 {
 				changeType = plan.ChangeDropColumn
 			}
 			steps = append(steps, plan.Step{

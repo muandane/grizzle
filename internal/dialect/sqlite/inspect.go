@@ -201,26 +201,11 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX) (*schema.Schema, error) {
 
 // NormalizeType standardizes SQLite types into canonical representations.
 func NormalizeType(t string) string {
-	s := strings.TrimSpace(strings.ToUpper(t))
+	s := strings.TrimSpace(t)
 	if s == "" {
 		return "TEXT"
 	}
-	switch s {
-	case "INT", "INTEGER", "BIGINT", "TINYINT", "SMALLINT", "MEDIUMINT":
-		return "INTEGER"
-	case "CHARACTER", "VARCHAR", "VARYING CHARACTER", "NCHAR", "NATIVE CHARACTER", "NVARCHAR", "TEXT", "CLOB":
-		return "TEXT"
-	case "REAL", "DOUBLE", "DOUBLE PRECISION", "FLOAT":
-		return "REAL"
-	case "BOOLEAN", "BOOL":
-		return "INTEGER"
-	case "BLOB":
-		return "BLOB"
-	case "NUMERIC", "DECIMAL":
-		return "NUMERIC"
-	default:
-		return s
-	}
+	return strings.ToUpper(schema.NormalizeType(s))
 }
 
 // NormalizeDefault standardizes default expressions in SQLite.
