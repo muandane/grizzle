@@ -1,6 +1,8 @@
 package diff
 
 import (
+	"fmt"
+	"maps"
 	"slices"
 
 	"github.com/yourorg/grizzle/internal/plan"
@@ -10,18 +12,19 @@ import (
 
 // Change represents a pure difference between live and desired database schemas.
 type Change struct {
-	Type        plan.ChangeType
-	Table       string
-	Column      *schema.Column
-	OldColumn   *schema.Column
-	Index       *schema.Index
-	OldIndex    *schema.Index
-	ForeignKey  *schema.ForeignKey
-	Enum        *schema.Enum
-	OldEnum     *schema.Enum
-	EnumValue   string
-	TableData   *schema.Table
-	Destructive bool
+	Type              plan.ChangeType
+	Table             string
+	Column            *schema.Column
+	OldColumn         *schema.Column
+	Index             *schema.Index
+	OldIndex          *schema.Index
+	ForeignKey        *schema.ForeignKey
+	Enum              *schema.Enum
+	OldEnum           *schema.Enum
+	EnumValue         string
+	TableData         *schema.Table
+	Destructive       bool
+	IsRenameCandidate bool
 
 	// Structural flags for hazard analysis
 	ColumnNotNull    bool
@@ -105,17 +108,11 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 		}
 
 		// Existing table: Diff columns
+		addedCols := make(map[string]*schema.Column)
 		for colName, dCol := range dTable.Columns {
 			lCol, colExists := lTable.Columns[colName]
 			if !colExists {
-				changes = append(changes, Change{
-					Type:             plan.ChangeAddColumn,
-					Table:            tblName,
-					Column:           dCol,
-					Destructive:      false,
-					ColumnNotNull:    !dCol.IsNullable,
-					ColumnHasDefault: dCol.DefaultValue != "",
-				})
+				addedCols[colName] = dCol
 			} else {
 				typeChanged := dCol.DataType != lCol.DataType
 				nullChanged := dCol.IsNullable != lCol.IsNullable
@@ -142,15 +139,91 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 		}
 
 		// Dropped columns
+		droppedCols := make(map[string]*schema.Column)
 		for colName, lCol := range lTable.Columns {
 			if _, inDesired := dTable.Columns[colName]; !inDesired {
-				changes = append(changes, Change{
-					Type:        plan.ChangeDropColumn,
-					Table:       tblName,
-					Column:      lCol,
-					Destructive: true,
-				})
+				droppedCols[colName] = lCol
 			}
+		}
+
+		// Check for explicit rename mappings from filters.Renames
+		droppedKeys := slices.Collect(maps.Keys(droppedCols))
+		slices.Sort(droppedKeys)
+
+		for _, lColName := range droppedKeys {
+			lCol := droppedCols[lColName]
+			var mappedNew string
+			if target, ok := filters.Renames[fmt.Sprintf("%s.%s", tblName, lColName)]; ok {
+				mappedNew = target
+			} else if target, ok := filters.Renames[lColName]; ok {
+				mappedNew = target
+			}
+
+			if mappedNew != "" {
+				if dCol, ok := addedCols[mappedNew]; ok {
+					// Disambiguated rename match found!
+					delete(droppedCols, lColName)
+					delete(addedCols, mappedNew)
+
+					if filters.ExpandContract {
+						// Staged Expand phase: add new column, keep old column in place
+						changes = append(changes, Change{
+							Type:             plan.ChangeAddColumn,
+							Table:            tblName,
+							Column:           dCol,
+							Destructive:      false,
+							ColumnNotNull:    !dCol.IsNullable,
+							ColumnHasDefault: dCol.DefaultValue != "",
+						})
+					} else {
+						// Single-step atomic rename
+						changes = append(changes, Change{
+							Type:        plan.ChangeRenameColumn,
+							Table:       tblName,
+							Column:      dCol,
+							OldColumn:   lCol,
+							Destructive: false,
+						})
+					}
+				}
+			}
+		}
+
+		// Process remaining added columns in sorted order
+		addedKeys := slices.Collect(maps.Keys(addedCols))
+		slices.Sort(addedKeys)
+		for _, colName := range addedKeys {
+			dCol := addedCols[colName]
+			changes = append(changes, Change{
+				Type:             plan.ChangeAddColumn,
+				Table:            tblName,
+				Column:           dCol,
+				Destructive:      false,
+				ColumnNotNull:    !dCol.IsNullable,
+				ColumnHasDefault: dCol.DefaultValue != "",
+			})
+		}
+
+		// Process remaining dropped columns (detecting unmapped ambiguous rename candidates)
+		remainingDropped := slices.Collect(maps.Keys(droppedCols))
+		slices.Sort(remainingDropped)
+		for _, colName := range remainingDropped {
+			lCol := droppedCols[colName]
+			isAmbiguousCandidate := false
+			for _, dCol := range addedCols {
+				if schema.NormalizeType(dCol.DataType) == schema.NormalizeType(lCol.DataType) {
+					isAmbiguousCandidate = true
+					break
+				}
+			}
+			changes = append(changes, Change{
+				Type:              plan.ChangeDropColumn,
+				Table:             tblName,
+				Column:            lCol,
+				OldColumn:         lCol,
+				Destructive:       true,
+				IsRenameCandidate: isAmbiguousCandidate,
+			})
 		}
 
 		// Indexes Diff

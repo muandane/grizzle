@@ -178,12 +178,14 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) e
 	_ = shadowTx.Rollback()
 
 	p := &plan.Plan{
-		TargetSchema:  cfg.TargetSchema,
-		Steps:         steps,
-		Policy:        cfg.Policy,
-		IncludeTables: cfg.Filters.Includes,
-		ExcludeTables: cfg.Filters.Excludes,
-		SchemaSQL:     cfg.SchemaSQL,
+		TargetSchema:   cfg.TargetSchema,
+		Steps:          steps,
+		Policy:         cfg.Policy,
+		IncludeTables:  cfg.Filters.Includes,
+		ExcludeTables:  cfg.Filters.Excludes,
+		Renames:        cfg.Filters.Renames,
+		ExpandContract: cfg.Filters.ExpandContract,
+		SchemaSQL:      cfg.SchemaSQL,
 	}
 
 	// 4b. Verify expected plan hash if provided (aborts with ErrPlanDrift on mismatch)
@@ -342,12 +344,14 @@ func PlanDiffPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 	}
 
 	return &plan.Plan{
-		TargetSchema:  cfg.TargetSchema,
-		Steps:         steps,
-		Policy:        cfg.Policy,
-		IncludeTables: cfg.Filters.Includes,
-		ExcludeTables: cfg.Filters.Excludes,
-		SchemaSQL:     cfg.SchemaSQL,
+		TargetSchema:   cfg.TargetSchema,
+		Steps:          steps,
+		Policy:         cfg.Policy,
+		IncludeTables:  cfg.Filters.Includes,
+		ExcludeTables:  cfg.Filters.Excludes,
+		Renames:        cfg.Filters.Renames,
+		ExpandContract: cfg.Filters.ExpandContract,
+		SchemaSQL:      cfg.SchemaSQL,
 	}, nil
 }
 
@@ -389,12 +393,14 @@ func SyncSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) error {
 	steps := sqlite.Diff(live, desired, cfg.Filters)
 
 	p := &plan.Plan{
-		TargetSchema:  "main",
-		Steps:         steps,
-		Policy:        cfg.Policy,
-		IncludeTables: cfg.Filters.Includes,
-		ExcludeTables: cfg.Filters.Excludes,
-		SchemaSQL:     cfg.SchemaSQL,
+		TargetSchema:   "main",
+		Steps:          steps,
+		Policy:         cfg.Policy,
+		IncludeTables:  cfg.Filters.Includes,
+		ExcludeTables:  cfg.Filters.Excludes,
+		Renames:        cfg.Filters.Renames,
+		ExpandContract: cfg.Filters.ExpandContract,
+		SchemaSQL:      cfg.SchemaSQL,
 	}
 
 	// 3b. Verify expected plan hash if provided (aborts with ErrPlanDrift on mismatch)
@@ -510,12 +516,14 @@ func PlanDiffSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) (*pla
 	steps := sqlite.Diff(live, desired, cfg.Filters)
 
 	return &plan.Plan{
-		TargetSchema:  "main",
-		Steps:         steps,
-		Policy:        cfg.Policy,
-		IncludeTables: cfg.Filters.Includes,
-		ExcludeTables: cfg.Filters.Excludes,
-		SchemaSQL:     cfg.SchemaSQL,
+		TargetSchema:   "main",
+		Steps:          steps,
+		Policy:         cfg.Policy,
+		IncludeTables:  cfg.Filters.Includes,
+		ExcludeTables:  cfg.Filters.Excludes,
+		Renames:        cfg.Filters.Renames,
+		ExpandContract: cfg.Filters.ExpandContract,
+		SchemaSQL:      cfg.SchemaSQL,
 	}, nil
 }
 

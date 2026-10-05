@@ -179,12 +179,16 @@ func RenderChange(targetSchema string, c diff.Change, nonConcurrent ...bool) pla
 	isNonConcurrent := len(nonConcurrent) > 0 && nonConcurrent[0]
 
 	step := plan.Step{
-		Type:             c.Type,
-		Table:            c.Table,
-		Destructive:      c.Destructive,
-		ColumnNotNull:    c.ColumnNotNull,
-		ColumnHasDefault: c.ColumnHasDefault,
-		TypeNarrowed:     c.TypeNarrowed,
+		Type:              c.Type,
+		Table:             c.Table,
+		Destructive:       c.Destructive,
+		ColumnNotNull:     c.ColumnNotNull,
+		ColumnHasDefault:  c.ColumnHasDefault,
+		TypeNarrowed:      c.TypeNarrowed,
+		IsRenameCandidate: c.IsRenameCandidate,
+	}
+	if c.OldColumn != nil {
+		step.OldColumn = c.OldColumn.Name
 	}
 
 	switch c.Type {
@@ -198,6 +202,8 @@ func RenderChange(targetSchema string, c diff.Change, nonConcurrent ...bool) pla
 		step.SQL = GenerateAddColumnSQL(targetSchema, c.Table, c.Column)
 	case plan.ChangeAlterColumn:
 		step.SQL = GenerateAlterColumnSQL(targetSchema, c.Table, c.OldColumn, c.Column)
+	case plan.ChangeRenameColumn:
+		step.SQL = fmt.Sprintf("ALTER TABLE %q.%q RENAME COLUMN %q TO %q;", targetSchema, c.Table, c.OldColumn.Name, c.Column.Name)
 	case plan.ChangeDropColumn:
 		step.SQL = fmt.Sprintf("ALTER TABLE %q.%q DROP COLUMN %q CASCADE;", targetSchema, c.Table, c.Column.Name)
 	case plan.ChangeCreateIndex:

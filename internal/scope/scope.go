@@ -18,9 +18,11 @@ var BuiltinIgnoredTables = []string{
 
 // Filters carries the unmanaged-table rules for diff and plan phases.
 type Filters struct {
-	Includes []string `json:"includes,omitempty"`
-	Excludes []string `json:"excludes,omitempty"`
-	Strict   bool     `json:"strict,omitempty"`
+	Includes       []string          `json:"includes,omitempty"`
+	Excludes       []string          `json:"excludes,omitempty"`
+	Strict         bool              `json:"strict,omitempty"`
+	Renames        map[string]string `json:"renames,omitempty"`
+	ExpandContract bool              `json:"expand_contract,omitempty"`
 }
 
 // Validate checks whether filter options conform to strict scoping requirements.

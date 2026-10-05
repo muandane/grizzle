@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 )
@@ -17,10 +18,11 @@ const (
 	ChangeCreateTable ChangeType = "CREATE_TABLE"
 	ChangeDropTable   ChangeType = "DROP_TABLE"
 	ChangeAddColumn   ChangeType = "ADD_COLUMN"
-	ChangeDropColumn  ChangeType = "DROP_COLUMN"
-	ChangeAlterColumn ChangeType = "ALTER_COLUMN"
-	ChangeCreateIndex ChangeType = "CREATE_INDEX"
-	ChangeDropIndex   ChangeType = "DROP_INDEX"
+	ChangeDropColumn         ChangeType = "DROP_COLUMN"
+	ChangeAlterColumn        ChangeType = "ALTER_COLUMN"
+	ChangeRenameColumn       ChangeType = "RENAME_COLUMN"
+	ChangeCreateIndex        ChangeType = "CREATE_INDEX"
+	ChangeDropIndex          ChangeType = "DROP_INDEX"
 	ChangeAddFK              ChangeType = "ADD_FK"
 	ChangeDropFK             ChangeType = "DROP_FK"
 	ChangeValidateConstraint ChangeType = "VALIDATE_CONSTRAINT"
@@ -35,10 +37,12 @@ type Step struct {
 	NonTx       bool       `json:"non_tx,omitzero"`
 
 	// Structural column metadata for precise hazard analysis
-	ColumnNotNull    bool `json:"column_not_null,omitzero"`
-	ColumnHasDefault bool `json:"column_has_default,omitzero"`
-	TypeNarrowed     bool `json:"type_narrowed,omitzero"`
-	IsTableRebuild   bool `json:"is_table_rebuild,omitzero"`
+	ColumnNotNull     bool   `json:"column_not_null,omitzero"`
+	ColumnHasDefault  bool   `json:"column_has_default,omitzero"`
+	TypeNarrowed      bool   `json:"type_narrowed,omitzero"`
+	IsTableRebuild    bool   `json:"is_table_rebuild,omitzero"`
+	IsRenameCandidate bool   `json:"is_rename_candidate,omitzero"`
+	OldColumn         string `json:"old_column,omitzero"`
 }
 
 // DropPolicy defines fine-grained permissions for destructive operations.
@@ -72,12 +76,14 @@ func (p DropPolicy) IsAllowed(s Step) bool {
 
 // Plan contains the complete list of sequenced migration steps.
 type Plan struct {
-	TargetSchema  string     `json:"target_schema"`
-	Steps         []Step     `json:"steps"`
-	Policy        DropPolicy `json:"policy"`
-	IncludeTables []string   `json:"include_tables,omitzero"`
-	ExcludeTables []string   `json:"exclude_tables,omitzero"`
-	SchemaSQL     string     `json:"schema_sql,omitzero"`
+	TargetSchema   string            `json:"target_schema"`
+	Steps          []Step            `json:"steps"`
+	Policy         DropPolicy        `json:"policy"`
+	IncludeTables  []string          `json:"include_tables,omitzero"`
+	ExcludeTables  []string          `json:"exclude_tables,omitzero"`
+	Renames        map[string]string `json:"renames,omitzero"`
+	ExpandContract bool              `json:"expand_contract,omitzero"`
+	SchemaSQL      string            `json:"schema_sql,omitzero"`
 }
 
 // Hash computes a deterministic SHA-256 hex digest of the canonical step list and scope.
@@ -93,10 +99,22 @@ func (p *Plan) Hash() string {
 	fmt.Fprintf(h, "includes:%s\n", strings.Join(includes, ","))
 	fmt.Fprintf(h, "excludes:%s\n", strings.Join(excludes, ","))
 
+	if len(p.Renames) > 0 {
+		renameKeys := slices.Collect(maps.Keys(p.Renames))
+		slices.Sort(renameKeys)
+		for _, k := range renameKeys {
+			fmt.Fprintf(h, "rename:%s->%s\n", k, p.Renames[k])
+		}
+	}
+	if p.ExpandContract {
+		fmt.Fprintf(h, "expand_contract:true\n")
+	}
+
 	for i, s := range p.Steps {
-		fmt.Fprintf(h, "step:%d|type:%s|table:%s|sql:%s|destructive:%t|non_tx:%t|not_null:%t|default:%t|narrowed:%t|rebuild:%t\n",
+		fmt.Fprintf(h, "step:%d|type:%s|table:%s|sql:%s|destructive:%t|non_tx:%t|not_null:%t|default:%t|narrowed:%t|rebuild:%t|rename_cand:%t|old_col:%s\n",
 			i, s.Type, s.Table, strings.TrimSpace(s.SQL), s.Destructive, s.NonTx,
 			s.ColumnNotNull, s.ColumnHasDefault, s.TypeNarrowed, s.IsTableRebuild,
+			s.IsRenameCandidate, s.OldColumn,
 		)
 	}
 
@@ -183,6 +201,8 @@ const (
 	HazardDropIndex HazardCode = "DROP_INDEX"
 	// HazardDropFK indicates removing referential integrity enforcement.
 	HazardDropFK HazardCode = "DROP_FK"
+	// HazardRenameAmbiguous indicates an ambiguous column rename candidate (same type dropped and added).
+	HazardRenameAmbiguous HazardCode = "RENAME_AMBIGUOUS"
 )
 
 // HazardLevel indicates the operational or data-loss severity of a migration step.
@@ -235,6 +255,16 @@ func (p *Plan) Hazards() []Hazard {
 				Description: desc,
 				SQL:         s.SQL,
 			})
+			if s.IsRenameCandidate {
+				hazards = append(hazards, Hazard{
+					Code:        HazardRenameAmbiguous,
+					Level:       HazardLevelCritical,
+					Type:        s.Type,
+					Table:       s.Table,
+					Description: fmt.Sprintf("Table %q has ambiguous column rename candidate for dropped column %q; requires explicit mapping in Options.Renames or separate plans", s.Table, s.OldColumn),
+					SQL:         s.SQL,
+				})
+			}
 		case ChangeAlterColumn:
 			if s.TypeNarrowed {
 				hazards = append(hazards, Hazard{

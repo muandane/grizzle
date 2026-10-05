@@ -124,17 +124,84 @@ func Diff(live, desired *schema.Schema, filters scope.Filters) []plan.Step {
 			continue
 		}
 
-		// Existing table: Check if rebuild is necessary
+		// Existing table: Check for explicit rename mappings or rebuild
 		needsRebuild := false
 		isDestructive := false
 		typeNarrowed := false
+		isRenameCandidate := false
+		var renameCandidateOldCol string
 
+		var droppedCols []string
 		for colName := range lTable.Columns {
 			if _, inDesired := dTable.Columns[colName]; !inDesired {
-				needsRebuild = true
-				isDestructive = true
-				break
+				droppedCols = append(droppedCols, colName)
 			}
+		}
+		var addedCols []string
+		for colName := range dTable.Columns {
+			if _, inLive := lTable.Columns[colName]; !inLive {
+				addedCols = append(addedCols, colName)
+			}
+		}
+
+		// Check if dropped columns match an explicit rename mapping
+		var mappedRenames [][2]string
+		for _, lColName := range droppedCols {
+			var mappedNew string
+			if target, ok := filters.Renames[fmt.Sprintf("%s.%s", tblName, lColName)]; ok {
+				mappedNew = target
+			} else if target, ok := filters.Renames[lColName]; ok {
+				mappedNew = target
+			}
+			if mappedNew != "" && slices.Contains(addedCols, mappedNew) {
+				mappedRenames = append(mappedRenames, [2]string{lColName, mappedNew})
+			}
+		}
+
+		// If all dropped/added columns are accounted for by explicit renames
+		pureRename := len(mappedRenames) > 0 && len(mappedRenames) == len(droppedCols) && len(mappedRenames) == len(addedCols)
+		if pureRename && !filters.ExpandContract {
+			for _, pair := range mappedRenames {
+				steps = append(steps, plan.Step{
+					Type:        plan.ChangeRenameColumn,
+					Table:       tblName,
+					SQL:         fmt.Sprintf("ALTER TABLE %q RENAME COLUMN %q TO %q;", tblName, pair[0], pair[1]),
+					Destructive: false,
+				})
+			}
+			for _, idx := range dTable.Indexes {
+				def := strings.TrimSpace(idx.Definition)
+				if !strings.HasSuffix(def, ";") {
+					def += ";"
+				}
+				steps = append(steps, plan.Step{
+					Type:        plan.ChangeCreateIndex,
+					Table:       tblName,
+					SQL:         def,
+					Destructive: false,
+				})
+			}
+			continue
+		}
+
+		if len(droppedCols) > 0 {
+			// Check for ambiguous candidates
+			for _, dColName := range droppedCols {
+				lCol := lTable.Columns[dColName]
+				for _, aColName := range addedCols {
+					aCol := dTable.Columns[aColName]
+					if schema.NormalizeType(lCol.DataType) == schema.NormalizeType(aCol.DataType) {
+						isRenameCandidate = true
+						renameCandidateOldCol = dColName
+						break
+					}
+				}
+				if isRenameCandidate {
+					break
+				}
+			}
+			needsRebuild = true
+			isDestructive = true
 		}
 
 		if !needsRebuild {
@@ -162,12 +229,14 @@ func Diff(live, desired *schema.Schema, filters scope.Filters) []plan.Step {
 				changeType = plan.ChangeDropColumn
 			}
 			steps = append(steps, plan.Step{
-				Type:           changeType,
-				Table:          tblName,
-				SQL:            rebuildSQL,
-				Destructive:    isDestructive || destructive,
-				TypeNarrowed:   typeNarrowed,
-				IsTableRebuild: true,
+				Type:              changeType,
+				Table:             tblName,
+				SQL:               rebuildSQL,
+				Destructive:       isDestructive || destructive,
+				TypeNarrowed:      typeNarrowed,
+				IsTableRebuild:    true,
+				IsRenameCandidate: isRenameCandidate,
+				OldColumn:         renameCandidateOldCol,
 			})
 
 			for _, idx := range dTable.Indexes {

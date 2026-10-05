@@ -87,6 +87,15 @@ type Options struct {
 	// RandFloat provides an optional random source func returning in [0.0, 1.0) for deterministic jitter in tests.
 	RandFloat func() float64
 
+	// Renames maps old column names to new column names (e.g. "users.old_col": "new_col" or "old_col": "new_col")
+	// to explicitly disambiguate column renames instead of treating them as DROP + ADD.
+	Renames map[string]string
+
+	// ExpandContract enables staged expand-and-contract zero-downtime migrations.
+	// In expand mode, renamed or modified columns are added alongside existing columns,
+	// delaying destructive drops to a later, separately approved plan.
+	ExpandContract bool
+
 	// DryRun returns the planned SQL statements without executing them on the live database.
 	DryRun bool
 
@@ -241,11 +250,27 @@ func resolveDropPolicy(opts Options) plan.DropPolicy {
 	}
 }
 
+// WithRenames sets the explicit column rename mapping.
+func WithRenames(renames map[string]string) Option {
+	return func(o *Options) {
+		o.Renames = renames
+	}
+}
+
+// WithExpandContract enables or disables staged expand-and-contract zero-downtime migrations.
+func WithExpandContract(expand bool) Option {
+	return func(o *Options) {
+		o.ExpandContract = expand
+	}
+}
+
 func toScopeFilters(opts Options) scope.Filters {
 	return scope.Filters{
-		Includes: opts.IncludeTables,
-		Excludes: opts.ExcludeTables,
-		Strict:   opts.StrictScope,
+		Includes:       opts.IncludeTables,
+		Excludes:       opts.ExcludeTables,
+		Strict:         opts.StrictScope,
+		Renames:        opts.Renames,
+		ExpandContract: opts.ExpandContract,
 	}
 }
 

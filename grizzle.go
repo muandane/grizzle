@@ -49,6 +49,7 @@ const (
 	ChangeAddFK              = plan.ChangeAddFK
 	ChangeDropFK             = plan.ChangeDropFK
 	ChangeValidateConstraint = plan.ChangeValidateConstraint
+	ChangeRenameColumn       = plan.ChangeRenameColumn
 )
 
 // HazardCode constants
@@ -60,6 +61,7 @@ const (
 	HazardIndexBuild       = plan.HazardIndexBuild
 	HazardDropIndex        = plan.HazardDropIndex
 	HazardDropFK           = plan.HazardDropFK
+	HazardRenameAmbiguous  = plan.HazardRenameAmbiguous
 )
 
 // HazardLevel constants
@@ -257,6 +259,8 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 			TargetSchema:    p.TargetSchema,
 			IncludeTables:   p.IncludeTables,
 			ExcludeTables:   p.ExcludeTables,
+			Renames:         p.Renames,
+			ExpandContract:  p.ExpandContract,
 			AllowDropTable:  &p.Policy.AllowTable,
 			AllowDropColumn: &p.Policy.AllowColumn,
 			AllowDropIndex:  &p.Policy.AllowIndex,
