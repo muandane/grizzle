@@ -1,0 +1,27 @@
+{
+  "target_schema": "main",
+  "steps": [
+    {
+      "type": "CREATE_TABLE",
+      "table": "posts",
+      "sql": "CREATE TABLE \"posts\" (\n  \"id\" INTEGER PRIMARY KEY AUTOINCREMENT,\n  \"user_id\" INTEGER NOT NULL,\n  \"title\" TEXT NOT NULL,\n  \"content\" TEXT,\n  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n);"
+    },
+    {
+      "type": "CREATE_INDEX",
+      "table": "posts",
+      "sql": "CREATE INDEX idx_posts_user_id ON posts(user_id);"
+    },
+    {
+      "type": "CREATE_TABLE",
+      "table": "users",
+      "sql": "CREATE TABLE \"users\" (\n  \"id\" INTEGER PRIMARY KEY AUTOINCREMENT,\n  \"email\" TEXT NOT NULL,\n  \"created_at\" TEXT DEFAULT 'now()'\n);"
+    }
+  ],
+  "policy": {
+    "allow_table": false,
+    "allow_column": false,
+    "allow_index": false,
+    "allow_fk": false
+  },
+  "schema_sql": "CREATE TABLE users (\n    id INTEGER PRIMARY KEY,\n    email TEXT NOT NULL,\n    created_at TEXT DEFAULT 'now()'\n);\n\nCREATE TABLE posts (\n    id INTEGER PRIMARY KEY,\n    user_id INTEGER NOT NULL,\n    title TEXT NOT NULL,\n    content TEXT,\n    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\n);\n\nCREATE INDEX idx_posts_user_id ON posts(user_id);\n"
+}

@@ -151,6 +151,7 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error {
 			Filters:       filters,
 			Policy:        policy,
 			AcceptHazards: opts.AcceptHazards,
+			ExpectedHash:  opts.ExpectedHash,
 			Logger:        opts.Logger,
 			DryRun:        opts.DryRun,
 		})
@@ -164,6 +165,7 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error {
 		Filters:       filters,
 		Policy:        policy,
 		AcceptHazards: opts.AcceptHazards,
+		ExpectedHash:  opts.ExpectedHash,
 		Logger:        opts.Logger,
 		DryRun:        opts.DryRun,
 	})
@@ -198,6 +200,66 @@ func PlanDiff(ctx context.Context, db *sql.DB, opts Options) (*Plan, error) {
 		Logger:       opts.Logger,
 		DryRun:       opts.DryRun,
 	})
+}
+
+// ApplyOpts configures verification and execution parameters when applying an approved Plan.
+type ApplyOpts struct {
+	// ExpectedHash is the approved plan hash. If non-empty, Apply recomputes the plan after
+	// acquiring the lock and verifies the recomputed hash matches ExpectedHash.
+	// If it does not match, Apply aborts with ErrPlanDrift.
+	ExpectedHash string
+
+	// AcceptHazards specifies explicitly accepted critical hazards.
+	AcceptHazards []HazardCode
+}
+
+// Apply applies an approved migration plan to the database.
+// If ExpectedHash is provided and the plan recomputed post-lock differs, Apply aborts with ErrPlanDrift.
+func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
+	if p == nil {
+		return fmt.Errorf("grizzle: plan cannot be nil")
+	}
+	if db == nil {
+		return fmt.Errorf("grizzle: database connection is nil")
+	}
+	if opts.ExpectedHash != "" && p.Hash() != opts.ExpectedHash {
+		return fmt.Errorf("%w: plan hash %q does not match expected hash %q", ErrPlanDrift, p.Hash(), opts.ExpectedHash)
+	}
+
+	if p.SchemaSQL != "" {
+		syncOpts := Options{
+			SchemaSQL:       p.SchemaSQL,
+			TargetSchema:    p.TargetSchema,
+			IncludeTables:   p.IncludeTables,
+			ExcludeTables:   p.ExcludeTables,
+			AllowDropTable:  &p.Policy.AllowTable,
+			AllowDropColumn: &p.Policy.AllowColumn,
+			AllowDropIndex:  &p.Policy.AllowIndex,
+			AllowDropFK:     &p.Policy.AllowFK,
+			AcceptHazards:   opts.AcceptHazards,
+			ExpectedHash:    opts.ExpectedHash,
+		}
+		return Sync(ctx, db, syncOpts)
+	}
+
+	// Direct execution fallback if SchemaSQL was not retained
+	if err := exec.GateHazards(p, opts.AcceptHazards); err != nil {
+		return err
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, s := range p.Steps {
+		if !p.Policy.IsAllowed(s) {
+			return &plan.DestructiveViolationError{Violations: []plan.Step{s}}
+		}
+		if _, err := tx.ExecContext(ctx, s.SQL); err != nil {
+			return fmt.Errorf("%w: failed executing [%s]: %v", plan.ErrExecutionFailed, s.SQL, err)
+		}
+	}
+	return tx.Commit()
 }
 
 // tableFilters bridges internal scope filters for existing root test suites.

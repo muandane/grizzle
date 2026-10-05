@@ -25,6 +25,7 @@ type PostgresExecConfig struct {
 	Filters       scope.Filters
 	Policy        plan.DropPolicy
 	AcceptHazards []plan.HazardCode
+	ExpectedHash  string
 	Logger        *slog.Logger
 	DryRun        bool
 }
@@ -95,6 +96,23 @@ func SyncPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) error
 		return err
 	}
 
+	p := &plan.Plan{
+		TargetSchema:  cfg.TargetSchema,
+		Steps:         steps,
+		Policy:        cfg.Policy,
+		IncludeTables: cfg.Filters.Includes,
+		ExcludeTables: cfg.Filters.Excludes,
+		SchemaSQL:     cfg.SchemaSQL,
+	}
+
+	// 4b. Verify expected plan hash if provided (aborts with ErrPlanDrift on mismatch)
+	if cfg.ExpectedHash != "" && p.Hash() != cfg.ExpectedHash {
+		if logger != nil {
+			logger.WarnContext(ctx, "grizzle: plan drift detected post-lock", "expected", cfg.ExpectedHash, "actual", p.Hash())
+		}
+		return fmt.Errorf("%w: expected hash %q, actual post-lock hash %q", plan.ErrPlanDrift, cfg.ExpectedHash, p.Hash())
+	}
+
 	if len(steps) == 0 {
 		if logger != nil {
 			logger.InfoContext(ctx, "grizzle: schema is already in sync", "duration", time.Since(start))
@@ -122,11 +140,6 @@ func SyncPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) error
 	}
 
 	// 5b. Enforce hazard gating (fails on critical hazards unless explicitly accepted)
-	p := &plan.Plan{
-		TargetSchema: cfg.TargetSchema,
-		Steps:        steps,
-		Policy:       cfg.Policy,
-	}
 	if err := GateHazards(p, cfg.AcceptHazards); err != nil {
 		if logger != nil {
 			logger.WarnContext(ctx, "grizzle: migration blocked by unaccepted critical hazards", "error", err)
@@ -195,9 +208,12 @@ func PlanDiffPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 	}
 
 	return &plan.Plan{
-		TargetSchema: cfg.TargetSchema,
-		Steps:        steps,
-		Policy:       cfg.Policy,
+		TargetSchema:  cfg.TargetSchema,
+		Steps:         steps,
+		Policy:        cfg.Policy,
+		IncludeTables: cfg.Filters.Includes,
+		ExcludeTables: cfg.Filters.Excludes,
+		SchemaSQL:     cfg.SchemaSQL,
 	}, nil
 }
 
@@ -207,6 +223,7 @@ type SQLiteExecConfig struct {
 	Filters       scope.Filters
 	Policy        plan.DropPolicy
 	AcceptHazards []plan.HazardCode
+	ExpectedHash  string
 	Logger        *slog.Logger
 	DryRun        bool
 }
@@ -237,6 +254,23 @@ func SyncSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) error {
 	// 3. Diff schemas
 	steps := sqlite.Diff(live, desired, cfg.Filters)
 
+	p := &plan.Plan{
+		TargetSchema:  "main",
+		Steps:         steps,
+		Policy:        cfg.Policy,
+		IncludeTables: cfg.Filters.Includes,
+		ExcludeTables: cfg.Filters.Excludes,
+		SchemaSQL:     cfg.SchemaSQL,
+	}
+
+	// 3b. Verify expected plan hash if provided (aborts with ErrPlanDrift on mismatch)
+	if cfg.ExpectedHash != "" && p.Hash() != cfg.ExpectedHash {
+		if logger != nil {
+			logger.WarnContext(ctx, "sqlite: plan drift detected post-lock", "expected", cfg.ExpectedHash, "actual", p.Hash())
+		}
+		return fmt.Errorf("%w: expected hash %q, actual post-lock hash %q", plan.ErrPlanDrift, cfg.ExpectedHash, p.Hash())
+	}
+
 	if len(steps) == 0 {
 		if logger != nil {
 			logger.InfoContext(ctx, "sqlite: schema is already in sync", "duration", time.Since(start))
@@ -263,11 +297,6 @@ func SyncSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) error {
 	}
 
 	// 4b. Enforce hazard gating (fails on critical hazards unless explicitly accepted)
-	p := &plan.Plan{
-		TargetSchema: "main",
-		Steps:        steps,
-		Policy:       cfg.Policy,
-	}
 	if err := GateHazards(p, cfg.AcceptHazards); err != nil {
 		if logger != nil {
 			logger.WarnContext(ctx, "sqlite: migration blocked by unaccepted critical hazards", "error", err)
@@ -340,9 +369,12 @@ func PlanDiffSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) (*pla
 	steps := sqlite.Diff(live, desired, cfg.Filters)
 
 	return &plan.Plan{
-		TargetSchema: "main",
-		Steps:        steps,
-		Policy:       cfg.Policy,
+		TargetSchema:  "main",
+		Steps:         steps,
+		Policy:        cfg.Policy,
+		IncludeTables: cfg.Filters.Includes,
+		ExcludeTables: cfg.Filters.Excludes,
+		SchemaSQL:     cfg.SchemaSQL,
 	}, nil
 }
 

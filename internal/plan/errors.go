@@ -30,6 +30,21 @@ var (
 
 	// ErrHazardBlocked is returned when a migration plan contains critical hazards not explicitly accepted in AcceptHazards.
 	ErrHazardBlocked = errors.New("grizzle: critical hazard rejected (unaccepted hazard)")
+
+	// ErrPlanDrift is returned when the approved plan hash differs from the recomputed plan hash after lock acquisition.
+	ErrPlanDrift = errors.New("grizzle: plan drift detected (hash mismatch)")
+
+	// ErrDrift is returned by Check when the live database schema differs from the desired schema.
+	ErrDrift = errors.New("grizzle: database schema drift detected")
+
+	// ErrLockTimeout is returned when an advisory lock cannot be acquired within the configured lock timeout.
+	ErrLockTimeout = errors.New("grizzle: lock acquisition timeout")
+
+	// ErrInvalidOptions is returned when provided Options fail validation.
+	ErrInvalidOptions = errors.New("grizzle: invalid options")
+
+	// ErrStrictScope is returned when StrictScope is enabled but no IncludeTables are specified.
+	ErrStrictScope = errors.New("grizzle: strict scope violation (IncludeTables required)")
 )
 
 // HazardError reports all critical hazards that were not explicitly accepted.

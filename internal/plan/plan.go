@@ -1,7 +1,11 @@
 package plan
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"slices"
+	"strings"
 )
 
 // ChangeType describes the category of a schema mutation.
@@ -66,9 +70,35 @@ func (p DropPolicy) IsAllowed(s Step) bool {
 
 // Plan contains the complete list of sequenced migration steps.
 type Plan struct {
-	TargetSchema string     `json:"target_schema"`
-	Steps        []Step     `json:"steps"`
-	Policy       DropPolicy `json:"policy"`
+	TargetSchema  string     `json:"target_schema"`
+	Steps         []Step     `json:"steps"`
+	Policy        DropPolicy `json:"policy"`
+	IncludeTables []string   `json:"include_tables,omitzero"`
+	ExcludeTables []string   `json:"exclude_tables,omitzero"`
+	SchemaSQL     string     `json:"schema_sql,omitzero"`
+}
+
+// Hash computes a deterministic SHA-256 hex digest of the canonical step list and scope.
+func (p *Plan) Hash() string {
+	h := sha256.New()
+
+	includes := slices.Clone(p.IncludeTables)
+	slices.Sort(includes)
+	excludes := slices.Clone(p.ExcludeTables)
+	slices.Sort(excludes)
+
+	fmt.Fprintf(h, "schema:%s\n", p.TargetSchema)
+	fmt.Fprintf(h, "includes:%s\n", strings.Join(includes, ","))
+	fmt.Fprintf(h, "excludes:%s\n", strings.Join(excludes, ","))
+
+	for i, s := range p.Steps {
+		fmt.Fprintf(h, "step:%d|type:%s|table:%s|sql:%s|destructive:%t|not_null:%t|default:%t|narrowed:%t|rebuild:%t\n",
+			i, s.Type, s.Table, strings.TrimSpace(s.SQL), s.Destructive,
+			s.ColumnNotNull, s.ColumnHasDefault, s.TypeNarrowed, s.IsTableRebuild,
+		)
+	}
+
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // HasDestructive reports whether any step in the plan is destructive.

@@ -27,6 +27,21 @@ var (
 
 	// ErrHazardBlocked is returned when a migration plan contains critical hazards not explicitly accepted in AcceptHazards.
 	ErrHazardBlocked = plan.ErrHazardBlocked
+
+	// ErrPlanDrift is returned when the approved plan hash differs from the recomputed plan hash after lock acquisition.
+	ErrPlanDrift = plan.ErrPlanDrift
+
+	// ErrDrift is returned by Check when the live database schema differs from the desired schema.
+	ErrDrift = plan.ErrDrift
+
+	// ErrLockTimeout is returned when an advisory lock cannot be acquired within the configured lock timeout.
+	ErrLockTimeout = plan.ErrLockTimeout
+
+	// ErrInvalidOptions is returned when provided Options fail validation.
+	ErrInvalidOptions = plan.ErrInvalidOptions
+
+	// ErrStrictScope is returned when StrictScope is enabled but no IncludeTables are specified.
+	ErrStrictScope = plan.ErrStrictScope
 )
 
 // HazardError reports all critical hazards that were not explicitly accepted.

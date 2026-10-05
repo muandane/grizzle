@@ -57,6 +57,10 @@ type Options struct {
 	// Critical hazards not present in this list will cause Apply to fail with ErrHazardBlocked.
 	AcceptHazards []plan.HazardCode
 
+	// ExpectedHash defines the approved plan approval hash to verify before execution.
+	// If the recomputed plan hash post-lock differs, execution aborts with ErrPlanDrift.
+	ExpectedHash string
+
 	// LockID is a 64-bit integer used for the PostgreSQL advisory lock (pg_advisory_xact_lock).
 	LockID int64
 
@@ -116,6 +120,13 @@ func WithIncludeTables(tables ...string) Option {
 func WithAcceptHazards(hazards ...plan.HazardCode) Option {
 	return func(o *Options) {
 		o.AcceptHazards = append(o.AcceptHazards, hazards...)
+	}
+}
+
+// WithExpectedHash sets the approved plan hash to verify before execution.
+func WithExpectedHash(hash string) Option {
+	return func(o *Options) {
+		o.ExpectedHash = hash
 	}
 }
 
