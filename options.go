@@ -64,10 +64,6 @@ type Options struct {
 	// Critical hazards not present in this list will cause Apply to fail with ErrHazardBlocked.
 	AcceptHazards []plan.HazardCode
 
-	// ExpectedHash defines the approved plan approval hash to verify before execution.
-	// If the recomputed plan hash post-lock differs, execution aborts with ErrPlanDrift.
-	ExpectedHash string
-
 	// NonConcurrentIndexes opts out of emitting CONCURRENTLY for PostgreSQL index creation/drops.
 	// When true, index operations are created inside the transaction.
 	NonConcurrentIndexes bool
@@ -155,12 +151,6 @@ func WithAcceptHazards(hazards ...plan.HazardCode) Option {
 	}
 }
 
-// WithExpectedHash sets the approved plan hash to verify before execution.
-func WithExpectedHash(hash string) Option {
-	return func(o *Options) {
-		o.ExpectedHash = hash
-	}
-}
 
 // WithNonConcurrentIndexes controls whether PostgreSQL index creation should run inside the transaction.
 func WithNonConcurrentIndexes(disabled bool) Option {

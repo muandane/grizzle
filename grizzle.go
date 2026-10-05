@@ -168,7 +168,6 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error {
 			Filters:       filters,
 			Policy:        policy,
 			AcceptHazards: opts.AcceptHazards,
-			ExpectedHash:  opts.ExpectedHash,
 			Logger:        opts.Logger,
 			DryRun:        opts.DryRun,
 		})
@@ -182,7 +181,6 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error {
 		Filters:              filters,
 		Policy:               policy,
 		AcceptHazards:        opts.AcceptHazards,
-		ExpectedHash:         opts.ExpectedHash,
 		NonConcurrentIndexes: opts.NonConcurrentIndexes,
 		LockTimeout:          opts.LockTimeout,
 		StatementTimeout:     opts.StatementTimeout,
@@ -266,9 +264,42 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 			AllowDropIndex:  &p.Policy.AllowIndex,
 			AllowDropFK:     &p.Policy.AllowFK,
 			AcceptHazards:   opts.AcceptHazards,
-			ExpectedHash:    opts.ExpectedHash,
 		}
-		return Sync(ctx, db, syncOpts)
+		if err := prepareOptions(ctx, db, &syncOpts); err != nil {
+			return err
+		}
+		policy := resolveDropPolicy(syncOpts)
+		filters := toScopeFilters(syncOpts)
+
+		if syncOpts.Dialect == DialectSQLite {
+			return exec.SyncSQLite(ctx, db, exec.SQLiteExecConfig{
+				SchemaSQL:     syncOpts.SchemaSQL,
+				Filters:       filters,
+				Policy:        policy,
+				AcceptHazards: opts.AcceptHazards,
+				ExpectedHash:  opts.ExpectedHash,
+				Logger:        syncOpts.Logger,
+				DryRun:        syncOpts.DryRun,
+			})
+		}
+
+		return exec.SyncPostgres(ctx, db, exec.PostgresExecConfig{
+			TargetSchema:         syncOpts.TargetSchema,
+			ShadowSchema:         syncOpts.ShadowSchema,
+			SchemaSQL:            syncOpts.SchemaSQL,
+			LockID:               syncOpts.LockID,
+			Filters:              filters,
+			Policy:               policy,
+			AcceptHazards:        opts.AcceptHazards,
+			ExpectedHash:         opts.ExpectedHash,
+			NonConcurrentIndexes: syncOpts.NonConcurrentIndexes,
+			LockTimeout:          syncOpts.LockTimeout,
+			StatementTimeout:     syncOpts.StatementTimeout,
+			MaxRetries:           syncOpts.MaxRetries,
+			RandFloat:            syncOpts.RandFloat,
+			Logger:               syncOpts.Logger,
+			DryRun:               syncOpts.DryRun,
+		})
 	}
 
 	// Direct execution fallback if SchemaSQL was not retained

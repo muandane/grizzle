@@ -104,13 +104,24 @@ func main() {
 				os.Exit(1)
 			}
 			opts := grizzle.Options{
-				SchemaSQL:    string(content),
-				AllowDrop:    *allowDrop,
-				ExpectedHash: *expectedHash,
+				SchemaSQL: string(content),
+				AllowDrop: *allowDrop,
 			}
-			if err := grizzle.Sync(ctx, db, opts); err != nil {
-				fmt.Fprintf(os.Stderr, "Apply error: %v\n", err)
-				os.Exit(1)
+			if *expectedHash != "" {
+				p, err := grizzle.PlanDiff(ctx, db, opts)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Plan error: %v\n", err)
+					os.Exit(1)
+				}
+				if err := grizzle.Apply(ctx, db, p, grizzle.ApplyOpts{ExpectedHash: *expectedHash}); err != nil {
+					fmt.Fprintf(os.Stderr, "Apply error: %v\n", err)
+					os.Exit(1)
+				}
+			} else {
+				if err := grizzle.Sync(ctx, db, opts); err != nil {
+					fmt.Fprintf(os.Stderr, "Apply error: %v\n", err)
+					os.Exit(1)
+				}
 			}
 		}
 		fmt.Println("Schema applied successfully.")
