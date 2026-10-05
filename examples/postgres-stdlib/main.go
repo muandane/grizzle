@@ -16,11 +16,6 @@ import (
 var schemaSQL string
 
 func main() {
-	// Bound the migration: the advisory lock blocks until any other in-flight
-	// sync finishes, so an explicit timeout avoids hanging startup indefinitely.
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
 		dsn = "postgres://postgres:password@localhost:5432/myapp?sslmode=disable"
@@ -32,14 +27,18 @@ func main() {
 	}
 	defer db.Close()
 
-	if err := db.PingContext(ctx); err != nil {
+	// Scope migration deadline to startup phase so server context does not inherit it
+	syncCtx, syncCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer syncCancel()
+
+	if err := db.PingContext(syncCtx); err != nil {
 		log.Fatalf("failed to connect to postgres: %v", err)
 	}
 
 	log.Println("Synchronizing database schema with Grizzle...")
 
 	// Run in-process declarative migration on application boot
-	err = grizzle.Sync(ctx, db, grizzle.Options{
+	err = grizzle.Sync(syncCtx, db, grizzle.Options{
 		SchemaSQL: schemaSQL,
 		AllowDrop: false, // Strict safety in production
 	})
