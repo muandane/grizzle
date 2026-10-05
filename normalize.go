@@ -78,13 +78,26 @@ func normalizeDefault(raw string) string {
 	return strings.TrimSpace(d)
 }
 
-// normalizeDefinition replaces references to shadowSchema with targetSchema in DDL expressions.
+// normalizeDefinition replaces references to shadowSchema with targetSchema in DDL expressions
+// and removes redundant schema qualifications from REFERENCES and type casts.
 func normalizeDefinition(def, shadowSchema, targetSchema string) string {
 	res := def
 	if shadowSchema != "" {
 		res = strings.ReplaceAll(res, shadowSchema+".", targetSchema+".")
 		res = strings.ReplaceAll(res, `"`+shadowSchema+`".`, `"`+targetSchema+`".`)
 	}
+	if targetSchema != "" {
+		// Strip schema prefix from REFERENCES <schema>.tbl -> REFERENCES tbl
+		res = strings.ReplaceAll(res, "REFERENCES "+targetSchema+".", "REFERENCES ")
+		res = strings.ReplaceAll(res, "REFERENCES \""+targetSchema+"\".", "REFERENCES ")
+		res = strings.ReplaceAll(res, "references "+targetSchema+".", "references ")
+		res = strings.ReplaceAll(res, "references \""+targetSchema+"\".", "references ")
+
+		// Strip schema prefix from type casts ::<schema>.type -> ::type
+		res = strings.ReplaceAll(res, "::"+targetSchema+".", "::")
+		res = strings.ReplaceAll(res, "::\""+targetSchema+"\".", "::")
+	}
 	return strings.TrimSpace(res)
 }
+
 
