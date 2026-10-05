@@ -16,6 +16,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/yourorg/grizzle/internal/dialect/postgres"
 	"github.com/yourorg/grizzle/internal/exec"
+	"github.com/yourorg/grizzle/internal/history"
 	"github.com/yourorg/grizzle/internal/plan"
 	"github.com/yourorg/grizzle/internal/scope"
 )
@@ -262,3 +263,101 @@ func TestConcurrency_LockTimeoutRetryAndConcurrent(t *testing.T) {
 		t.Fatalf("SyncPostgres failed despite lock timeout retry: %v", err)
 	}
 }
+
+func TestConcurrency_LockCoverageAcrossTxAndNonTxGroups(t *testing.T) {
+	db := getIntegrationDB(t)
+	defer db.Close()
+
+	schema := fmt.Sprintf("test_lock_cov_%d", time.Now().UnixNano())
+	_, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema))
+	if err != nil {
+		t.Fatalf("failed creating schema: %v", err)
+	}
+	defer func() {
+		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schema))
+	}()
+
+	// Schema needing both a table (tx group) and a concurrent index (non-tx group)
+	desiredSQL := `
+		CREATE TABLE articles (
+			id BIGINT PRIMARY KEY,
+			title TEXT NOT NULL,
+			slug TEXT NOT NULL
+		);
+		CREATE INDEX idx_articles_slug ON articles(slug);
+	`
+
+	const numPods = 10
+	var wg sync.WaitGroup
+	errs := make(chan error, numPods)
+	barrier := make(chan struct{})
+
+	for i := 0; i < numPods; i++ {
+		wg.Add(1)
+		go func(podID int) {
+			defer wg.Done()
+			<-barrier // Launch all 10 pods simultaneously
+
+			ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+			defer cancel()
+
+			cfg := exec.PostgresExecConfig{
+				TargetSchema: schema,
+				ShadowSchema: fmt.Sprintf("%s_shad_%d", schema, podID),
+				SchemaSQL:    desiredSQL,
+				LockID:       postgres.GenerateLockID(schema),
+				Filters:      scope.Filters{},
+				Policy: plan.DropPolicy{
+					AllowTable:  false,
+					AllowColumn: false,
+					AllowIndex:  false,
+					AllowFK:     false,
+				},
+				LockTimeout:      5 * time.Second,
+				StatementTimeout: 30 * time.Second,
+				MaxRetries:       5,
+			}
+
+			if err := exec.SyncPostgres(ctx, db, cfg); err != nil {
+				errs <- fmt.Errorf("pod %d failed: %w", podID, err)
+			}
+		}(i)
+	}
+
+	close(barrier)
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Errorf("pod migration error: %v", err)
+	}
+
+	// Assert exactly ONE execution recorded in grizzle_history across all 10 pods
+	records, err := history.List(context.Background(), db, "postgres", schema)
+	if err != nil {
+		t.Fatalf("failed reading history: %v", err)
+	}
+
+	if len(records) != 1 {
+		t.Fatalf("expected exactly 1 history row executed across 10 pods, got %d records: %+v", len(records), records)
+	}
+
+	if records[0].Status != "applied" {
+		t.Errorf("expected history record status 'applied', got %q", records[0].Status)
+	}
+
+	// Verify the table and the concurrent index exist and are valid
+	var indexValid bool
+	err = db.QueryRow(fmt.Sprintf(`
+		SELECT ix.indisvalid
+		FROM pg_index ix
+		JOIN pg_class t ON t.oid = ix.indrelid
+		JOIN pg_class i ON i.oid = ix.indexrelid
+		JOIN pg_namespace n ON n.oid = t.relnamespace
+		WHERE n.nspname = '%s' AND i.relname = 'idx_articles_slug';
+	`, schema)).Scan(&indexValid)
+	if err != nil || !indexValid {
+		t.Fatalf("expected idx_articles_slug to exist and be valid, err: %v, valid: %t", err, indexValid)
+	}
+}
+

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/yourorg/grizzle/internal/dialect"
+	"github.com/yourorg/grizzle/internal/plan"
 )
 
 // GenerateLockID produces a deterministic 64-bit integer hash from a schema identifier.
@@ -29,8 +30,8 @@ func AcquireAdvisoryLock(ctx context.Context, dbtx dialect.DBTX, lockID int64) e
 }
 
 // AcquireSessionAdvisoryLock acquires a PostgreSQL session-level exclusive advisory lock on a dedicated connection.
-// It uses pg_try_advisory_lock with non-blocking retries to avoid holding waiting transactions that would
-// deadlock against concurrent non-transactional operations such as CREATE INDEX CONCURRENTLY.
+// It uses pg_try_advisory_lock in a non-blocking loop to avoid holding open server-side lock wait queues
+// that would cause PostgreSQL deadlock detection against concurrent non-transactional DDL such as CREATE INDEX CONCURRENTLY.
 func AcquireSessionAdvisoryLock(ctx context.Context, dbtx dialect.DBTX, lockID int64) error {
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
@@ -47,7 +48,7 @@ func AcquireSessionAdvisoryLock(ctx context.Context, dbtx dialect.DBTX, lockID i
 
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("timeout waiting for pg_advisory_lock: %w", ctx.Err())
+			return fmt.Errorf("%w: %v", plan.ErrLockTimeout, ctx.Err())
 		case <-ticker.C:
 		}
 	}
