@@ -1,4 +1,4 @@
-package grizzle
+package sqlite
 
 import (
 	"cmp"
@@ -6,12 +6,17 @@ import (
 	"maps"
 	"slices"
 	"strings"
+
+	"github.com/yourorg/grizzle/internal/dialect"
+	"github.com/yourorg/grizzle/internal/plan"
+	"github.com/yourorg/grizzle/internal/schema"
+	"github.com/yourorg/grizzle/internal/scope"
 )
 
-// generateSQLiteCreateTable constructs a standard SQLite CREATE TABLE statement.
-func generateSQLiteCreateTable(tbl *TableIR) string {
+// GenerateSQLiteCreateTable constructs a standard SQLite CREATE TABLE statement.
+func GenerateSQLiteCreateTable(tbl *schema.Table) string {
 	cols := slices.Collect(maps.Values(tbl.Columns))
-	slices.SortFunc(cols, func(a, b *ColumnIR) int {
+	slices.SortFunc(cols, func(a, b *schema.Column) int {
 		return cmp.Compare(a.Position, b.Position)
 	})
 
@@ -20,7 +25,6 @@ func generateSQLiteCreateTable(tbl *TableIR) string {
 
 	for _, c := range cols {
 		line := fmt.Sprintf("  %q %s", c.Name, c.DataType)
-		// Single-column integer PK in SQLite is autoincrement primary key
 		if isSinglePK && c.Name == tbl.PrimaryKey.Columns[0] && strings.EqualFold(c.DataType, "INTEGER") {
 			line += " PRIMARY KEY AUTOINCREMENT"
 		} else {
@@ -34,7 +38,6 @@ func generateSQLiteCreateTable(tbl *TableIR) string {
 		lines = append(lines, line)
 	}
 
-	// Composite primary key
 	if tbl.PrimaryKey != nil && len(tbl.PrimaryKey.Columns) > 1 {
 		var quotedCols []string
 		for _, col := range tbl.PrimaryKey.Columns {
@@ -43,7 +46,6 @@ func generateSQLiteCreateTable(tbl *TableIR) string {
 		lines = append(lines, fmt.Sprintf("  PRIMARY KEY (%s)", strings.Join(quotedCols, ", ")))
 	}
 
-	// Foreign keys
 	for _, fk := range tbl.ForeignKeys {
 		lines = append(lines, "  "+fk.Definition)
 	}
@@ -51,16 +53,14 @@ func generateSQLiteCreateTable(tbl *TableIR) string {
 	return fmt.Sprintf("CREATE TABLE %q (\n%s\n);", tbl.Name, strings.Join(lines, ",\n"))
 }
 
-// generateSQLiteRebuildPlan generates the standard 12-step atomic table replacement plan.
-func generateSQLiteRebuildPlan(liveTable, desiredTable *TableIR) (string, bool) {
+// GenerateSQLiteRebuildPlan generates the standard 12-step atomic table replacement plan.
+func GenerateSQLiteRebuildPlan(liveTable, desiredTable *schema.Table) (string, bool) {
 	tempTable := "_grizzle_new_" + desiredTable.Name
 
-	// 1. Create temporary new table
 	rebuiltTable := *desiredTable
 	rebuiltTable.Name = tempTable
-	createTempSQL := generateSQLiteCreateTable(&rebuiltTable)
+	createTempSQL := GenerateSQLiteCreateTable(&rebuiltTable)
 
-	// 2. Determine common columns to copy
 	var commonCols []string
 	var droppedCols []string
 	for colName := range liveTable.Columns {
@@ -75,13 +75,10 @@ func generateSQLiteRebuildPlan(liveTable, desiredTable *TableIR) (string, bool) 
 	colList := strings.Join(commonCols, ", ")
 	copyDataSQL := fmt.Sprintf("INSERT INTO %q (%s) SELECT %s FROM %q;", tempTable, colList, colList, liveTable.Name)
 	if len(commonCols) == 0 {
-		copyDataSQL = "" // No data to copy
+		copyDataSQL = ""
 	}
 
-	// 3. Drop old table
 	dropOldSQL := fmt.Sprintf("DROP TABLE %q;", liveTable.Name)
-
-	// 4. Rename temp table to final name
 	renameSQL := fmt.Sprintf("ALTER TABLE %q RENAME TO %q;", tempTable, liveTable.Name)
 
 	var statements []string
@@ -95,22 +92,21 @@ func generateSQLiteRebuildPlan(liveTable, desiredTable *TableIR) (string, bool) 
 	return strings.Join(statements, "\n"), isDestructive
 }
 
-// diffSQLiteSchemas compares live and desired schemas and produces a sequenced list of SQLite steps.
-func diffSQLiteSchemas(live, desired *SchemaIR, filters tableFilters) []Step {
-	var steps []Step
+// Diff compares live and desired schemas and produces a sequenced list of SQLite steps.
+func Diff(live, desired *schema.Schema, filters scope.Filters) []plan.Step {
+	var steps []plan.Step
 
 	// 1. Tables
 	for tblName, dTable := range desired.Tables {
-		if !isTableManaged(tblName, filters) {
+		if !scope.IsTableManaged(tblName, filters) {
 			continue
 		}
 		lTable, exists := live.Tables[tblName]
 		if !exists {
-			// New table
-			steps = append(steps, Step{
-				Type:        ChangeCreateTable,
+			steps = append(steps, plan.Step{
+				Type:        plan.ChangeCreateTable,
 				Table:       tblName,
-				SQL:         generateSQLiteCreateTable(dTable),
+				SQL:         GenerateSQLiteCreateTable(dTable),
 				Destructive: false,
 			})
 			for _, idx := range dTable.Indexes {
@@ -118,8 +114,8 @@ func diffSQLiteSchemas(live, desired *SchemaIR, filters tableFilters) []Step {
 				if !strings.HasSuffix(def, ";") {
 					def += ";"
 				}
-				steps = append(steps, Step{
-					Type:        ChangeCreateIndex,
+				steps = append(steps, plan.Step{
+					Type:        plan.ChangeCreateIndex,
 					Table:       tblName,
 					SQL:         def,
 					Destructive: false,
@@ -132,7 +128,6 @@ func diffSQLiteSchemas(live, desired *SchemaIR, filters tableFilters) []Step {
 		needsRebuild := false
 		isDestructive := false
 
-		// Check dropped columns
 		for colName := range lTable.Columns {
 			if _, inDesired := dTable.Columns[colName]; !inDesired {
 				needsRebuild = true
@@ -141,7 +136,6 @@ func diffSQLiteSchemas(live, desired *SchemaIR, filters tableFilters) []Step {
 			}
 		}
 
-		// Check column alterations
 		if !needsRebuild {
 			for colName, dCol := range dTable.Columns {
 				lCol, inLive := lTable.Columns[colName]
@@ -158,34 +152,31 @@ func diffSQLiteSchemas(live, desired *SchemaIR, filters tableFilters) []Step {
 		}
 
 		if needsRebuild {
-			// Execute 12-step table rebuild
-			rebuildSQL, destructive := generateSQLiteRebuildPlan(lTable, dTable)
-			changeType := ChangeAlterColumn
+			rebuildSQL, destructive := GenerateSQLiteRebuildPlan(lTable, dTable)
+			changeType := plan.ChangeAlterColumn
 			if isDestructive || destructive {
-				changeType = ChangeDropColumn
+				changeType = plan.ChangeDropColumn
 			}
-			steps = append(steps, Step{
+			steps = append(steps, plan.Step{
 				Type:        changeType,
 				Table:       tblName,
 				SQL:         rebuildSQL,
 				Destructive: isDestructive || destructive,
 			})
 
-			// Re-create all desired indexes
 			for _, idx := range dTable.Indexes {
 				def := strings.TrimSpace(idx.Definition)
 				if !strings.HasSuffix(def, ";") {
 					def += ";"
 				}
-				steps = append(steps, Step{
-					Type:        ChangeCreateIndex,
+				steps = append(steps, plan.Step{
+					Type:        plan.ChangeCreateIndex,
 					Table:       tblName,
 					SQL:         def,
 					Destructive: false,
 				})
 			}
 		} else {
-			// Check if columns were simply added (no rebuild needed)
 			for colName, dCol := range dTable.Columns {
 				if _, inLive := lTable.Columns[colName]; !inLive {
 					clause := fmt.Sprintf("%q %s", dCol.Name, dCol.DataType)
@@ -195,8 +186,8 @@ func diffSQLiteSchemas(live, desired *SchemaIR, filters tableFilters) []Step {
 					if dCol.DefaultValue != "" {
 						clause += " DEFAULT " + dCol.DefaultValue
 					}
-					steps = append(steps, Step{
-						Type:             ChangeAddColumn,
+					steps = append(steps, plan.Step{
+						Type:             plan.ChangeAddColumn,
 						Table:            tblName,
 						SQL:              fmt.Sprintf("ALTER TABLE %q ADD COLUMN %s;", tblName, clause),
 						Destructive:      false,
@@ -206,7 +197,6 @@ func diffSQLiteSchemas(live, desired *SchemaIR, filters tableFilters) []Step {
 				}
 			}
 
-			// Check indexes
 			for idxName, dIdx := range dTable.Indexes {
 				lIdx, inLive := lTable.Indexes[idxName]
 				if !inLive {
@@ -214,15 +204,15 @@ func diffSQLiteSchemas(live, desired *SchemaIR, filters tableFilters) []Step {
 					if !strings.HasSuffix(def, ";") {
 						def += ";"
 					}
-					steps = append(steps, Step{
-						Type:        ChangeCreateIndex,
+					steps = append(steps, plan.Step{
+						Type:        plan.ChangeCreateIndex,
 						Table:       tblName,
 						SQL:         def,
 						Destructive: false,
 					})
 				} else if dIdx.Definition != lIdx.Definition {
-					steps = append(steps, Step{
-						Type:        ChangeDropIndex,
+					steps = append(steps, plan.Step{
+						Type:        plan.ChangeDropIndex,
 						Table:       tblName,
 						SQL:         fmt.Sprintf("DROP INDEX IF EXISTS %q;", idxName),
 						Destructive: true,
@@ -231,8 +221,8 @@ func diffSQLiteSchemas(live, desired *SchemaIR, filters tableFilters) []Step {
 					if !strings.HasSuffix(def, ";") {
 						def += ";"
 					}
-					steps = append(steps, Step{
-						Type:        ChangeCreateIndex,
+					steps = append(steps, plan.Step{
+						Type:        plan.ChangeCreateIndex,
 						Table:       tblName,
 						SQL:         def,
 						Destructive: false,
@@ -242,8 +232,8 @@ func diffSQLiteSchemas(live, desired *SchemaIR, filters tableFilters) []Step {
 
 			for idxName := range lTable.Indexes {
 				if _, inDesired := dTable.Indexes[idxName]; !inDesired {
-					steps = append(steps, Step{
-						Type:        ChangeDropIndex,
+					steps = append(steps, plan.Step{
+						Type:        plan.ChangeDropIndex,
 						Table:       tblName,
 						SQL:         fmt.Sprintf("DROP INDEX IF EXISTS %q;", idxName),
 						Destructive: true,
@@ -255,12 +245,12 @@ func diffSQLiteSchemas(live, desired *SchemaIR, filters tableFilters) []Step {
 
 	// 2. Dropped tables
 	for tblName := range live.Tables {
-		if !isTableManaged(tblName, filters) {
+		if !scope.IsTableManaged(tblName, filters) {
 			continue
 		}
 		if _, inDesired := desired.Tables[tblName]; !inDesired {
-			steps = append(steps, Step{
-				Type:        ChangeDropTable,
+			steps = append(steps, plan.Step{
+				Type:        plan.ChangeDropTable,
 				Table:       tblName,
 				SQL:         fmt.Sprintf("DROP TABLE %q;", tblName),
 				Destructive: true,
@@ -269,4 +259,9 @@ func diffSQLiteSchemas(live, desired *SchemaIR, filters tableFilters) []Step {
 	}
 
 	return steps
+}
+
+// Render implements dialect.Dialect for single steps.
+func Render(step plan.Step) ([]dialect.Stmt, error) {
+	return []dialect.Stmt{{SQL: step.SQL, NonTx: false}}, nil
 }

@@ -1,0 +1,206 @@
+package postgres
+
+import (
+	"cmp"
+	"fmt"
+	"maps"
+	"slices"
+	"strings"
+
+	"github.com/yourorg/grizzle/internal/dialect"
+	"github.com/yourorg/grizzle/internal/diff"
+	"github.com/yourorg/grizzle/internal/plan"
+	"github.com/yourorg/grizzle/internal/schema"
+)
+
+// IsSerialColumn checks whether a column is an implicit serial sequence column.
+func IsSerialColumn(tableName string, col *schema.Column) (string, bool) {
+	if strings.HasPrefix(col.DefaultValue, "nextval(") &&
+		(strings.Contains(col.DefaultValue, tableName+"_"+col.Name+"_seq") ||
+			strings.Contains(col.DefaultValue, col.Name+"_seq")) {
+		switch col.DataType {
+		case "bigint":
+			return "bigserial", true
+		case "integer":
+			return "serial", true
+		case "smallint":
+			return "smallserial", true
+		}
+	}
+	return "", false
+}
+
+// GenerateCreateEnumSQL constructs a CREATE TYPE ... AS ENUM statement.
+func GenerateCreateEnumSQL(targetSchema string, e *schema.Enum) string {
+	var quotedVals []string
+	for _, v := range e.Values {
+		quotedVals = append(quotedVals, fmt.Sprintf("'%s'", strings.ReplaceAll(v, "'", "''")))
+	}
+	return fmt.Sprintf("CREATE TYPE %q.%q AS ENUM (%s);", targetSchema, e.Name, strings.Join(quotedVals, ", "))
+}
+
+// GenerateAddEnumValueSQL constructs an ALTER TYPE ... ADD VALUE statement.
+func GenerateAddEnumValueSQL(targetSchema, enumName, val string) string {
+	return fmt.Sprintf("ALTER TYPE %q.%q ADD VALUE '%s';", targetSchema, enumName, strings.ReplaceAll(val, "'", "''"))
+}
+
+// GenerateCreateTableSQL constructs a CREATE TABLE statement including columns and primary key.
+func GenerateCreateTableSQL(targetSchema string, tbl *schema.Table) string {
+	cols := slices.Collect(maps.Values(tbl.Columns))
+	slices.SortFunc(cols, func(a, b *schema.Column) int {
+		return cmp.Compare(a.Position, b.Position)
+	})
+
+	var lines []string
+	for _, c := range cols {
+		var line string
+		if serialType, isSerial := IsSerialColumn(tbl.Name, c); isSerial {
+			line = fmt.Sprintf("  %q %s", c.Name, serialType)
+		} else if c.IsIdentity {
+			line = fmt.Sprintf("  %q %s GENERATED %s AS IDENTITY", c.Name, c.DataType, c.IdentityType)
+		} else {
+			line = fmt.Sprintf("  %q %s", c.Name, c.DataType)
+			if !c.IsNullable {
+				line += " NOT NULL"
+			}
+			if c.DefaultValue != "" {
+				line += " DEFAULT " + c.DefaultValue
+			}
+		}
+		lines = append(lines, line)
+	}
+
+	if tbl.PrimaryKey != nil && len(tbl.PrimaryKey.Columns) > 0 {
+		var quotedCols []string
+		for _, col := range tbl.PrimaryKey.Columns {
+			quotedCols = append(quotedCols, fmt.Sprintf("%q", col))
+		}
+		pkLine := fmt.Sprintf("  CONSTRAINT %q PRIMARY KEY (%s)", tbl.PrimaryKey.Name, strings.Join(quotedCols, ", "))
+		lines = append(lines, pkLine)
+	}
+
+	return fmt.Sprintf("CREATE TABLE %q.%q (\n%s\n);", targetSchema, tbl.Name, strings.Join(lines, ",\n"))
+}
+
+// GenerateAddColumnSQL constructs an ALTER TABLE ... ADD COLUMN statement.
+func GenerateAddColumnSQL(targetSchema, tableName string, col *schema.Column) string {
+	var clause string
+	if serialType, isSerial := IsSerialColumn(tableName, col); isSerial {
+		clause = fmt.Sprintf("%q %s", col.Name, serialType)
+	} else if col.IsIdentity {
+		clause = fmt.Sprintf("%q %s GENERATED %s AS IDENTITY", col.Name, col.DataType, col.IdentityType)
+	} else {
+		clause = fmt.Sprintf("%q %s", col.Name, col.DataType)
+		if !col.IsNullable {
+			clause += " NOT NULL"
+		}
+		if col.DefaultValue != "" {
+			clause += " DEFAULT " + col.DefaultValue
+		}
+	}
+	return fmt.Sprintf("ALTER TABLE %q.%q ADD COLUMN %s;", targetSchema, tableName, clause)
+}
+
+// GenerateAlterColumnSQL constructs an ALTER TABLE ... ALTER COLUMN statement for modified columns.
+func GenerateAlterColumnSQL(targetSchema, tableName string, live, desired *schema.Column) string {
+	var actions []string
+
+	if desired.DataType != live.DataType {
+		actions = append(actions, fmt.Sprintf("ALTER COLUMN %q TYPE %s", desired.Name, desired.DataType))
+	}
+
+	if desired.IsNullable != live.IsNullable {
+		if desired.IsNullable {
+			actions = append(actions, fmt.Sprintf("ALTER COLUMN %q DROP NOT NULL", desired.Name))
+		} else {
+			actions = append(actions, fmt.Sprintf("ALTER COLUMN %q SET NOT NULL", desired.Name))
+		}
+	}
+
+	if desired.DefaultValue != live.DefaultValue {
+		if desired.DefaultValue == "" {
+			actions = append(actions, fmt.Sprintf("ALTER COLUMN %q DROP DEFAULT", desired.Name))
+		} else {
+			actions = append(actions, fmt.Sprintf("ALTER COLUMN %q SET DEFAULT %s", desired.Name, desired.DefaultValue))
+		}
+	}
+
+	return fmt.Sprintf("ALTER TABLE %q.%q %s;", targetSchema, tableName, strings.Join(actions, ", "))
+}
+
+// GenerateCreateIndexSQL constructs a CREATE [UNIQUE] INDEX statement with terminating semicolon.
+func GenerateCreateIndexSQL(normalizedIndexDef string) string {
+	def := strings.TrimSpace(normalizedIndexDef)
+	if !strings.HasSuffix(def, ";") {
+		def += ";"
+	}
+	return def
+}
+
+// GenerateDropIndexSQL constructs a DROP INDEX statement.
+func GenerateDropIndexSQL(targetSchema, indexName string) string {
+	return fmt.Sprintf("DROP INDEX IF EXISTS %q.%q;", targetSchema, indexName)
+}
+
+// GenerateAddFKSQL constructs an ALTER TABLE ... ADD CONSTRAINT statement for foreign keys.
+func GenerateAddFKSQL(targetSchema, tableName, fkName, normalizedFKDef string) string {
+	return fmt.Sprintf("ALTER TABLE %q.%q ADD CONSTRAINT %q %s;", targetSchema, tableName, fkName, normalizedFKDef)
+}
+
+// GenerateDropFKSQL constructs an ALTER TABLE ... DROP CONSTRAINT statement.
+func GenerateDropFKSQL(targetSchema, tableName, fkName string) string {
+	return fmt.Sprintf("ALTER TABLE %q.%q DROP CONSTRAINT IF EXISTS %q;", targetSchema, tableName, fkName)
+}
+
+// RenderChange converts a pure diff.Change into an executable plan.Step with PostgreSQL DDL.
+func RenderChange(targetSchema string, c diff.Change) plan.Step {
+	step := plan.Step{
+		Type:             c.Type,
+		Table:            c.Table,
+		Destructive:      c.Destructive,
+		ColumnNotNull:    c.ColumnNotNull,
+		ColumnHasDefault: c.ColumnHasDefault,
+	}
+
+	switch c.Type {
+	case plan.ChangeCreateEnum:
+		step.SQL = GenerateCreateEnumSQL(targetSchema, c.Enum)
+	case plan.ChangeAlterEnum:
+		step.SQL = GenerateAddEnumValueSQL(targetSchema, c.Table, c.EnumValue)
+	case plan.ChangeCreateTable:
+		step.SQL = GenerateCreateTableSQL(targetSchema, c.TableData)
+	case plan.ChangeAddColumn:
+		step.SQL = GenerateAddColumnSQL(targetSchema, c.Table, c.Column)
+	case plan.ChangeAlterColumn:
+		step.SQL = GenerateAlterColumnSQL(targetSchema, c.Table, c.OldColumn, c.Column)
+	case plan.ChangeDropColumn:
+		step.SQL = fmt.Sprintf("ALTER TABLE %q.%q DROP COLUMN %q CASCADE;", targetSchema, c.Table, c.Column.Name)
+	case plan.ChangeCreateIndex:
+		step.SQL = GenerateCreateIndexSQL(c.Index.Definition)
+	case plan.ChangeDropIndex:
+		step.SQL = GenerateDropIndexSQL(targetSchema, c.Index.Name)
+	case plan.ChangeAddFK:
+		step.SQL = GenerateAddFKSQL(targetSchema, c.Table, c.ForeignKey.Name, c.ForeignKey.Definition)
+	case plan.ChangeDropFK:
+		step.SQL = GenerateDropFKSQL(targetSchema, c.Table, c.ForeignKey.Name)
+	case plan.ChangeDropTable:
+		step.SQL = fmt.Sprintf("DROP TABLE %q.%q CASCADE;", targetSchema, c.Table)
+	}
+
+	return step
+}
+
+// RenderChanges converts a list of pure changes into sequenced, topologically ordered plan steps.
+func RenderChanges(targetSchema string, changes []diff.Change) []plan.Step {
+	steps := make([]plan.Step, len(changes))
+	for i, c := range changes {
+		steps[i] = RenderChange(targetSchema, c)
+	}
+	plan.SortSteps(steps)
+	return steps
+}
+
+// Render implements dialect.Dialect for single steps.
+func Render(step plan.Step) ([]dialect.Stmt, error) {
+	return []dialect.Stmt{{SQL: step.SQL, NonTx: false}}, nil
+}

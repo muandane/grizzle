@@ -1,4 +1,4 @@
-package grizzle
+package schema
 
 import (
 	"fmt"
@@ -17,8 +17,8 @@ var (
 	numParenRegex  = regexp.MustCompile(`^\(?(-?\d+(?:\.\d+)?)(?:::[\w\."\s]+)?\)?$`)
 )
 
-// stripOuterParens strips surrounding balanced parentheses while respecting quotes.
-func stripOuterParens(s string) string {
+// StripOuterParens strips surrounding balanced parentheses while respecting quotes.
+func StripOuterParens(s string) string {
 	s = strings.TrimSpace(s)
 	for strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")") {
 		count := 0
@@ -66,8 +66,8 @@ func stripOuterParens(s string) string {
 	return s
 }
 
-// normalizeType standardizes PostgreSQL data type representations to avoid false-positive diff loops.
-func normalizeType(raw string) string {
+// NormalizeType standardizes PostgreSQL data type representations to avoid false-positive diff loops.
+func NormalizeType(raw string) string {
 	t := strings.TrimSpace(strings.ToLower(raw))
 
 	// Normalize character varying to varchar
@@ -107,10 +107,10 @@ func normalizeType(raw string) string {
 	}
 }
 
-// normalizeDefault sanitizes default values returned by pg_catalog.
+// NormalizeDefault sanitizes default values returned by pg_catalog.
 // For example, "'draft'::character varying" becomes "'draft'", and "('draft'::text)" becomes "'draft'".
 // Compound expressions like ('2024-01-01'::date + '1 day'::interval) are preserved verbatim.
-func normalizeDefault(raw string) string {
+func NormalizeDefault(raw string) string {
 	d := strings.TrimSpace(raw)
 	if d == "" {
 		return ""
@@ -138,7 +138,7 @@ func normalizeDefault(raw string) string {
 	}
 
 	// 4. Unwrap outer parens for function calls and keyword checks
-	unwrapped := stripOuterParens(d)
+	unwrapped := StripOuterParens(d)
 
 	// Normalize CURRENT_TIMESTAMP to now()
 	if strings.EqualFold(unwrapped, "CURRENT_TIMESTAMP") || strings.EqualFold(unwrapped, "now()") {
@@ -158,9 +158,9 @@ func normalizeDefault(raw string) string {
 	return d
 }
 
-// normalizeDefinition standardizes index and constraint definitions between live and shadow schemas.
+// NormalizeDefinition standardizes index and constraint definitions between live and shadow schemas.
 // It restricts ON <schema>. stripping to the index header to avoid mutating string literals in WHERE predicates.
-func normalizeDefinition(def, shadowSchema, targetSchema string) string {
+func NormalizeDefinition(def, shadowSchema, targetSchema string) string {
 	res := def
 
 	// Split index header from WHERE predicate if present, preserving predicate literals

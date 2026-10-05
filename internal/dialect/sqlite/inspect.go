@@ -1,26 +1,25 @@
-package grizzle
+package sqlite
 
 import (
 	"context"
 	"database/sql"
 	"fmt"
 	"strings"
+
+	"github.com/yourorg/grizzle/internal/dialect"
+	"github.com/yourorg/grizzle/internal/schema"
 )
 
-type sqliteQuerier interface {
-	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
-}
-
-// inspectSQLiteSchema extracts the complete relational schema from an SQLite database connection.
-func inspectSQLiteSchema(ctx context.Context, q sqliteQuerier) (*SchemaIR, error) {
-	schema := &SchemaIR{
+// Inspect extracts the complete relational schema from an SQLite database connection.
+func Inspect(ctx context.Context, dbtx dialect.DBTX) (*schema.Schema, error) {
+	s := &schema.Schema{
 		Name:   "main",
-		Tables: make(map[string]*TableIR),
-		Enums:  make(map[string]*EnumIR),
+		Tables: make(map[string]*schema.Table),
+		Enums:  make(map[string]*schema.Enum),
 	}
 
 	// 1. Get Table names
-	tblRows, err := q.QueryContext(ctx, "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_grizzle_%' ORDER BY name;")
+	tblRows, err := dbtx.QueryContext(ctx, "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_grizzle_%' ORDER BY name;")
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: querying tables: %w", err)
 	}
@@ -37,16 +36,16 @@ func inspectSQLiteSchema(ctx context.Context, q sqliteQuerier) (*SchemaIR, error
 	_ = tblRows.Close()
 
 	for _, tblName := range tableNames {
-		tbl := &TableIR{
+		tbl := &schema.Table{
 			Name:        tblName,
-			Columns:     make(map[string]*ColumnIR),
-			Indexes:     make(map[string]*IndexIR),
-			ForeignKeys: make(map[string]*ForeignKeyIR),
+			Columns:     make(map[string]*schema.Column),
+			Indexes:     make(map[string]*schema.Index),
+			ForeignKeys: make(map[string]*schema.ForeignKey),
 		}
-		schema.Tables[tblName] = tbl
+		s.Tables[tblName] = tbl
 
 		// 2. Query columns using PRAGMA table_info
-		colRows, err := q.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%q);", tblName))
+		colRows, err := dbtx.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%q);", tblName))
 		if err != nil {
 			return nil, fmt.Errorf("sqlite: querying columns for %q: %w", tblName, err)
 		}
@@ -66,13 +65,13 @@ func inspectSQLiteSchema(ctx context.Context, q sqliteQuerier) (*SchemaIR, error
 				return nil, err
 			}
 
-			normType := normalizeSQLiteType(colType)
+			normType := NormalizeType(colType)
 			defVal := ""
 			if dfltValue.Valid {
-				defVal = normalizeSQLiteDefault(dfltValue.String)
+				defVal = NormalizeDefault(dfltValue.String)
 			}
 
-			tbl.Columns[name] = &ColumnIR{
+			tbl.Columns[name] = &schema.Column{
 				Name:         name,
 				DataType:     normType,
 				IsNullable:   notnull == 0,
@@ -87,14 +86,14 @@ func inspectSQLiteSchema(ctx context.Context, q sqliteQuerier) (*SchemaIR, error
 		_ = colRows.Close()
 
 		if len(pkCols) > 0 {
-			tbl.PrimaryKey = &PrimaryKeyIR{
+			tbl.PrimaryKey = &schema.PrimaryKey{
 				Name:    tblName + "_pkey",
 				Columns: pkCols,
 			}
 		}
 
 		// 3. Query Foreign Keys using PRAGMA foreign_key_list
-		fkRows, err := q.QueryContext(ctx, fmt.Sprintf("PRAGMA foreign_key_list(%q);", tblName))
+		fkRows, err := dbtx.QueryContext(ctx, fmt.Sprintf("PRAGMA foreign_key_list(%q);", tblName))
 		if err != nil {
 			return nil, fmt.Errorf("sqlite: querying foreign keys for %q: %w", tblName, err)
 		}
@@ -149,7 +148,7 @@ func inspectSQLiteSchema(ctx context.Context, q sqliteQuerier) (*SchemaIR, error
 			if grp.onUpdate != "" && !strings.EqualFold(grp.onUpdate, "NO ACTION") {
 				def += " ON UPDATE " + grp.onUpdate
 			}
-			tbl.ForeignKeys[fkName] = &ForeignKeyIR{
+			tbl.ForeignKeys[fkName] = &schema.ForeignKey{
 				Name:       fkName,
 				TableName:  tblName,
 				Definition: def,
@@ -157,7 +156,7 @@ func inspectSQLiteSchema(ctx context.Context, q sqliteQuerier) (*SchemaIR, error
 		}
 
 		// 4. Query Indexes from sqlite_schema
-		idxRows, err := q.QueryContext(ctx, "SELECT name, sql FROM sqlite_schema WHERE type='index' AND sql IS NOT NULL AND tbl_name = $1 AND name NOT LIKE 'sqlite_%';", tblName)
+		idxRows, err := dbtx.QueryContext(ctx, "SELECT name, sql FROM sqlite_schema WHERE type='index' AND sql IS NOT NULL AND tbl_name = $1 AND name NOT LIKE 'sqlite_%';", tblName)
 		if err != nil {
 			return nil, fmt.Errorf("sqlite: querying indexes for %q: %w", tblName, err)
 		}
@@ -169,7 +168,7 @@ func inspectSQLiteSchema(ctx context.Context, q sqliteQuerier) (*SchemaIR, error
 				return nil, err
 			}
 			isUnique := strings.Contains(strings.ToUpper(indexSql), "CREATE UNIQUE INDEX")
-			tbl.Indexes[name] = &IndexIR{
+			tbl.Indexes[name] = &schema.Index{
 				Name:       name,
 				TableName:  tblName,
 				IsUnique:   isUnique,
@@ -179,10 +178,11 @@ func inspectSQLiteSchema(ctx context.Context, q sqliteQuerier) (*SchemaIR, error
 		_ = idxRows.Close()
 	}
 
-	return schema, nil
+	return s, nil
 }
 
-func normalizeSQLiteType(t string) string {
+// NormalizeType standardizes SQLite types into canonical representations.
+func NormalizeType(t string) string {
 	s := strings.TrimSpace(strings.ToUpper(t))
 	if s == "" {
 		return "TEXT"
@@ -195,7 +195,7 @@ func normalizeSQLiteType(t string) string {
 	case "REAL", "DOUBLE", "DOUBLE PRECISION", "FLOAT":
 		return "REAL"
 	case "BOOLEAN", "BOOL":
-		return "INTEGER" // SQLite stores booleans as integer 0 or 1
+		return "INTEGER"
 	case "BLOB":
 		return "BLOB"
 	case "NUMERIC", "DECIMAL":
@@ -205,6 +205,7 @@ func normalizeSQLiteType(t string) string {
 	}
 }
 
-func normalizeSQLiteDefault(d string) string {
+// NormalizeDefault standardizes default expressions in SQLite.
+func NormalizeDefault(d string) string {
 	return strings.TrimSpace(d)
 }

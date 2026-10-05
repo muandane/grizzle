@@ -1,18 +1,20 @@
-package grizzle
+package postgres
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"strings"
+
+	"github.com/yourorg/grizzle/internal/dialect"
+	"github.com/yourorg/grizzle/internal/schema"
 )
 
-// inspectSchema reads the relational state of the specified schema directly from pg_catalog.
-func inspectSchema(ctx context.Context, tx *sql.Tx, schemaName string) (*SchemaIR, error) {
-	schema := &SchemaIR{
+// Inspect reads the relational state of the specified schema directly from pg_catalog.
+func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema.Schema, error) {
+	s := &schema.Schema{
 		Name:   schemaName,
-		Tables: make(map[string]*TableIR),
-		Enums:  make(map[string]*EnumIR),
+		Tables: make(map[string]*schema.Table),
+		Enums:  make(map[string]*schema.Enum),
 	}
 
 	// 1. Inspect Custom ENUM Types
@@ -26,7 +28,7 @@ func inspectSchema(ctx context.Context, tx *sql.Tx, schemaName string) (*SchemaI
 		WHERE n.nspname = $1
 		ORDER BY t.typname, e.enumsortorder;
 	`
-	enumRows, err := tx.QueryContext(ctx, enumQuery, schemaName)
+	enumRows, err := dbtx.QueryContext(ctx, enumQuery, schemaName)
 	if err != nil {
 		return nil, fmt.Errorf("inspecting enums in schema %q: %w", schemaName, err)
 	}
@@ -37,10 +39,10 @@ func inspectSchema(ctx context.Context, tx *sql.Tx, schemaName string) (*SchemaI
 		if err := enumRows.Scan(&enumName, &enumVal); err != nil {
 			return nil, fmt.Errorf("scanning enum in schema %q: %w", schemaName, err)
 		}
-		e, exists := schema.Enums[enumName]
+		e, exists := s.Enums[enumName]
 		if !exists {
-			e = &EnumIR{Name: enumName}
-			schema.Enums[enumName] = e
+			e = &schema.Enum{Name: enumName}
+			s.Enums[enumName] = e
 		}
 		e.Values = append(e.Values, enumVal)
 	}
@@ -70,7 +72,7 @@ func inspectSchema(ctx context.Context, tx *sql.Tx, schemaName string) (*SchemaI
 		ORDER BY c.relname, a.attnum;
 	`
 
-	rows, err := tx.QueryContext(ctx, colQuery, schemaName)
+	rows, err := dbtx.QueryContext(ctx, colQuery, schemaName)
 	if err != nil {
 		return nil, fmt.Errorf("inspecting columns in schema %q: %w", schemaName, err)
 	}
@@ -91,25 +93,25 @@ func inspectSchema(ctx context.Context, tx *sql.Tx, schemaName string) (*SchemaI
 			return nil, fmt.Errorf("scanning column data in schema %q: %w", schemaName, err)
 		}
 
-		tbl, exists := schema.Tables[tableName]
+		tbl, exists := s.Tables[tableName]
 		if !exists {
-			tbl = &TableIR{
+			tbl = &schema.Table{
 				Name:        tableName,
-				Columns:     make(map[string]*ColumnIR),
-				Indexes:     make(map[string]*IndexIR),
-				ForeignKeys: make(map[string]*ForeignKeyIR),
+				Columns:     make(map[string]*schema.Column),
+				Indexes:     make(map[string]*schema.Index),
+				ForeignKeys: make(map[string]*schema.ForeignKey),
 			}
-			schema.Tables[tableName] = tbl
+			s.Tables[tableName] = tbl
 		}
 
 		cleanedType := strings.TrimPrefix(rawType, schemaName+".")
 		cleanedType = strings.TrimPrefix(cleanedType, `"`+schemaName+`".`)
 
-		col := &ColumnIR{
+		col := &schema.Column{
 			Name:         colName,
-			DataType:     normalizeType(cleanedType),
+			DataType:     schema.NormalizeType(cleanedType),
 			IsNullable:   isNullable,
-			DefaultValue: normalizeDefault(rawDefault),
+			DefaultValue: schema.NormalizeDefault(rawDefault),
 			Position:     position,
 		}
 
@@ -145,7 +147,7 @@ func inspectSchema(ctx context.Context, tx *sql.Tx, schemaName string) (*SchemaI
 		GROUP BY c.relname, con.conname;
 	`
 
-	pkRows, err := tx.QueryContext(ctx, pkQuery, schemaName)
+	pkRows, err := dbtx.QueryContext(ctx, pkQuery, schemaName)
 	if err != nil {
 		return nil, fmt.Errorf("inspecting primary keys in schema %q: %w", schemaName, err)
 	}
@@ -161,12 +163,12 @@ func inspectSchema(ctx context.Context, tx *sql.Tx, schemaName string) (*SchemaI
 			return nil, fmt.Errorf("scanning primary key in schema %q: %w", schemaName, err)
 		}
 
-		if tbl, exists := schema.Tables[tableName]; exists && colsJoined != "" {
+		if tbl, exists := s.Tables[tableName]; exists && colsJoined != "" {
 			var pkCols []string
 			for c := range strings.SplitSeq(colsJoined, ",") {
 				pkCols = append(pkCols, strings.TrimSpace(c))
 			}
-			tbl.PrimaryKey = &PrimaryKeyIR{
+			tbl.PrimaryKey = &schema.PrimaryKey{
 				Name:    pkName,
 				Columns: pkCols,
 			}
@@ -192,7 +194,7 @@ func inspectSchema(ctx context.Context, tx *sql.Tx, schemaName string) (*SchemaI
 		  AND NOT ix.indisprimary
 		ORDER BY t.relname, i.relname;
 	`
-	idxRows, err := tx.QueryContext(ctx, idxQuery, schemaName)
+	idxRows, err := dbtx.QueryContext(ctx, idxQuery, schemaName)
 	if err != nil {
 		return nil, fmt.Errorf("inspecting indexes in schema %q: %w", schemaName, err)
 	}
@@ -209,8 +211,8 @@ func inspectSchema(ctx context.Context, tx *sql.Tx, schemaName string) (*SchemaI
 			return nil, fmt.Errorf("scanning index in schema %q: %w", schemaName, err)
 		}
 
-		if tbl, exists := schema.Tables[tableName]; exists {
-			tbl.Indexes[indexName] = &IndexIR{
+		if tbl, exists := s.Tables[tableName]; exists {
+			tbl.Indexes[indexName] = &schema.Index{
 				Name:       indexName,
 				TableName:  tableName,
 				IsUnique:   isUnique,
@@ -236,7 +238,7 @@ func inspectSchema(ctx context.Context, tx *sql.Tx, schemaName string) (*SchemaI
 		  AND con.contype = 'f'
 		ORDER BY c.relname, con.conname;
 	`
-	fkRows, err := tx.QueryContext(ctx, fkQuery, schemaName)
+	fkRows, err := dbtx.QueryContext(ctx, fkQuery, schemaName)
 	if err != nil {
 		return nil, fmt.Errorf("inspecting foreign keys in schema %q: %w", schemaName, err)
 	}
@@ -252,8 +254,8 @@ func inspectSchema(ctx context.Context, tx *sql.Tx, schemaName string) (*SchemaI
 			return nil, fmt.Errorf("scanning foreign key in schema %q: %w", schemaName, err)
 		}
 
-		if tbl, exists := schema.Tables[tableName]; exists {
-			tbl.ForeignKeys[fkName] = &ForeignKeyIR{
+		if tbl, exists := s.Tables[tableName]; exists {
+			tbl.ForeignKeys[fkName] = &schema.ForeignKey{
 				Name:       fkName,
 				TableName:  tableName,
 				Definition: fkDef,
@@ -264,5 +266,5 @@ func inspectSchema(ctx context.Context, tx *sql.Tx, schemaName string) (*SchemaI
 		return nil, err
 	}
 
-	return schema, nil
+	return s, nil
 }

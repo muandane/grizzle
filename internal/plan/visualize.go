@@ -1,4 +1,4 @@
-package grizzle
+package plan
 
 import (
 	"fmt"
