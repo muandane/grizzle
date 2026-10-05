@@ -96,11 +96,14 @@ func generateSQLiteRebuildPlan(liveTable, desiredTable *TableIR) (string, bool) 
 }
 
 // diffSQLiteSchemas compares live and desired schemas and produces a sequenced list of SQLite steps.
-func diffSQLiteSchemas(live, desired *SchemaIR) []Step {
+func diffSQLiteSchemas(live, desired *SchemaIR, filters tableFilters) []Step {
 	var steps []Step
 
 	// 1. Tables
 	for tblName, dTable := range desired.Tables {
+		if !isTableManaged(tblName, filters) {
+			continue
+		}
 		lTable, exists := live.Tables[tblName]
 		if !exists {
 			// New table
@@ -193,10 +196,12 @@ func diffSQLiteSchemas(live, desired *SchemaIR) []Step {
 						clause += " DEFAULT " + dCol.DefaultValue
 					}
 					steps = append(steps, Step{
-						Type:        ChangeAddColumn,
-						Table:       tblName,
-						SQL:         fmt.Sprintf("ALTER TABLE %q ADD COLUMN %s;", tblName, clause),
-						Destructive: false,
+						Type:             ChangeAddColumn,
+						Table:            tblName,
+						SQL:              fmt.Sprintf("ALTER TABLE %q ADD COLUMN %s;", tblName, clause),
+						Destructive:      false,
+						ColumnNotNull:    !dCol.IsNullable,
+						ColumnHasDefault: dCol.DefaultValue != "",
 					})
 				}
 			}
@@ -250,6 +255,9 @@ func diffSQLiteSchemas(live, desired *SchemaIR) []Step {
 
 	// 2. Dropped tables
 	for tblName := range live.Tables {
+		if !isTableManaged(tblName, filters) {
+			continue
+		}
 		if _, inDesired := desired.Tables[tblName]; !inDesired {
 			steps = append(steps, Step{
 				Type:        ChangeDropTable,

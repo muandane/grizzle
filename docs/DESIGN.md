@@ -1,16 +1,12 @@
-# Grizzle Deep Technical Design
+# Grizzle technical design
 
-This document details the internal algorithms, data structures, catalog queries, and type normalization strategies used by **Grizzle**.
+This document details the internal data structures, catalog queries, type normalization strategies, and diffing algorithms used by Grizzle.
 
----
+## 1. Internal representation data structures
 
-## 1. Internal Representation (IR) Data Structures
+Grizzle normalizes live and desired database schemas into an engine-agnostic schema intermediate representation (`SchemaIR`):
 
 ```go
-package grizzle
-
-import "database/sql"
-
 type SchemaIR struct {
     Name   string
     Tables map[string]*TableIR
@@ -29,7 +25,7 @@ type ColumnIR struct {
     Name         string
     DataType     string // Normalized (e.g. "bigint", "varchar(255)", "boolean")
     IsNullable   bool
-    DefaultValue string // Sanitized, stripped of Postgres casts (e.g., 'active' instead of 'active'::character varying)
+    DefaultValue string // Sanitized, stripped of Postgres casts or redundant parens
     Position     int
 }
 
@@ -43,7 +39,7 @@ type IndexIR struct {
 type ForeignKeyIR struct {
     Name       string
     TableName  string
-    Definition string // Normalized constraint definition (e.g. "FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE")
+    Definition string // Normalized constraint definition
 }
 
 type PrimaryKeyIR struct {
@@ -57,13 +53,13 @@ type EnumIR struct {
 }
 ```
 
----
+## 2. Catalog inspection
 
-## 2. PostgreSQL Catalog Queries
+### 2.1 PostgreSQL catalog queries
 
-Rather than querying the slow and feature-limited `information_schema`, Grizzle queries `pg_catalog` directly for maximum performance and complete metadata.
+Grizzle queries `pg_catalog` directly rather than `information_schema` for speed and full type fidelity:
 
-### 2.1 Table & Column Extraction
+* **Tables and columns**:
 ```sql
 SELECT
     c.relname AS table_name,
@@ -79,13 +75,13 @@ JOIN pg_namespace n ON n.oid = c.relnamespace
 JOIN pg_type t ON t.oid = a.atttypid
 LEFT JOIN pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum
 WHERE n.nspname = $1
-  AND c.relkind = 'r'       -- Ordinary tables only
-  AND a.attnum > 0          -- Filter out system columns (oid, xmin, etc.)
-  AND NOT a.attisdropped    -- Filter out dropped columns
+  AND c.relkind = 'r'
+  AND a.attnum > 0
+  AND NOT a.attisdropped
 ORDER BY c.relname, a.attnum;
 ```
 
-### 2.2 Index Extraction
+* **Indexes**:
 ```sql
 SELECT
     t.relname AS table_name,
@@ -97,11 +93,11 @@ JOIN pg_class t ON t.oid = ix.indrelid
 JOIN pg_class i ON i.oid = ix.indexrelid
 JOIN pg_namespace n ON n.oid = t.relnamespace
 WHERE n.nspname = $1
-  AND NOT ix.indisprimary   -- Primary keys are tracked separately
+  AND NOT ix.indisprimary
 ORDER BY t.relname, i.relname;
 ```
 
-### 2.3 Foreign Key Extraction
+* **Foreign keys**:
 ```sql
 SELECT
     c.relname AS table_name,
@@ -111,97 +107,89 @@ FROM pg_constraint con
 JOIN pg_class c ON c.oid = con.conrelid
 JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE n.nspname = $1
-  AND con.contype = 'f'     -- Foreign key constraints
+  AND con.contype = 'f'
 ORDER BY c.relname, con.conname;
 ```
 
----
+### 2.2 SQLite catalog queries
 
-## 3. Type Normalization Strategy
+On SQLite, metadata is introspected from `sqlite_schema` and system PRAGMAs:
+* Tables: `SELECT name, sql FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'`
+* Columns: `PRAGMA table_info(<table_name>)`
+* Foreign keys: `PRAGMA foreign_key_list(<table_name>)`
+* Indexes: `SELECT name, sql FROM sqlite_schema WHERE type='index' AND tbl_name = ?`
 
-One of the most common pitfalls in SQL diffing is **false-positive changes** caused by dialect aliases. PostgreSQL frequently records one string in `pg_type` but outputs another when formatting.
+## 3. Type normalization and default sanitization
 
-Grizzle applies an explicit normalization pass on all incoming types:
+Dialects report internal type representations that differ from input DDL, causing false-positive diffs if compared directly.
 
-| PostgreSQL Internal | Normalized Grizzle Form | Handled Aliases |
+Grizzle standardizes aliases to canonical types:
+
+| Engine | Raw dialect name | Normalized form |
 | :--- | :--- | :--- |
-| `int4` | `integer` | `int`, `int4`, `serial` |
-| `int8` | `bigint` | `int8`, `bigserial` |
-| `int2` | `smallint` | `int2`, `smallserial` |
-| `bool` | `boolean` | `bool` |
-| `varchar(N)` | `varchar(N)` | `character varying(N)` |
-| `timestamptz` | `timestamptz` | `timestamp with time zone` |
-| `timestamp` | `timestamp` | `timestamp without time zone` |
+| PostgreSQL | `int4`, `serial` | `integer` |
+| PostgreSQL | `int8`, `bigserial` | `bigint` |
+| PostgreSQL | `int2`, `smallserial` | `smallint` |
+| PostgreSQL | `bool` | `boolean` |
+| PostgreSQL | `character varying(N)` | `varchar(N)` |
+| PostgreSQL | `timestamp with time zone` | `timestamptz` |
+| PostgreSQL | `timestamp without time zone` | `timestamp` |
 
-### Default Value Sanitization
-PostgreSQL automatically appends type casts to default expressions:
-* Desired: `'active'`
-* Catalog returns: `'active'::character varying`
-* Desired: `now()`
-* Catalog returns: `CURRENT_TIMESTAMP`
+### Default value normalization
 
-Grizzle normalizes defaults by stripping explicit `::type` suffixes and standardizing `CURRENT_TIMESTAMP` to `now()`.
+PostgreSQL wraps defaults in outer parentheses and appends type cast suffixes:
+* Raw catalog output: `('draft'::character varying)`
+* Normalized output: `'draft'`
+* Raw catalog output: `('2024-01-01'::date + '1 day'::interval)`
+* Normalized output: `'2024-01-01'::date + '1 day'::interval`
 
----
+To preserve arithmetic and compound expressions while removing unnecessary cast noise from single literals, Grizzle uses quote-aware parenthesis stripping and targets single-literal cast expressions (`'literal'::type`).
 
-## 4. Diffing Algorithm
+## 4. Diffing algorithm and scope filtering
 
-```mermaid
-flowchart TD
-    Start["Diff(liveSchema, desiredSchema)"] --> TableLoop["For each Table in Desired"]
-    
-    TableLoop --> Exists{"Table exists in Live?"}
-    Exists -- No --> EmitCreateTable["Emit CREATE TABLE"]
-    Exists -- Yes --> ColLoop["For each Column in Desired"]
-    
-    ColLoop --> ColExists{"Column exists in Live?"}
-    ColExists -- No --> EmitAddCol["Emit ADD COLUMN"]
-    ColExists -- Yes --> CheckType{"Type / Null / Default changed?"}
-    CheckType -- Yes --> EmitAlterCol["Emit ALTER COLUMN"]
-    CheckType -- No --> NextCol["Next Column"]
-    
-    NextCol --> ColLoop
-    ColLoop --> DetectDroppedCols["Check Live columns missing from Desired (Emit DROP COLUMN)"]
-    DetectDroppedCols --> IndexDiff["Diff Indexes (Add/Drop)"]
-    IndexDiff --> FKDiff["Diff Foreign Keys (Add/Drop)"]
-    
-    FKDiff --> DetectDroppedTables["Check Live tables missing from Desired (Emit DROP TABLE)"]
-    DetectDroppedTables --> Done["Return Unsorted Steps"]
-```
+The diff engine executes the following evaluation for each table:
 
----
+1. **Table filtering**: Check if table matches `ExcludeTables`, built-in extension names (`spatial_ref_sys`), or is omitted from `IncludeTables`. If unmanaged, skip the table completely.
+2. **Table existence**: If desired table does not exist in live schema, emit `ChangeCreateTable`.
+3. **Column comparison**:
+   * If desired column is absent in live table, emit `ChangeAddColumn`.
+   * If column exists, check normalized type, nullability, and default value. If different, emit `ChangeAlterColumn`. Mark as destructive if narrowing types (e.g. `bigint` to `integer`).
+   * For live columns missing from desired table, emit `ChangeDropColumn` marked as destructive.
+4. **Index comparison**: Compare normalized index definitions. Emit `ChangeDropIndex` and `ChangeCreateIndex` as needed.
+5. **Foreign key comparison**: Compare constraint definitions. Emit `ChangeDropFK` and `ChangeAddFK`.
+6. **Dropped tables**: Emit `ChangeDropTable` for live managed tables missing from desired schema.
 
-## 5. Topological Sorter (Execution Ordering)
+## 5. Topological statement ordering
 
-PostgreSQL rejects DDL executed in an arbitrary order (e.g. creating a foreign key to a table that has not been created yet). 
-
-Grizzle sorts all generated `MigrationStep` items using a strict priority ladder:
+Generated steps are ordered to prevent foreign key or dependency conflicts during execution:
 
 ```go
 const (
-    PriorityDropFK      = 10  // Remove FKs first to unlock tables
-    PriorityDropIndex   = 20  // Remove obsolete indexes
-    PriorityCreateTable = 30  // Create bare tables (PKs included, FKs deferred)
-    PriorityAddColumn   = 40  // Add new columns
-    PriorityAlterColumn = 50  // Alter column types / constraints
-    PriorityCreateIndex = 60  // Build new indexes
-    PriorityAddFK       = 70  // Add foreign keys once all tables and columns exist
-    PriorityDropColumn  = 80  // Drop columns (if allowed)
-    PriorityDropTable   = 90  // Drop tables (if allowed)
+    PriorityDropFK      = 10 // Drop foreign keys to remove cross-table references
+    PriorityDropIndex   = 20 // Drop obsolete indexes
+    PriorityCreateTable = 30 // Create new tables without foreign keys
+    PriorityAddColumn   = 40 // Add new columns
+    PriorityAlterColumn = 50 // Modify column types and constraints
+    PriorityCreateIndex = 60 // Build new indexes
+    PriorityAddFK       = 70 // Add foreign keys
+    PriorityDropColumn  = 80 // Drop columns (if permitted by policy)
+    PriorityDropTable   = 90 // Drop tables (if permitted by policy)
 )
 ```
 
----
+## 6. SQLite 12-step rebuild procedure
 
-## 6. Deterministic Advisory Locking
+SQLite does not support altering column types or dropping columns natively. Grizzle executes the following migration sequence when changes require table reconstruction:
 
-To avoid requiring users to manually manage lock IDs, Grizzle derives a deterministic 64-bit integer lock ID from the database name and schema name using FNV-1a hashing:
-
-```go
-func GenerateLockID(dbName, schemaName string) int64 {
-    h := fnv.New64a()
-    h.Write([]byte(dbName + ":" + schemaName))
-    return int64(h.Sum64())
-}
-```
-This guarantees that different databases or schemas on the same PostgreSQL cluster never block each other, while instances of the same service synchronize safely.
+1. Set `PRAGMA foreign_keys = OFF;`
+2. Create `_grizzle_rebuild_<table_name>` with the desired schema.
+3. Copy intersecting columns:
+   ```sql
+   INSERT INTO "_grizzle_rebuild_users" ("id", "email")
+   SELECT "id", "email" FROM "users";
+   ```
+4. Drop old table: `DROP TABLE "users";`
+5. Rename new table: `ALTER TABLE "_grizzle_rebuild_users" RENAME TO "users";`
+6. Re-create all indexes associated with the table.
+7. Verify foreign key consistency with `PRAGMA foreign_key_check;`
+8. Set `PRAGMA foreign_keys = ON;`

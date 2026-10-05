@@ -130,7 +130,10 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error {
 	}
 
 	// 5. Diff schemas
-	steps := diffSchemas(live, desired, opts.TargetSchema, opts.ShadowSchema)
+	steps := diffSchemas(live, desired, opts.TargetSchema, opts.ShadowSchema, tableFilters{
+		includes: opts.IncludeTables,
+		excludes: opts.ExcludeTables,
+	})
 	policy := resolveDropPolicy(opts)
 
 	if len(steps) == 0 {
@@ -233,7 +236,10 @@ func PlanDiff(ctx context.Context, db *sql.DB, opts Options) (*Plan, error) {
 	}
 
 	// 5. Diff
-	steps := diffSchemas(live, desired, opts.TargetSchema, opts.ShadowSchema)
+	steps := diffSchemas(live, desired, opts.TargetSchema, opts.ShadowSchema, tableFilters{
+		includes: opts.IncludeTables,
+		excludes: opts.ExcludeTables,
+	})
 	policy := resolveDropPolicy(opts)
 
 	return &Plan{

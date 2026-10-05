@@ -1,132 +1,179 @@
-# Grizzle Specification (SPEC)
+# Grizzle specification
 
-This document outlines the formal technical and functional specification for **Grizzle**.
+This document defines the technical specification, API contract, and safety model for Grizzle.
 
----
+## 1. Scope and engine compatibility
 
-## 1. Scope & Compatibility
+* **Language**: Go 1.27+
+* **Engines supported**:
+  * PostgreSQL 13, 14, 15, 16, 17+
+  * SQLite 3.35+ (via pure-Go `modernc.org/sqlite`, zero Cgo)
+* **Database drivers supported**:
+  * PostgreSQL: `github.com/jackc/pgx/v5/stdlib`, `github.com/lib/pq`
+  * SQLite: `modernc.org/sqlite`, `github.com/mattn/go-sqlite3`
+* **Dependencies**: Pure Go standard library and driver interfaces. Zero external CLI binaries or Docker containers.
 
-* **Language**: Go 1.22+
-* **Primary Target Engine**: PostgreSQL 13, 14, 15, 16, 17+
-* **Go Drivers Supported**: Standard `database/sql` interfaces, compatible with `github.com/jackc/pgx/v5/stdlib` and `github.com/lib/pq`.
-* **Zero External Dependencies**: Standard library only (no Cgo, no Atlas binaries, no CLI tools).
+## 2. API contract
 
----
-
-## 2. API Contract
-
-### 2.1 Primary Function Signature
+### 2.1 Primary functions
 
 ```go
+// Sync synchronizes the live database schema to match opts.SchemaSQL.
 func Sync(ctx context.Context, db *sql.DB, opts Options) error
-```
 
-### 2.2 Configuration Options
-
-```go
-type Options struct {
-    // SchemaSQL contains the complete DDL representing the desired state.
-    // Usually supplied via //go:embed schema.sql.
-    SchemaSQL string
-
-    // TargetSchema is the schema to manage (defaults to "public").
-    TargetSchema string
-
-    // ShadowSchema is the temporary schema name used for compilation (defaults to "_grizzle_shadow").
-    ShadowSchema string
-
-    // AllowDrop permits destructive changes (DROP TABLE, DROP COLUMN, DROP INDEX).
-    // Defaults to false for safety.
-    AllowDrop bool
-
-    // LockID is a 64-bit integer used for pg_advisory_xact_lock.
-    // Defaults to a stable hash of the TargetSchema name.
-    LockID int64
-
-    // DryRun returns planned SQL statements without executing them on the live database.
-    DryRun bool
-
-    // Logger accepts a custom logging hook for migration events.
-    Logger Logger
-}
-
-type Plan struct {
-    Steps []Step
-}
-
-type Step struct {
-    Type        string
-    Table       string
-    SQL         string
-    Destructive bool
-}
-
-// PlanDiff generates the planned migration steps without applying them.
+// PlanDiff computes the migration plan without executing any changes on the target database.
 func PlanDiff(ctx context.Context, db *sql.DB, opts Options) (*Plan, error)
 ```
 
----
+### 2.2 Configuration options
 
-## 3. Supported Schema Constructs
+```go
+type Options struct {
+    // Dialect explicitly defines the database engine (DialectPostgres or DialectSQLite).
+    // If empty, Grizzle detects the dialect automatically from the driver type.
+    Dialect Dialect
 
-Grizzle supports the full breadth of standard PostgreSQL DDL by leveraging PostgreSQL's native parser:
+    // SchemaSQL contains the complete DDL representing the desired state.
+    // Typically embedded at build time with //go:embed schema.sql.
+    SchemaSQL string
+
+    // TargetSchema is the PostgreSQL schema to manage (defaults to "public").
+    TargetSchema string
+
+    // ShadowSchema is the temporary schema name used for validation (defaults to "_grizzle_shadow").
+    ShadowSchema string
+
+    // AllowDrop permits all destructive operations when set to true.
+    // Defaults to false for zero data loss.
+    AllowDrop bool
+
+    // Granular drop overrides (nil inherits from AllowDrop):
+    AllowDropTable  *bool
+    AllowDropColumn *bool
+    AllowDropIndex  *bool
+    AllowDropFK     *bool
+
+    // ExcludeTables defines table names or glob patterns (e.g. "spatial_ref_sys", "asynq_*")
+    // that Grizzle will never alter, diff, or drop.
+    ExcludeTables []string
+
+    // IncludeTables restricts management scope to only the specified tables or patterns.
+    // If empty, Grizzle manages all tables declared in SchemaSQL while respecting ExcludeTables.
+    IncludeTables []string
+
+    // LockID is a 64-bit integer for pg_advisory_xact_lock.
+    // Defaults to a stable hash of TargetSchema.
+    LockID int64
+
+    // DryRun outputs planned statements without executing them.
+    DryRun bool
+
+    // Logger accepts a structured logger (*slog.Logger) for migration events.
+    Logger *slog.Logger
+}
+```
+
+### 2.3 Plan, hazard analysis, and visualization
+
+```go
+type Plan struct {
+    TargetSchema string
+    Steps        []Step
+    Policy       DropPolicy
+}
+
+func (p *Plan) Additions() int
+func (p *Plan) Modifications() int
+func (p *Plan) Deletions() int
+func (p *Plan) Blocked() int
+func (p *Plan) Summary() (adds, alters, drops, blocked int)
+func (p *Plan) Hazards() []Hazard
+func (p *Plan) Format(w io.Writer, useColor bool) error
+func (p *Plan) String() string
+
+type HazardLevel string
+
+const (
+    HazardLevelCritical HazardLevel = "CRITICAL" // Data destruction (DROP TABLE, DROP COLUMN)
+    HazardLevelWarning  HazardLevel = "WARNING"  // Execution risk (NOT NULL without DEFAULT)
+    HazardLevelNotice   HazardLevel = "NOTICE"   // Locking or performance impact (INDEX creation/drop)
+)
+
+type Hazard struct {
+    Level       HazardLevel `json:"level"`
+    Type        ChangeType  `json:"type"`
+    Table       string      `json:"table"`
+    Description string      `json:"description"`
+    SQL         string      `json:"sql"`
+}
+```
+
+## 3. Supported schema constructs
+
+### PostgreSQL
 
 | Construct | Supported | Notes |
 | :--- | :---: | :--- |
-| `CREATE TABLE` | ✅ | Full support with composite primary keys |
-| `DROP TABLE` | ✅ | Guarded by `AllowDrop: true` |
-| `ADD COLUMN` | ✅ | Supports default expressions and nullability |
-| `DROP COLUMN` | ✅ | Guarded by `AllowDrop: true` |
-| `ALTER COLUMN TYPE` | ✅ | Automatically casts compatible types |
-| `ALTER COLUMN SET/DROP NOT NULL` | ✅ | Supported |
-| `ALTER COLUMN SET/DROP DEFAULT` | ✅ | Supported |
-| `CREATE INDEX` | ✅ | Unique, non-unique, multicolumn, and partial (`WHERE`) |
-| `DROP INDEX` | ✅ | Guarded by `AllowDrop: true` |
-| `FOREIGN KEY` | ✅ | Full support for `ON DELETE` / `ON UPDATE` actions |
-| `ENUM Types` | ✅ | Custom `CREATE TYPE ... AS ENUM` |
-| `UUID / JSONB / Arrays` | ✅ | Full native type support |
+| `CREATE TABLE` | Yes | Composite primary keys, unlogged tables |
+| `DROP TABLE` | Yes | Guarded by `AllowDropTable` |
+| `ADD COLUMN` | Yes | Default expressions, nullability, generated columns |
+| `DROP COLUMN` | Yes | Guarded by `AllowDropColumn` |
+| `ALTER COLUMN TYPE` | Yes | Automatic `USING` cast generation |
+| `ALTER COLUMN SET/DROP NOT NULL` | Yes | Fully supported |
+| `ALTER COLUMN SET/DROP DEFAULT` | Yes | Literal, function, and interval defaults |
+| `CREATE INDEX` | Yes | B-tree, GIN, GiST, BRIN, unique, partial (`WHERE`), expressions |
+| `DROP INDEX` | Yes | Guarded by `AllowDropIndex` |
+| `FOREIGN KEY` | Yes | `ON DELETE` / `ON UPDATE` actions (CASCADE, SET NULL, RESTRICT) |
+| `ENUM Types` | Yes | `CREATE TYPE ... AS ENUM`, `ALTER TYPE ... ADD VALUE` |
+| `Native Types` | Yes | UUID, JSONB, Arrays, Timestamps, Numerics |
 
----
+### SQLite
 
-## 4. Safety Model & Invariants
+| Construct | Supported | Notes |
+| :--- | :---: | :--- |
+| `CREATE TABLE` | Yes | Primary keys, autoincrement, column constraints |
+| `DROP TABLE` | Yes | Guarded by `AllowDropTable` |
+| `ADD COLUMN` | Yes | Direct `ALTER TABLE ... ADD COLUMN` when constraints permit |
+| `DROP COLUMN` | Yes | Handled via SQLite 12-step table rebuild |
+| `ALTER COLUMN TYPE` | Yes | Handled via SQLite 12-step table rebuild |
+| `CREATE INDEX` | Yes | Direct `CREATE INDEX` and `CREATE UNIQUE INDEX` |
+| `DROP INDEX` | Yes | Guarded by `AllowDropIndex` |
+| `FOREIGN KEY` | Yes | Validated with `PRAGMA foreign_key_check` |
 
-### Invariant 1: Non-Destructive by Default
-If `Options.AllowDrop == false`, Grizzle guarantees that **no existing data is destroyed**.
-* If a table present in `public` is missing from `schema.sql`, execution halts with `ErrDestructiveBlocked`.
-* If a column present in `public` is missing from `schema.sql`, execution halts with `ErrDestructiveBlocked`.
+## 4. Safety model and invariants
 
-### Invariant 2: Atomic Execution (All-or-Nothing)
-All DDL operations (or the decision to perform none) execute within a single PostgreSQL transaction.
-* If any statement fails (e.g. invalid type cast on existing rows), the entire migration rolls back.
-* The live database is never left in an unrecoverable or half-migrated state.
+### Invariant 1: Non-destructive by default
+If `AllowDrop` is false (the default), Grizzle refuses to execute any plan containing table or column deletions. It returns a `*DestructiveViolationError` detailing the blocked operations.
 
-### Invariant 3: Single-Writer Mutual Exclusion
-* Execution is bounded by `pg_advisory_xact_lock(lock_id)`.
-* Multiple concurrent application instances queue sequentially.
-* The lock is freed on transaction commit or rollback, even in ungraceful crashes.
+### Invariant 2: Distributed mutual exclusion
+PostgreSQL migrations acquire `pg_advisory_xact_lock(lock_id)` inside the active transaction. Concurrent pod boots queue behind the lock and resume only after the first transaction commits. Subsequent pods detect zero pending changes and start immediately.
 
----
+### Invariant 3: Pre-flight shadow validation
+`SchemaSQL` is validated in an isolated shadow schema (`_grizzle_shadow` or an in-memory SQLite database) before inspecting or touching the live schema. SQL errors stop execution without altering live tables.
 
-## 5. Performance Standards
+### Invariant 4: Third-party table preservation
+Tables matching `ExcludeTables` or known extension patterns (`spatial_ref_sys`, `geometry_columns`) are excluded from diffing, drop detection, and modification. Whitelisting with `IncludeTables` restricts Grizzle exclusively to named tables.
 
-* **Execution Overhead**:
-  * Clean boot (0 pending diffs): `< 40ms` total latency.
-  * Typical sync (1–5 table adjustments): `< 150ms`.
-* **Memory Footprint**: `< 15MB` heap allocation during schema diffing.
-* **Connection Consumption**: Uses exactly 1 connection from the `*sql.DB` pool during synchronization.
+### Invariant 5: Transactional atomicity
+All migration statements run in a single transaction. If any statement fails, the entire transaction rolls back.
 
----
+## 5. Performance standards
 
-## 6. Error Taxonomy
+* **Warm boot (0 pending diffs)**: `< 15ms` execution time.
+* **Cold boot (initial schema creation)**: `< 80ms`.
+* **Memory usage**: `< 10MB` heap allocations during diffing.
+* **Database connections**: Uses 1 connection from the pool during migration.
 
-Grizzle provides explicit sentinel errors:
+## 6. Error taxonomy
 
 ```go
 var (
-    ErrEmptySchema        = errors.New("grizzle: schema SQL cannot be empty")
-    ErrDestructiveBlocked = errors.New("grizzle: destructive change rejected by policy")
-    ErrLockAcquisition    = errors.New("grizzle: failed to acquire advisory lock")
-    ErrCompilationFailed  = errors.New("grizzle: schema compilation in shadow schema failed")
-    ErrExecutionFailed    = errors.New("grizzle: applying DDL to live schema failed")
+    ErrEmptySchema         = errors.New("grizzle: schema SQL cannot be empty")
+    ErrDestructiveBlocked  = errors.New("grizzle: destructive change rejected by policy")
+    ErrLockAcquisition     = errors.New("grizzle: failed to acquire advisory lock")
+    ErrCompilationFailed   = errors.New("grizzle: schema compilation in shadow schema failed")
+    ErrExecutionFailed     = errors.New("grizzle: applying DDL to live schema failed")
+    ErrInspectionFailed    = errors.New("grizzle: inspecting schema failed")
+    ErrUnsupportedDialect  = errors.New("grizzle: unsupported database dialect")
 )
 ```

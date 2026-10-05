@@ -48,7 +48,10 @@ func syncSQLite(ctx context.Context, db *sql.DB, opts Options) error {
 	}
 
 	// 4. Diff schemas
-	steps := diffSQLiteSchemas(live, desired)
+	steps := diffSQLiteSchemas(live, desired, tableFilters{
+		includes: opts.IncludeTables,
+		excludes: opts.ExcludeTables,
+	})
 	policy := resolveDropPolicy(opts)
 
 	if len(steps) == 0 {
@@ -145,7 +148,10 @@ func planDiffSQLite(ctx context.Context, db *sql.DB, opts Options) (*Plan, error
 		return nil, err
 	}
 
-	steps := diffSQLiteSchemas(live, desired)
+	steps := diffSQLiteSchemas(live, desired, tableFilters{
+		includes: opts.IncludeTables,
+		excludes: opts.ExcludeTables,
+	})
 	policy := resolveDropPolicy(opts)
 
 	return &Plan{

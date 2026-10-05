@@ -1,24 +1,16 @@
-# Grizzle 🐻⚡
+# Grizzle
 
-> **Declarative, in-process database schema automigration for Go.**  
-> Define your schema once in standard `schema.sql`. No migration sequence files. No merge conflicts. No external CLI or Docker containers required.
+Grizzle provides declarative, in-process database schema automigration for Go applications. It synchronizes PostgreSQL and SQLite schemas directly from standard `schema.sql` files at application boot, eliminating migration sequence files, version collisions, and external CLI tools.
 
----
+## Problems Grizzle solves
 
-## The Problem Grizzle Solves
+1. **Migration sequence conflicts.** When multiple developers generate numbered migration files on different Git branches (e.g. `0005_add_users.sql` and `0005_add_teams.sql`), merging to the main branch causes file name collisions and execution ordering ambiguities. Grizzle diffs the desired state against the live catalog directly.
+2. **Schema duplication in ORMs.** Libraries such as GORM and Ent require declaring schemas using Go struct tags or Go DSLs. GORM auto-migration only adds missing columns and skips column type alterations or drop detection. Grizzle uses standard SQL DDL as the single source of truth.
+3. **External binary requirements.** Tools such as Atlas, Prisma, and Drizzle require standalone CLI binaries, Node.js runtimes, or pre-migration Docker containers. Grizzle runs entirely within the compiled Go application binary.
 
-1. **Migration Sequence Conflicts (Goose, Flyway, golang-migrate):**  
-   When multiple developers create migrations concurrently on different Git branches (e.g. `0005_add_users.sql` and `0005_add_teams.sql`), merging to `main` results in version number collisions or non-deterministic execution order.
-2. **Heavyweight ORMs (GORM, Ent):**  
-   Forces you to define schemas using Go struct tags instead of SQL. GORM’s `AutoMigrate` only adds missing columns and cannot reliably handle type modifications, drop detection, or complex index diffs.
-3. **Complex CLI Workflows (Atlas, Prisma, Drizzle-Kit):**  
-   Require external binaries, Node.js runtimes, Docker containers, or pre-deploy CLI steps that complicate container images and developer workflows.
+## Quick start
 
----
-
-## The Grizzle Approach
-
-With Grizzle, your single source of truth is plain SQL (e.g., `schema.sql`):
+Define your database schema in standard SQL:
 
 ```sql
 -- schema.sql
@@ -32,7 +24,7 @@ CREATE TABLE users (
 CREATE INDEX idx_users_created_at ON users (created_at);
 ```
 
-You embed it and call Grizzle directly in `main.go` on startup:
+Embed the file and call `grizzle.Sync` in `main.go`:
 
 ```go
 package main
@@ -55,63 +47,58 @@ func main() {
 
 	db, err := sql.Open("pgx", "postgres://postgres:password@localhost:5432/myapp?sslmode=disable")
 	if err != nil {
-		log.Fatalf("failed to connect to db: %v", err)
+		log.Fatalf("connect failed: %v", err)
 	}
 	defer db.Close()
 
-	// In-process automigration on application boot
+	// Run declarative migration on startup
 	err = grizzle.Sync(ctx, db, grizzle.Options{
 		SchemaSQL: schemaSQL,
-		AllowDrop: false, // Prevents accidental data loss in production
+		AllowDrop: false, // Prevents accidental data destruction in production
+		ExcludeTables: []string{"asynq_*", "temporal_*"}, // Protects worker queue tables
 	})
 	if err != nil {
-		log.Fatalf("grizzle sync failed: %v", err)
+		log.Fatalf("migration failed: %v", err)
 	}
 
-	log.Println("Database schema is in sync! Starting app...")
-	// Start your HTTP / gRPC server...
+	log.Println("Database synchronized. Starting server...")
 }
 ```
 
----
+## Features
 
-## Key Features
+* **Zero external dependencies**: Runs completely in-process within your compiled Go binary. Zero Cgo.
+* **PostgreSQL and SQLite engines**: Supports PostgreSQL 13+ and SQLite 3.35+ (via `modernc.org/sqlite`).
+* **Automatic dialect detection**: Identifies the database engine from the driver type without manual configuration.
+* **Multi-pod safety**: Acquires PostgreSQL transactional advisory locks (`pg_advisory_xact_lock`) to prevent race conditions during concurrent replica startups.
+* **SQLite 12-step rebuild**: Executes table recreation procedures to modify column types and drop constraints without data loss.
+* **Non-destructive defaults**: `AllowDrop: false` halts execution if columns or tables are missing from `schema.sql`. Granular flags (`AllowDropTable`, `AllowDropColumn`, `AllowDropIndex`, `AllowDropFK`) allow selective overrides.
+* **Third-party table preservation**: Protects external tables (PostGIS metadata, task queues like `asynq` or `pgboss`) via `ExcludeTables` patterns and `IncludeTables` whitelisting.
+* **Static hazard analysis**: `Plan.Hazards()` flags data-loss risks, missing defaults on `NOT NULL` columns, and table locking operations before applying changes.
+* **Terminal visualization**: Renders colored migration diffs and hazards using `Plan.Format(os.Stdout, true)`.
 
-* 🚀 **Zero External Binaries**: Runs completely in-process within your compiled Go binary.
-* 🐘 **PostgreSQL & 🪶 SQLite**: First-class support for PostgreSQL 13+ and SQLite 3.35+ (via pure-Go `modernc.org/sqlite`, zero Cgo required).
-* 🔍 **Automatic Dialect Detection**: Automatically detects PostgreSQL or SQLite from your `*sql.DB` connection driver without configuration.
-* 🛡️ **Multi-Replica Safe**: Leverages transactional PostgreSQL advisory locks (`pg_advisory_xact_lock`) to eliminate race conditions when multiple pods boot simultaneously.
-* 🔄 **SQLite 12-Step Rebuild Engine**: Seamlessly handles SQLite column modifications and drops while preserving 100% of existing row data and foreign keys.
-* 🔒 **Fine-Grained Drop Protection**: `AllowDrop: false` halts boot on destructive operations. Granular switches (`AllowDropTable`, `AllowDropColumn`, `AllowDropIndex`, `AllowDropFK`) enable surgical permission controls.
-* 📊 **Terminal Visualizer**: Inspect diffs before executing with `PlanDiff()`, colorized terminal output (`Plan.Format(os.Stdout, true)`), and structured logging via standard `log/slog`.
-* 🧩 **Git Merge Friendly**: Changes to `schema.sql` merge naturally like any code file—no sequence number coordination.
+## Documentation index
 
----
+* [Safety analysis & production comparison](docs/SAFETY.md): Comparison of Grizzle, Drizzle ORM, Atlas, Ent, and TypeORM, detailing production invariants and guarantees.
+* [System architecture](docs/ARCHITECTURE.md): Component diagrams, state transitions, and execution flow.
+* [Specification](docs/SPEC.md): API contract, configuration options, and error taxonomy.
+* [Design notes](docs/DESIGN.md): PostgreSQL catalog inspection, SQLite rebuild engine, and type normalization algorithms.
+* [Roadmap](docs/ROADMAP.md): Development milestones and completed implementation phases.
 
-## Documentation Index
+## Development environment
 
-* 📐 **[System Architecture](docs/ARCHITECTURE.md)**: Architectural diagrams, state machine, and component flow.
-* 📋 **[Functional & Technical Spec](docs/SPEC.md)**: Guarantees, API contracts, safety models, and limits.
-* 🛠️ **[Deep Technical Design](docs/DESIGN.md)**: PostgreSQL catalog queries, diffing algorithms, and type normalization.
-* 🗺️ **[Development Roadmap](docs/ROADMAP.md)**: Step-by-step phases to build, test, and ship Grizzle.
-
----
-
-## Development Environment (Nix + devenv)
-
-Grizzle includes a reproducible Nix developer environment powered by [devenv](https://devenv.sh/). It automatically provisions Go, PostgreSQL 16, `golangci-lint`, and client tools.
+Grizzle uses [devenv](https://devenv.sh/) to provide a reproducible development shell with Go 1.27, PostgreSQL 16, and test utilities.
 
 ```bash
-# 1. Enter the dev shell (or let direnv load it automatically)
+# 1. Enter the dev shell
 devenv shell
 
-# 2. Start local PostgreSQL daemon in background
+# 2. Start PostgreSQL daemon
 devenv up
 
-# 3. Available helper commands inside the shell
-test-all    # Run all unit and integration tests with -race
+# 3. Development commands
+test-all    # Run tests with race detection (-race)
 lint        # Run golangci-lint
-db-shell    # Open psql connected to the local test database
-db-reset    # Cleanly reset the public schema in grizzle_test
+db-shell    # Open psql on grizzle_test
+db-reset    # Reset public schema
 ```
-

@@ -2,11 +2,70 @@ package grizzle
 
 import (
 	"fmt"
+	"path"
 	"slices"
 )
 
+// tableFilters carries unmanaged-table rules for the diff phase.
+type tableFilters struct {
+	includes []string
+	excludes []string
+}
+
+// isTableManaged returns true if the table is managed by Grizzle according to include/exclude rules.
+func isTableManaged(tableName string, filters tableFilters) bool {
+	// Built-in system and GIS extension tables that must never be altered or dropped
+	builtinIgnored := []string{
+		"spatial_ref_sys",
+		"geometry_columns",
+		"geography_columns",
+		"raster_columns",
+		"raster_overviews",
+	}
+	for _, b := range builtinIgnored {
+		if tableName == b {
+			return false
+		}
+	}
+
+	// User-defined Exclude patterns
+	for _, pattern := range filters.excludes {
+		matched, err := path.Match(pattern, tableName)
+		if err != nil {
+			// If pattern contains malformed glob syntax (e.g. unclosed '['),
+			// fall back to literal comparison so the protection rule is not silently disabled.
+			if pattern == tableName {
+				return false
+			}
+			continue
+		}
+		if matched || pattern == tableName {
+			return false
+		}
+	}
+
+	// User-defined Include patterns (if specified, only matching tables are managed)
+	if len(filters.includes) > 0 {
+		for _, pattern := range filters.includes {
+			matched, err := path.Match(pattern, tableName)
+			if err != nil {
+				if pattern == tableName {
+					return true
+				}
+				continue
+			}
+			if matched || pattern == tableName {
+				return true
+			}
+		}
+		return false
+	}
+
+	return true
+}
+
 // diffSchemas compares the live schema with the desired schema and produces a sequenced list of migration steps.
-func diffSchemas(live, desired *SchemaIR, targetSchema, shadowSchema string) []Step {
+func diffSchemas(live, desired *SchemaIR, targetSchema, shadowSchema string, filters tableFilters) []Step {
 	var steps []Step
 
 	// 1. Custom ENUM Types Diff
@@ -37,6 +96,9 @@ func diffSchemas(live, desired *SchemaIR, targetSchema, shadowSchema string) []S
 
 	// 2. Tables & Columns Diff
 	for tblName, dTable := range desired.Tables {
+		if !isTableManaged(tblName, filters) {
+			continue
+		}
 		lTable, exists := live.Tables[tblName]
 		if !exists {
 			// New table to create
@@ -77,10 +139,12 @@ func diffSchemas(live, desired *SchemaIR, targetSchema, shadowSchema string) []S
 			if !colExists {
 				// Added column
 				steps = append(steps, Step{
-					Type:        ChangeAddColumn,
-					Table:       tblName,
-					SQL:         generateAddColumnSQL(targetSchema, tblName, dCol),
-					Destructive: false,
+					Type:             ChangeAddColumn,
+					Table:            tblName,
+					SQL:              generateAddColumnSQL(targetSchema, tblName, dCol),
+					Destructive:      false,
+					ColumnNotNull:    !dCol.IsNullable,
+					ColumnHasDefault: dCol.DefaultValue != "",
 				})
 			} else {
 				// Check for column alterations
@@ -198,6 +262,9 @@ func diffSchemas(live, desired *SchemaIR, targetSchema, shadowSchema string) []S
 
 	// 3. Detect dropped tables
 	for tblName := range live.Tables {
+		if !isTableManaged(tblName, filters) {
+			continue
+		}
 		if _, exists := desired.Tables[tblName]; !exists {
 			steps = append(steps, Step{
 				Type:        ChangeDropTable,

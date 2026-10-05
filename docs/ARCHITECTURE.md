@@ -1,31 +1,29 @@
-# Grizzle Architecture
+# Grizzle architecture
 
-This document details the architectural design, lifecycle, and component interactions of **Grizzle**.
+This document details the architectural design, lifecycle, and component interactions of Grizzle.
 
----
-
-## 1. High-Level Architecture
+## 1. High-level architecture
 
 Grizzle operates as an embedded in-process library inside the Go application runtime. It does not spawn background daemons, launch child processes, or query external CLI binaries.
 
 ```mermaid
 flowchart TD
-    subgraph Go Application Process [Go Application Process (Startup)]
-        AppMain["main() / Boot Hook"] --> SyncCall["grizzle.Sync(ctx, db, opts)"]
-        SyncCall --> LockMgr["1. Lock Manager (Advisory Lock)"]
-        LockMgr --> ShadowRunner["2. Shadow Schema Runner"]
-        ShadowRunner --> Inspector["3. Catalog Inspector (Dual Inspection)"]
-        Inspector --> DiffEngine["4. Diff Engine"]
-        DiffEngine --> SafetyGuard["5. Safety & Destructive Guards"]
-        SafetyGuard --> Planner["6. Topological DDL Planner"]
-        Planner --> Applier["7. Transactional Applier"]
-        Applier --> Cleanup["8. Shadow Schema Cleanup & Unlock"]
+    subgraph Go Application Process [Go application process]
+        AppMain["main() / boot hook"] --> SyncCall["grizzle.Sync(ctx, db, opts)"]
+        SyncCall --> LockMgr["1. Lock manager (advisory lock)"]
+        LockMgr --> ShadowRunner["2. Shadow schema runner"]
+        ShadowRunner --> Inspector["3. Catalog inspector (dual inspection)"]
+        Inspector --> DiffEngine["4. Diff engine with scope filters"]
+        DiffEngine --> SafetyGuard["5. Safety policy and hazard analyzer"]
+        SafetyGuard --> Planner["6. Topological DDL planner"]
+        Planner --> Applier["7. Transactional applier"]
+        Applier --> Cleanup["8. Shadow cleanup and unlock"]
     end
 
-    subgraph Target Database [PostgreSQL Target Database]
+    subgraph Target Database [Database server]
         AdvisoryLock[("pg_advisory_xact_lock")]
         ShadowSchema[("Schema: _grizzle_shadow")]
-        PublicSchema[("Schema: public (Live Data)")]
+        PublicSchema[("Schema: public (live data)")]
     end
 
     LockMgr -.-> AdvisoryLock
@@ -35,105 +33,115 @@ flowchart TD
     Applier -.-> PublicSchema
 ```
 
----
+## 2. In-process shadow schema validation
 
-## 2. The In-Process Shadow Schema Pattern
+Parsing arbitrary SQL DDL text in application code is error-prone because database dialects contain complex grammars for custom enums, interval expressions, partial indexes, and generated columns.
 
-The hardest part of declarative database management is parsing arbitrary SQL DDL. Writing a parser in Go that handles PostgreSQL dialect specifics (e.g., custom enums, complex defaults, partial indexes, generated columns) is brittle and error-prone.
-
-Grizzle avoids parsing SQL text entirely by using PostgreSQL itself as the compiler:
+Grizzle avoids custom SQL parsing by using the database engine itself as the compiler:
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant App as Go Application
-    participant DB as PostgreSQL Server (Tx)
+    participant DB as Database Server (Tx)
 
     App->>DB: BEGIN Transaction
     App->>DB: SELECT pg_advisory_xact_lock(lock_id)
-    Note over App,DB: Pods 2..N block here until Pod 1 finishes
+    Note over App,DB: Concurrent pods wait here until Pod 1 commits
 
     App->>DB: DROP SCHEMA IF EXISTS _grizzle_shadow CASCADE;
     App->>DB: CREATE SCHEMA _grizzle_shadow;
     App->>DB: SET LOCAL search_path TO _grizzle_shadow, public;
     App->>DB: Exec(schema.sql)
-    Note over DB: PostgreSQL parses & compiles SQL into its internal catalog!
+    Note over DB: PostgreSQL compiles SQL into its internal catalog
 
     App->>DB: SET LOCAL search_path TO public;
-    App->>DB: Inspect public schema (Live State)
-    App->>DB: Inspect _grizzle_shadow schema (Desired State)
+    App->>DB: Inspect public schema (live state)
+    App->>DB: Inspect _grizzle_shadow schema (desired state)
 
-    Note over App: DiffEngine compares Live vs Desired State
-    Note over App: Validates Safety Rules (AllowDrop)
-    Note over App: Plans Topological DDL Sequence
+    Note over App: DiffEngine filters unmanaged tables and computes changes
+    Note over App: Validates safety policies and identifies hazards
+    Note over App: Sequences statements topologically
 
-    App->>DB: Apply generated ALTER / CREATE / DROP statements on public
+    App->>DB: Apply generated DDL statements on public schema
     App->>DB: DROP SCHEMA _grizzle_shadow CASCADE;
     App->>DB: COMMIT Transaction
-    Note over DB: Advisory Lock automatically released! Pods 2..N proceed.
+    Note over DB: Advisory lock automatically released. Waiting pods proceed.
 ```
 
----
+On SQLite, the shadow compilation runs inside an in-memory database (`sql.Open("sqlite", ":memory:")`), verifying SQL statements without affecting disk files.
 
-## 3. Core Component Breakdown
+## 3. Core components
 
-### 3.1 Lock Manager
-* **Purpose**: Guarantees that only a single instance of the application executes migrations during multi-replica deployments (e.g. Kubernetes rolling updates).
+### 3.1 Lock manager
+* **Purpose**: Coordinates concurrent replicas during rolling cluster deployments.
 * **Mechanism**: PostgreSQL Transactional Advisory Locks (`pg_advisory_xact_lock`).
-* **Properties**:
-  * Bound to the transaction lifecycle.
-  * Does not require custom lock tables or heartbeat workers.
-  * Automatically released if the app crashes, panics, or the connection is severed.
+* **Guarantees**:
+  * Bound directly to transaction lifecycle.
+  * No custom lock tables or polling daemons.
+  * Automatically released on transaction commit, rollback, process crash, or network termination.
 
-### 3.2 Shadow Runner
-* **Purpose**: Executes the user's `schema.sql` in total isolation without touching live production tables.
-* **Mechanism**: Creates an ephemeral schema named `_grizzle_shadow` (or configurable prefix) and restricts execution via `search_path`.
-* **Cleanup**: Uses deferred execution to ensure the shadow schema is dropped even if errors occur.
+### 3.2 Shadow runner
+* **Purpose**: Compiles the user's `schema.sql` in isolation without touching live production tables.
+* **Mechanism**: PostgreSQL uses an ephemeral schema named `_grizzle_shadow` with localized `search_path`. SQLite uses an isolated `:memory:` database instance.
+* **Cleanup**: Uses deferred execution to ensure the shadow schema is dropped even if errors occur during compilation.
 
-### 3.3 Catalog Inspector
-* **Purpose**: Extracts the relational structure of both the live schema (`public`) and the shadow schema (`_grizzle_shadow`).
-* **Source**: Direct queries against PostgreSQL system catalogs (`pg_class`, `pg_attribute`, `pg_constraint`, `pg_index`, `information_schema`).
-* **Extracted Entities**:
-  * Tables
-  * Columns (name, data type, length, nullability, default expression)
-  * Primary Keys
-  * Indexes (unique flags, column lists, expressions, predicates)
-  * Foreign Keys (referencing table, referencing columns, `ON DELETE`, `ON UPDATE`)
+### 3.3 Catalog inspector
+* **Purpose**: Extracts relational metadata from live and shadow schemas.
+* **Source**:
+  * PostgreSQL: Direct queries against `pg_catalog` (`pg_class`, `pg_attribute`, `pg_constraint`, `pg_index`, `pg_type`).
+  * SQLite: Queries against `sqlite_schema`, `PRAGMA table_info`, and `PRAGMA foreign_key_list`.
+* **Entities extracted**: Tables, columns, data types, nullability, defaults, primary keys, indexes, foreign keys, and enum definitions.
 
-### 3.4 Diff Engine
-* **Purpose**: Compares `Live State` vs `Desired State` and generates an unordered list of atomic `Change` actions.
-* **Operations Detected**:
-  * `CreateTable` / `DropTable`
-  * `AddColumn` / `DropColumn` / `AlterColumn` (type, nullability, defaults)
-  * `CreateIndex` / `DropIndex`
-  * `AddForeignKey` / `DropForeignKey`
+### 3.4 Table scope filter
+* **Purpose**: Protects third-party tables from modification or deletion.
+* **Mechanism**: Evaluates table names against:
+  * Built-in extension ignore lists (such as PostGIS `spatial_ref_sys`, `geometry_columns`).
+  * User-defined `ExcludeTables` wildcard patterns (such as `asynq_*`, `temporal_*`).
+  * User-defined `IncludeTables` whitelists.
 
-### 3.5 Safety & Destructive Guards
-* **Purpose**: Protects against accidental data destruction in production environments.
-* **Policy**:
-  * If `AllowDrop == false` and any `DropTable`, `DropColumn`, or irreversible type change is planned, Grizzle immediately aborts the transaction with a descriptive error.
-  * No queries are executed against the live schema if a violation occurs.
+### 3.5 Diff engine
+* **Purpose**: Compares live state against desired state and produces atomic schema operations.
+* **Operations**: Table creations, table drops, column additions, column drops, column alterations (type, nullability, default), index creations, index drops, foreign key additions, foreign key drops, and enum modifications.
 
-### 3.6 Topological DDL Planner
-* **Purpose**: Orders migration steps to satisfy relational dependencies.
-* **Execution Order**:
-  1. Drop Foreign Keys (removes cross-table locks and dependency blocks)
-  2. Drop Indexes (cleans up obsolete indexes)
-  3. Create Tables (empty tables created without foreign keys first)
-  4. Add Columns (expands existing tables)
-  5. Alter Columns (adjusts types, nullability, and defaults)
-  6. Create Indexes (builds new query paths)
-  7. Add Foreign Keys (links parent and child tables)
-  8. Drop Columns *(if permitted)*
-  9. Drop Tables *(if permitted)*
+### 3.6 Safety policy and hazard analyzer
+* **Purpose**: Prevents accidental data destruction and flags operational risks before execution.
+* **Policies**:
+  * `AllowDrop: false` blocks all destructive operations (`DROP TABLE`, `DROP COLUMN`, destructive type conversions).
+  * Granular overrides allow targeted operations (`AllowDropIndex: ptr(true)`).
+* **Hazard levels**:
+  * `CRITICAL`: Potential data loss (`DROP TABLE`, `DROP COLUMN`, destructive type narrowing).
+  * `WARNING`: Execution failures on non-empty tables (adding `NOT NULL` without `DEFAULT`).
+  * `NOTICE`: Operational impacts (index creation table locks, index drops, foreign key drops).
 
----
+### 3.7 Topological DDL planner
+* **Purpose**: Sequences migration statements to satisfy relational constraints:
+  1. Drop foreign keys (removes cross-table locks and dependency blocks)
+  2. Drop indexes (removes obsolete indexes)
+  3. Create tables (creates empty tables before foreign keys reference them)
+  4. Add columns (widens existing tables)
+  5. Alter columns (changes types, nullability, defaults)
+  6. Create indexes (adds new query paths)
+  7. Add foreign keys (links parent and child tables)
+  8. Drop columns (if permitted by policy)
+  9. Drop tables (if permitted by policy)
 
-## 4. Concurrency & High Availability Guarantees
+### 3.8 SQLite 12-step rebuild engine
+Because SQLite does not support altering or dropping existing columns natively, Grizzle implements SQLite's recommended 12-step table recreation procedure:
+1. Disable foreign key checks (`PRAGMA foreign_keys = OFF`).
+2. Create replacement table `_grizzle_rebuild_<table_name>`.
+3. Copy compatible columns (`INSERT INTO ... SELECT ...`).
+4. Drop old table.
+5. Rename replacement table to original name.
+6. Re-create indexes and triggers.
+7. Verify referential integrity (`PRAGMA foreign_key_check`).
+8. Re-enable foreign keys (`PRAGMA foreign_keys = ON`).
+
+## 4. Concurrency and recovery guarantees
 
 | Scenario | Behavior | Guarantee |
 | :--- | :--- | :--- |
-| **Simultaneous Startup (5 Pods)** | Pod 1 acquires lock, Pods 2–5 block on `pg_advisory_xact_lock`. | Exact-once migration execution. |
-| **Subsequent Pods Unblocked** | Pod 1 commits. Pod 2 acquires lock, inspects schema, detects 0 diffs, exits immediately. | Zero redundant DDL executions. |
-| **Process Crash During Sync** | Connection terminates; PostgreSQL automatically rolls back transaction and releases lock. | No corrupt partial state, no orphaned locks. |
-| **Invalid SQL in `schema.sql`** | Fails in the shadow schema before touching `public`. | Production database remains untouched. |
+| **Simultaneous startup (10 pods)** | Pod 1 acquires `pg_advisory_xact_lock`. Pods 2 to 10 wait on lock. | Exactly one migration execution. No race conditions. |
+| **Subsequent pod execution** | Pod 1 commits. Pod 2 acquires lock, inspects schema, detects 0 diffs, exits in < 15ms. | Zero redundant DDL statements executed. |
+| **Application crash during sync** | Database connection closes. Database rolls back transaction and frees advisory lock. | Zero partial schema states. No deadlocks. |
+| **Syntax error in `schema.sql`** | Compilation fails in shadow schema before touching live schema. | Live database remains untouched. |

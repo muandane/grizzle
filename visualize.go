@@ -88,6 +88,26 @@ func (p *Plan) Format(w io.Writer, useColor bool) error {
 		sb.WriteString(fmt.Sprintf("\n%s\n", summaryText))
 	}
 
+	hazards := p.Hazards()
+	if len(hazards) > 0 {
+		hazardHeader := "\nDetected Hazards:\n"
+		if useColor {
+			hazardHeader = fmt.Sprintf("\n%s%sDetected Hazards:%s\n", colorBold, colorYellow, colorReset)
+		}
+		sb.WriteString(hazardHeader)
+		for _, h := range hazards {
+			if useColor {
+				hColor := colorYellow
+				if h.Level == HazardLevelCritical {
+					hColor = colorRed
+				}
+				sb.WriteString(fmt.Sprintf("  %s[%s]%s %s\n", hColor, h.Level, colorReset, h.Description))
+			} else {
+				sb.WriteString(fmt.Sprintf("  [%s] %s\n", h.Level, h.Description))
+			}
+		}
+	}
+
 	_, err := io.WriteString(w, sb.String())
 	return err
 }

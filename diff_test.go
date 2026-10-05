@@ -39,7 +39,7 @@ func TestDiffSchemas_CreateTable(t *testing.T) {
 		},
 	}
 
-	steps := diffSchemas(live, desired, "public", "_grizzle_shadow")
+	steps := diffSchemas(live, desired, "public", "_grizzle_shadow", tableFilters{})
 	if len(steps) != 1 {
 		t.Fatalf("expected 1 step, got %d", len(steps))
 	}
@@ -80,7 +80,7 @@ func TestDiffSchemas_AddColumn(t *testing.T) {
 		},
 	}
 
-	steps := diffSchemas(live, desired, "public", "_grizzle_shadow")
+	steps := diffSchemas(live, desired, "public", "_grizzle_shadow", tableFilters{})
 	if len(steps) != 1 {
 		t.Fatalf("expected 1 step, got %d", len(steps))
 	}
@@ -121,7 +121,7 @@ func TestDiffSchemas_DropColumn_Destructive(t *testing.T) {
 		},
 	}
 
-	steps := diffSchemas(live, desired, "public", "_grizzle_shadow")
+	steps := diffSchemas(live, desired, "public", "_grizzle_shadow", tableFilters{})
 	if len(steps) != 1 {
 		t.Fatalf("expected 1 step, got %d", len(steps))
 	}
@@ -152,7 +152,7 @@ func TestDiffSchemas_Enums(t *testing.T) {
 		},
 	}
 
-	steps := diffSchemas(live, desired, "public", "_grizzle_shadow")
+	steps := diffSchemas(live, desired, "public", "_grizzle_shadow", tableFilters{})
 	if len(steps) != 2 {
 		t.Fatalf("expected 2 steps (1 create enum, 1 alter enum), got %d", len(steps))
 	}
@@ -199,7 +199,7 @@ func TestDiffSchemas_IndexesAndForeignKeys(t *testing.T) {
 		},
 	}
 
-	steps := diffSchemas(live, desired, "public", "_grizzle_shadow")
+	steps := diffSchemas(live, desired, "public", "_grizzle_shadow", tableFilters{})
 
 	// Expect:
 	// 1. Drop old_idx (Priority 20)
