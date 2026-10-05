@@ -21,8 +21,9 @@ func getSQLiteDB(t *testing.T) *sql.DB {
 	return db
 }
 
+//go:fix inline
 func boolPtr(b bool) *bool {
-	return &b
+	return new(b)
 }
 
 func TestSQLite_EndToEnd(t *testing.T) {
@@ -167,8 +168,7 @@ func TestSQLite_EndToEnd(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected DestructiveViolationError when dropping column with AllowDrop=false")
 	}
-	var de *grizzle.DestructiveViolationError
-	if !errors.As(err, &de) {
+	if _, ok := errors.AsType[*grizzle.DestructiveViolationError](err); !ok {
 		t.Fatalf("expected DestructiveViolationError, got: %T: %v", err, err)
 	}
 
@@ -176,7 +176,7 @@ func TestSQLite_EndToEnd(t *testing.T) {
 	err = grizzle.Sync(ctx, db, grizzle.Options{
 		Dialect:         grizzle.DialectSQLite,
 		SchemaSQL:       schemaV3,
-		AllowDropColumn: boolPtr(true),
+		AllowDropColumn: new(true),
 	})
 	if err != nil {
 		t.Fatalf("Sync V3 rebuild failed: %v", err)
@@ -254,7 +254,7 @@ func TestSQLite_FineGrainedSafetyPolicy(t *testing.T) {
 	err = grizzle.Sync(ctx, db, grizzle.Options{
 		SchemaSQL:      v2,
 		AllowDrop:      false,
-		AllowDropTable: boolPtr(true),
+		AllowDropTable: new(true),
 	})
 	if err != nil {
 		t.Fatalf("expected success with AllowDropTable=true, got: %v", err)

@@ -9,10 +9,14 @@ devenv.local.yaml
 # pre-commit
 .pre-commit-config.yaml
 
-# OS
+# OS and Editors
 .DS_Store
+.idea/
+.vscode/
+*.swp
+*~
 
-# Go binaries and coverage
+# Go binaries, coverage, and profiling
 *.exe
 *.exe~
 *.dll
@@ -20,11 +24,14 @@ devenv.local.yaml
 *.dylib
 *.test
 *.out
+*.prof
+cpu.pprof
+mem.pprof
 coverage.txt
 dist/
 bin/
 
-# SQLite databases
+# SQLite databases and journals
 *.db
 *.db-*
 *.sqlite
@@ -33,3 +40,9 @@ bin/
 *.sqlite3-*
 *.db3
 *.db3-*
+
+# PostgreSQL dumps and logs
+*.sql.dump
+*.dump
+*.pgdump
+*.log

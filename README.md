@@ -101,4 +101,5 @@ test-all    # Run tests with race detection (-race)
 lint        # Run golangci-lint
 db-shell    # Open psql on grizzle_test
 db-reset    # Reset public schema
+clean       # Remove generated SQLite databases and test artifacts
 ```

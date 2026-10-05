@@ -22,10 +22,8 @@ func isTableManaged(tableName string, filters tableFilters) bool {
 		"raster_columns",
 		"raster_overviews",
 	}
-	for _, b := range builtinIgnored {
-		if tableName == b {
-			return false
-		}
+	if slices.Contains(builtinIgnored, tableName) {
+		return false
 	}
 
 	// User-defined Exclude patterns

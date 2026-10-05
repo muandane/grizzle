@@ -52,6 +52,12 @@
       psql "$DATABASE_URL" -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
       echo "Database schema reset successfully."
     '';
+
+    "clean".exec = ''
+      echo "Cleaning generated SQLite databases, test logs, and build artifacts..."
+      find . -type f \( -name "*.db" -o -name "*.db-*" -o -name "*.sqlite" -o -name "*.sqlite-*" -o -name "*.out" -o -name "coverage.txt" -o -name "*.prof" -o -name "*.log" \) -delete
+      echo "Clean complete."
+    '';
   };
 
   # Enter shell greeting & checks
@@ -65,6 +71,7 @@
     echo "  devenv up   -> Start background PostgreSQL daemon"
     echo "  db-shell    -> Connect to local test database via psql"
     echo "  db-reset    -> Wipe and recreate public schema"
+    echo "  clean       -> Remove generated SQLite files and test artifacts"
     echo "  test-all    -> Run Go tests with race detector"
     echo "  lint        -> Run golangci-lint"
   '';
