@@ -129,22 +129,44 @@ func GenerateAlterColumnSQL(targetSchema, tableName string, live, desired *schem
 }
 
 // GenerateCreateIndexSQL constructs a CREATE [UNIQUE] INDEX statement with terminating semicolon.
-func GenerateCreateIndexSQL(normalizedIndexDef string) string {
+func GenerateCreateIndexSQL(normalizedIndexDef string, concurrently bool) string {
 	def := strings.TrimSpace(normalizedIndexDef)
 	if !strings.HasSuffix(def, ";") {
 		def += ";"
 	}
+	if !concurrently {
+		return def
+	}
+
+	upper := strings.ToUpper(def)
+	if strings.Contains(upper, " INDEX CONCURRENTLY ") {
+		return def
+	}
+	if strings.HasPrefix(upper, "CREATE UNIQUE INDEX ") {
+		return "CREATE UNIQUE INDEX CONCURRENTLY " + def[len("CREATE UNIQUE INDEX "):]
+	}
+	if strings.HasPrefix(upper, "CREATE INDEX ") {
+		return "CREATE INDEX CONCURRENTLY " + def[len("CREATE INDEX "):]
+	}
 	return def
 }
 
-// GenerateDropIndexSQL constructs a DROP INDEX statement.
-func GenerateDropIndexSQL(targetSchema, indexName string) string {
+// GenerateDropIndexSQL constructs a DROP INDEX statement with optional CONCURRENTLY.
+func GenerateDropIndexSQL(targetSchema, indexName string, concurrently bool) string {
+	if concurrently {
+		return fmt.Sprintf("DROP INDEX CONCURRENTLY IF EXISTS %q.%q;", targetSchema, indexName)
+	}
 	return fmt.Sprintf("DROP INDEX IF EXISTS %q.%q;", targetSchema, indexName)
 }
 
-// GenerateAddFKSQL constructs an ALTER TABLE ... ADD CONSTRAINT statement for foreign keys.
+// GenerateAddFKSQL constructs an ALTER TABLE ... ADD CONSTRAINT statement with NOT VALID for safe zero-lock addition.
 func GenerateAddFKSQL(targetSchema, tableName, fkName, normalizedFKDef string) string {
-	return fmt.Sprintf("ALTER TABLE %q.%q ADD CONSTRAINT %q %s;", targetSchema, tableName, fkName, normalizedFKDef)
+	return fmt.Sprintf("ALTER TABLE %q.%q ADD CONSTRAINT %q %s NOT VALID;", targetSchema, tableName, fkName, normalizedFKDef)
+}
+
+// GenerateValidateFKSQL constructs an ALTER TABLE ... VALIDATE CONSTRAINT statement.
+func GenerateValidateFKSQL(targetSchema, tableName, fkName string) string {
+	return fmt.Sprintf("ALTER TABLE %q.%q VALIDATE CONSTRAINT %q;", targetSchema, tableName, fkName)
 }
 
 // GenerateDropFKSQL constructs an ALTER TABLE ... DROP CONSTRAINT statement.
@@ -153,7 +175,9 @@ func GenerateDropFKSQL(targetSchema, tableName, fkName string) string {
 }
 
 // RenderChange converts a pure diff.Change into an executable plan.Step with PostgreSQL DDL.
-func RenderChange(targetSchema string, c diff.Change) plan.Step {
+func RenderChange(targetSchema string, c diff.Change, nonConcurrent ...bool) plan.Step {
+	isNonConcurrent := len(nonConcurrent) > 0 && nonConcurrent[0]
+
 	step := plan.Step{
 		Type:             c.Type,
 		Table:            c.Table,
@@ -177,9 +201,11 @@ func RenderChange(targetSchema string, c diff.Change) plan.Step {
 	case plan.ChangeDropColumn:
 		step.SQL = fmt.Sprintf("ALTER TABLE %q.%q DROP COLUMN %q CASCADE;", targetSchema, c.Table, c.Column.Name)
 	case plan.ChangeCreateIndex:
-		step.SQL = GenerateCreateIndexSQL(c.Index.Definition)
+		step.SQL = GenerateCreateIndexSQL(c.Index.Definition, !isNonConcurrent)
+		step.NonTx = !isNonConcurrent
 	case plan.ChangeDropIndex:
-		step.SQL = GenerateDropIndexSQL(targetSchema, c.Index.Name)
+		step.SQL = GenerateDropIndexSQL(targetSchema, c.Index.Name, !isNonConcurrent)
+		step.NonTx = !isNonConcurrent
 	case plan.ChangeAddFK:
 		step.SQL = GenerateAddFKSQL(targetSchema, c.Table, c.ForeignKey.Name, c.ForeignKey.Definition)
 	case plan.ChangeDropFK:
@@ -192,16 +218,29 @@ func RenderChange(targetSchema string, c diff.Change) plan.Step {
 }
 
 // RenderChanges converts a list of pure changes into sequenced, topologically ordered plan steps.
-func RenderChanges(targetSchema string, changes []diff.Change) []plan.Step {
-	steps := make([]plan.Step, len(changes))
-	for i, c := range changes {
-		steps[i] = RenderChange(targetSchema, c)
+func RenderChanges(targetSchema string, changes []diff.Change, nonConcurrent ...bool) []plan.Step {
+	isNonConcurrent := len(nonConcurrent) > 0 && nonConcurrent[0]
+	var steps []plan.Step
+
+	for _, c := range changes {
+		step := RenderChange(targetSchema, c, isNonConcurrent)
+		steps = append(steps, step)
+
+		if c.Type == plan.ChangeAddFK {
+			validateStep := plan.Step{
+				Type:  plan.ChangeValidateConstraint,
+				Table: c.Table,
+				SQL:   GenerateValidateFKSQL(targetSchema, c.Table, c.ForeignKey.Name),
+			}
+			steps = append(steps, validateStep)
+		}
 	}
+
 	plan.SortSteps(steps)
 	return steps
 }
 
 // Render implements dialect.Dialect for single steps.
 func Render(step plan.Step) ([]dialect.Stmt, error) {
-	return []dialect.Stmt{{SQL: step.SQL, NonTx: false}}, nil
+	return []dialect.Stmt{{SQL: step.SQL, NonTx: step.NonTx}}, nil
 }

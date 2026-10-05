@@ -46,8 +46,9 @@ const (
 	ChangeAlterColumn = plan.ChangeAlterColumn
 	ChangeCreateIndex = plan.ChangeCreateIndex
 	ChangeDropIndex   = plan.ChangeDropIndex
-	ChangeAddFK       = plan.ChangeAddFK
-	ChangeDropFK      = plan.ChangeDropFK
+	ChangeAddFK              = plan.ChangeAddFK
+	ChangeDropFK             = plan.ChangeDropFK
+	ChangeValidateConstraint = plan.ChangeValidateConstraint
 )
 
 // HazardCode constants
@@ -158,16 +159,17 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error {
 	}
 
 	return exec.SyncPostgres(ctx, db, exec.PostgresExecConfig{
-		TargetSchema:  opts.TargetSchema,
-		ShadowSchema:  opts.ShadowSchema,
-		SchemaSQL:     opts.SchemaSQL,
-		LockID:        opts.LockID,
-		Filters:       filters,
-		Policy:        policy,
-		AcceptHazards: opts.AcceptHazards,
-		ExpectedHash:  opts.ExpectedHash,
-		Logger:        opts.Logger,
-		DryRun:        opts.DryRun,
+		TargetSchema:         opts.TargetSchema,
+		ShadowSchema:         opts.ShadowSchema,
+		SchemaSQL:            opts.SchemaSQL,
+		LockID:               opts.LockID,
+		Filters:              filters,
+		Policy:               policy,
+		AcceptHazards:        opts.AcceptHazards,
+		ExpectedHash:         opts.ExpectedHash,
+		NonConcurrentIndexes: opts.NonConcurrentIndexes,
+		Logger:               opts.Logger,
+		DryRun:               opts.DryRun,
 	})
 }
 
@@ -191,14 +193,15 @@ func PlanDiff(ctx context.Context, db *sql.DB, opts Options) (*Plan, error) {
 	}
 
 	return exec.PlanDiffPostgres(ctx, db, exec.PostgresExecConfig{
-		TargetSchema: opts.TargetSchema,
-		ShadowSchema: opts.ShadowSchema,
-		SchemaSQL:    opts.SchemaSQL,
-		LockID:       opts.LockID,
-		Filters:      filters,
-		Policy:       policy,
-		Logger:       opts.Logger,
-		DryRun:       opts.DryRun,
+		TargetSchema:         opts.TargetSchema,
+		ShadowSchema:         opts.ShadowSchema,
+		SchemaSQL:            opts.SchemaSQL,
+		LockID:               opts.LockID,
+		Filters:              filters,
+		Policy:               policy,
+		NonConcurrentIndexes: opts.NonConcurrentIndexes,
+		Logger:               opts.Logger,
+		DryRun:               opts.DryRun,
 	})
 }
 

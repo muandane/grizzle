@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yourorg/grizzle/internal/dialect"
 	"github.com/yourorg/grizzle/internal/dialect/postgres"
 	"github.com/yourorg/grizzle/internal/dialect/sqlite"
 	"github.com/yourorg/grizzle/internal/diff"
@@ -17,37 +18,58 @@ import (
 )
 
 // PostgresExecConfig specifies the execution options for PostgreSQL synchronization.
+// PostgresExecConfig specifies the execution options for PostgreSQL synchronization.
 type PostgresExecConfig struct {
-	TargetSchema  string
-	ShadowSchema  string
-	SchemaSQL     string
-	LockID        int64
-	Filters       scope.Filters
-	Policy        plan.DropPolicy
-	AcceptHazards []plan.HazardCode
-	ExpectedHash  string
-	Logger        *slog.Logger
-	DryRun        bool
+	TargetSchema         string
+	ShadowSchema         string
+	SchemaSQL            string
+	LockID               int64
+	Filters              scope.Filters
+	Policy               plan.DropPolicy
+	AcceptHazards        []plan.HazardCode
+	ExpectedHash         string
+	NonConcurrentIndexes bool
+	Logger               *slog.Logger
+	DryRun               bool
 }
 
 // DiffPostgres computes the diff and renders the sequenced migration steps for PostgreSQL.
-func DiffPostgres(ctx context.Context, tx *sql.Tx, cfg PostgresExecConfig) ([]plan.Step, error) {
-	live, err := postgres.Inspect(ctx, tx, cfg.TargetSchema)
+func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig) ([]plan.Step, error) {
+	live, err := postgres.Inspect(ctx, dbtx, cfg.TargetSchema)
 	if err != nil {
 		return nil, fmt.Errorf("%w: live schema: %v", plan.ErrInspectionFailed, err)
 	}
 
-	desired, err := postgres.Inspect(ctx, tx, cfg.ShadowSchema)
+	desired, err := postgres.Inspect(ctx, dbtx, cfg.ShadowSchema)
 	if err != nil {
 		return nil, fmt.Errorf("%w: shadow schema: %v", plan.ErrInspectionFailed, err)
 	}
 
 	changes := diff.Diff(live, desired, cfg.TargetSchema, cfg.ShadowSchema, cfg.Filters)
-	steps := postgres.RenderChanges(cfg.TargetSchema, changes)
+	steps := postgres.RenderChanges(cfg.TargetSchema, changes, cfg.NonConcurrentIndexes)
 	return steps, nil
 }
 
-// SyncPostgres synchronizes PostgreSQL within a single transaction protected by an advisory lock.
+// StepGroup partitions contiguous steps into transactional and non-transactional execution batches.
+type StepGroup struct {
+	NonTx bool
+	Steps []plan.Step
+}
+
+// GroupSteps partitions migration steps into contiguous batches based on transactional requirement.
+func GroupSteps(steps []plan.Step) []StepGroup {
+	var groups []StepGroup
+	for _, s := range steps {
+		if len(groups) == 0 || groups[len(groups)-1].NonTx != s.NonTx {
+			groups = append(groups, StepGroup{NonTx: s.NonTx, Steps: []plan.Step{s}})
+		} else {
+			groups[len(groups)-1].Steps = append(groups[len(groups)-1].Steps, s)
+		}
+	}
+	return groups
+}
+
+// SyncPostgres synchronizes PostgreSQL with session-level advisory locking and split tx/non-tx execution.
 func SyncPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) error {
 	start := time.Now()
 	logger := cfg.Logger
@@ -55,32 +77,40 @@ func SyncPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) error
 		logger.InfoContext(ctx, "grizzle: starting schema synchronization", "target_schema", cfg.TargetSchema)
 	}
 
-	tx, err := db.BeginTx(ctx, nil)
+	conn, err := db.Conn(ctx)
 	if err != nil {
-		return fmt.Errorf("grizzle: failed to begin transaction: %w", err)
+		return fmt.Errorf("grizzle: failed to acquire connection: %w", err)
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer conn.Close()
 
-	// 1. Acquire transaction advisory lock
-	if err := postgres.AcquireAdvisoryLock(ctx, tx, cfg.LockID); err != nil {
+	// 1. Acquire session-level advisory lock on dedicated connection
+	if err := postgres.AcquireSessionAdvisoryLock(ctx, conn, cfg.LockID); err != nil {
 		if logger != nil {
 			logger.ErrorContext(ctx, "grizzle: lock acquisition failed", "lock_id", cfg.LockID, "error", err)
 		}
 		return fmt.Errorf("%w: %v", plan.ErrLockAcquisition, err)
 	}
+	defer func() {
+		_ = postgres.ReleaseSessionAdvisoryLock(context.Background(), conn, cfg.LockID)
+	}()
+
 	if logger != nil {
-		logger.DebugContext(ctx, "grizzle: acquired advisory lock", "lock_id", cfg.LockID)
+		logger.DebugContext(ctx, "grizzle: acquired session advisory lock", "lock_id", cfg.LockID)
 	}
 
-	// 2. Setup shadow schema and ensure cleanup
-	if err := postgres.SetupShadowSchema(ctx, tx, cfg.ShadowSchema); err != nil {
+	// 2. Setup shadow schema and diff schemas inside an isolated transaction
+	shadowStart := time.Now()
+	shadowTx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("grizzle: failed to begin shadow tx: %w", err)
+	}
+	defer func() { _ = shadowTx.Rollback() }()
+
+	if err := postgres.SetupShadowSchema(ctx, shadowTx, cfg.ShadowSchema); err != nil {
 		return err
 	}
-	defer func() { _ = postgres.DropShadowSchema(context.Background(), tx, cfg.ShadowSchema) }()
 
-	// 3. Compile user schema in shadow schema
-	shadowStart := time.Now()
-	if err := postgres.RunShadowDDL(ctx, tx, cfg.ShadowSchema, cfg.TargetSchema, cfg.SchemaSQL); err != nil {
+	if err := postgres.RunShadowDDL(ctx, shadowTx, cfg.ShadowSchema, cfg.TargetSchema, cfg.SchemaSQL); err != nil {
 		if logger != nil {
 			logger.ErrorContext(ctx, "grizzle: shadow compilation failed", "error", err)
 		}
@@ -90,11 +120,12 @@ func SyncPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) error
 		logger.DebugContext(ctx, "grizzle: shadow compilation succeeded", "duration", time.Since(shadowStart))
 	}
 
-	// 4. Diff schemas
-	steps, err := DiffPostgres(ctx, tx, cfg)
+	// 3. Diff schemas post-lock
+	steps, err := DiffPostgres(ctx, shadowTx, cfg)
 	if err != nil {
 		return err
 	}
+	_ = shadowTx.Rollback()
 
 	p := &plan.Plan{
 		TargetSchema:  cfg.TargetSchema,
@@ -117,8 +148,8 @@ func SyncPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) error
 		if logger != nil {
 			logger.InfoContext(ctx, "grizzle: schema is already in sync", "duration", time.Since(start))
 		}
-		_ = postgres.DropShadowSchema(ctx, tx, cfg.ShadowSchema)
-		return tx.Commit()
+		_ = postgres.DropShadowSchema(ctx, conn, cfg.ShadowSchema)
+		return nil
 	}
 
 	if logger != nil {
@@ -151,31 +182,59 @@ func SyncPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) error
 		if logger != nil {
 			logger.InfoContext(ctx, "grizzle: dry-run mode, skipping statement execution")
 		}
-		_ = postgres.DropShadowSchema(ctx, tx, cfg.ShadowSchema)
-		return tx.Commit()
+		_ = postgres.DropShadowSchema(ctx, conn, cfg.ShadowSchema)
+		return nil
 	}
 
-	// 6. Apply DDL statements
-	for i, s := range steps {
-		stepStart := time.Now()
-		if _, err := tx.ExecContext(ctx, s.SQL); err != nil {
-			if logger != nil {
-				logger.ErrorContext(ctx, "grizzle: failed executing step", "step_index", i+1, "sql", s.SQL, "error", err)
+	// 6. Cleanup shadow schema before live execution
+	if err := postgres.DropShadowSchema(ctx, conn, cfg.ShadowSchema); err != nil {
+		return err
+	}
+
+	// 7. Apply DDL statements split into transactional and non-transactional groups
+	groups := GroupSteps(steps)
+	stepIdx := 0
+
+	for _, group := range groups {
+		if group.NonTx {
+			// Non-transactional steps (e.g. CREATE INDEX CONCURRENTLY) executed directly on dedicated conn
+			for _, s := range group.Steps {
+				stepIdx++
+				stepStart := time.Now()
+				if _, err := conn.ExecContext(ctx, s.SQL); err != nil {
+					if logger != nil {
+						logger.ErrorContext(ctx, "grizzle: failed executing non-tx step", "step_index", stepIdx, "sql", s.SQL, "error", err)
+					}
+					return fmt.Errorf("%w: failed executing non-tx [%s]: %v", plan.ErrExecutionFailed, s.SQL, err)
+				}
+				if logger != nil {
+					logger.DebugContext(ctx, "grizzle: executed non-tx step", "step_index", stepIdx, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
+				}
 			}
-			return fmt.Errorf("%w: failed executing [%s]: %v", plan.ErrExecutionFailed, s.SQL, err)
+		} else {
+			// Transactional group executed in transaction on dedicated conn
+			tx, err := conn.BeginTx(ctx, nil)
+			if err != nil {
+				return fmt.Errorf("grizzle: failed to begin step transaction: %w", err)
+			}
+			for _, s := range group.Steps {
+				stepIdx++
+				stepStart := time.Now()
+				if _, err := tx.ExecContext(ctx, s.SQL); err != nil {
+					_ = tx.Rollback()
+					if logger != nil {
+						logger.ErrorContext(ctx, "grizzle: failed executing step in tx", "step_index", stepIdx, "sql", s.SQL, "error", err)
+					}
+					return fmt.Errorf("%w: failed executing [%s]: %v", plan.ErrExecutionFailed, s.SQL, err)
+				}
+				if logger != nil {
+					logger.DebugContext(ctx, "grizzle: executed step in tx", "step_index", stepIdx, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
+				}
+			}
+			if err := tx.Commit(); err != nil {
+				return fmt.Errorf("grizzle: failed committing step transaction: %w", err)
+			}
 		}
-		if logger != nil {
-			logger.DebugContext(ctx, "grizzle: executed step", "step_index", i+1, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
-		}
-	}
-
-	// 7. Cleanup shadow schema
-	if err := postgres.DropShadowSchema(ctx, tx, cfg.ShadowSchema); err != nil {
-		return err
-	}
-
-	if err := tx.Commit(); err != nil {
-		return err
 	}
 
 	if logger != nil {

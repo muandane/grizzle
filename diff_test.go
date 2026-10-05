@@ -202,20 +202,24 @@ func TestDiffSchemas_IndexesAndForeignKeys(t *testing.T) {
 	steps := diffSchemas(live, desired, "public", "_grizzle_shadow", tableFilters{})
 
 	// Expect:
-	// 1. Drop old_idx (Priority 20)
-	// 2. Create idx_users_id (Priority 70)
-	// 3. Add fk_users_org (Priority 80)
-	if len(steps) != 3 {
-		t.Fatalf("expected 3 steps, got %d", len(steps))
+	// 1. Drop old_idx CONCURRENTLY (Priority 20)
+	// 2. Create idx_users_id CONCURRENTLY (Priority 70)
+	// 3. Add fk_users_org NOT VALID (Priority 80)
+	// 4. Validate fk_users_org (Priority 85)
+	if len(steps) != 4 {
+		t.Fatalf("expected 4 steps, got %d", len(steps))
 	}
 
-	if steps[0].Type != ChangeDropIndex || steps[0].SQL != `DROP INDEX IF EXISTS "public"."old_idx";` {
-		t.Errorf("expected ChangeDropIndex, got %+v", steps[0])
+	if steps[0].Type != ChangeDropIndex || steps[0].SQL != `DROP INDEX CONCURRENTLY IF EXISTS "public"."old_idx";` {
+		t.Errorf("expected ChangeDropIndex CONCURRENTLY, got %+v", steps[0])
 	}
 	if steps[1].Type != ChangeCreateIndex {
 		t.Errorf("expected ChangeCreateIndex, got %+v", steps[1])
 	}
 	if steps[2].Type != ChangeAddFK {
 		t.Errorf("expected ChangeAddFK, got %+v", steps[2])
+	}
+	if steps[3].Type != ChangeValidateConstraint {
+		t.Errorf("expected ChangeValidateConstraint, got %+v", steps[3])
 	}
 }

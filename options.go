@@ -61,6 +61,10 @@ type Options struct {
 	// If the recomputed plan hash post-lock differs, execution aborts with ErrPlanDrift.
 	ExpectedHash string
 
+	// NonConcurrentIndexes opts out of emitting CONCURRENTLY for PostgreSQL index creation/drops.
+	// When true, index operations are created inside the transaction.
+	NonConcurrentIndexes bool
+
 	// LockID is a 64-bit integer used for the PostgreSQL advisory lock (pg_advisory_xact_lock).
 	LockID int64
 
@@ -127,6 +131,13 @@ func WithAcceptHazards(hazards ...plan.HazardCode) Option {
 func WithExpectedHash(hash string) Option {
 	return func(o *Options) {
 		o.ExpectedHash = hash
+	}
+}
+
+// WithNonConcurrentIndexes controls whether PostgreSQL index creation should run inside the transaction.
+func WithNonConcurrentIndexes(disabled bool) Option {
+	return func(o *Options) {
+		o.NonConcurrentIndexes = disabled
 	}
 }
 

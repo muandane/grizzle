@@ -12,10 +12,11 @@ func SortSteps(steps []Step) {
 		ChangeCreateTable: 40,  // 5. Create bare tables (PKs included, FKs deferred)
 		ChangeAddColumn:   50,  // 6. Add new columns
 		ChangeAlterColumn: 60,  // 7. Modify column types, nullability, defaults
-		ChangeCreateIndex: 70,  // 8. Build new indexes
-		ChangeAddFK:       80,  // 9. Add foreign keys now that all tables and columns exist
-		ChangeDropColumn:  90,  // 10. Drop columns (if allowed)
-		ChangeDropTable:   100, // 11. Drop tables (if allowed)
+		ChangeCreateIndex:        70,  // 8. Build new indexes
+		ChangeAddFK:              80,  // 9. Add foreign keys (NOT VALID) now that all tables and columns exist
+		ChangeValidateConstraint: 85,  // 10. Validate foreign keys
+		ChangeDropColumn:         90,  // 11. Drop columns (if allowed)
+		ChangeDropTable:          100, // 12. Drop tables (if allowed)
 	}
 
 	slices.SortStableFunc(steps, func(a, b Step) int {

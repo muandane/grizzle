@@ -21,8 +21,9 @@ const (
 	ChangeAlterColumn ChangeType = "ALTER_COLUMN"
 	ChangeCreateIndex ChangeType = "CREATE_INDEX"
 	ChangeDropIndex   ChangeType = "DROP_INDEX"
-	ChangeAddFK       ChangeType = "ADD_FK"
-	ChangeDropFK      ChangeType = "DROP_FK"
+	ChangeAddFK              ChangeType = "ADD_FK"
+	ChangeDropFK             ChangeType = "DROP_FK"
+	ChangeValidateConstraint ChangeType = "VALIDATE_CONSTRAINT"
 )
 
 // Step represents a single atomic DDL migration statement.
@@ -31,6 +32,7 @@ type Step struct {
 	Table       string     `json:"table"`
 	SQL         string     `json:"sql"`
 	Destructive bool       `json:"destructive,omitzero"`
+	NonTx       bool       `json:"non_tx,omitzero"`
 
 	// Structural column metadata for precise hazard analysis
 	ColumnNotNull    bool `json:"column_not_null,omitzero"`
@@ -92,8 +94,8 @@ func (p *Plan) Hash() string {
 	fmt.Fprintf(h, "excludes:%s\n", strings.Join(excludes, ","))
 
 	for i, s := range p.Steps {
-		fmt.Fprintf(h, "step:%d|type:%s|table:%s|sql:%s|destructive:%t|not_null:%t|default:%t|narrowed:%t|rebuild:%t\n",
-			i, s.Type, s.Table, strings.TrimSpace(s.SQL), s.Destructive,
+		fmt.Fprintf(h, "step:%d|type:%s|table:%s|sql:%s|destructive:%t|non_tx:%t|not_null:%t|default:%t|narrowed:%t|rebuild:%t\n",
+			i, s.Type, s.Table, strings.TrimSpace(s.SQL), s.Destructive, s.NonTx,
 			s.ColumnNotNull, s.ColumnHasDefault, s.TypeNarrowed, s.IsTableRebuild,
 		)
 	}
