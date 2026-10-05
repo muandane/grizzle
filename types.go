@@ -2,8 +2,24 @@ package grizzle
 
 import "log/slog"
 
+// Dialect specifies the target SQL database dialect.
+type Dialect string
+
+const (
+	// DialectAuto automatically detects dialect from the database connection.
+	DialectAuto Dialect = ""
+	// DialectPostgres targets PostgreSQL (13+).
+	DialectPostgres Dialect = "postgres"
+	// DialectSQLite targets SQLite (3.35+).
+	DialectSQLite Dialect = "sqlite"
+)
+
 // Options configures the schema synchronization process.
 type Options struct {
+	// Dialect explicitly defines the database engine (DialectPostgres, DialectSQLite).
+	// If DialectAuto (empty), Grizzle auto-detects from the database connection.
+	Dialect Dialect
+
 	// SchemaSQL is the complete DDL representing the desired database state.
 	// Typically provided via //go:embed schema.sql.
 	SchemaSQL string

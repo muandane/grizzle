@@ -78,9 +78,12 @@ func main() {
 ## Key Features
 
 * 🚀 **Zero External Binaries**: Runs completely in-process within your compiled Go binary.
-* 🛡️ **Multi-Replica Safe**: Leverages transactional PostgreSQL advisory locks (`pg_advisory_xact_lock`) to eliminate race conditions when 10+ pods boot simultaneously.
-* 🎯 **100% Native Dialect Support**: Uses the **Shadow Schema Isolation** pattern—PostgreSQL itself parses and validates your SQL.
-* 🔒 **Destructive Change Protection**: `AllowDrop: false` halts boot if a destructive drop (table/column) is detected.
+* 🐘 **PostgreSQL & 🪶 SQLite**: First-class support for PostgreSQL 13+ and SQLite 3.35+ (via pure-Go `modernc.org/sqlite`, zero Cgo required).
+* 🔍 **Automatic Dialect Detection**: Automatically detects PostgreSQL or SQLite from your `*sql.DB` connection driver without configuration.
+* 🛡️ **Multi-Replica Safe**: Leverages transactional PostgreSQL advisory locks (`pg_advisory_xact_lock`) to eliminate race conditions when multiple pods boot simultaneously.
+* 🔄 **SQLite 12-Step Rebuild Engine**: Seamlessly handles SQLite column modifications and drops while preserving 100% of existing row data and foreign keys.
+* 🔒 **Fine-Grained Drop Protection**: `AllowDrop: false` halts boot on destructive operations. Granular switches (`AllowDropTable`, `AllowDropColumn`, `AllowDropIndex`, `AllowDropFK`) enable surgical permission controls.
+* 📊 **Terminal Visualizer**: Inspect diffs before executing with `PlanDiff()`, colorized terminal output (`Plan.Format(os.Stdout, true)`), and structured logging via standard `log/slog`.
 * 🧩 **Git Merge Friendly**: Changes to `schema.sql` merge naturally like any code file—no sequence number coordination.
 
 ---

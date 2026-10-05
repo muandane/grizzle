@@ -9,23 +9,72 @@ import (
 	"time"
 )
 
-func prepareOptions(opts *Options) error {
+func detectDialect(ctx context.Context, db *sql.DB) (Dialect, error) {
+	if db == nil {
+		return "", fmt.Errorf("grizzle: database connection is nil")
+	}
+
+	// 1. Inspect driver type if available
+	if drv := db.Driver(); drv != nil {
+		drvName := strings.ToLower(fmt.Sprintf("%T", drv))
+		switch {
+		case strings.Contains(drvName, "sqlite"):
+			return DialectSQLite, nil
+		case strings.Contains(drvName, "pgx"), strings.Contains(drvName, "pq"), strings.Contains(drvName, "postgres"):
+			return DialectPostgres, nil
+		}
+	}
+
+	// 2. Query probing fallback
+	var sqliteVer string
+	if err := db.QueryRowContext(ctx, "SELECT sqlite_version()").Scan(&sqliteVer); err == nil {
+		return DialectSQLite, nil
+	}
+
+	var pgVer string
+	if err := db.QueryRowContext(ctx, "SELECT version()").Scan(&pgVer); err == nil {
+		return DialectPostgres, nil
+	}
+
+	return "", fmt.Errorf("grizzle: unable to detect database dialect, please set Options.Dialect explicitly")
+}
+
+func prepareOptions(ctx context.Context, db *sql.DB, opts *Options) error {
 	if strings.TrimSpace(opts.SchemaSQL) == "" {
 		return ErrEmptySchema
 	}
-	opts.TargetSchema = cmp.Or(opts.TargetSchema, "public")
-	opts.ShadowSchema = cmp.Or(opts.ShadowSchema, "_grizzle_shadow")
-	if opts.LockID == 0 {
-		opts.LockID = generateLockID(opts.TargetSchema)
+	if opts.Dialect == DialectAuto {
+		d, err := detectDialect(ctx, db)
+		if err != nil {
+			return err
+		}
+		opts.Dialect = d
+	}
+	switch opts.Dialect {
+	case DialectSQLite:
+		opts.TargetSchema = cmp.Or(opts.TargetSchema, "main")
+	case DialectPostgres:
+		opts.TargetSchema = cmp.Or(opts.TargetSchema, "public")
+		opts.ShadowSchema = cmp.Or(opts.ShadowSchema, "_grizzle_shadow")
+		if opts.LockID == 0 {
+			opts.LockID = generateLockID(opts.TargetSchema)
+		}
+	default:
+		return fmt.Errorf("grizzle: unsupported dialect %q", opts.Dialect)
 	}
 	return nil
 }
 
 // Sync synchronizes the target database schema to match the desired state in opts.SchemaSQL.
-// It executes in a single transaction protected by a PostgreSQL advisory lock.
+// For PostgreSQL, it executes in a single transaction protected by an advisory lock.
+// For SQLite, it executes in a transaction with foreign keys handling.
 func Sync(ctx context.Context, db *sql.DB, opts Options) error {
-	if err := prepareOptions(&opts); err != nil {
+	if err := prepareOptions(ctx, db, &opts); err != nil {
 		return err
+	}
+
+	if opts.Dialect == DialectSQLite {
+		return syncSQLite(ctx, db, opts)
 	}
 
 	start := time.Now()
@@ -142,8 +191,12 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error {
 
 // PlanDiff inspects the live database and computes the planned migration steps without applying them.
 func PlanDiff(ctx context.Context, db *sql.DB, opts Options) (*Plan, error) {
-	if err := prepareOptions(&opts); err != nil {
+	if err := prepareOptions(ctx, db, &opts); err != nil {
 		return nil, err
+	}
+
+	if opts.Dialect == DialectSQLite {
+		return planDiffSQLite(ctx, db, opts)
 	}
 
 	tx, err := db.BeginTx(ctx, nil)
