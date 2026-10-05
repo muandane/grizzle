@@ -63,10 +63,17 @@ type StepGroup struct {
 }
 
 // GroupSteps partitions migration steps into contiguous batches based on transactional requirement.
+// Non-transactional steps run standalone. VALIDATE CONSTRAINT steps run in separate transactions
+// after ADD ... NOT VALID steps commit, releasing ACCESS EXCLUSIVE table locks.
 func GroupSteps(steps []plan.Step) []StepGroup {
 	var groups []StepGroup
 	for _, s := range steps {
-		if len(groups) == 0 || groups[len(groups)-1].NonTx != s.NonTx {
+		isNewGroup := len(groups) == 0 ||
+			groups[len(groups)-1].NonTx != s.NonTx ||
+			s.Type == plan.ChangeValidateConstraint ||
+			(len(groups) > 0 && len(groups[len(groups)-1].Steps) > 0 && groups[len(groups)-1].Steps[len(groups[len(groups)-1].Steps)-1].Type == plan.ChangeValidateConstraint)
+
+		if isNewGroup {
 			groups = append(groups, StepGroup{NonTx: s.NonTx, Steps: []plan.Step{s}})
 		} else {
 			groups[len(groups)-1].Steps = append(groups[len(groups)-1].Steps, s)

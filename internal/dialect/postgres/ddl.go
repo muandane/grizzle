@@ -214,6 +214,8 @@ func RenderChange(targetSchema string, c diff.Change, nonConcurrent ...bool) pla
 		step.NonTx = !isNonConcurrent
 	case plan.ChangeAddFK:
 		step.SQL = GenerateAddFKSQL(targetSchema, c.Table, c.ForeignKey.Name, c.ForeignKey.Definition)
+	case plan.ChangeValidateConstraint:
+		step.SQL = GenerateValidateFKSQL(targetSchema, c.Table, c.ForeignKey.Name)
 	case plan.ChangeDropFK:
 		step.SQL = GenerateDropFKSQL(targetSchema, c.Table, c.ForeignKey.Name)
 	case plan.ChangeDropTable:

@@ -41,6 +41,7 @@ type ForeignKey struct {
 	Name       string `json:"name"`
 	TableName  string `json:"table_name"`
 	Definition string `json:"definition"`
+	IsValid    bool   `json:"is_valid"`
 }
 
 // Enum represents a custom database ENUM type.

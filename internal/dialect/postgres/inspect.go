@@ -233,7 +233,8 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 		SELECT
 			c.relname AS table_name,
 			con.conname AS constraint_name,
-			pg_get_constraintdef(con.oid) AS constraint_def
+			pg_get_constraintdef(con.oid) AS constraint_def,
+			con.convalidated AS is_valid
 		FROM pg_constraint con
 		JOIN pg_class c ON c.oid = con.conrelid
 		JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -252,8 +253,9 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 			tableName string
 			fkName    string
 			fkDef     string
+			isValid   bool
 		)
-		if err := fkRows.Scan(&tableName, &fkName, &fkDef); err != nil {
+		if err := fkRows.Scan(&tableName, &fkName, &fkDef, &isValid); err != nil {
 			return nil, fmt.Errorf("scanning foreign key in schema %q: %w", schemaName, err)
 		}
 
@@ -262,6 +264,7 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 				Name:       fkName,
 				TableName:  tableName,
 				Definition: fkDef,
+				IsValid:    isValid,
 			}
 		}
 	}

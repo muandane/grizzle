@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 
 	"github.com/yourorg/grizzle/internal/plan"
 	"github.com/yourorg/grizzle/internal/schema"
@@ -289,7 +290,9 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 				})
 			} else {
 				normLive := schema.NormalizeDefinition(lFK.Definition, shadowSchema, targetSchema)
-				if normDef != normLive {
+				baseLive := strings.TrimSuffix(normLive, " NOT VALID")
+				baseDef := strings.TrimSuffix(normDef, " NOT VALID")
+				if baseDef != baseLive {
 					changes = append(changes, Change{
 						Type:        plan.ChangeDropFK,
 						Table:       tblName,
@@ -300,6 +303,15 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 					fkCopy.Definition = normDef
 					changes = append(changes, Change{
 						Type:        plan.ChangeAddFK,
+						Table:       tblName,
+						ForeignKey:  &fkCopy,
+						Destructive: false,
+					})
+				} else if !lFK.IsValid {
+					fkCopy := *lFK
+					fkCopy.Definition = baseLive
+					changes = append(changes, Change{
+						Type:        plan.ChangeValidateConstraint,
 						Table:       tblName,
 						ForeignKey:  &fkCopy,
 						Destructive: false,

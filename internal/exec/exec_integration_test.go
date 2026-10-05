@@ -472,3 +472,100 @@ func TestRetry_AbortAfterPartialProgress(t *testing.T) {
 	}
 }
 
+func TestFK_ValidateConstraintRunsInSeparateTxAfterCommit(t *testing.T) {
+	db := getIntegrationDB(t)
+	defer db.Close()
+
+	schema := fmt.Sprintf("test_fk_sep_%d", time.Now().UnixNano())
+	_, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema))
+	if err != nil {
+		t.Fatalf("failed creating schema: %v", err)
+	}
+	defer func() {
+		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schema))
+	}()
+
+	// 1. Create parents and children tables
+	initSQL := fmt.Sprintf(`
+		CREATE TABLE %s.parents (id INT PRIMARY KEY);
+		CREATE TABLE %s.children (id INT PRIMARY KEY, parent_id INT);
+	`, schema, schema)
+	_, err = db.Exec(initSQL)
+	if err != nil {
+		t.Fatalf("failed creating initial tables: %v", err)
+	}
+
+	// 2. Insert invalid row in children referencing non-existent parent 999
+	_, err = db.Exec(fmt.Sprintf("INSERT INTO %s.children (id, parent_id) VALUES (1, 999);", schema))
+	if err != nil {
+		t.Fatalf("failed inserting invalid child row: %v", err)
+	}
+
+	// 3. Desired schema defines FK from children.parent_id -> parents.id
+	desiredSQL := `
+		CREATE TABLE parents (id INT PRIMARY KEY);
+		CREATE TABLE children (
+			id INT PRIMARY KEY,
+			parent_id INT,
+			CONSTRAINT fk_child_parent FOREIGN KEY (parent_id) REFERENCES parents(id)
+		);
+	`
+
+	cfg := exec.PostgresExecConfig{
+		TargetSchema: schema,
+		ShadowSchema: fmt.Sprintf("_shadow_%s", schema),
+		SchemaSQL:    desiredSQL,
+		LockID:       time.Now().UnixNano(),
+		Policy:       plan.DropPolicy{},
+		LockTimeout:  5 * time.Second,
+		StatementTimeout: 10 * time.Second,
+	}
+
+	// 4. SyncPostgres should fail on VALIDATE CONSTRAINT because parent 999 doesn't exist
+	err = exec.SyncPostgres(context.Background(), db, cfg)
+	if err == nil {
+		t.Fatalf("expected SyncPostgres to fail on VALIDATE CONSTRAINT with invalid rows, got nil")
+	}
+
+	// 5. CRUCIAL ASSERTION:
+	// Because ADD CONSTRAINT ... NOT VALID ran and committed in Tx 1 before VALIDATE in Tx 2,
+	// the constraint MUST exist in PostgreSQL pg_constraint with convalidated = false!
+	// (If they were in the same transaction, ADD CONSTRAINT would have rolled back and not exist at all).
+	var convalidated bool
+	query := fmt.Sprintf(`
+		SELECT convalidated
+		FROM pg_constraint
+		WHERE conname = 'fk_child_parent'
+		  AND conrelid = '%s.children'::regclass;
+	`, schema)
+	err = db.QueryRow(query).Scan(&convalidated)
+	if err != nil {
+		t.Fatalf("expected constraint fk_child_parent to exist in catalog (proving ADD NOT VALID committed in separate tx), err: %v", err)
+	}
+	if convalidated {
+		t.Errorf("expected convalidated to be false before VALIDATE CONSTRAINT succeeds")
+	}
+
+	// 6. Repair the invalid data by inserting parent 999
+	_, err = db.Exec(fmt.Sprintf("INSERT INTO %s.parents (id) VALUES (999);", schema))
+	if err != nil {
+		t.Fatalf("failed inserting parent 999: %v", err)
+	}
+
+	// 7. Run sync again: VALIDATE CONSTRAINT should now succeed!
+	err = exec.SyncPostgres(context.Background(), db, cfg)
+	if err != nil {
+		t.Fatalf("expected SyncPostgres to succeed after data repair, got: %v", err)
+	}
+
+	// 8. Assert convalidated is now true
+	err = db.QueryRow(query).Scan(&convalidated)
+	if err != nil {
+		t.Fatalf("failed querying constraint after repair: %v", err)
+	}
+	if !convalidated {
+		t.Errorf("expected convalidated to be true after successful validation")
+	}
+}
+
+
