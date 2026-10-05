@@ -8,6 +8,32 @@ import (
 
 var castRegex = regexp.MustCompile(`::[a-zA-Z0-9_\."\s]+(\[\])?$`)
 
+// stripOuterParens strips surrounding balanced parentheses e.g. "('draft'::text)" -> "'draft'::text"
+func stripOuterParens(s string) string {
+	s = strings.TrimSpace(s)
+	for strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")") {
+		count := 0
+		balanced := true
+		for i := 0; i < len(s)-1; i++ {
+			if s[i] == '(' {
+				count++
+			} else if s[i] == ')' {
+				count--
+				if count == 0 {
+					balanced = false
+					break
+				}
+			}
+		}
+		if balanced && count == 1 {
+			s = strings.TrimSpace(s[1 : len(s)-1])
+		} else {
+			break
+		}
+	}
+	return s
+}
+
 // normalizeType standardizes PostgreSQL data type representations to avoid false-positive diff loops.
 func normalizeType(raw string) string {
 	t := strings.TrimSpace(strings.ToLower(raw))
@@ -50,9 +76,9 @@ func normalizeType(raw string) string {
 }
 
 // normalizeDefault sanitizes default values returned by pg_catalog.
-// For example, "'draft'::character varying" becomes "'draft'", and "CURRENT_TIMESTAMP" becomes "now()".
+// For example, "'draft'::character varying" becomes "'draft'", and "('draft'::text)" becomes "'draft'".
 func normalizeDefault(raw string) string {
-	d := strings.TrimSpace(raw)
+	d := stripOuterParens(raw)
 	if d == "" {
 		return ""
 	}
@@ -75,29 +101,42 @@ func normalizeDefault(raw string) string {
 	// Strip explicit Postgres type casts like 'foo'::character varying
 	d = castRegex.ReplaceAllString(d, "")
 
+	// Strip remaining balanced parens if cast stripping uncovered them (e.g. ('draft'))
+	d = stripOuterParens(d)
+
 	return strings.TrimSpace(d)
 }
 
-// normalizeDefinition replaces references to shadowSchema with targetSchema in DDL expressions
-// and removes redundant schema qualifications from REFERENCES and type casts.
+// normalizeDefinition standardizes index and constraint definitions between live and shadow schemas.
 func normalizeDefinition(def, shadowSchema, targetSchema string) string {
 	res := def
-	if shadowSchema != "" {
+	schemas := []string{shadowSchema, targetSchema}
+	for _, s := range schemas {
+		if s == "" {
+			continue
+		}
+		// Strip schema from "ON <schema>."
+		res = strings.ReplaceAll(res, " ON "+s+".", " ON ")
+		res = strings.ReplaceAll(res, " ON \""+s+"\".", " ON ")
+		res = strings.ReplaceAll(res, " on "+s+".", " on ")
+		res = strings.ReplaceAll(res, " on \""+s+"\".", " on ")
+
+		// Strip schema from "REFERENCES <schema>."
+		res = strings.ReplaceAll(res, "REFERENCES "+s+".", "REFERENCES ")
+		res = strings.ReplaceAll(res, "REFERENCES \""+s+"\".", "REFERENCES ")
+		res = strings.ReplaceAll(res, "references "+s+".", "references ")
+		res = strings.ReplaceAll(res, "references \""+s+"\".", "references ")
+
+		// Strip schema from type casts "::<schema>."
+		res = strings.ReplaceAll(res, "::"+s+".", "::")
+		res = strings.ReplaceAll(res, "::\""+s+"\".", "::")
+	}
+
+	// Also replace any remaining occurrences of shadowSchema with targetSchema
+	if shadowSchema != "" && targetSchema != "" {
 		res = strings.ReplaceAll(res, shadowSchema+".", targetSchema+".")
 		res = strings.ReplaceAll(res, `"`+shadowSchema+`".`, `"`+targetSchema+`".`)
 	}
-	if targetSchema != "" {
-		// Strip schema prefix from REFERENCES <schema>.tbl -> REFERENCES tbl
-		res = strings.ReplaceAll(res, "REFERENCES "+targetSchema+".", "REFERENCES ")
-		res = strings.ReplaceAll(res, "REFERENCES \""+targetSchema+"\".", "REFERENCES ")
-		res = strings.ReplaceAll(res, "references "+targetSchema+".", "references ")
-		res = strings.ReplaceAll(res, "references \""+targetSchema+"\".", "references ")
 
-		// Strip schema prefix from type casts ::<schema>.type -> ::type
-		res = strings.ReplaceAll(res, "::"+targetSchema+".", "::")
-		res = strings.ReplaceAll(res, "::\""+targetSchema+"\".", "::")
-	}
 	return strings.TrimSpace(res)
 }
-
-

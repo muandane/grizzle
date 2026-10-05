@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"log"
 	"os"
+	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/yourorg/grizzle"
@@ -15,7 +16,10 @@ import (
 var schemaSQL string
 
 func main() {
-	ctx := context.Background()
+	// Bound the migration: the advisory lock blocks until any other in-flight
+	// sync finishes, so an explicit timeout avoids hanging startup indefinitely.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
 
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
@@ -24,9 +28,13 @@ func main() {
 
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
-		log.Fatalf("failed to connect to postgres: %v", err)
+		log.Fatalf("invalid DSN: %v", err)
 	}
 	defer db.Close()
+
+	if err := db.PingContext(ctx); err != nil {
+		log.Fatalf("failed to connect to postgres: %v", err)
+	}
 
 	log.Println("Synchronizing database schema with Grizzle...")
 

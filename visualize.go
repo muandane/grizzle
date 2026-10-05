@@ -72,20 +72,21 @@ func (p *Plan) Format(w io.Writer, useColor bool) error {
 	}
 
 	adds, alters, drops, blocked := p.Summary()
-	summaryLine := fmt.Sprintf("\nPlan: %d to add, %d to alter, %d to destroy", adds, alters, drops)
+	summaryText := fmt.Sprintf("Plan: %d to add, %d to alter, %d to destroy", adds, alters, drops)
 	if blocked > 0 {
-		summaryLine += fmt.Sprintf(" (%d blocked by safety policy)", blocked)
+		summaryText += fmt.Sprintf(" (%d blocked by safety policy)", blocked)
 	}
-	summaryLine += ".\n"
+	summaryText += "."
 
 	if useColor {
+		summaryColor := colorBold
 		if blocked > 0 {
-			summaryLine = fmt.Sprintf("\n%s%sPlan: %d to add, %d to alter, %d to destroy (%d blocked by safety policy).%s\n", colorBold, colorRed, adds, alters, drops, blocked, colorReset)
-		} else {
-			summaryLine = fmt.Sprintf("\n%sPlan: %d to add, %d to alter, %d to destroy.%s\n", colorBold, adds, alters, drops, colorReset)
+			summaryColor = colorBold + colorRed
 		}
+		sb.WriteString(fmt.Sprintf("\n%s%s%s\n", summaryColor, summaryText, colorReset))
+	} else {
+		sb.WriteString(fmt.Sprintf("\n%s\n", summaryText))
 	}
-	sb.WriteString(summaryLine)
 
 	_, err := io.WriteString(w, sb.String())
 	return err

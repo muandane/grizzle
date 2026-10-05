@@ -1,17 +1,19 @@
 -- Declarative SQLite schema
 CREATE TABLE devices (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    serial_number TEXT NOT NULL UNIQUE,
+    serial_number TEXT NOT NULL,
     firmware_version TEXT NOT NULL,
-    last_seen_at TEXT DEFAULT 'CURRENT_TIMESTAMP'
+    last_seen_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE UNIQUE INDEX idx_devices_serial_number ON devices (serial_number);
 
 CREATE TABLE telemetry_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     device_id INTEGER NOT NULL,
     temperature REAL NOT NULL,
     battery_level INTEGER NOT NULL,
-    recorded_at TEXT DEFAULT 'CURRENT_TIMESTAMP',
+    recorded_at TEXT DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
 );
 

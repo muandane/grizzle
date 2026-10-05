@@ -23,6 +23,12 @@ devenv.local.yaml
 coverage.txt
 dist/
 bin/
-*.db
-*.sqlite
 
+# SQLite databases
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+*.db3

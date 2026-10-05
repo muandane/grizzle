@@ -17,7 +17,7 @@ func main() {
 	ctx := context.Background()
 
 	// Pure Go embedded SQLite (no Cgo required)
-	db, err := sql.Open("sqlite", "file:app.db?cache=shared&mode=rwc")
+	db, err := sql.Open("sqlite", "file:app.db")
 	if err != nil {
 		log.Fatalf("failed to open sqlite database: %v", err)
 	}
