@@ -16,12 +16,13 @@ func TestIsTableManaged(t *testing.T) {
 		table    string
 		expected bool
 	}{
-		// Built-in extension tables are never managed
+		// Built-in extension tables and history are never managed
 		{"spatial_ref_sys", false},
 		{"geometry_columns", false},
 		{"geography_columns", false},
 		{"raster_columns", false},
 		{"raster_overviews", false},
+		{"grizzle_history", false},
 
 		// Included tables
 		{"users", true},
@@ -40,10 +41,41 @@ func TestIsTableManaged(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		got := scope.IsTableManaged(tt.table, filters)
-		if got != tt.expected {
-			t.Errorf("IsTableManaged(%q) = %v, expected %v", tt.table, got, tt.expected)
-		}
+		t.Run(tt.table, func(t *testing.T) {
+			got := scope.IsTableManaged(tt.table, filters)
+			if got != tt.expected {
+				t.Errorf("IsTableManaged(%q) = %v, expected %v", tt.table, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestFilters_Validate(t *testing.T) {
+	// Strict with empty includes should fail
+	fStrictEmpty := scope.Filters{
+		Strict:   true,
+		Includes: nil,
+	}
+	if err := fStrictEmpty.Validate(); err == nil {
+		t.Errorf("expected error for strict mode with empty includes, got nil")
+	}
+
+	// Strict with non-empty includes should pass
+	fStrictNonEmpty := scope.Filters{
+		Strict:   true,
+		Includes: []string{"users"},
+	}
+	if err := fStrictNonEmpty.Validate(); err != nil {
+		t.Errorf("expected nil error for strict mode with includes, got: %v", err)
+	}
+
+	// Non-strict with empty includes should pass
+	fNonStrict := scope.Filters{
+		Strict:   false,
+		Includes: nil,
+	}
+	if err := fNonStrict.Validate(); err != nil {
+		t.Errorf("expected nil error for non-strict mode, got: %v", err)
 	}
 }
 

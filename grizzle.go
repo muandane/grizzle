@@ -115,6 +115,9 @@ func prepareOptions(ctx context.Context, db *sql.DB, opts *Options) error {
 	if strings.TrimSpace(opts.SchemaSQL) == "" {
 		return ErrEmptySchema
 	}
+	if opts.StrictScope && len(opts.IncludeTables) == 0 {
+		return ErrStrictScope
+	}
 	if opts.Dialect == DialectAuto {
 		d, err := detectDialect(ctx, db)
 		if err != nil {

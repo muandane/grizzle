@@ -1,6 +1,7 @@
 package scope
 
 import (
+	"errors"
 	"path"
 	"slices"
 )
@@ -12,6 +13,7 @@ var BuiltinIgnoredTables = []string{
 	"geography_columns",
 	"raster_columns",
 	"raster_overviews",
+	"grizzle_history",
 }
 
 // Filters carries the unmanaged-table rules for diff and plan phases.
@@ -19,6 +21,14 @@ type Filters struct {
 	Includes []string `json:"includes,omitempty"`
 	Excludes []string `json:"excludes,omitempty"`
 	Strict   bool     `json:"strict,omitempty"`
+}
+
+// Validate checks whether filter options conform to strict scoping requirements.
+func (f Filters) Validate() error {
+	if f.Strict && len(f.Includes) == 0 {
+		return errors.New("grizzle: strict scope violation: IncludeTables cannot be empty when StrictScope is enabled")
+	}
+	return nil
 }
 
 // IsTableManaged returns true if the table is managed by Grizzle according to the given filters.

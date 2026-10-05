@@ -54,6 +54,12 @@ type Options struct {
 	// IncludeTables limits Grizzle's management scope to only the specified tables or patterns.
 	IncludeTables []string
 
+	// StrictScope requires IncludeTables to be non-empty. When true and IncludeTables is empty,
+	// operations fail immediately with ErrStrictScope.
+	// Strongly recommended for production environments to avoid accidental alterations or drops
+	// of untracked tables.
+	StrictScope bool
+
 	// AcceptHazards lists critical hazard codes that are explicitly approved to execute.
 	// Critical hazards not present in this list will cause Apply to fail with ErrHazardBlocked.
 	AcceptHazards []plan.HazardCode
@@ -182,10 +188,20 @@ func WithRandFloat(fn func() float64) Option {
 	}
 }
 
+// WithStrictScope enables strict scoping mode requiring non-empty IncludeTables.
+func WithStrictScope(strict bool) Option {
+	return func(o *Options) {
+		o.StrictScope = strict
+	}
+}
+
 // Validate checks whether the options are consistent and valid.
 func (o *Options) Validate() error {
 	if strings.TrimSpace(o.SchemaSQL) == "" {
 		return ErrEmptySchema
+	}
+	if o.StrictScope && len(o.IncludeTables) == 0 {
+		return ErrStrictScope
 	}
 	switch o.Dialect {
 	case DialectAuto, DialectPostgres, DialectSQLite:
@@ -229,6 +245,7 @@ func toScopeFilters(opts Options) scope.Filters {
 	return scope.Filters{
 		Includes: opts.IncludeTables,
 		Excludes: opts.ExcludeTables,
+		Strict:   opts.StrictScope,
 	}
 }
 
