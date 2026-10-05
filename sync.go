@@ -1,6 +1,7 @@
 package grizzle
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"fmt"
@@ -11,12 +12,8 @@ func prepareOptions(opts *Options) error {
 	if strings.TrimSpace(opts.SchemaSQL) == "" {
 		return ErrEmptySchema
 	}
-	if opts.TargetSchema == "" {
-		opts.TargetSchema = "public"
-	}
-	if opts.ShadowSchema == "" {
-		opts.ShadowSchema = "_grizzle_shadow"
-	}
+	opts.TargetSchema = cmp.Or(opts.TargetSchema, "public")
+	opts.ShadowSchema = cmp.Or(opts.ShadowSchema, "_grizzle_shadow")
 	if opts.LockID == 0 {
 		opts.LockID = generateLockID(opts.TargetSchema)
 	}

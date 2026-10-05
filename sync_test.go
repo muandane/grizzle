@@ -48,7 +48,7 @@ func TestSync_EndToEnd(t *testing.T) {
 	defer func() { _ = db.Close() }()
 	resetPublicSchema(t, db)
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// 1. Initial Provisioning
 	schemaV1 := `
@@ -161,7 +161,7 @@ func TestPlanDiff(t *testing.T) {
 	defer func() { _ = db.Close() }()
 	resetPublicSchema(t, db)
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	schema := `
 		CREATE TABLE teams (
@@ -210,10 +210,8 @@ func TestSync_Concurrency(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make(chan error, numGoroutines)
 
-	for i := 0; i < numGoroutines; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range numGoroutines {
+		wg.Go(func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 
@@ -224,7 +222,7 @@ func TestSync_Concurrency(t *testing.T) {
 			if err != nil {
 				errs <- err
 			}
-		}()
+		})
 	}
 
 	wg.Wait()

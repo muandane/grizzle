@@ -13,11 +13,11 @@ func normalizeType(raw string) string {
 	t := strings.TrimSpace(strings.ToLower(raw))
 
 	// Normalize character varying to varchar
-	if strings.HasPrefix(t, "character varying") {
-		return strings.Replace(t, "character varying", "varchar", 1)
+	if after, ok := strings.CutPrefix(t, "character varying"); ok {
+		return "varchar" + after
 	}
-	if strings.HasPrefix(t, "char(") || strings.HasPrefix(t, "character(") {
-		return strings.Replace(t, "character(", "char(", 1)
+	if after, ok := strings.CutPrefix(t, "character("); ok {
+		return "char(" + after
 	}
 
 	// Normalize integers and serials
@@ -63,12 +63,10 @@ func normalizeDefault(raw string) string {
 	}
 
 	// Normalize nextval('schema.seq_name'::regclass) -> nextval('seq_name'::regclass)
-	if strings.HasPrefix(d, "nextval('") {
-		start := len("nextval('")
-		if end := strings.Index(d[start:], "'"); end != -1 {
-			seqName := d[start : start+end]
-			if dot := strings.LastIndex(seqName, "."); dot != -1 {
-				seqName = seqName[dot+1:]
+	if after, ok := strings.CutPrefix(d, "nextval('"); ok {
+		if seqName, _, ok := strings.Cut(after, "'"); ok {
+			if _, seq, found := strings.CutLast(seqName, "."); found {
+				seqName = seq
 			}
 			return fmt.Sprintf("nextval('%s'::regclass)", seqName)
 		}

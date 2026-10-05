@@ -1,8 +1,10 @@
 package grizzle
 
 import (
+	"cmp"
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 	"strings"
 )
 
@@ -25,12 +27,10 @@ func isSerialColumn(tableName string, col *ColumnIR) (string, bool) {
 
 // generateCreateTableSQL constructs a CREATE TABLE statement including columns and primary key.
 func generateCreateTableSQL(targetSchema string, tbl *TableIR) string {
-	cols := make([]*ColumnIR, 0, len(tbl.Columns))
-	for _, c := range tbl.Columns {
-		cols = append(cols, c)
-	}
-	sort.Slice(cols, func(i, j int) bool {
-		return cols[i].Position < cols[j].Position
+	// Collect and sort columns by original position using modern slices and maps packages
+	cols := slices.Collect(maps.Values(tbl.Columns))
+	slices.SortFunc(cols, func(a, b *ColumnIR) int {
+		return cmp.Compare(a.Position, b.Position)
 	})
 
 	var lines []string
@@ -124,7 +124,7 @@ func sortSteps(steps []Step) {
 		ChangeDropTable:   50,
 	}
 
-	sort.SliceStable(steps, func(i, j int) bool {
-		return priority[steps[i].Type] < priority[steps[j].Type]
+	slices.SortStableFunc(steps, func(a, b Step) int {
+		return cmp.Compare(priority[a.Type], priority[b.Type])
 	})
 }

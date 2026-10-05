@@ -38,7 +38,7 @@ type Step struct {
 	Type        ChangeType `json:"type"`
 	Table       string     `json:"table"`
 	SQL         string     `json:"sql"`
-	Destructive bool       `json:"destructive"`
+	Destructive bool       `json:"destructive,omitzero"`
 }
 
 // Plan contains the complete list of sequenced migration steps.

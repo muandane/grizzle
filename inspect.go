@@ -123,7 +123,7 @@ func inspectSchema(ctx context.Context, tx *sql.Tx, schemaName string) (*SchemaI
 
 		if tbl, exists := schema.Tables[tableName]; exists && colsJoined != "" {
 			var pkCols []string
-			for _, c := range strings.Split(colsJoined, ",") {
+			for c := range strings.SplitSeq(colsJoined, ",") {
 				pkCols = append(pkCols, strings.TrimSpace(c))
 			}
 			tbl.PrimaryKey = &PrimaryKeyIR{
