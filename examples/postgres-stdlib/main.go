@@ -35,12 +35,12 @@ func main() {
 		log.Fatalf("failed to connect to postgres: %v", err)
 	}
 
-	log.Println("Synchronizing database schema with Grizzle...")
-
+	targetSchema := os.Getenv("PG_SCHEMA")
 	// Run in-process declarative migration on application boot
 	err = grizzle.Sync(syncCtx, db, grizzle.Options{
-		SchemaSQL: schemaSQL,
-		AllowDrop: false, // Strict safety in production
+		TargetSchema: targetSchema,
+		SchemaSQL:    schemaSQL,
+		AllowDrop:    false, // Strict safety in production
 	})
 	if err != nil {
 		log.Fatalf("database schema sync failed: %v", err)

@@ -78,3 +78,84 @@ func TestPlan_Format(t *testing.T) {
 		t.Errorf("Format missing step SQL: %s", out)
 	}
 }
+
+func TestPlan_HasDestructive(t *testing.T) {
+	p1 := &plan.Plan{
+		Steps: []plan.Step{
+			{Type: plan.ChangeCreateTable, Destructive: false},
+		},
+	}
+	if p1.HasDestructive() {
+		t.Errorf("expected HasDestructive to be false")
+	}
+
+	p2 := &plan.Plan{
+		Steps: []plan.Step{
+			{Type: plan.ChangeDropTable, Destructive: true},
+		},
+	}
+	if !p2.HasDestructive() {
+		t.Errorf("expected HasDestructive to be true")
+	}
+}
+
+func TestPlan_ErrorTypes(t *testing.T) {
+	// HazardError
+	hErr := &plan.HazardError{
+		Hazards: []plan.Hazard{
+			{Code: plan.HazardDropTable},
+			{Code: plan.HazardTypeNarrow},
+		},
+	}
+	if !strings.Contains(hErr.Error(), "DROP_TABLE") {
+		t.Errorf("unexpected HazardError message: %s", hErr.Error())
+	}
+	if !hErr.Is(plan.ErrHazardBlocked) {
+		t.Errorf("expected HazardError to match ErrHazardBlocked")
+	}
+	if hErr.Unwrap() != plan.ErrHazardBlocked {
+		t.Errorf("expected Unwrap to return ErrHazardBlocked")
+	}
+
+	// DestructiveViolationError
+	dErrSingle := &plan.DestructiveViolationError{
+		Violations: []plan.Step{
+			{Type: plan.ChangeDropColumn, Table: "users"},
+		},
+	}
+	if !strings.Contains(dErrSingle.Error(), "DROP_COLUMN on users") {
+		t.Errorf("unexpected dErrSingle message: %s", dErrSingle.Error())
+	}
+	if !dErrSingle.Is(plan.ErrDestructiveBlocked) {
+		t.Errorf("expected DestructiveViolationError to match ErrDestructiveBlocked")
+	}
+
+	dErrMulti := &plan.DestructiveViolationError{
+		Violations: []plan.Step{
+			{Type: plan.ChangeDropColumn, Table: "users"},
+			{Type: plan.ChangeDropTable, Table: "orders"},
+		},
+	}
+	if !strings.Contains(dErrMulti.Error(), "2 destructive changes") {
+		t.Errorf("unexpected dErrMulti message: %s", dErrMulti.Error())
+	}
+
+	// DriftError
+	driftEmpty := &plan.DriftError{}
+	if driftEmpty.Error() != "grizzle: database schema drift detected" {
+		t.Errorf("unexpected empty DriftError message: %s", driftEmpty.Error())
+	}
+	driftWithPlan := &plan.DriftError{
+		Plan: &plan.Plan{Steps: []plan.Step{{Type: plan.ChangeCreateTable}}},
+	}
+	if !strings.Contains(driftWithPlan.Error(), "1 change(s)") {
+		t.Errorf("unexpected driftWithPlan message: %s", driftWithPlan.Error())
+	}
+	if !driftWithPlan.Is(plan.ErrDrift) {
+		t.Errorf("expected DriftError to match ErrDrift")
+	}
+	if driftWithPlan.Unwrap() != plan.ErrDrift {
+		t.Errorf("expected Unwrap to return ErrDrift")
+	}
+}
+
