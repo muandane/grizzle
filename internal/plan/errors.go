@@ -88,3 +88,23 @@ func (e *DestructiveViolationError) Is(target error) bool {
 	return target == ErrDestructiveBlocked
 }
 
+// DriftError reports unapplied differences between the live schema and the desired schema.
+type DriftError struct {
+	Plan *Plan
+}
+
+func (e *DriftError) Error() string {
+	if e.Plan == nil || len(e.Plan.Steps) == 0 {
+		return "grizzle: database schema drift detected"
+	}
+	return fmt.Sprintf("grizzle: schema drift detected: %d change(s) difference between live and desired schemas", len(e.Plan.Steps))
+}
+
+func (e *DriftError) Is(target error) bool {
+	return target == ErrDrift
+}
+
+func (e *DriftError) Unwrap() error {
+	return ErrDrift
+}
+

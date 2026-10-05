@@ -13,6 +13,7 @@ import (
 	"github.com/yourorg/grizzle/internal/dialect/postgres"
 	"github.com/yourorg/grizzle/internal/dialect/sqlite"
 	"github.com/yourorg/grizzle/internal/diff"
+	"github.com/yourorg/grizzle/internal/history"
 	"github.com/yourorg/grizzle/internal/plan"
 	"github.com/yourorg/grizzle/internal/scope"
 )
@@ -244,7 +245,8 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) e
 	groups := GroupSteps(steps)
 	stepIdx := 0
 
-	for _, group := range groups {
+	for groupIdx, group := range groups {
+		isLastGroup := groupIdx == len(groups)-1
 		if group.NonTx {
 			// Non-transactional steps (e.g. CREATE INDEX CONCURRENTLY) executed directly on dedicated conn
 			for _, s := range group.Steps {
@@ -258,6 +260,13 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) e
 				}
 				if logger != nil {
 					logger.DebugContext(ctx, "grizzle: executed non-tx step", "step_index", stepIdx, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
+				}
+			}
+			if isLastGroup {
+				if err := history.RecordPlan(ctx, conn, "postgres", cfg.TargetSchema, p, time.Since(start)); err != nil {
+					if logger != nil {
+						logger.WarnContext(ctx, "grizzle: failed recording history on conn", "error", err)
+					}
 				}
 			}
 		} else {
@@ -285,6 +294,16 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) e
 					logger.DebugContext(ctx, "grizzle: executed step in tx", "step_index", stepIdx, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
 				}
 			}
+
+			// Record history in same transaction before commit where possible
+			if isLastGroup {
+				if err := history.RecordPlan(ctx, tx, "postgres", cfg.TargetSchema, p, time.Since(start)); err != nil {
+					if logger != nil {
+						logger.WarnContext(ctx, "grizzle: failed recording history in tx", "error", err)
+					}
+				}
+			}
+
 			if err := tx.Commit(); err != nil {
 				return fmt.Errorf("grizzle: failed committing step transaction: %w", err)
 			}
@@ -456,6 +475,13 @@ func SyncSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) error {
 	}
 	if _, err := tx.ExecContext(ctx, "PRAGMA foreign_keys = ON;"); err != nil {
 		return fmt.Errorf("sqlite: failed to re-enable foreign keys: %w", err)
+	}
+
+	// Record history in same transaction
+	if err := history.RecordPlan(ctx, tx, "sqlite", "", p, time.Since(start)); err != nil {
+		if logger != nil {
+			logger.WarnContext(ctx, "sqlite: failed recording history in tx", "error", err)
+		}
 	}
 
 	if err := tx.Commit(); err != nil {

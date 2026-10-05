@@ -50,3 +50,6 @@ type HazardError = plan.HazardError
 // DestructiveViolationError reports all destructive steps that were rejected by the active safety policy.
 type DestructiveViolationError = plan.DestructiveViolationError
 
+// DriftError reports unapplied differences between the live schema and the desired schema.
+type DriftError = plan.DriftError
+

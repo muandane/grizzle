@@ -287,6 +287,22 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 	return tx.Commit()
 }
 
+// Check inspects the live database and returns ErrDrift (wrapped in DriftError) if the schema
+// differs from the desired schema specified in opts.SchemaSQL.
+// It is strictly read-only, never modifies the database, and never auto-fixes drift.
+func Check(ctx context.Context, db *sql.DB, opts Options) error {
+	p, err := PlanDiff(ctx, db, opts)
+	if err != nil {
+		return err
+	}
+
+	if len(p.Steps) > 0 {
+		return &plan.DriftError{Plan: p}
+	}
+
+	return nil
+}
+
 // tableFilters bridges internal scope filters for existing root test suites.
 type tableFilters struct {
 	includes []string
