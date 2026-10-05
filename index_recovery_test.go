@@ -25,7 +25,7 @@ func TestInvalidIndexRecovery_Postgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed opening pg: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := db.Ping(); err != nil {
 		t.Skipf("skipping postgres invalid index recovery test, database not reachable: %v", err)

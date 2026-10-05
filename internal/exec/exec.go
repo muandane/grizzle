@@ -133,7 +133,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 	if err != nil {
 		return 0, fmt.Errorf("grizzle: failed to acquire connection: %w", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if err := postgres.ValidateIdentifier(cfg.TargetSchema); err == nil {
 		_, _ = conn.ExecContext(ctx, fmt.Sprintf("SET search_path TO %q, public;", cfg.TargetSchema))
@@ -269,7 +269,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 		defer cancel()
 		histConn, err := db.Conn(histCtx)
 		if err == nil {
-			defer histConn.Close()
+			defer func() { _ = histConn.Close() }()
 			_ = history.RecordProgress(histCtx, histConn, "postgres", cfg.TargetSchema, p, status, failedStep, execErr, time.Since(start))
 		}
 	}

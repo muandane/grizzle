@@ -149,7 +149,7 @@ func TestApply_EdgeCases(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed opening sqlite: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	directPlan := &grizzle.Plan{
 		Steps: []plan.Step{

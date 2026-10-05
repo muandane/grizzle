@@ -16,24 +16,48 @@ import (
 	"github.com/muandane/grizzle/internal/scope"
 )
 
-// Public type aliases
-type (
-	Plan        = plan.Plan
-	Step        = plan.Step
-	ChangeType  = plan.ChangeType
-	DropPolicy  = plan.DropPolicy
-	HazardLevel = plan.HazardLevel
-	HazardCode  = plan.HazardCode
-	Hazard      = plan.Hazard
+// Plan is the complete migration plan containing sequenced steps, policy, and hashes.
+type Plan = plan.Plan
 
-	SchemaIR     = schema.Schema
-	TableIR      = schema.Table
-	ColumnIR     = schema.Column
-	IndexIR      = schema.Index
-	ForeignKeyIR = schema.ForeignKey
-	PrimaryKeyIR = schema.PrimaryKey
-	EnumIR       = schema.Enum
-)
+// Step represents a single atomic migration step to execute.
+type Step = plan.Step
+
+// ChangeType describes the classification of a schema change.
+type ChangeType = plan.ChangeType
+
+// DropPolicy defines the safety behavior for destructive drops.
+type DropPolicy = plan.DropPolicy
+
+// HazardLevel indicates the severity of potential data loss or downtime.
+type HazardLevel = plan.HazardLevel
+
+// HazardCode identifies the specific type of migration hazard detected.
+type HazardCode = plan.HazardCode
+
+// Hazard describes an operation that could cause data loss or service disruption.
+type Hazard = plan.Hazard
+
+// SchemaIR represents the database-agnostic schema intermediate representation.
+type SchemaIR = schema.Schema
+
+// TableIR represents the intermediate representation of a database table.
+type TableIR = schema.Table
+
+// ColumnIR represents the intermediate representation of a database column.
+type ColumnIR = schema.Column
+
+// IndexIR represents the intermediate representation of a database index.
+type IndexIR = schema.Index
+
+// ForeignKeyIR represents the intermediate representation of a foreign key relationship.
+type ForeignKeyIR = schema.ForeignKey
+
+// PrimaryKeyIR represents the intermediate representation of a table primary key.
+type PrimaryKeyIR = schema.PrimaryKey
+
+// EnumIR represents the intermediate representation of an enum type.
+type EnumIR = schema.Enum
+
 
 // ChangeType constants
 const (

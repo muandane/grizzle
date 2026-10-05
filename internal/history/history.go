@@ -250,7 +250,7 @@ func List(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName string
 	if err != nil {
 		return nil, fmt.Errorf("querying grizzle_history: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var records []Record
 	for rows.Next() {

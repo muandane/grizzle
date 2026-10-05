@@ -48,7 +48,7 @@ func TestLocking_ForeignKeyNotValidAndValidate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open pg: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := db.Ping(); err != nil {
 		t.Skipf("skipping postgres locking test, database not reachable: %v", err)
@@ -130,7 +130,7 @@ func TestLocking_RecomputeDiffPostLock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open pg: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := db.Ping(); err != nil {
 		t.Skipf("skipping postgres locking test, database not reachable: %v", err)
@@ -195,7 +195,7 @@ func TestLocking_NonConcurrentIndexes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open pg: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := db.Ping(); err != nil {
 		t.Skipf("skipping postgres locking test, database not reachable: %v", err)

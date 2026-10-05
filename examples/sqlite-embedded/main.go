@@ -21,7 +21,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to open sqlite database: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	log.Println("Synchronizing embedded SQLite schema with Grizzle...")
 

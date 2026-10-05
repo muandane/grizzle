@@ -18,7 +18,7 @@ func TestDrift_CheckDetectsDifferenceWithoutApplying(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed opening sqlite: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	ctx := context.Background()
 	initialSQL := "CREATE TABLE users (id INTEGER PRIMARY KEY);"
@@ -83,7 +83,7 @@ func TestHistory_RecordedOnSync(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed opening sqlite: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	ctx := context.Background()
 	schemaSQL := "CREATE TABLE products (id INTEGER PRIMARY KEY, title TEXT);"
@@ -145,7 +145,7 @@ func TestHistory_PostgresRecording(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed opening pg: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := db.Ping(); err != nil {
 		t.Skipf("skipping postgres history test, database not reachable: %v", err)
@@ -199,7 +199,7 @@ func TestHistory_PartialOnKilledNonTxStep(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed opening pg: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := db.Ping(); err != nil {
 		t.Skipf("skipping postgres history test, database not reachable: %v", err)
@@ -255,7 +255,7 @@ func TestHistory_PartialOnKilledNonTxStep(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed acquiring lock conn: %v", err)
 	}
-	defer lockConn.Close()
+	defer func() { _ = lockConn.Close() }()
 
 	_, err = lockConn.ExecContext(context.Background(), fmt.Sprintf("SET search_path TO %q, public;", schema))
 	if err != nil {

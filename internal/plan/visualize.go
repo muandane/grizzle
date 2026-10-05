@@ -83,9 +83,9 @@ func (p *Plan) Format(w io.Writer, useColor bool) error {
 		if blocked > 0 {
 			summaryColor = colorBold + colorRed
 		}
-		sb.WriteString(fmt.Sprintf("\n%s%s%s\n", summaryColor, summaryText, colorReset))
+		fmt.Fprintf(&sb, "\n%s%s%s\n", summaryColor, summaryText, colorReset)
 	} else {
-		sb.WriteString(fmt.Sprintf("\n%s\n", summaryText))
+		fmt.Fprintf(&sb, "\n%s\n", summaryText)
 	}
 
 	hazards := p.Hazards()
@@ -101,9 +101,9 @@ func (p *Plan) Format(w io.Writer, useColor bool) error {
 				if h.Level == HazardLevelCritical {
 					hColor = colorRed
 				}
-				sb.WriteString(fmt.Sprintf("  %s[%s]%s %s\n", hColor, h.Level, colorReset, h.Description))
+				fmt.Fprintf(&sb, "  %s[%s]%s %s\n", hColor, h.Level, colorReset, h.Description)
 			} else {
-				sb.WriteString(fmt.Sprintf("  [%s] %s\n", h.Level, h.Description))
+				fmt.Fprintf(&sb, "  [%s] %s\n", h.Level, h.Description)
 			}
 		}
 	}

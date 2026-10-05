@@ -243,7 +243,7 @@ func TestPlan_GoldenFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open sqlite: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	ctx := context.Background()
 	p, err := grizzle.PlanDiff(ctx, db, grizzle.Options{
@@ -261,16 +261,16 @@ func TestPlan_GoldenFile(t *testing.T) {
 	}
 
 	if *updateGolden {
-		if err := os.WriteFile(goldenPath, planJSON, 0644); err != nil {
+		if err := os.WriteFile(goldenPath, planJSON, 0600); err != nil {
 			t.Fatalf("failed updating golden file: %v", err)
 		}
 		t.Logf("Updated golden file %s", goldenPath)
 	}
 
-	expectedJSON, err := os.ReadFile(goldenPath)
+	expectedJSON, err := os.ReadFile(goldenPath) //nolint:gosec // G304: test reads static testdata golden file
 	if os.IsNotExist(err) {
 		// First-time generation
-		if err := os.WriteFile(goldenPath, planJSON, 0644); err != nil {
+		if err := os.WriteFile(goldenPath, planJSON, 0600); err != nil {
 			t.Fatalf("failed writing initial golden file: %v", err)
 		}
 		expectedJSON = planJSON

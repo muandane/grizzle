@@ -94,7 +94,7 @@ func TestParity_Renames_AmbiguousAndExplicit(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed opening sqlite: %v", err)
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 		runTest(t, grizzle.DialectSQLite, db, "main")
 	})
 
@@ -110,7 +110,7 @@ func TestParity_Renames_AmbiguousAndExplicit(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed opening postgres: %v", err)
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 		if err := db.Ping(); err != nil {
 			t.Skipf("skipping postgres parity test, not reachable: %v", err)
 		}
@@ -195,7 +195,7 @@ func TestParity_Hazards_TypeNarrowing(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed opening sqlite: %v", err)
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 		runTest(t, grizzle.DialectSQLite, db, "main")
 	})
 
@@ -211,7 +211,7 @@ func TestParity_Hazards_TypeNarrowing(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed opening postgres: %v", err)
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 		if err := db.Ping(); err != nil {
 			t.Skipf("skipping postgres parity test, not reachable: %v", err)
 		}
@@ -321,7 +321,7 @@ func TestParity_StrictScope(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed opening sqlite: %v", err)
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 		runTest(t, grizzle.DialectSQLite, db, "main")
 	})
 
@@ -337,7 +337,7 @@ func TestParity_StrictScope(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed opening postgres: %v", err)
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 		if err := db.Ping(); err != nil {
 			t.Skipf("skipping postgres parity test, not reachable: %v", err)
 		}

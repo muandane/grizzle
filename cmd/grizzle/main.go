@@ -1,3 +1,4 @@
+// Package main implements the grizzle CLI.
 package main
 
 import (
@@ -7,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/muandane/grizzle"
@@ -39,13 +41,13 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error connecting to database: %v\n", err)
 		os.Exit(1)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	ctx := context.Background()
 
 	switch command {
 	case "plan":
-		content, err := os.ReadFile(*schemaFile)
+		content, err := os.ReadFile(filepath.Clean(*schemaFile)) //nolint:gosec // G703, G304: CLI accepts user-provided schema file path
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error reading schema file %q: %v\n", *schemaFile, err)
 			os.Exit(1)
@@ -67,7 +69,7 @@ func main() {
 				os.Exit(1)
 			}
 			if *outputFile != "" {
-				if err := os.WriteFile(*outputFile, data, 0644); err != nil {
+				if err := os.WriteFile(filepath.Clean(*outputFile), data, 0600); err != nil { //nolint:gosec // G703, G304: CLI accepts user-provided output destination file path
 					fmt.Fprintf(os.Stderr, "Writing plan error: %v\n", err)
 					os.Exit(1)
 				}
@@ -81,7 +83,7 @@ func main() {
 
 	case "apply":
 		if *planFile != "" {
-			planData, err := os.ReadFile(*planFile)
+			planData, err := os.ReadFile(filepath.Clean(*planFile)) //nolint:gosec // G703, G304: CLI accepts user-provided plan file path
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error reading plan file %q: %v\n", *planFile, err)
 				os.Exit(1)
@@ -99,7 +101,7 @@ func main() {
 				os.Exit(1)
 			}
 		} else {
-			content, err := os.ReadFile(*schemaFile)
+			content, err := os.ReadFile(filepath.Clean(*schemaFile)) //nolint:gosec // G703, G304: CLI accepts user-provided schema file path
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error reading schema file %q: %v\n", *schemaFile, err)
 				os.Exit(1)
@@ -128,7 +130,7 @@ func main() {
 		fmt.Println("Schema applied successfully.")
 
 	case "check":
-		content, err := os.ReadFile(*schemaFile)
+		content, err := os.ReadFile(filepath.Clean(*schemaFile)) //nolint:gosec // G703, G304: CLI accepts user-provided schema file path
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error reading schema file %q: %v\n", *schemaFile, err)
 			os.Exit(1)

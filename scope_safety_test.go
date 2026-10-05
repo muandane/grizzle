@@ -29,7 +29,7 @@ func TestScopeSafety_StrictScopeRequiresIncludeTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open sqlite: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	ctx := context.Background()
 	err = grizzle.Sync(ctx, db, opts)
@@ -59,7 +59,7 @@ func TestScopeSafety_StrictScopeWithIncludeTablesSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open sqlite: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	ctx := context.Background()
 	err = grizzle.Sync(ctx, db, opts)
@@ -85,7 +85,7 @@ func TestScopeSafety_BuiltinExtensionExclusions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open pg: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := db.Ping(); err != nil {
 		t.Skipf("skipping postgres scope test, database not reachable: %v", err)

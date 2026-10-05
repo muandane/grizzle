@@ -13,13 +13,13 @@ func TestCLI_HelpAndUnknown(t *testing.T) {
 	tmpDir := t.TempDir()
 	binPath := filepath.Join(tmpDir, "grizzle")
 
-	buildCmd := exec.Command("go", "build", "-o", binPath, ".")
+	buildCmd := exec.Command("go", "build", "-o", binPath, ".") //nolint:gosec // G204: test builds newly compiled CLI binary
 	if out, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed building CLI: %v\nOutput: %s", err, string(out))
 	}
 
 	// 1. Run without arguments
-	cmd := exec.Command(binPath)
+	cmd := exec.Command(binPath) //nolint:gosec // G204: test executes newly built CLI binary
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		t.Errorf("expected error running without args, got success")
@@ -29,7 +29,7 @@ func TestCLI_HelpAndUnknown(t *testing.T) {
 	}
 
 	// 2. Run with unknown command
-	cmdUnknown := exec.Command(binPath, "foo", "-dsn", "postgres://localhost:5432")
+	cmdUnknown := exec.Command(binPath, "foo", "-dsn", "postgres://localhost:5432") //nolint:gosec // G204: test executes newly built CLI binary
 	outUnknown, err := cmdUnknown.CombinedOutput()
 	if err == nil {
 		t.Errorf("expected error running unknown command, got success")
@@ -39,7 +39,7 @@ func TestCLI_HelpAndUnknown(t *testing.T) {
 	}
 
 	// 3. Run without DSN
-	cmdNoDSN := exec.Command(binPath, "plan")
+	cmdNoDSN := exec.Command(binPath, "plan") //nolint:gosec // G204: test executes newly built CLI binary
 	cmdNoDSN.Env = append(os.Environ(), "DATABASE_URL=")
 	outNoDSN, err := cmdNoDSN.CombinedOutput()
 	if err == nil {

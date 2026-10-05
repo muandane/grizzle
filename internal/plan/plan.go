@@ -12,6 +12,7 @@ import (
 // ChangeType describes the category of a schema mutation.
 type ChangeType string
 
+// ChangeType constants define the supported kinds of atomic schema changes.
 const (
 	ChangeCreateEnum  ChangeType = "CREATE_ENUM"
 	ChangeAlterEnum   ChangeType = "ALTER_ENUM"
@@ -95,23 +96,27 @@ func (p *Plan) Hash() string {
 	excludes := slices.Clone(p.ExcludeTables)
 	slices.Sort(excludes)
 
-	fmt.Fprintf(h, "schema:%s\n", p.TargetSchema)
-	fmt.Fprintf(h, "includes:%s\n", strings.Join(includes, ","))
-	fmt.Fprintf(h, "excludes:%s\n", strings.Join(excludes, ","))
+	write := func(format string, args ...any) {
+		_, _ = fmt.Fprintf(h, format, args...)
+	}
+
+	write("schema:%s\n", p.TargetSchema)
+	write("includes:%s\n", strings.Join(includes, ","))
+	write("excludes:%s\n", strings.Join(excludes, ","))
 
 	if len(p.Renames) > 0 {
 		renameKeys := slices.Collect(maps.Keys(p.Renames))
 		slices.Sort(renameKeys)
 		for _, k := range renameKeys {
-			fmt.Fprintf(h, "rename:%s->%s\n", k, p.Renames[k])
+			write("rename:%s->%s\n", k, p.Renames[k])
 		}
 	}
 	if p.ExpandContract {
-		fmt.Fprintf(h, "expand_contract:true\n")
+		write("expand_contract:true\n")
 	}
 
 	for i, s := range p.Steps {
-		fmt.Fprintf(h, "step:%d|type:%s|table:%s|sql:%s|destructive:%t|non_tx:%t|not_null:%t|default:%t|narrowed:%t|rebuild:%t|rename_cand:%t|old_col:%s\n",
+		write("step:%d|type:%s|table:%s|sql:%s|destructive:%t|non_tx:%t|not_null:%t|default:%t|narrowed:%t|rebuild:%t|rename_cand:%t|old_col:%s\n",
 			i, s.Type, s.Table, strings.TrimSpace(s.SQL), s.Destructive, s.NonTx,
 			s.ColumnNotNull, s.ColumnHasDefault, s.TypeNarrowed, s.IsTableRebuild,
 			s.IsRenameCandidate, s.OldColumn,

@@ -34,7 +34,7 @@ func RunBackfill(ctx context.Context, db *sql.DB, targetSchema string, renames m
 			continue
 		}
 
-		tblRef := table
+		var tblRef string
 		if targetSchema != "" && targetSchema != "main" && targetSchema != "public" {
 			tblRef = fmt.Sprintf("%q.%q", targetSchema, table)
 		} else {
@@ -42,6 +42,7 @@ func RunBackfill(ctx context.Context, db *sql.DB, targetSchema string, renames m
 		}
 
 		// Check if newCol exists and how many rows have newCol IS NULL
+		//nolint:gosec // G201: tblRef and newCol are structurally validated from internal schema definitions
 		checkQuery := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %q IS NULL;", tblRef, newCol)
 		var nullCount int
 		if err := db.QueryRowContext(ctx, checkQuery).Scan(&nullCount); err != nil {

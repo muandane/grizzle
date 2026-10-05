@@ -143,7 +143,7 @@ func TestHardening_SQLite_ConcurrentReads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open shared memory db: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	schema := `CREATE TABLE cache (key TEXT PRIMARY KEY, val TEXT);`
 	if err := grizzle.Sync(ctx, db, grizzle.Options{SchemaSQL: schema}); err != nil {

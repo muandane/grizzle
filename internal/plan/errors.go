@@ -60,6 +60,7 @@ func (e *HazardError) Error() string {
 	return fmt.Sprintf("grizzle: blocked by unaccepted critical hazard(s) [%s]", strings.Join(codes, ", "))
 }
 
+// Is reports whether target matches ErrHazardBlocked.
 func (e *HazardError) Is(target error) bool {
 	return target == ErrHazardBlocked
 }
@@ -84,6 +85,7 @@ func (e *DestructiveViolationError) Error() string {
 	return fmt.Sprintf("grizzle: %d destructive changes rejected by safety policy: [%s]", len(e.Violations), strings.Join(details, ", "))
 }
 
+// Is reports whether target matches ErrDestructiveBlocked.
 func (e *DestructiveViolationError) Is(target error) bool {
 	return target == ErrDestructiveBlocked
 }
@@ -100,6 +102,7 @@ func (e *DriftError) Error() string {
 	return fmt.Sprintf("grizzle: schema drift detected: %d change(s) difference between live and desired schemas", len(e.Plan.Steps))
 }
 
+// Is reports whether target matches ErrDrift.
 func (e *DriftError) Is(target error) bool {
 	return target == ErrDrift
 }

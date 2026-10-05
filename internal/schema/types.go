@@ -55,14 +55,3 @@ type PrimaryKey struct {
 	Name    string   `json:"name"`
 	Columns []string `json:"columns"`
 }
-
-// Legacy aliases for backward compatibility within Grizzle.
-type (
-	SchemaIR     = Schema
-	TableIR      = Table
-	ColumnIR     = Column
-	IndexIR      = Index
-	ForeignKeyIR = ForeignKey
-	EnumIR       = Enum
-	PrimaryKeyIR = PrimaryKey
-)

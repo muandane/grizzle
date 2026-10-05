@@ -51,7 +51,7 @@ func ComputeBackoff(attempt int, randFn func() float64) time.Duration {
 	if randFn != nil {
 		r = randFn()
 	} else {
-		r = rand.Float64()
+		r = rand.Float64() //nolint:gosec // G404: weak random is sufficient for retry backoff jitter
 	}
 
 	// Full jitter: between 50% and 100% of backoff

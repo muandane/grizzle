@@ -17,7 +17,7 @@ func TestHistory_SQLiteReadWrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed opening sqlite: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	ctx := context.Background()
 

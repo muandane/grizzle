@@ -21,11 +21,6 @@ func getSQLiteDB(t *testing.T) *sql.DB {
 	return db
 }
 
-//go:fix inline
-func boolPtr(b bool) *bool {
-	return new(b)
-}
-
 func TestSQLite_EndToEnd(t *testing.T) {
 	db := getSQLiteDB(t)
 	ctx := t.Context()

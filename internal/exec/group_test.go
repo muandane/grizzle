@@ -21,7 +21,7 @@ func TestGroupSteps_FKValidateInSeparateGroup(t *testing.T) {
 	}
 
 	// Verify ADD FK is in a group before VALIDATE CONSTRAINT
-	var addFKGroup, validateGroup int = -1, -1
+	addFKGroup, validateGroup := -1, -1
 	for i, g := range groups {
 		for _, s := range g.Steps {
 			if s.Type == plan.ChangeAddFK {

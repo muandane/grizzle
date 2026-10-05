@@ -25,7 +25,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("invalid DSN: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	// Scope migration deadline to startup phase so server context does not inherit it
 	syncCtx, syncCancel := context.WithTimeout(context.Background(), 2*time.Minute)

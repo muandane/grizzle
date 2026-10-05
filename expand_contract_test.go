@@ -18,7 +18,7 @@ func TestExpandContract_AmbiguousRenameEmitsHazard(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed opening sqlite: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	ctx := context.Background()
 
@@ -87,7 +87,7 @@ func TestExpandContract_SingleStepRenameWithMapping(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed opening sqlite: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	ctx := context.Background()
 
@@ -162,7 +162,7 @@ func TestExpandContract_PostgresStagedExpand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed opening pg: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := db.Ping(); err != nil {
 		t.Skipf("skipping postgres expand-contract test, database not reachable: %v", err)
@@ -236,7 +236,7 @@ func TestExpandContract_StagedPlansAndBackfill(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed opening sqlite: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	ctx := context.Background()
 
@@ -326,7 +326,7 @@ func TestExpandContract_StagedPlansAndBackfill(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed querying members after expand: %v", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	type memberRow struct {
 		id   int
@@ -411,7 +411,7 @@ func TestExpandContract_PostgresStagedPlansAndBackfill(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed opening pg: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := db.Ping(); err != nil {
 		t.Skipf("skipping postgres expand-contract staged test, database not reachable: %v", err)
@@ -509,7 +509,7 @@ func TestExpandContract_PostgresStagedPlansAndBackfill(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed querying members after expand: %v", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	type memberRow struct {
 		id   int64

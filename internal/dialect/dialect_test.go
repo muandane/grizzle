@@ -57,7 +57,7 @@ func TestDialect_SQLite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed opening sqlite: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	_, err = db.Exec("CREATE TABLE test_tbl (id INTEGER PRIMARY KEY);")
 	if err != nil {
