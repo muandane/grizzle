@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/yourorg/grizzle"
 	_ "modernc.org/sqlite"
@@ -286,3 +287,88 @@ func TestPlan_GoldenFile(t *testing.T) {
 		t.Errorf("plan hash mismatch against golden file:\ngot:  %s\nwant: %s", p.Hash(), goldenPlan.Hash())
 	}
 }
+
+func TestPlan_Hash_ExcludesOperationalFields(t *testing.T) {
+	ctx := context.Background()
+	db := setupSQLiteDB(t)
+
+	schemaSQL := `CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT);`
+
+	baseOpts := grizzle.Options{
+		Dialect:   grizzle.DialectSQLite,
+		SchemaSQL: schemaSQL,
+	}
+
+	basePlan, err := grizzle.PlanDiff(ctx, db, baseOpts)
+	if err != nil {
+		t.Fatalf("PlanDiff failed: %v", err)
+	}
+	baseHash := basePlan.Hash()
+
+	t.Run("excluded_AcceptHazards", func(t *testing.T) {
+		opts := baseOpts
+		opts.AcceptHazards = []grizzle.HazardCode{grizzle.HazardDropTable, grizzle.HazardDropColumn}
+		p, err := grizzle.PlanDiff(ctx, db, opts)
+		if err != nil {
+			t.Fatalf("PlanDiff failed: %v", err)
+		}
+		if p.Hash() != baseHash {
+			t.Errorf("AcceptHazards altered hash: got %s, want %s", p.Hash(), baseHash)
+		}
+	})
+
+	t.Run("excluded_LockTimeout", func(t *testing.T) {
+		opts := baseOpts
+		opts.LockTimeout = 42 * time.Second
+		p, err := grizzle.PlanDiff(ctx, db, opts)
+		if err != nil {
+			t.Fatalf("PlanDiff failed: %v", err)
+		}
+		if p.Hash() != baseHash {
+			t.Errorf("LockTimeout altered hash: got %s, want %s", p.Hash(), baseHash)
+		}
+	})
+
+	t.Run("excluded_StatementTimeout", func(t *testing.T) {
+		opts := baseOpts
+		opts.StatementTimeout = 15 * time.Minute
+		p, err := grizzle.PlanDiff(ctx, db, opts)
+		if err != nil {
+			t.Fatalf("PlanDiff failed: %v", err)
+		}
+		if p.Hash() != baseHash {
+			t.Errorf("StatementTimeout altered hash: got %s, want %s", p.Hash(), baseHash)
+		}
+	})
+
+	t.Run("excluded_MaxRetries", func(t *testing.T) {
+		opts := baseOpts
+		opts.MaxRetries = 99
+		p, err := grizzle.PlanDiff(ctx, db, opts)
+		if err != nil {
+			t.Fatalf("PlanDiff failed: %v", err)
+		}
+		if p.Hash() != baseHash {
+			t.Errorf("MaxRetries altered hash: got %s, want %s", p.Hash(), baseHash)
+		}
+	})
+
+	t.Run("excluded_Timestamps", func(t *testing.T) {
+		// Calling Hash() across time intervals must produce strictly identical digest
+		h1 := basePlan.Hash()
+		time.Sleep(50 * time.Millisecond)
+		h2 := basePlan.Hash()
+		if h1 != h2 {
+			t.Errorf("Timestamp difference altered hash: %s vs %s", h1, h2)
+		}
+	})
+
+	t.Run("included_Renames", func(t *testing.T) {
+		pWithRenames := *basePlan
+		pWithRenames.Renames = map[string]string{"customers.name": "full_name"}
+		if pWithRenames.Hash() == baseHash {
+			t.Errorf("expected Renames to alter hash, but remained identical")
+		}
+	})
+}
+
