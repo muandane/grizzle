@@ -173,5 +173,3 @@ func TestHardening_SQLite_ConcurrentReads(t *testing.T) {
 	}
 	wg.Wait()
 }
-
-
