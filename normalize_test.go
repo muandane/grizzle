@@ -40,6 +40,9 @@ func TestNormalizeDefault(t *testing.T) {
 		{"('draft'::text)", "'draft'"},
 		{"('active'::character varying)", "'active'"},
 		{"('standard')", "'standard'"},
+		{"('READY)'::text)", "'READY)'"},
+		{"('READY('::text)", "'READY('"},
+		{"('^(a|b)$'::text)", "'^(a|b)$'"},
 		{"(CURRENT_TIMESTAMP)", "now()"},
 		{"CURRENT_TIMESTAMP", "now()"},
 		{"(now())", "now()"},
@@ -48,6 +51,10 @@ func TestNormalizeDefault(t *testing.T) {
 		{"(true)", "true"},
 		{"10", "10"},
 		{"(10)", "10"},
+		{"(-5)", "-5"},
+		// Compound expressions must NOT have their trailing casts stripped or be corrupted
+		{"('2024-01-01'::date + '1 day'::interval)", "('2024-01-01'::date + '1 day'::interval)"},
+		{"('a'::text || 'b'::text)", "('a'::text || 'b'::text)"},
 		{"", ""},
 	}
 
@@ -83,5 +90,13 @@ func TestNormalizeDefinition(t *testing.T) {
 
 	if normLiveFK != normShadowFK {
 		t.Errorf("foreign key definitions did not normalize symmetrically:\nlive:   %q\nshadow: %q", normLiveFK, normShadowFK)
+	}
+
+	// Predicate with string literal matching "ON public." must not be corrupted
+	predIdx := "CREATE INDEX idx_flag ON public.orders (status) WHERE (status = 'ON public.flag')"
+	normPred := normalizeDefinition(predIdx, shadow, target)
+	expectedPred := "CREATE INDEX idx_flag ON orders (status) WHERE (status = 'ON public.flag')"
+	if normPred != expectedPred {
+		t.Errorf("predicate with literal 'ON public.flag' was mutated:\ngot:  %q\nwant: %q", normPred, expectedPred)
 	}
 }

@@ -26,9 +26,10 @@ bin/
 
 # SQLite databases
 *.db
-*.db-wal
-*.db-shm
-*.db-journal
+*.db-*
 *.sqlite
+*.sqlite-*
 *.sqlite3
+*.sqlite3-*
 *.db3
+*.db3-*
