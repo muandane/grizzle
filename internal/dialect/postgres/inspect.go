@@ -13,8 +13,9 @@ import (
 func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema.Schema, error) {
 	s := &schema.Schema{
 		Name:   schemaName,
-		Tables: make(map[string]*schema.Table),
-		Enums:  make(map[string]*schema.Enum),
+		Tables:    make(map[string]*schema.Table),
+		Enums:     make(map[string]*schema.Enum),
+		Unmanaged: make(map[string]*schema.UnmanagedObject),
 	}
 
 	// 1. Inspect Custom ENUM Types
@@ -269,6 +270,234 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 		}
 	}
 	if err := fkRows.Err(); err != nil {
+		return nil, err
+	}
+	_ = fkRows.Close()
+
+	// 6. Inspect Unmanaged Objects
+	// 6a. Views and Materialized Views
+	viewQuery := `
+		SELECT
+			c.relname AS view_name,
+			c.relkind AS view_kind
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1
+		  AND c.relkind IN ('v', 'm')
+		ORDER BY c.relname;
+	`
+	viewRows, err := dbtx.QueryContext(ctx, viewQuery, schemaName)
+	if err != nil {
+		return nil, fmt.Errorf("inspecting views in schema %q: %w", schemaName, err)
+	}
+	defer func() { _ = viewRows.Close() }()
+
+	for viewRows.Next() {
+		var viewName, viewKind string
+		if err := viewRows.Scan(&viewName, &viewKind); err != nil {
+			return nil, fmt.Errorf("scanning view in schema %q: %w", schemaName, err)
+		}
+		kind := schema.UnmanagedView
+		if viewKind == "m" {
+			kind = schema.UnmanagedMaterialized
+		}
+		s.Unmanaged[viewName] = &schema.UnmanagedObject{
+			Name: viewName,
+			Kind: kind,
+		}
+	}
+	if err := viewRows.Err(); err != nil {
+		return nil, err
+	}
+	_ = viewRows.Close()
+
+	// 6b. View Column Dependencies from pg_depend
+	viewDepQuery := `
+		SELECT
+			c.relname AS view_name,
+			dep_c.relname AS referenced_table,
+			COALESCE(a.attname, '') AS referenced_column
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		JOIN pg_rewrite r ON r.ev_class = c.oid
+		JOIN pg_depend d ON d.objid = r.oid AND d.classid = 'pg_rewrite'::regclass AND d.refclassid = 'pg_class'::regclass
+		JOIN pg_class dep_c ON dep_c.oid = d.refobjid
+		LEFT JOIN pg_attribute a ON a.attrelid = dep_c.oid AND a.attnum = d.refobjsubid AND NOT a.attisdropped
+		WHERE n.nspname = $1
+		  AND c.relkind IN ('v', 'm')
+		  AND dep_c.relkind IN ('r', 'p')
+		  AND dep_c.relname != c.relname
+		ORDER BY c.relname, dep_c.relname, a.attname;
+	`
+	depRows, err := dbtx.QueryContext(ctx, viewDepQuery, schemaName)
+	if err != nil {
+		return nil, fmt.Errorf("inspecting view dependencies in schema %q: %w", schemaName, err)
+	}
+	defer func() { _ = depRows.Close() }()
+
+	for depRows.Next() {
+		var viewName, refTable, refCol string
+		if err := depRows.Scan(&viewName, &refTable, &refCol); err != nil {
+			return nil, fmt.Errorf("scanning view dependency: %w", err)
+		}
+		if obj, ok := s.Unmanaged[viewName]; ok {
+			obj.DependsOn = append(obj.DependsOn, schema.DependencyRef{
+				Table:  refTable,
+				Column: refCol,
+			})
+		}
+	}
+	if err := depRows.Err(); err != nil {
+		return nil, err
+	}
+	_ = depRows.Close()
+
+	// 6c. Triggers on Tables
+	trgQuery := `
+		SELECT
+			t.tgname AS trigger_name,
+			c.relname AS table_name
+		FROM pg_trigger t
+		JOIN pg_class c ON c.oid = t.tgrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1
+		  AND NOT t.tgisinternal
+		ORDER BY t.tgname;
+	`
+	trgRows, err := dbtx.QueryContext(ctx, trgQuery, schemaName)
+	if err != nil {
+		return nil, fmt.Errorf("inspecting triggers in schema %q: %w", schemaName, err)
+	}
+	defer func() { _ = trgRows.Close() }()
+
+	for trgRows.Next() {
+		var trgName, tblName string
+		if err := trgRows.Scan(&trgName, &tblName); err != nil {
+			return nil, fmt.Errorf("scanning trigger in schema %q: %w", schemaName, err)
+		}
+		key := "trigger:" + tblName + "." + trgName
+		s.Unmanaged[key] = &schema.UnmanagedObject{
+			Name:  trgName,
+			Kind:  schema.UnmanagedTrigger,
+			Table: tblName,
+			DependsOn: []schema.DependencyRef{
+				{Table: tblName},
+			},
+		}
+	}
+	if err := trgRows.Err(); err != nil {
+		return nil, err
+	}
+	_ = trgRows.Close()
+
+	// 6d. Stored Functions and Procedures
+	procQuery := `
+		SELECT
+			p.proname AS proc_name
+		FROM pg_proc p
+		JOIN pg_namespace n ON n.oid = p.pronamespace
+		WHERE n.nspname = $1
+		  AND NOT EXISTS (
+		      SELECT 1 FROM pg_depend d
+		      WHERE d.objid = p.oid AND d.deptype = 'e'
+		  )
+		ORDER BY p.proname;
+	`
+	procRows, err := dbtx.QueryContext(ctx, procQuery, schemaName)
+	if err != nil {
+		return nil, fmt.Errorf("inspecting procedures in schema %q: %w", schemaName, err)
+	}
+	defer func() { _ = procRows.Close() }()
+
+	for procRows.Next() {
+		var procName string
+		if err := procRows.Scan(&procName); err != nil {
+			return nil, fmt.Errorf("scanning procedure in schema %q: %w", schemaName, err)
+		}
+		key := "function:" + procName
+		s.Unmanaged[key] = &schema.UnmanagedObject{
+			Name: procName,
+			Kind: schema.UnmanagedFunction,
+		}
+	}
+	if err := procRows.Err(); err != nil {
+		return nil, err
+	}
+	_ = procRows.Close()
+
+	// 6e. Sequences not owned by managed tables
+	seqQuery := `
+		SELECT
+			c.relname AS seq_name,
+			COALESCE(t.relname, '') AS owned_by_table,
+			COALESCE(a.attname, '') AS owned_by_col
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		LEFT JOIN pg_depend d ON d.objid = c.oid AND d.classid = 'pg_class'::regclass AND d.refclassid = 'pg_class'::regclass AND d.deptype = 'a'
+		LEFT JOIN pg_class t ON t.oid = d.refobjid
+		LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = d.refobjsubid
+		WHERE n.nspname = $1
+		  AND c.relkind = 'S'
+		ORDER BY c.relname;
+	`
+	seqRows, err := dbtx.QueryContext(ctx, seqQuery, schemaName)
+	if err != nil {
+		return nil, fmt.Errorf("inspecting sequences in schema %q: %w", schemaName, err)
+	}
+	defer func() { _ = seqRows.Close() }()
+
+	for seqRows.Next() {
+		var seqName, ownedTable, ownedCol string
+		if err := seqRows.Scan(&seqName, &ownedTable, &ownedCol); err != nil {
+			return nil, fmt.Errorf("scanning sequence in schema %q: %w", schemaName, err)
+		}
+		if ownedTable == "" || s.Tables[ownedTable] == nil {
+			seqObj := &schema.UnmanagedObject{
+				Name: seqName,
+				Kind: schema.UnmanagedSequence,
+			}
+			if ownedTable != "" {
+				seqObj.Table = ownedTable
+				seqObj.DependsOn = append(seqObj.DependsOn, schema.DependencyRef{
+					Table:  ownedTable,
+					Column: ownedCol,
+				})
+			}
+			s.Unmanaged["sequence:"+seqName] = seqObj
+		}
+	}
+	if err := seqRows.Err(); err != nil {
+		return nil, err
+	}
+	_ = seqRows.Close()
+
+	// 6f. Domains
+	domainQuery := `
+		SELECT
+			t.typname AS domain_name
+		FROM pg_type t
+		JOIN pg_namespace n ON n.oid = t.typnamespace
+		WHERE n.nspname = $1
+		  AND t.typtype = 'd'
+		ORDER BY t.typname;
+	`
+	domainRows, err := dbtx.QueryContext(ctx, domainQuery, schemaName)
+	if err != nil {
+		return nil, fmt.Errorf("inspecting domains in schema %q: %w", schemaName, err)
+	}
+	defer func() { _ = domainRows.Close() }()
+
+	for domainRows.Next() {
+		var domainName string
+		if err := domainRows.Scan(&domainName); err != nil {
+			return nil, fmt.Errorf("scanning domain in schema %q: %w", schemaName, err)
+		}
+		s.Unmanaged["domain:"+domainName] = &schema.UnmanagedObject{
+			Name: domainName,
+			Kind: schema.UnmanagedDomain,
+		}
+	}
+	if err := domainRows.Err(); err != nil {
 		return nil, err
 	}
 

@@ -86,6 +86,33 @@ const (
 	HazardDropIndex        = plan.HazardDropIndex
 	HazardDropFK           = plan.HazardDropFK
 	HazardRenameAmbiguous  = plan.HazardRenameAmbiguous
+	HazardUnmanagedDependency = plan.HazardUnmanagedDependency
+)
+
+// UnmanagedObject represents an unmanaged database object detected during introspection.
+type UnmanagedObject = schema.UnmanagedObject
+
+// UnmanagedKind represents the category of an unmanaged database object.
+type UnmanagedKind = schema.UnmanagedKind
+
+// DependencyRef represents a reference to a table or column that an unmanaged object depends on.
+type DependencyRef = schema.DependencyRef
+
+const (
+	// UnmanagedView indicates a standard SQL VIEW.
+	UnmanagedView = schema.UnmanagedView
+	// UnmanagedMaterialized indicates a MATERIALIZED VIEW.
+	UnmanagedMaterialized = schema.UnmanagedMaterialized
+	// UnmanagedTrigger indicates a database trigger attached to a table.
+	UnmanagedTrigger = schema.UnmanagedTrigger
+	// UnmanagedFunction indicates a stored procedure or function.
+	UnmanagedFunction = schema.UnmanagedFunction
+	// UnmanagedSequence indicates an unmanaged database sequence.
+	UnmanagedSequence = schema.UnmanagedSequence
+	// UnmanagedEnum indicates an unmanaged custom enum type.
+	UnmanagedEnum = schema.UnmanagedEnum
+	// UnmanagedDomain indicates an unmanaged domain type.
+	UnmanagedDomain = schema.UnmanagedDomain
 )
 
 // HazardLevel constants

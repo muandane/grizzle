@@ -2,9 +2,44 @@ package schema
 
 // Schema represents the parsed relational structure of a database schema.
 type Schema struct {
-	Name   string              `json:"name"`
-	Tables map[string]*Table   `json:"tables"`
-	Enums  map[string]*Enum    `json:"enums"`
+	Name      string                      `json:"name"`
+	Tables    map[string]*Table           `json:"tables"`
+	Enums     map[string]*Enum            `json:"enums"`
+	Unmanaged map[string]*UnmanagedObject `json:"unmanaged,omitempty"`
+}
+
+// UnmanagedKind specifies the type of an unmanaged database object.
+type UnmanagedKind string
+
+const (
+	// UnmanagedView indicates a standard SQL VIEW.
+	UnmanagedView UnmanagedKind = "VIEW"
+	// UnmanagedMaterialized indicates a MATERIALIZED VIEW.
+	UnmanagedMaterialized UnmanagedKind = "MATERIALIZED_VIEW"
+	// UnmanagedTrigger indicates a database trigger attached to a table.
+	UnmanagedTrigger UnmanagedKind = "TRIGGER"
+	// UnmanagedFunction indicates a stored procedure or function.
+	UnmanagedFunction UnmanagedKind = "FUNCTION"
+	// UnmanagedSequence indicates an unmanaged database sequence.
+	UnmanagedSequence UnmanagedKind = "SEQUENCE"
+	// UnmanagedEnum indicates an unmanaged custom enum type.
+	UnmanagedEnum UnmanagedKind = "ENUM"
+	// UnmanagedDomain indicates an unmanaged domain type.
+	UnmanagedDomain UnmanagedKind = "DOMAIN"
+)
+
+// DependencyRef identifies a table or column that an unmanaged object depends on.
+type DependencyRef struct {
+	Table  string `json:"table"`
+	Column string `json:"column,omitempty"`
+}
+
+// UnmanagedObject represents a database object detected in the live database that Grizzle does not manage.
+type UnmanagedObject struct {
+	Name      string          `json:"name"`
+	Kind      UnmanagedKind   `json:"kind"`
+	Table     string          `json:"table,omitempty"`
+	DependsOn []DependencyRef `json:"depends_on,omitempty"`
 }
 
 // Table represents a table within a schema.

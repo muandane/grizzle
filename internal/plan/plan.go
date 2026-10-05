@@ -38,12 +38,13 @@ type Step struct {
 	NonTx       bool       `json:"non_tx,omitzero"`
 
 	// Structural column metadata for precise hazard analysis
-	ColumnNotNull     bool   `json:"column_not_null,omitzero"`
-	ColumnHasDefault  bool   `json:"column_has_default,omitzero"`
-	TypeNarrowed      bool   `json:"type_narrowed,omitzero"`
-	IsTableRebuild    bool   `json:"is_table_rebuild,omitzero"`
-	IsRenameCandidate bool   `json:"is_rename_candidate,omitzero"`
-	OldColumn         string `json:"old_column,omitzero"`
+	ColumnNotNull     bool     `json:"column_not_null,omitzero"`
+	ColumnHasDefault  bool     `json:"column_has_default,omitzero"`
+	TypeNarrowed      bool     `json:"type_narrowed,omitzero"`
+	IsTableRebuild    bool     `json:"is_table_rebuild,omitzero"`
+	IsRenameCandidate bool     `json:"is_rename_candidate,omitzero"`
+	OldColumn         string   `json:"old_column,omitzero"`
+	UnmanagedDeps     []string `json:"unmanaged_deps,omitzero"`
 }
 
 // DropPolicy defines fine-grained permissions for destructive operations.
@@ -116,10 +117,14 @@ func (p *Plan) Hash() string {
 	}
 
 	for i, s := range p.Steps {
-		write("step:%d|type:%s|table:%s|sql:%s|destructive:%t|non_tx:%t|not_null:%t|default:%t|narrowed:%t|rebuild:%t|rename_cand:%t|old_col:%s\n",
+		unmStr := ""
+		if len(s.UnmanagedDeps) > 0 {
+			unmStr = "|unmanaged_deps:" + strings.Join(s.UnmanagedDeps, ",")
+		}
+		write("step:%d|type:%s|table:%s|sql:%s|destructive:%t|non_tx:%t|not_null:%t|default:%t|narrowed:%t|rebuild:%t|rename_cand:%t|old_col:%s%s\n",
 			i, s.Type, s.Table, strings.TrimSpace(s.SQL), s.Destructive, s.NonTx,
 			s.ColumnNotNull, s.ColumnHasDefault, s.TypeNarrowed, s.IsTableRebuild,
-			s.IsRenameCandidate, s.OldColumn,
+			s.IsRenameCandidate, s.OldColumn, unmStr,
 		)
 	}
 
@@ -208,6 +213,8 @@ const (
 	HazardDropFK HazardCode = "DROP_FK"
 	// HazardRenameAmbiguous indicates an ambiguous column rename candidate (same type dropped and added).
 	HazardRenameAmbiguous HazardCode = "RENAME_AMBIGUOUS"
+	// HazardUnmanagedDependency indicates a drop or type change touches a column/table that an unmanaged object depends on.
+	HazardUnmanagedDependency HazardCode = "UNMANAGED_DEPENDENCY"
 )
 
 // HazardLevel indicates the operational or data-loss severity of a migration step.
@@ -236,6 +243,16 @@ type Hazard struct {
 func (p *Plan) Hazards() []Hazard {
 	var hazards []Hazard
 	for _, s := range p.Steps {
+		if len(s.UnmanagedDeps) > 0 {
+			hazards = append(hazards, Hazard{
+				Code:        HazardUnmanagedDependency,
+				Level:       HazardLevelCritical,
+				Type:        s.Type,
+				Table:       s.Table,
+				Description: fmt.Sprintf("Table %q operation affects unmanaged dependent object(s) [%s]", s.Table, strings.Join(s.UnmanagedDeps, ", ")),
+				SQL:         s.SQL,
+			})
+		}
 		switch s.Type {
 		case ChangeDropTable:
 			hazards = append(hazards, Hazard{

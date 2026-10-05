@@ -36,6 +36,9 @@ type Change struct {
 	TypeNarrowed   bool
 	NullChanged    bool
 	DefaultChanged bool
+
+	// Unmanaged object dependencies (views, triggers, functions depending on this table/column)
+	UnmanagedDeps []string
 }
 
 // Diff compares live and desired schemas using the given scope filters and returns pure changes.
@@ -122,6 +125,10 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 				if typeChanged || nullChanged || defChanged {
 					typeNarrowed := typeChanged && schema.IsTypeNarrowing(lCol.DataType, dCol.DataType)
 					destructive := typeNarrowed || (!dCol.IsNullable && lCol.IsNullable)
+					var unmDeps []string
+					if typeChanged || typeNarrowed {
+						unmDeps = findUnmanagedDeps(live.Unmanaged, tblName, colName)
+					}
 					changes = append(changes, Change{
 						Type:             plan.ChangeAlterColumn,
 						Table:            tblName,
@@ -134,6 +141,7 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 						Destructive:      destructive,
 						ColumnNotNull:    !dCol.IsNullable,
 						ColumnHasDefault: dCol.DefaultValue != "",
+						UnmanagedDeps:    unmDeps,
 					})
 				}
 			}
@@ -226,6 +234,7 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 				OldColumn:         lCol,
 				Destructive:       true,
 				IsRenameCandidate: isAmbiguousCandidate,
+				UnmanagedDeps:     findUnmanagedDeps(live.Unmanaged, tblName, colName),
 			})
 		}
 
@@ -339,12 +348,36 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 		}
 		if _, exists := desired.Tables[tblName]; !exists {
 			changes = append(changes, Change{
-				Type:        plan.ChangeDropTable,
-				Table:       tblName,
-				Destructive: true,
+				Type:          plan.ChangeDropTable,
+				Table:         tblName,
+				Destructive:   true,
+				UnmanagedDeps: findUnmanagedDeps(live.Unmanaged, tblName, ""),
 			})
 		}
 	}
 
 	return changes
+}
+
+func findUnmanagedDeps(unmanaged map[string]*schema.UnmanagedObject, table, column string) []string {
+	if len(unmanaged) == 0 {
+		return nil
+	}
+	var deps []string
+	for _, obj := range unmanaged {
+		for _, ref := range obj.DependsOn {
+			if ref.Table == table {
+				if column == "" || ref.Column == "" || ref.Column == column {
+					depStr := fmt.Sprintf("%s:%s", obj.Kind, obj.Name)
+					if ref.Column != "" {
+						depStr += fmt.Sprintf(" (column %s.%s)", ref.Table, ref.Column)
+					}
+					deps = append(deps, depStr)
+					break
+				}
+			}
+		}
+	}
+	slices.Sort(deps)
+	return deps
 }

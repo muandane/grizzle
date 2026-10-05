@@ -186,6 +186,7 @@ func RenderChange(targetSchema string, c diff.Change, nonConcurrent ...bool) pla
 		ColumnHasDefault:  c.ColumnHasDefault,
 		TypeNarrowed:      c.TypeNarrowed,
 		IsRenameCandidate: c.IsRenameCandidate,
+		UnmanagedDeps:     c.UnmanagedDeps,
 	}
 	if c.OldColumn != nil {
 		step.OldColumn = c.OldColumn.Name
