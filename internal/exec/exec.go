@@ -123,6 +123,10 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) e
 	}
 	defer conn.Close()
 
+	if err := postgres.ValidateIdentifier(cfg.TargetSchema); err == nil {
+		_, _ = conn.ExecContext(ctx, fmt.Sprintf("SET search_path TO %q, public;", cfg.TargetSchema))
+	}
+
 	// Apply session-level timeouts
 	_ = ApplySessionTimeouts(ctx, conn, cfg.LockTimeout, cfg.StatementTimeout)
 
@@ -261,6 +265,9 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) e
 			tx, err := conn.BeginTx(ctx, nil)
 			if err != nil {
 				return fmt.Errorf("grizzle: failed to begin step transaction: %w", err)
+			}
+			if err := postgres.ValidateIdentifier(cfg.TargetSchema); err == nil {
+				_, _ = tx.ExecContext(ctx, fmt.Sprintf("SET LOCAL search_path TO %q, public;", cfg.TargetSchema))
 			}
 			_ = ApplyTxTimeouts(ctx, tx, cfg.LockTimeout, cfg.StatementTimeout)
 
