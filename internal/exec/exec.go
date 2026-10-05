@@ -29,6 +29,10 @@ type PostgresExecConfig struct {
 	AcceptHazards        []plan.HazardCode
 	ExpectedHash         string
 	NonConcurrentIndexes bool
+	LockTimeout          time.Duration
+	StatementTimeout     time.Duration
+	MaxRetries           int
+	RandFloat            func() float64
 	Logger               *slog.Logger
 	DryRun               bool
 }
@@ -69,8 +73,44 @@ func GroupSteps(steps []plan.Step) []StepGroup {
 	return groups
 }
 
-// SyncPostgres synchronizes PostgreSQL with session-level advisory locking and split tx/non-tx execution.
+// SyncPostgres synchronizes PostgreSQL with session-level advisory locking, timeouts, and retry logic.
 func SyncPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) error {
+	maxRetries := cfg.MaxRetries
+	if maxRetries < 0 {
+		maxRetries = 0
+	}
+
+	attempt := 0
+	for {
+		err := syncPostgresOnce(ctx, db, cfg)
+		if err == nil {
+			return nil
+		}
+
+		if !IsLockTimeout(err) || attempt >= maxRetries {
+			return err
+		}
+
+		attempt++
+		backoff := ComputeBackoff(attempt, cfg.RandFloat)
+		if cfg.Logger != nil {
+			cfg.Logger.WarnContext(ctx, "grizzle: lock timeout encountered, retrying migration",
+				"attempt", attempt,
+				"max_retries", maxRetries,
+				"backoff_ms", backoff.Milliseconds(),
+				"error", err,
+			)
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("context cancelled during lock retry: %w", ctx.Err())
+		case <-time.After(backoff):
+		}
+	}
+}
+
+func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) error {
 	start := time.Now()
 	logger := cfg.Logger
 	if logger != nil {
@@ -82,6 +122,9 @@ func SyncPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) error
 		return fmt.Errorf("grizzle: failed to acquire connection: %w", err)
 	}
 	defer conn.Close()
+
+	// Apply session-level timeouts
+	_ = ApplySessionTimeouts(ctx, conn, cfg.LockTimeout, cfg.StatementTimeout)
 
 	// 1. Acquire session-level advisory lock on dedicated connection
 	if err := postgres.AcquireSessionAdvisoryLock(ctx, conn, cfg.LockID); err != nil {
@@ -105,6 +148,8 @@ func SyncPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) error
 		return fmt.Errorf("grizzle: failed to begin shadow tx: %w", err)
 	}
 	defer func() { _ = shadowTx.Rollback() }()
+
+	_ = ApplyTxTimeouts(ctx, shadowTx, cfg.LockTimeout, cfg.StatementTimeout)
 
 	if err := postgres.SetupShadowSchema(ctx, shadowTx, cfg.ShadowSchema); err != nil {
 		return err
@@ -217,6 +262,8 @@ func SyncPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) error
 			if err != nil {
 				return fmt.Errorf("grizzle: failed to begin step transaction: %w", err)
 			}
+			_ = ApplyTxTimeouts(ctx, tx, cfg.LockTimeout, cfg.StatementTimeout)
+
 			for _, s := range group.Steps {
 				stepIdx++
 				stepStart := time.Now()
@@ -251,6 +298,8 @@ func PlanDiffPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 		return nil, fmt.Errorf("grizzle: failed to begin transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	_ = ApplyTxTimeouts(ctx, tx, cfg.LockTimeout, cfg.StatementTimeout)
 
 	if err := postgres.SetupShadowSchema(ctx, tx, cfg.ShadowSchema); err != nil {
 		return nil, err

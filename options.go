@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/yourorg/grizzle/internal/plan"
 	"github.com/yourorg/grizzle/internal/scope"
@@ -67,6 +68,18 @@ type Options struct {
 
 	// LockID is a 64-bit integer used for the PostgreSQL advisory lock (pg_advisory_xact_lock).
 	LockID int64
+
+	// LockTimeout specifies the maximum time to wait when acquiring locks (defaults to 5s).
+	LockTimeout time.Duration
+
+	// StatementTimeout specifies the maximum execution time for any single DDL statement (defaults to 5m).
+	StatementTimeout time.Duration
+
+	// MaxRetries specifies the number of retry attempts upon lock timeout (SQLSTATE 55P03, defaults to 3).
+	MaxRetries int
+
+	// RandFloat provides an optional random source func returning in [0.0, 1.0) for deterministic jitter in tests.
+	RandFloat func() float64
 
 	// DryRun returns the planned SQL statements without executing them on the live database.
 	DryRun bool
@@ -138,6 +151,34 @@ func WithExpectedHash(hash string) Option {
 func WithNonConcurrentIndexes(disabled bool) Option {
 	return func(o *Options) {
 		o.NonConcurrentIndexes = disabled
+	}
+}
+
+// WithLockTimeout sets the maximum duration to wait for acquiring locks.
+func WithLockTimeout(d time.Duration) Option {
+	return func(o *Options) {
+		o.LockTimeout = d
+	}
+}
+
+// WithStatementTimeout sets the maximum duration for any single migration DDL statement.
+func WithStatementTimeout(d time.Duration) Option {
+	return func(o *Options) {
+		o.StatementTimeout = d
+	}
+}
+
+// WithMaxRetries sets the maximum retry attempts upon lock timeout conflict (SQLSTATE 55P03).
+func WithMaxRetries(n int) Option {
+	return func(o *Options) {
+		o.MaxRetries = n
+	}
+}
+
+// WithRandFloat sets a custom random float function for deterministic backoff jitter in tests.
+func WithRandFloat(fn func() float64) Option {
+	return func(o *Options) {
+		o.RandFloat = fn
 	}
 }
 

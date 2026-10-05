@@ -131,6 +131,17 @@ func prepareOptions(ctx context.Context, db *sql.DB, opts *Options) error {
 		if opts.LockID == 0 {
 			opts.LockID = defaultPostgresLockID(opts.TargetSchema)
 		}
+		if opts.LockTimeout <= 0 {
+			opts.LockTimeout = exec.DefaultLockTimeout
+		}
+		if opts.StatementTimeout <= 0 {
+			opts.StatementTimeout = exec.DefaultStatementTimeout
+		}
+		if opts.MaxRetries < 0 {
+			opts.MaxRetries = 0
+		} else if opts.MaxRetries == 0 {
+			opts.MaxRetries = exec.DefaultMaxRetries
+		}
 	default:
 		return fmt.Errorf("grizzle: unsupported dialect %q", opts.Dialect)
 	}
@@ -168,6 +179,10 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error {
 		AcceptHazards:        opts.AcceptHazards,
 		ExpectedHash:         opts.ExpectedHash,
 		NonConcurrentIndexes: opts.NonConcurrentIndexes,
+		LockTimeout:          opts.LockTimeout,
+		StatementTimeout:     opts.StatementTimeout,
+		MaxRetries:           opts.MaxRetries,
+		RandFloat:            opts.RandFloat,
 		Logger:               opts.Logger,
 		DryRun:               opts.DryRun,
 	})
@@ -200,6 +215,10 @@ func PlanDiff(ctx context.Context, db *sql.DB, opts Options) (*Plan, error) {
 		Filters:              filters,
 		Policy:               policy,
 		NonConcurrentIndexes: opts.NonConcurrentIndexes,
+		LockTimeout:          opts.LockTimeout,
+		StatementTimeout:     opts.StatementTimeout,
+		MaxRetries:           opts.MaxRetries,
+		RandFloat:            opts.RandFloat,
 		Logger:               opts.Logger,
 		DryRun:               opts.DryRun,
 	})
