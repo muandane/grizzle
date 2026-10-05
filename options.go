@@ -53,6 +53,10 @@ type Options struct {
 	// IncludeTables limits Grizzle's management scope to only the specified tables or patterns.
 	IncludeTables []string
 
+	// AcceptHazards lists critical hazard codes that are explicitly approved to execute.
+	// Critical hazards not present in this list will cause Apply to fail with ErrHazardBlocked.
+	AcceptHazards []plan.HazardCode
+
 	// LockID is a 64-bit integer used for the PostgreSQL advisory lock (pg_advisory_xact_lock).
 	LockID int64
 
@@ -105,6 +109,13 @@ func WithExcludeTables(tables ...string) Option {
 func WithIncludeTables(tables ...string) Option {
 	return func(o *Options) {
 		o.IncludeTables = tables
+	}
+}
+
+// WithAcceptHazards configures explicitly accepted critical hazard codes.
+func WithAcceptHazards(hazards ...plan.HazardCode) Option {
+	return func(o *Options) {
+		o.AcceptHazards = append(o.AcceptHazards, hazards...)
 	}
 }
 

@@ -155,7 +155,25 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX) (*schema.Schema, error) {
 			}
 		}
 
-		// 4. Query Indexes from sqlite_schema
+		// 4. Query Indexes using PRAGMA index_list for structural uniqueness
+		uniqueMap := make(map[string]bool)
+		idxListRows, err := dbtx.QueryContext(ctx, fmt.Sprintf("PRAGMA index_list(%q);", tblName))
+		if err == nil {
+			for idxListRows.Next() {
+				var (
+					seq       int
+					name      string
+					uniqueVal int
+					origin    string
+					partial   int
+				)
+				if err := idxListRows.Scan(&seq, &name, &uniqueVal, &origin, &partial); err == nil {
+					uniqueMap[name] = (uniqueVal == 1)
+				}
+			}
+			_ = idxListRows.Close()
+		}
+
 		idxRows, err := dbtx.QueryContext(ctx, "SELECT name, sql FROM sqlite_schema WHERE type='index' AND sql IS NOT NULL AND tbl_name = $1 AND name NOT LIKE 'sqlite_%';", tblName)
 		if err != nil {
 			return nil, fmt.Errorf("sqlite: querying indexes for %q: %w", tblName, err)
@@ -167,11 +185,10 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX) (*schema.Schema, error) {
 				_ = idxRows.Close()
 				return nil, err
 			}
-			isUnique := strings.Contains(strings.ToUpper(indexSql), "CREATE UNIQUE INDEX")
 			tbl.Indexes[name] = &schema.Index{
 				Name:       name,
 				TableName:  tblName,
-				IsUnique:   isUnique,
+				IsUnique:   uniqueMap[name],
 				Definition: indexSql,
 			}
 		}

@@ -153,16 +153,18 @@ func TestSafety_Plan_Hazards(t *testing.T) {
 			},
 			{
 				// SQLite rebuild drop column path
-				Type:        ChangeDropColumn,
-				Table:       "users",
-				SQL:         `CREATE TABLE "_rebuild" (); INSERT INTO "_rebuild" SELECT id FROM users; DROP TABLE "users"; ALTER TABLE "_rebuild" RENAME TO "users";`,
-				Destructive: true,
+				Type:           ChangeDropColumn,
+				Table:          "users",
+				SQL:            `CREATE TABLE "_rebuild" (); INSERT INTO "_rebuild" SELECT id FROM users; DROP TABLE "users"; ALTER TABLE "_rebuild" RENAME TO "users";`,
+				Destructive:    true,
+				IsTableRebuild: true,
 			},
 			{
-				Type:        ChangeAlterColumn,
-				Table:       "orders",
-				SQL:         `ALTER TABLE "orders" ALTER COLUMN "amount" TYPE smallint;`,
-				Destructive: true,
+				Type:         ChangeAlterColumn,
+				Table:        "orders",
+				SQL:          `ALTER TABLE "orders" ALTER COLUMN "amount" TYPE smallint;`,
+				Destructive:  true,
+				TypeNarrowed: true,
 			},
 			{
 				Type:        ChangeAlterColumn,
@@ -215,10 +217,10 @@ func TestSafety_Plan_Hazards(t *testing.T) {
 	// 1. DROP TABLE -> CRITICAL
 	// 2. DROP COLUMN (Postgres) -> CRITICAL
 	// 3. DROP COLUMN (SQLite rebuild with DROP TABLE) -> CRITICAL (with rebuild description)
-	// 4. ALTER COLUMN (destructive) -> CRITICAL
+	// 4. ALTER COLUMN (destructive type narrowing) -> CRITICAL
 	// 5. ALTER COLUMN (safe) -> NOTICE
-	// 6. ADD COLUMN "tax" NOT NULL without DEFAULT -> WARNING
-	// 7. ADD COLUMN "default_status" NOT NULL without DEFAULT -> WARNING
+	// 6. ADD COLUMN "tax" NOT NULL without DEFAULT -> CRITICAL
+	// 7. ADD COLUMN "default_status" NOT NULL without DEFAULT -> CRITICAL
 	// (ADD COLUMN with DEFAULT 0 -> none)
 	// 8. CREATE INDEX -> NOTICE
 	// 9. DROP INDEX -> NOTICE
@@ -227,34 +229,34 @@ func TestSafety_Plan_Hazards(t *testing.T) {
 		t.Fatalf("expected 10 hazards, got %d: %+v", len(hazards), hazards)
 	}
 
-	if hazards[0].Level != HazardLevelCritical || hazards[0].Type != ChangeDropTable {
+	if hazards[0].Level != HazardLevelCritical || hazards[0].Type != ChangeDropTable || hazards[0].Code != HazardDropTable {
 		t.Errorf("expected hazard 0 to be CRITICAL DROP TABLE, got: %+v", hazards[0])
 	}
-	if hazards[1].Level != HazardLevelCritical || !strings.Contains(hazards[1].Description, "Column on table") {
+	if hazards[1].Level != HazardLevelCritical || !strings.Contains(hazards[1].Description, "Column on table") || hazards[1].Code != HazardDropColumn {
 		t.Errorf("expected hazard 1 to describe dropped column, got: %+v", hazards[1])
 	}
-	if hazards[2].Level != HazardLevelCritical || !strings.Contains(hazards[2].Description, "dropped and recreated") {
+	if hazards[2].Level != HazardLevelCritical || !strings.Contains(hazards[2].Description, "dropped and recreated") || hazards[2].Code != HazardDropColumn {
 		t.Errorf("expected hazard 2 to describe SQLite table rebuild, got: %+v", hazards[2])
 	}
-	if hazards[3].Level != HazardLevelCritical || hazards[3].Type != ChangeAlterColumn {
+	if hazards[3].Level != HazardLevelCritical || hazards[3].Type != ChangeAlterColumn || hazards[3].Code != HazardTypeNarrow {
 		t.Errorf("expected hazard 3 to be CRITICAL ALTER COLUMN, got: %+v", hazards[3])
 	}
 	if hazards[4].Level != HazardLevelNotice || hazards[4].Type != ChangeAlterColumn {
 		t.Errorf("expected hazard 4 to be NOTICE ALTER COLUMN, got: %+v", hazards[4])
 	}
-	if hazards[5].Level != HazardLevelWarning || hazards[5].Type != ChangeAddColumn {
-		t.Errorf("expected hazard 5 to be WARNING ADD COLUMN, got: %+v", hazards[5])
+	if hazards[5].Level != HazardLevelCritical || hazards[5].Type != ChangeAddColumn || hazards[5].Code != HazardNotNullNoDefault {
+		t.Errorf("expected hazard 5 to be CRITICAL ADD COLUMN, got: %+v", hazards[5])
 	}
-	if hazards[6].Level != HazardLevelWarning || hazards[6].Type != ChangeAddColumn {
-		t.Errorf("expected hazard 6 to be WARNING ADD COLUMN for default_status, got: %+v", hazards[6])
+	if hazards[6].Level != HazardLevelCritical || hazards[6].Type != ChangeAddColumn || hazards[6].Code != HazardNotNullNoDefault {
+		t.Errorf("expected hazard 6 to be CRITICAL ADD COLUMN for default_status, got: %+v", hazards[6])
 	}
-	if hazards[7].Level != HazardLevelNotice || hazards[7].Type != ChangeCreateIndex {
+	if hazards[7].Level != HazardLevelNotice || hazards[7].Type != ChangeCreateIndex || hazards[7].Code != HazardIndexBuild {
 		t.Errorf("expected hazard 7 to be NOTICE CREATE INDEX, got: %+v", hazards[7])
 	}
-	if hazards[8].Level != HazardLevelNotice || hazards[8].Type != ChangeDropIndex {
+	if hazards[8].Level != HazardLevelNotice || hazards[8].Type != ChangeDropIndex || hazards[8].Code != HazardDropIndex {
 		t.Errorf("expected hazard 8 to be NOTICE DROP INDEX, got: %+v", hazards[8])
 	}
-	if hazards[9].Level != HazardLevelNotice || hazards[9].Type != ChangeDropFK {
+	if hazards[9].Level != HazardLevelNotice || hazards[9].Type != ChangeDropFK || hazards[9].Code != HazardDropFK {
 		t.Errorf("expected hazard 9 to be NOTICE DROP FK, got: %+v", hazards[9])
 	}
 }
@@ -287,9 +289,6 @@ func TestSafety_Plan_Format_Hazards(t *testing.T) {
 	}
 	if !strings.Contains(out, "[CRITICAL]") {
 		t.Errorf("expected [CRITICAL] hazard badge, got: %s", out)
-	}
-	if !strings.Contains(out, "[WARNING]") {
-		t.Errorf("expected [WARNING] hazard badge, got: %s", out)
 	}
 
 	// Color format

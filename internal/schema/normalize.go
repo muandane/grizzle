@@ -2,7 +2,9 @@ package schema
 
 import (
 	"fmt"
+	"math"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -215,3 +217,121 @@ func NormalizeDefinition(def, shadowSchema, targetSchema string) string {
 
 	return strings.TrimSpace(res)
 }
+
+// IsTypeNarrowing determines whether converting from oldType to newType narrows the type or risks data loss.
+func IsTypeNarrowing(oldType, newType string) bool {
+	oldT := NormalizeType(oldType)
+	newT := NormalizeType(newType)
+	if oldT == newT {
+		return false
+	}
+
+	// 1. Integer rank
+	intRank := map[string]int{
+		"smallint": 1,
+		"integer":  2,
+		"bigint":   3,
+	}
+	oldInt, isOldInt := intRank[oldT]
+	newInt, isNewInt := intRank[newT]
+	if isOldInt && isNewInt {
+		return newInt < oldInt
+	}
+
+	// 2. Float rank
+	floatRank := map[string]int{
+		"real":             1,
+		"double precision": 2,
+	}
+	oldFloat, isOldFloat := floatRank[oldT]
+	newFloat, isNewFloat := floatRank[newT]
+	if isOldFloat && isNewFloat {
+		return newFloat < oldFloat
+	}
+
+	// Integer -> Float/Double is widening (safe)
+	if isOldInt && isNewFloat {
+		return false
+	}
+	// Float -> Integer is narrowing
+	if isOldFloat && isNewInt {
+		return true
+	}
+
+	// 3. String types (varchar, char, text)
+	parseStr := func(t string) (base string, length int, isStr bool) {
+		t = strings.ToLower(strings.TrimSpace(t))
+		if t == "text" {
+			return "text", math.MaxInt, true
+		}
+		if t == "varchar" {
+			return "varchar", math.MaxInt, true
+		}
+		if after, ok := strings.CutPrefix(t, "varchar("); ok {
+			if numStr, _, ok := strings.Cut(after, ")"); ok {
+				if n, err := strconv.Atoi(strings.TrimSpace(numStr)); err == nil {
+					return "varchar", n, true
+				}
+			}
+		}
+		if after, ok := strings.CutPrefix(t, "char("); ok {
+			if numStr, _, ok := strings.Cut(after, ")"); ok {
+				if n, err := strconv.Atoi(strings.TrimSpace(numStr)); err == nil {
+					return "char", n, true
+				}
+			}
+		}
+		return "", 0, false
+	}
+
+	_, oldLen, isOldStr := parseStr(oldT)
+	_, newLen, isNewStr := parseStr(newT)
+	if isOldStr && isNewStr {
+		return newLen < oldLen
+	}
+
+	// Any scalar -> string/text is widening (safe)
+	if (isOldInt || isOldFloat) && isNewStr {
+		return false
+	}
+
+	// 4. Numeric / Decimal
+	parseNumeric := func(t string) (prec, scale int, isNum bool) {
+		t = strings.ToLower(strings.TrimSpace(t))
+		if t == "numeric" {
+			return math.MaxInt, math.MaxInt, true
+		}
+		if after, ok := strings.CutPrefix(t, "numeric("); ok {
+			if args, _, ok := strings.Cut(after, ")"); ok {
+				parts := strings.Split(args, ",")
+				if len(parts) == 1 {
+					if p, err := strconv.Atoi(strings.TrimSpace(parts[0])); err == nil {
+						return p, 0, true
+					}
+				} else if len(parts) == 2 {
+					p, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
+					s, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
+					if err1 == nil && err2 == nil {
+						return p, s, true
+					}
+				}
+			}
+		}
+		return 0, 0, false
+	}
+
+	oldP, oldS, isOldNum := parseNumeric(oldT)
+	newP, newS, isNewNum := parseNumeric(newT)
+	if isOldNum && isNewNum {
+		return newP < oldP || newS < oldS
+	}
+
+	// Integer -> Numeric is widening (safe)
+	if isOldInt && isNewNum {
+		return false
+	}
+
+	// Default fallback: any other non-identical type transition carries risk/narrowing
+	return true
+}
+

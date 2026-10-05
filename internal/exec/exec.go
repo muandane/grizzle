@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
@@ -17,14 +18,15 @@ import (
 
 // PostgresExecConfig specifies the execution options for PostgreSQL synchronization.
 type PostgresExecConfig struct {
-	TargetSchema string
-	ShadowSchema string
-	SchemaSQL    string
-	LockID       int64
-	Filters      scope.Filters
-	Policy       plan.DropPolicy
-	Logger       *slog.Logger
-	DryRun       bool
+	TargetSchema  string
+	ShadowSchema  string
+	SchemaSQL     string
+	LockID        int64
+	Filters       scope.Filters
+	Policy        plan.DropPolicy
+	AcceptHazards []plan.HazardCode
+	Logger        *slog.Logger
+	DryRun        bool
 }
 
 // DiffPostgres computes the diff and renders the sequenced migration steps for PostgreSQL.
@@ -105,7 +107,7 @@ func SyncPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) error
 		logger.InfoContext(ctx, "grizzle: computed migration plan", "steps_count", len(steps))
 	}
 
-	// 5. Enforce safety policy
+	// 5. Enforce safety policy (policy check hard-blocks drops regardless of AcceptHazards)
 	var violations []plan.Step
 	for _, s := range steps {
 		if !cfg.Policy.IsAllowed(s) {
@@ -117,6 +119,19 @@ func SyncPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) error
 			logger.WarnContext(ctx, "grizzle: migration blocked by safety policy", "violations_count", len(violations))
 		}
 		return &plan.DestructiveViolationError{Violations: violations}
+	}
+
+	// 5b. Enforce hazard gating (fails on critical hazards unless explicitly accepted)
+	p := &plan.Plan{
+		TargetSchema: cfg.TargetSchema,
+		Steps:        steps,
+		Policy:       cfg.Policy,
+	}
+	if err := GateHazards(p, cfg.AcceptHazards); err != nil {
+		if logger != nil {
+			logger.WarnContext(ctx, "grizzle: migration blocked by unaccepted critical hazards", "error", err)
+		}
+		return err
 	}
 
 	if cfg.DryRun {
@@ -188,11 +203,12 @@ func PlanDiffPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 
 // SQLiteExecConfig specifies the execution options for SQLite synchronization.
 type SQLiteExecConfig struct {
-	SchemaSQL string
-	Filters   scope.Filters
-	Policy    plan.DropPolicy
-	Logger    *slog.Logger
-	DryRun    bool
+	SchemaSQL     string
+	Filters       scope.Filters
+	Policy        plan.DropPolicy
+	AcceptHazards []plan.HazardCode
+	Logger        *slog.Logger
+	DryRun        bool
 }
 
 // SyncSQLite synchronizes SQLite in a single transaction with foreign keys handling.
@@ -232,7 +248,7 @@ func SyncSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) error {
 		logger.InfoContext(ctx, "sqlite: computed migration plan", "steps_count", len(steps))
 	}
 
-	// 4. Enforce safety policy
+	// 4. Enforce safety policy (policy check hard-blocks drops regardless of AcceptHazards)
 	var violations []plan.Step
 	for _, s := range steps {
 		if !cfg.Policy.IsAllowed(s) {
@@ -244,6 +260,19 @@ func SyncSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) error {
 			logger.WarnContext(ctx, "sqlite: migration blocked by safety policy", "violations_count", len(violations))
 		}
 		return &plan.DestructiveViolationError{Violations: violations}
+	}
+
+	// 4b. Enforce hazard gating (fails on critical hazards unless explicitly accepted)
+	p := &plan.Plan{
+		TargetSchema: "main",
+		Steps:        steps,
+		Policy:       cfg.Policy,
+	}
+	if err := GateHazards(p, cfg.AcceptHazards); err != nil {
+		if logger != nil {
+			logger.WarnContext(ctx, "sqlite: migration blocked by unaccepted critical hazards", "error", err)
+		}
+		return err
 	}
 
 	if cfg.DryRun {
@@ -316,3 +345,20 @@ func PlanDiffSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) (*pla
 		Policy:       cfg.Policy,
 	}, nil
 }
+
+// GateHazards checks whether any critical hazards in the plan are not accepted.
+func GateHazards(p *plan.Plan, accept []plan.HazardCode) error {
+	var unaccepted []plan.Hazard
+	for _, h := range p.Hazards() {
+		if h.Level == plan.HazardLevelCritical {
+			if !slices.Contains(accept, h.Code) {
+				unaccepted = append(unaccepted, h)
+			}
+		}
+	}
+	if len(unaccepted) > 0 {
+		return &plan.HazardError{Hazards: unaccepted}
+	}
+	return nil
+}
+

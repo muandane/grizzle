@@ -27,7 +27,31 @@ var (
 
 	// ErrUnsupportedDialect is returned when an unrecognized database driver or dialect is provided.
 	ErrUnsupportedDialect = errors.New("grizzle: unsupported database dialect")
+
+	// ErrHazardBlocked is returned when a migration plan contains critical hazards not explicitly accepted in AcceptHazards.
+	ErrHazardBlocked = errors.New("grizzle: critical hazard rejected (unaccepted hazard)")
 )
+
+// HazardError reports all critical hazards that were not explicitly accepted.
+type HazardError struct {
+	Hazards []Hazard
+}
+
+func (e *HazardError) Error() string {
+	var codes []string
+	for _, h := range e.Hazards {
+		codes = append(codes, string(h.Code))
+	}
+	return fmt.Sprintf("grizzle: blocked by unaccepted critical hazard(s) [%s]", strings.Join(codes, ", "))
+}
+
+func (e *HazardError) Is(target error) bool {
+	return target == ErrHazardBlocked
+}
+
+func (e *HazardError) Unwrap() error {
+	return ErrHazardBlocked
+}
 
 // DestructiveViolationError reports all destructive steps that were rejected by the active safety policy.
 type DestructiveViolationError struct {
@@ -48,3 +72,4 @@ func (e *DestructiveViolationError) Error() string {
 func (e *DestructiveViolationError) Is(target error) bool {
 	return target == ErrDestructiveBlocked
 }
+

@@ -23,6 +23,7 @@ type (
 	ChangeType  = plan.ChangeType
 	DropPolicy  = plan.DropPolicy
 	HazardLevel = plan.HazardLevel
+	HazardCode  = plan.HazardCode
 	Hazard      = plan.Hazard
 
 	SchemaIR     = schema.Schema
@@ -47,6 +48,17 @@ const (
 	ChangeDropIndex   = plan.ChangeDropIndex
 	ChangeAddFK       = plan.ChangeAddFK
 	ChangeDropFK      = plan.ChangeDropFK
+)
+
+// HazardCode constants
+const (
+	HazardDropTable        = plan.HazardDropTable
+	HazardDropColumn       = plan.HazardDropColumn
+	HazardTypeNarrow       = plan.HazardTypeNarrow
+	HazardNotNullNoDefault = plan.HazardNotNullNoDefault
+	HazardIndexBuild       = plan.HazardIndexBuild
+	HazardDropIndex        = plan.HazardDropIndex
+	HazardDropFK           = plan.HazardDropFK
 )
 
 // HazardLevel constants
@@ -135,23 +147,25 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error {
 
 	if opts.Dialect == DialectSQLite {
 		return exec.SyncSQLite(ctx, db, exec.SQLiteExecConfig{
-			SchemaSQL: opts.SchemaSQL,
-			Filters:   filters,
-			Policy:    policy,
-			Logger:    opts.Logger,
-			DryRun:    opts.DryRun,
+			SchemaSQL:     opts.SchemaSQL,
+			Filters:       filters,
+			Policy:        policy,
+			AcceptHazards: opts.AcceptHazards,
+			Logger:        opts.Logger,
+			DryRun:        opts.DryRun,
 		})
 	}
 
 	return exec.SyncPostgres(ctx, db, exec.PostgresExecConfig{
-		TargetSchema: opts.TargetSchema,
-		ShadowSchema: opts.ShadowSchema,
-		SchemaSQL:    opts.SchemaSQL,
-		LockID:       opts.LockID,
-		Filters:      filters,
-		Policy:       policy,
-		Logger:       opts.Logger,
-		DryRun:       opts.DryRun,
+		TargetSchema:  opts.TargetSchema,
+		ShadowSchema:  opts.ShadowSchema,
+		SchemaSQL:     opts.SchemaSQL,
+		LockID:        opts.LockID,
+		Filters:       filters,
+		Policy:        policy,
+		AcceptHazards: opts.AcceptHazards,
+		Logger:        opts.Logger,
+		DryRun:        opts.DryRun,
 	})
 }
 

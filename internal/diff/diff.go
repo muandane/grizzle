@@ -29,6 +29,7 @@ type Change struct {
 
 	// Column change flags
 	TypeChanged    bool
+	TypeNarrowed   bool
 	NullChanged    bool
 	DefaultChanged bool
 }
@@ -121,13 +122,15 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 				defChanged := dCol.DefaultValue != lCol.DefaultValue
 
 				if typeChanged || nullChanged || defChanged {
-					destructive := typeChanged || (!dCol.IsNullable && lCol.IsNullable)
+					typeNarrowed := typeChanged && schema.IsTypeNarrowing(lCol.DataType, dCol.DataType)
+					destructive := typeNarrowed || (!dCol.IsNullable && lCol.IsNullable)
 					changes = append(changes, Change{
 						Type:             plan.ChangeAlterColumn,
 						Table:            tblName,
 						Column:           dCol,
 						OldColumn:        lCol,
 						TypeChanged:      typeChanged,
+						TypeNarrowed:     typeNarrowed,
 						NullChanged:      nullChanged,
 						DefaultChanged:   defChanged,
 						Destructive:      destructive,

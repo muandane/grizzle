@@ -2,7 +2,6 @@ package plan
 
 import (
 	"fmt"
-	"strings"
 )
 
 // ChangeType describes the category of a schema mutation.
@@ -32,6 +31,8 @@ type Step struct {
 	// Structural column metadata for precise hazard analysis
 	ColumnNotNull    bool `json:"column_not_null,omitzero"`
 	ColumnHasDefault bool `json:"column_has_default,omitzero"`
+	TypeNarrowed     bool `json:"type_narrowed,omitzero"`
+	IsTableRebuild   bool `json:"is_table_rebuild,omitzero"`
 }
 
 // DropPolicy defines fine-grained permissions for destructive operations.
@@ -132,13 +133,33 @@ func (p *Plan) Summary() (adds, alters, drops, blocked int) {
 	return p.Additions(), p.Modifications(), p.Deletions(), p.Blocked()
 }
 
+// HazardCode represents a stable, machine-readable identifier for a migration hazard.
+type HazardCode string
+
+const (
+	// HazardDropTable indicates a table drop resulting in complete data loss.
+	HazardDropTable HazardCode = "DROP_TABLE"
+	// HazardDropColumn indicates a column drop resulting in data loss for row values.
+	HazardDropColumn HazardCode = "DROP_COLUMN"
+	// HazardTypeNarrow indicates a column type change that narrows capacity or causes data loss/truncation.
+	HazardTypeNarrow HazardCode = "TYPE_NARROW"
+	// HazardNotNullNoDefault indicates adding a NOT NULL column without a default to an existing table.
+	HazardNotNullNoDefault HazardCode = "NOT_NULL_NO_DEFAULT"
+	// HazardIndexBuild indicates index creation table locking or execution load.
+	HazardIndexBuild HazardCode = "INDEX_BUILD"
+	// HazardDropIndex indicates query performance degradation risk from dropping an index.
+	HazardDropIndex HazardCode = "DROP_INDEX"
+	// HazardDropFK indicates removing referential integrity enforcement.
+	HazardDropFK HazardCode = "DROP_FK"
+)
+
 // HazardLevel indicates the operational or data-loss severity of a migration step.
 type HazardLevel string
 
 const (
-	// HazardLevelCritical indicates potential data loss (e.g. DROP TABLE, DROP COLUMN).
+	// HazardLevelCritical indicates potential data loss or immediate runtime failure (e.g. DROP TABLE, DROP COLUMN, TYPE_NARROW, NOT_NULL_NO_DEFAULT).
 	HazardLevelCritical HazardLevel = "CRITICAL"
-	// HazardLevelWarning indicates execution risk (e.g. NOT NULL without DEFAULT on existing table).
+	// HazardLevelWarning indicates operational execution risk.
 	HazardLevelWarning HazardLevel = "WARNING"
 	// HazardLevelNotice indicates table locking or performance implications (e.g. index build).
 	HazardLevelNotice HazardLevel = "NOTICE"
@@ -146,6 +167,7 @@ const (
 
 // Hazard describes an operational risk detected in a planned migration step.
 type Hazard struct {
+	Code        HazardCode  `json:"code"`
 	Level       HazardLevel `json:"level"`
 	Type        ChangeType  `json:"type"`
 	Table       string      `json:"table"`
@@ -160,6 +182,7 @@ func (p *Plan) Hazards() []Hazard {
 		switch s.Type {
 		case ChangeDropTable:
 			hazards = append(hazards, Hazard{
+				Code:        HazardDropTable,
 				Level:       HazardLevelCritical,
 				Type:        s.Type,
 				Table:       s.Table,
@@ -168,11 +191,12 @@ func (p *Plan) Hazards() []Hazard {
 			})
 		case ChangeDropColumn:
 			desc := fmt.Sprintf("Column on table %q will be dropped with all existing row values", s.Table)
-			if strings.Contains(strings.ToUpper(s.SQL), "DROP TABLE") {
+			if s.IsTableRebuild {
 				// SQLite rebuild path: whole table is dropped and recreated.
 				desc = fmt.Sprintf("Table %q will be dropped and recreated; only matching columns are copied back", s.Table)
 			}
 			hazards = append(hazards, Hazard{
+				Code:        HazardDropColumn,
 				Level:       HazardLevelCritical,
 				Type:        s.Type,
 				Table:       s.Table,
@@ -180,30 +204,30 @@ func (p *Plan) Hazards() []Hazard {
 				SQL:         s.SQL,
 			})
 		case ChangeAlterColumn:
-			level := HazardLevelNotice
-			desc := fmt.Sprintf("Column on table %q will be modified", s.Table)
-			if s.Destructive {
-				level = HazardLevelCritical
-				desc = fmt.Sprintf("Column on table %q has a destructive type change that may cause data loss or truncation", s.Table)
-			}
-			hazards = append(hazards, Hazard{
-				Level:       level,
-				Type:        s.Type,
-				Table:       s.Table,
-				Description: desc,
-				SQL:         s.SQL,
-			})
-		case ChangeAddColumn:
-			hasWarning := s.ColumnNotNull && !s.ColumnHasDefault
-			if !hasWarning && !s.ColumnNotNull && !s.ColumnHasDefault {
-				upperSQL := strings.ToUpper(s.SQL)
-				if strings.Contains(upperSQL, "NOT NULL") && !strings.Contains(upperSQL, "DEFAULT") {
-					hasWarning = true
-				}
-			}
-			if hasWarning {
+			if s.TypeNarrowed {
 				hazards = append(hazards, Hazard{
-					Level:       HazardLevelWarning,
+					Code:        HazardTypeNarrow,
+					Level:       HazardLevelCritical,
+					Type:        s.Type,
+					Table:       s.Table,
+					Description: fmt.Sprintf("Column on table %q has a destructive type change that may cause data loss or truncation", s.Table),
+					SQL:         s.SQL,
+				})
+			} else {
+				hazards = append(hazards, Hazard{
+					Code:        "ALTER_COLUMN",
+					Level:       HazardLevelNotice,
+					Type:        s.Type,
+					Table:       s.Table,
+					Description: fmt.Sprintf("Column on table %q will be modified", s.Table),
+					SQL:         s.SQL,
+				})
+			}
+		case ChangeAddColumn:
+			if s.ColumnNotNull && !s.ColumnHasDefault {
+				hazards = append(hazards, Hazard{
+					Code:        HazardNotNullNoDefault,
+					Level:       HazardLevelCritical,
 					Type:        s.Type,
 					Table:       s.Table,
 					Description: fmt.Sprintf("Adding NOT NULL column without DEFAULT to existing table %q will fail if the table contains rows", s.Table),
@@ -212,6 +236,7 @@ func (p *Plan) Hazards() []Hazard {
 			}
 		case ChangeCreateIndex:
 			hazards = append(hazards, Hazard{
+				Code:        HazardIndexBuild,
 				Level:       HazardLevelNotice,
 				Type:        s.Type,
 				Table:       s.Table,
@@ -220,6 +245,7 @@ func (p *Plan) Hazards() []Hazard {
 			})
 		case ChangeDropIndex:
 			hazards = append(hazards, Hazard{
+				Code:        HazardDropIndex,
 				Level:       HazardLevelNotice,
 				Type:        s.Type,
 				Table:       s.Table,
@@ -228,6 +254,7 @@ func (p *Plan) Hazards() []Hazard {
 			})
 		case ChangeDropFK:
 			hazards = append(hazards, Hazard{
+				Code:        HazardDropFK,
 				Level:       HazardLevelNotice,
 				Type:        s.Type,
 				Table:       s.Table,
@@ -238,3 +265,4 @@ func (p *Plan) Hazards() []Hazard {
 	}
 	return hazards
 }
+

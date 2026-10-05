@@ -104,3 +104,67 @@ func TestNormalizeDefinition(t *testing.T) {
 		t.Errorf("predicate with literal 'ON public.flag' was mutated:\ngot:  %q\nwant: %q", normPred, expectedPred)
 	}
 }
+
+func TestIsTypeNarrowing(t *testing.T) {
+	tests := []struct {
+		oldType  string
+		newType  string
+		expected bool
+	}{
+		// Identical
+		{"bigint", "bigint", false},
+		{"integer", "int4", false},
+		{"varchar(255)", "character varying(255)", false},
+
+		// Integers
+		{"bigint", "integer", true},
+		{"bigint", "smallint", true},
+		{"integer", "smallint", true},
+		{"integer", "bigint", false},
+		{"smallint", "integer", false},
+		{"smallint", "bigint", false},
+
+		// Floats
+		{"double precision", "real", true},
+		{"real", "double precision", false},
+
+		// Integers & Floats
+		{"integer", "double precision", false},
+		{"real", "integer", true},
+
+		// Strings
+		{"text", "varchar(255)", true},
+		{"varchar(255)", "text", false},
+		{"varchar(100)", "varchar(50)", true},
+		{"varchar(50)", "varchar(100)", false},
+		{"varchar", "varchar(100)", true},
+		{"varchar(100)", "varchar", false},
+		{"char(50)", "char(20)", true},
+		{"char(20)", "char(50)", false},
+
+		// Scalar -> String (safe)
+		{"integer", "text", false},
+		{"bigint", "varchar(255)", false},
+
+		// Numerics
+		{"numeric(10,2)", "numeric(8,2)", true},
+		{"numeric(10,2)", "numeric(10,1)", true},
+		{"numeric(8,2)", "numeric(10,2)", false},
+		{"numeric", "numeric(10,2)", true},
+		{"numeric(10,2)", "numeric", false},
+		{"integer", "numeric", false},
+
+		// Incompatible / cross-domain (narrowing/risky)
+		{"text", "integer", true},
+		{"timestamp", "date", true},
+		{"boolean", "integer", true},
+	}
+
+	for _, tt := range tests {
+		got := schema.IsTypeNarrowing(tt.oldType, tt.newType)
+		if got != tt.expected {
+			t.Errorf("IsTypeNarrowing(%q, %q) = %v, expected %v", tt.oldType, tt.newType, got, tt.expected)
+		}
+	}
+}
+

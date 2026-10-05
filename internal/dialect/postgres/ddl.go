@@ -160,6 +160,7 @@ func RenderChange(targetSchema string, c diff.Change) plan.Step {
 		Destructive:      c.Destructive,
 		ColumnNotNull:    c.ColumnNotNull,
 		ColumnHasDefault: c.ColumnHasDefault,
+		TypeNarrowed:     c.TypeNarrowed,
 	}
 
 	switch c.Type {

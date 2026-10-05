@@ -127,6 +127,7 @@ func Diff(live, desired *schema.Schema, filters scope.Filters) []plan.Step {
 		// Existing table: Check if rebuild is necessary
 		needsRebuild := false
 		isDestructive := false
+		typeNarrowed := false
 
 		for colName := range lTable.Columns {
 			if _, inDesired := dTable.Columns[colName]; !inDesired {
@@ -142,7 +143,10 @@ func Diff(live, desired *schema.Schema, filters scope.Filters) []plan.Step {
 				if inLive {
 					if dCol.DataType != lCol.DataType || dCol.IsNullable != lCol.IsNullable || dCol.DefaultValue != lCol.DefaultValue {
 						needsRebuild = true
-						if dCol.DataType != lCol.DataType || (!dCol.IsNullable && lCol.IsNullable) {
+						if schema.IsTypeNarrowing(lCol.DataType, dCol.DataType) {
+							typeNarrowed = true
+							isDestructive = true
+						} else if !dCol.IsNullable && lCol.IsNullable {
 							isDestructive = true
 						}
 						break
@@ -158,10 +162,12 @@ func Diff(live, desired *schema.Schema, filters scope.Filters) []plan.Step {
 				changeType = plan.ChangeDropColumn
 			}
 			steps = append(steps, plan.Step{
-				Type:        changeType,
-				Table:       tblName,
-				SQL:         rebuildSQL,
-				Destructive: isDestructive || destructive,
+				Type:           changeType,
+				Table:          tblName,
+				SQL:            rebuildSQL,
+				Destructive:    isDestructive || destructive,
+				TypeNarrowed:   typeNarrowed,
+				IsTableRebuild: true,
 			})
 
 			for _, idx := range dTable.Indexes {

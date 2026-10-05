@@ -172,11 +172,12 @@ func TestSQLite_EndToEnd(t *testing.T) {
 		t.Fatalf("expected DestructiveViolationError, got: %T: %v", err, err)
 	}
 
-	// With AllowDropColumn: true, 12-step rebuild succeeds and preserves rows!
+	// With AllowDropColumn: true and AcceptHazards, 12-step rebuild succeeds and preserves rows!
 	err = grizzle.Sync(ctx, db, grizzle.Options{
 		Dialect:         grizzle.DialectSQLite,
 		SchemaSQL:       schemaV3,
 		AllowDropColumn: new(true),
+		AcceptHazards:   []grizzle.HazardCode{grizzle.HazardDropColumn},
 	})
 	if err != nil {
 		t.Fatalf("Sync V3 rebuild failed: %v", err)
@@ -250,11 +251,12 @@ func TestSQLite_FineGrainedSafetyPolicy(t *testing.T) {
 		t.Fatal("expected error dropping table with AllowDrop=false")
 	}
 
-	// 2. Allowed when AllowDropTable = true
+	// 2. Allowed when AllowDropTable = true and AcceptHazards has HazardDropTable
 	err = grizzle.Sync(ctx, db, grizzle.Options{
 		SchemaSQL:      v2,
 		AllowDrop:      false,
 		AllowDropTable: new(true),
+		AcceptHazards:  []grizzle.HazardCode{grizzle.HazardDropTable},
 	})
 	if err != nil {
 		t.Fatalf("expected success with AllowDropTable=true, got: %v", err)

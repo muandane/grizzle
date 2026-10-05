@@ -53,11 +53,11 @@ func TestPlan_Hazards(t *testing.T) {
 	if len(hazards) != 2 {
 		t.Fatalf("expected 2 hazards, got %d", len(hazards))
 	}
-	if hazards[0].Level != plan.HazardLevelCritical {
-		t.Errorf("expected CRITICAL for DROP TABLE, got %s", hazards[0].Level)
+	if hazards[0].Level != plan.HazardLevelCritical || hazards[0].Code != plan.HazardDropTable {
+		t.Errorf("expected CRITICAL DROP_TABLE, got %s / %s", hazards[0].Level, hazards[0].Code)
 	}
-	if hazards[1].Level != plan.HazardLevelWarning {
-		t.Errorf("expected WARNING for NOT NULL ADD COLUMN, got %s", hazards[1].Level)
+	if hazards[1].Level != plan.HazardLevelCritical || hazards[1].Code != plan.HazardNotNullNoDefault {
+		t.Errorf("expected CRITICAL NOT_NULL_NO_DEFAULT, got %s / %s", hazards[1].Level, hazards[1].Code)
 	}
 }
 

@@ -24,7 +24,14 @@ var (
 
 	// ErrUnsupportedDialect is returned when an unrecognized database driver or dialect is provided.
 	ErrUnsupportedDialect = plan.ErrUnsupportedDialect
+
+	// ErrHazardBlocked is returned when a migration plan contains critical hazards not explicitly accepted in AcceptHazards.
+	ErrHazardBlocked = plan.ErrHazardBlocked
 )
+
+// HazardError reports all critical hazards that were not explicitly accepted.
+type HazardError = plan.HazardError
 
 // DestructiveViolationError reports all destructive steps that were rejected by the active safety policy.
 type DestructiveViolationError = plan.DestructiveViolationError
+

@@ -143,10 +143,11 @@ func TestSync_EndToEnd(t *testing.T) {
 		t.Fatalf("data loss occurred after rejected destructive change: %v", err)
 	}
 
-	// 5. Destructive Drop with AllowDrop=true
+	// 5. Destructive Drop with AllowDrop=true and AcceptHazards
 	err = grizzle.Sync(ctx, db, grizzle.Options{
-		SchemaSQL: schemaV3MissingColumn,
-		AllowDrop: true, // Explicitly allowed
+		SchemaSQL:     schemaV3MissingColumn,
+		AllowDrop:     true, // Explicitly allowed
+		AcceptHazards: []grizzle.HazardCode{grizzle.HazardDropColumn},
 	})
 	if err != nil {
 		t.Fatalf("Sync with AllowDrop=true failed: %v", err)
