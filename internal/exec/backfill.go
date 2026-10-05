@@ -7,7 +7,7 @@ import (
 	"log/slog"
 	"strings"
 
-	"github.com/yourorg/grizzle/internal/plan"
+	"github.com/muandane/grizzle/internal/plan"
 )
 
 // BackfillFunc defines the hook function signature for batch backfilling columns outside the DDL lock window.

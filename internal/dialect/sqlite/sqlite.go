@@ -3,9 +3,9 @@ package sqlite
 import (
 	"context"
 
-	"github.com/yourorg/grizzle/internal/dialect"
-	"github.com/yourorg/grizzle/internal/plan"
-	"github.com/yourorg/grizzle/internal/schema"
+	"github.com/muandane/grizzle/internal/dialect"
+	"github.com/muandane/grizzle/internal/plan"
+	"github.com/muandane/grizzle/internal/schema"
 )
 
 // SQLite implements the dialect.Dialect interface for SQLite.

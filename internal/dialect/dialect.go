@@ -4,8 +4,8 @@ import (
 	"context"
 	"database/sql"
 
-	"github.com/yourorg/grizzle/internal/plan"
-	"github.com/yourorg/grizzle/internal/schema"
+	"github.com/muandane/grizzle/internal/plan"
+	"github.com/muandane/grizzle/internal/schema"
 )
 
 // DBTX specifies the common SQL executor interface satisfied by *sql.DB, *sql.Tx, and *sql.Conn.

@@ -9,8 +9,8 @@ import (
 	"os/user"
 	"time"
 
-	"github.com/yourorg/grizzle/internal/dialect"
-	"github.com/yourorg/grizzle/internal/plan"
+	"github.com/muandane/grizzle/internal/dialect"
+	"github.com/muandane/grizzle/internal/plan"
 )
 
 // Record tracks an applied migration plan.

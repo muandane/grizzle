@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/yourorg/grizzle"
+	"github.com/muandane/grizzle"
 )
 
 func BenchmarkSync_WarmBoot_PostgreSQL(b *testing.B) {

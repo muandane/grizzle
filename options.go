@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yourorg/grizzle/internal/plan"
-	"github.com/yourorg/grizzle/internal/scope"
+	"github.com/muandane/grizzle/internal/plan"
+	"github.com/muandane/grizzle/internal/scope"
 )
 
 // Dialect specifies the target SQL database dialect.

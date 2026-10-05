@@ -8,8 +8,8 @@ import (
 
 	_ "modernc.org/sqlite"
 
-	"github.com/yourorg/grizzle/internal/history"
-	"github.com/yourorg/grizzle/internal/plan"
+	"github.com/muandane/grizzle/internal/history"
+	"github.com/muandane/grizzle/internal/plan"
 )
 
 func TestHistory_SQLiteReadWrite(t *testing.T) {

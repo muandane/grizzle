@@ -7,13 +7,13 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/yourorg/grizzle/internal/dialect/postgres"
-	"github.com/yourorg/grizzle/internal/dialect/sqlite"
-	"github.com/yourorg/grizzle/internal/diff"
-	"github.com/yourorg/grizzle/internal/exec"
-	"github.com/yourorg/grizzle/internal/plan"
-	"github.com/yourorg/grizzle/internal/schema"
-	"github.com/yourorg/grizzle/internal/scope"
+	"github.com/muandane/grizzle/internal/dialect/postgres"
+	"github.com/muandane/grizzle/internal/dialect/sqlite"
+	"github.com/muandane/grizzle/internal/diff"
+	"github.com/muandane/grizzle/internal/exec"
+	"github.com/muandane/grizzle/internal/plan"
+	"github.com/muandane/grizzle/internal/schema"
+	"github.com/muandane/grizzle/internal/scope"
 )
 
 // Public type aliases

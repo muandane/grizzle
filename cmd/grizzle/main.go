@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/yourorg/grizzle"
+	"github.com/muandane/grizzle"
 )
 
 func main() {

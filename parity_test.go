@@ -10,7 +10,7 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
-	"github.com/yourorg/grizzle"
+	"github.com/muandane/grizzle"
 	_ "modernc.org/sqlite"
 )
 

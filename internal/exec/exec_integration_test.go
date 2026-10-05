@@ -14,11 +14,11 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
-	"github.com/yourorg/grizzle/internal/dialect/postgres"
-	"github.com/yourorg/grizzle/internal/exec"
-	"github.com/yourorg/grizzle/internal/history"
-	"github.com/yourorg/grizzle/internal/plan"
-	"github.com/yourorg/grizzle/internal/scope"
+	"github.com/muandane/grizzle/internal/dialect/postgres"
+	"github.com/muandane/grizzle/internal/exec"
+	"github.com/muandane/grizzle/internal/history"
+	"github.com/muandane/grizzle/internal/plan"
+	"github.com/muandane/grizzle/internal/scope"
 )
 
 func getIntegrationDB(t *testing.T) *sql.DB {
@@ -40,9 +40,10 @@ func getIntegrationDB(t *testing.T) *sql.DB {
 	defer cancel()
 
 	if err := db.PingContext(ctx); err != nil {
-		t.Skipf("skipping integration test; PostgreSQL not available at %s: %v", dsn, err)
+		t.Fatalf("integration test failed: PostgreSQL/Docker is unavailable at %s: %v (no silent skip allowed under the integration tag)", dsn, err)
 	}
 
+	t.Logf("CI: running integration test %s against PostgreSQL at %s", t.Name(), dsn)
 	return db
 }
 

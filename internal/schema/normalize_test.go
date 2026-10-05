@@ -3,7 +3,7 @@ package schema_test
 import (
 	"testing"
 
-	"github.com/yourorg/grizzle/internal/schema"
+	"github.com/muandane/grizzle/internal/schema"
 )
 
 func TestNormalizeType(t *testing.T) {

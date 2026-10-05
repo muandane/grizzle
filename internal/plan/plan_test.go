@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/yourorg/grizzle/internal/plan"
+	"github.com/muandane/grizzle/internal/plan"
 )
 
 func TestPlan_Summary(t *testing.T) {

@@ -7,10 +7,10 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/yourorg/grizzle/internal/dialect"
-	"github.com/yourorg/grizzle/internal/plan"
-	"github.com/yourorg/grizzle/internal/schema"
-	"github.com/yourorg/grizzle/internal/scope"
+	"github.com/muandane/grizzle/internal/dialect"
+	"github.com/muandane/grizzle/internal/plan"
+	"github.com/muandane/grizzle/internal/schema"
+	"github.com/muandane/grizzle/internal/scope"
 )
 
 // GenerateSQLiteCreateTable constructs a standard SQLite CREATE TABLE statement.
@@ -97,7 +97,10 @@ func Diff(live, desired *schema.Schema, filters scope.Filters) []plan.Step {
 	var steps []plan.Step
 
 	// 1. Tables
-	for tblName, dTable := range desired.Tables {
+	tableNames := slices.Collect(maps.Keys(desired.Tables))
+	slices.Sort(tableNames)
+	for _, tblName := range tableNames {
+		dTable := desired.Tables[tblName]
 		if !scope.IsTableManaged(tblName, filters) {
 			continue
 		}
@@ -337,7 +340,9 @@ func Diff(live, desired *schema.Schema, filters scope.Filters) []plan.Step {
 	}
 
 	// 2. Dropped tables
-	for tblName := range live.Tables {
+	liveTableNames := slices.Collect(maps.Keys(live.Tables))
+	slices.Sort(liveTableNames)
+	for _, tblName := range liveTableNames {
 		if !scope.IsTableManaged(tblName, filters) {
 			continue
 		}

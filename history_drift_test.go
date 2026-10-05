@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yourorg/grizzle"
-	"github.com/yourorg/grizzle/internal/history"
+	"github.com/muandane/grizzle"
+	"github.com/muandane/grizzle/internal/history"
 )
 
 func TestDrift_CheckDetectsDifferenceWithoutApplying(t *testing.T) {

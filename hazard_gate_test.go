@@ -6,9 +6,9 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/yourorg/grizzle"
-	"github.com/yourorg/grizzle/internal/exec"
-	"github.com/yourorg/grizzle/internal/plan"
+	"github.com/muandane/grizzle"
+	"github.com/muandane/grizzle/internal/exec"
+	"github.com/muandane/grizzle/internal/plan"
 	_ "modernc.org/sqlite"
 )
 

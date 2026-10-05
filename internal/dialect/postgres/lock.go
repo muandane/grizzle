@@ -7,8 +7,8 @@ import (
 	"hash/fnv"
 	"time"
 
-	"github.com/yourorg/grizzle/internal/dialect"
-	"github.com/yourorg/grizzle/internal/plan"
+	"github.com/muandane/grizzle/internal/dialect"
+	"github.com/muandane/grizzle/internal/plan"
 )
 
 // GenerateLockID produces a deterministic 64-bit integer hash from a schema identifier.

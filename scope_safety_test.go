@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yourorg/grizzle"
+	"github.com/muandane/grizzle"
 )
 
 func TestScopeSafety_StrictScopeRequiresIncludeTables(t *testing.T) {

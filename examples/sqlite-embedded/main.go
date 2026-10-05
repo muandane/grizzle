@@ -6,7 +6,7 @@ import (
 	_ "embed"
 	"log"
 
-	"github.com/yourorg/grizzle"
+	"github.com/muandane/grizzle"
 	_ "modernc.org/sqlite"
 )
 

@@ -33,7 +33,7 @@ func TestArchitecture_DependencyRules(t *testing.T) {
 	}
 
 	const (
-		modulePrefix = "github.com/yourorg/grizzle"
+		modulePrefix = "github.com/muandane/grizzle"
 		schemaPkg    = modulePrefix + "/internal/schema"
 		scopePkg     = modulePrefix + "/internal/scope"
 		planPkg      = modulePrefix + "/internal/plan"

@@ -7,7 +7,7 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/yourorg/grizzle"
+	"github.com/muandane/grizzle"
 	_ "modernc.org/sqlite"
 )
 

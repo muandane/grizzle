@@ -6,9 +6,9 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/yourorg/grizzle/internal/plan"
-	"github.com/yourorg/grizzle/internal/schema"
-	"github.com/yourorg/grizzle/internal/scope"
+	"github.com/muandane/grizzle/internal/plan"
+	"github.com/muandane/grizzle/internal/schema"
+	"github.com/muandane/grizzle/internal/scope"
 )
 
 // Change represents a pure difference between live and desired database schemas.

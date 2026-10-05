@@ -3,7 +3,7 @@ package scope_test
 import (
 	"testing"
 
-	"github.com/yourorg/grizzle/internal/scope"
+	"github.com/muandane/grizzle/internal/scope"
 )
 
 func TestIsTableManaged(t *testing.T) {

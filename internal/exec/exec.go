@@ -9,13 +9,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yourorg/grizzle/internal/dialect"
-	"github.com/yourorg/grizzle/internal/dialect/postgres"
-	"github.com/yourorg/grizzle/internal/dialect/sqlite"
-	"github.com/yourorg/grizzle/internal/diff"
-	"github.com/yourorg/grizzle/internal/history"
-	"github.com/yourorg/grizzle/internal/plan"
-	"github.com/yourorg/grizzle/internal/scope"
+	"github.com/muandane/grizzle/internal/dialect"
+	"github.com/muandane/grizzle/internal/dialect/postgres"
+	"github.com/muandane/grizzle/internal/dialect/sqlite"
+	"github.com/muandane/grizzle/internal/diff"
+	"github.com/muandane/grizzle/internal/history"
+	"github.com/muandane/grizzle/internal/plan"
+	"github.com/muandane/grizzle/internal/scope"
 )
 
 // PostgresExecConfig specifies the execution options for PostgreSQL synchronization.

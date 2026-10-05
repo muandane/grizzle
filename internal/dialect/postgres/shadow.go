@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"regexp"
 
-	"github.com/yourorg/grizzle/internal/dialect"
+	"github.com/muandane/grizzle/internal/dialect"
 )
 
 var validIdentRegex = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)

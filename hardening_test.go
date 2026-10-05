@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yourorg/grizzle"
+	"github.com/muandane/grizzle"
 )
 
 // TestHardening_MultiPodFuzzing simulates a Kubernetes deployment where 50 replicas boot

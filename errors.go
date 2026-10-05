@@ -1,6 +1,6 @@
 package grizzle
 
-import "github.com/yourorg/grizzle/internal/plan"
+import "github.com/muandane/grizzle/internal/plan"
 
 var (
 	// ErrEmptySchema is returned when the provided SchemaSQL string is empty or contains only whitespace.

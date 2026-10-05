@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/yourorg/grizzle/internal/exec"
-	"github.com/yourorg/grizzle/internal/plan"
+	"github.com/muandane/grizzle/internal/exec"
+	"github.com/muandane/grizzle/internal/plan"
 )
 
 type customSQLError struct {

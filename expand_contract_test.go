@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yourorg/grizzle"
+	"github.com/muandane/grizzle"
 )
 
 func TestExpandContract_AmbiguousRenameEmitsHazard(t *testing.T) {

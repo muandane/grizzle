@@ -9,7 +9,7 @@ This document outlines the step-by-step execution plan to build, test, and ship 
 **Objective**: Deliver a working in-process `Sync()` function for standard PostgreSQL tables and columns.
 
 - [x] **1.1 Project Scaffolding**
-  - Initialize `go.mod` (module `github.com/yourorg/grizzle`).
+  - Initialize `go.mod` (module `github.com/muandane/grizzle`).
   - Configure linting and CI templates (golangci-lint, GitHub Actions).
 - [x] **1.2 PostgreSQL Catalog Inspector**
   - Implement `inspectSchema()` using direct `pg_catalog` queries.

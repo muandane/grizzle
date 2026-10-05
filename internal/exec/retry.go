@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/yourorg/grizzle/internal/plan"
+	"github.com/muandane/grizzle/internal/plan"
 )
 
 type sqlStateCoder interface {

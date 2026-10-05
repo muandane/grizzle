@@ -1,4 +1,4 @@
-module github.com/yourorg/grizzle
+module github.com/muandane/grizzle
 
 go 1.27.1
 

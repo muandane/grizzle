@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 
-	"github.com/yourorg/grizzle/internal/schema"
+	"github.com/muandane/grizzle/internal/schema"
 	_ "modernc.org/sqlite"
 )
 

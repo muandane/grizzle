@@ -51,7 +51,7 @@ import (
 	"log"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
-	"github.com/yourorg/grizzle"
+	"github.com/muandane/grizzle"
 )
 
 //go:embed db/schema.sql

@@ -1,3 +1,5 @@
+//go:build integration
+
 package grizzle_test
 
 import (
@@ -9,14 +11,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yourorg/grizzle"
-	"github.com/yourorg/grizzle/internal/exec"
+	"github.com/muandane/grizzle"
+	"github.com/muandane/grizzle/internal/exec"
 )
 
 func TestTimeouts_ConflictingHolder_RetrySucceeds(t *testing.T) {
-	connStr := os.Getenv("POSTGRES_DSN")
+	connStr := os.Getenv("DATABASE_URL")
 	if connStr == "" {
-		connStr = "postgres://postgres:postgres@localhost:5432/grizzle_test?sslmode=disable"
+		connStr = os.Getenv("POSTGRES_DSN")
+	}
+	if connStr == "" {
+		connStr = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable"
 	}
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {
@@ -25,8 +30,9 @@ func TestTimeouts_ConflictingHolder_RetrySucceeds(t *testing.T) {
 	defer db.Close()
 
 	if err := db.Ping(); err != nil {
-		t.Skipf("skipping postgres timeout test, database not reachable: %v", err)
+		t.Fatalf("integration test failed: PostgreSQL/Docker unavailable at %s: %v (no silent skip allowed under integration tag)", connStr, err)
 	}
+	t.Logf("CI: running integration test %s against PostgreSQL at %s", t.Name(), connStr)
 
 	schema := fmt.Sprintf("test_to_retry_%d", time.Now().UnixNano())
 	_, err = db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema))
@@ -95,9 +101,12 @@ func TestTimeouts_ConflictingHolder_RetrySucceeds(t *testing.T) {
 }
 
 func TestTimeouts_ConflictingHolder_ExhaustRetriesFails(t *testing.T) {
-	connStr := os.Getenv("POSTGRES_DSN")
+	connStr := os.Getenv("DATABASE_URL")
 	if connStr == "" {
-		connStr = "postgres://postgres:postgres@localhost:5432/grizzle_test?sslmode=disable"
+		connStr = os.Getenv("POSTGRES_DSN")
+	}
+	if connStr == "" {
+		connStr = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable"
 	}
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {
@@ -106,8 +115,9 @@ func TestTimeouts_ConflictingHolder_ExhaustRetriesFails(t *testing.T) {
 	defer db.Close()
 
 	if err := db.Ping(); err != nil {
-		t.Skipf("skipping postgres timeout test, database not reachable: %v", err)
+		t.Fatalf("integration test failed: PostgreSQL/Docker unavailable at %s: %v (no silent skip allowed under integration tag)", connStr, err)
 	}
+	t.Logf("CI: running integration test %s against PostgreSQL at %s", t.Name(), connStr)
 
 	schema := fmt.Sprintf("test_to_fail_%d", time.Now().UnixNano())
 	_, err = db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema))
