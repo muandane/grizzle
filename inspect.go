@@ -12,9 +12,44 @@ func inspectSchema(ctx context.Context, tx *sql.Tx, schemaName string) (*SchemaI
 	schema := &SchemaIR{
 		Name:   schemaName,
 		Tables: make(map[string]*TableIR),
+		Enums:  make(map[string]*EnumIR),
 	}
 
-	// 1. Inspect Tables and Columns
+	// 1. Inspect Custom ENUM Types
+	enumQuery := `
+		SELECT
+			t.typname AS enum_name,
+			e.enumlabel AS enum_value
+		FROM pg_type t
+		JOIN pg_enum e ON e.enumtypid = t.oid
+		JOIN pg_namespace n ON n.oid = t.typnamespace
+		WHERE n.nspname = $1
+		ORDER BY t.typname, e.enumsortorder;
+	`
+	enumRows, err := tx.QueryContext(ctx, enumQuery, schemaName)
+	if err != nil {
+		return nil, fmt.Errorf("inspecting enums in schema %q: %w", schemaName, err)
+	}
+	defer func() { _ = enumRows.Close() }()
+
+	for enumRows.Next() {
+		var enumName, enumVal string
+		if err := enumRows.Scan(&enumName, &enumVal); err != nil {
+			return nil, fmt.Errorf("scanning enum in schema %q: %w", schemaName, err)
+		}
+		e, exists := schema.Enums[enumName]
+		if !exists {
+			e = &EnumIR{Name: enumName}
+			schema.Enums[enumName] = e
+		}
+		e.Values = append(e.Values, enumVal)
+	}
+	if err := enumRows.Err(); err != nil {
+		return nil, err
+	}
+	_ = enumRows.Close()
+
+	// 2. Inspect Tables and Columns
 	colQuery := `
 		SELECT
 			c.relname AS table_name,
@@ -59,15 +94,20 @@ func inspectSchema(ctx context.Context, tx *sql.Tx, schemaName string) (*SchemaI
 		tbl, exists := schema.Tables[tableName]
 		if !exists {
 			tbl = &TableIR{
-				Name:    tableName,
-				Columns: make(map[string]*ColumnIR),
+				Name:        tableName,
+				Columns:     make(map[string]*ColumnIR),
+				Indexes:     make(map[string]*IndexIR),
+				ForeignKeys: make(map[string]*ForeignKeyIR),
 			}
 			schema.Tables[tableName] = tbl
 		}
 
+		cleanedType := strings.TrimPrefix(rawType, schemaName+".")
+		cleanedType = strings.TrimPrefix(cleanedType, `"`+schemaName+`".`)
+
 		col := &ColumnIR{
 			Name:         colName,
-			DataType:     normalizeType(rawType),
+			DataType:     normalizeType(cleanedType),
 			IsNullable:   isNullable,
 			DefaultValue: normalizeDefault(rawDefault),
 			Position:     position,
@@ -89,7 +129,7 @@ func inspectSchema(ctx context.Context, tx *sql.Tx, schemaName string) (*SchemaI
 	}
 	_ = rows.Close()
 
-	// 2. Inspect Primary Keys
+	// 3. Inspect Primary Keys
 	pkQuery := `
 		SELECT
 			c.relname AS table_name,
@@ -133,6 +173,94 @@ func inspectSchema(ctx context.Context, tx *sql.Tx, schemaName string) (*SchemaI
 		}
 	}
 	if err := pkRows.Err(); err != nil {
+		return nil, err
+	}
+	_ = pkRows.Close()
+
+	// 4. Inspect Indexes (excluding primary keys)
+	idxQuery := `
+		SELECT
+			t.relname AS table_name,
+			i.relname AS index_name,
+			ix.indisunique AS is_unique,
+			pg_get_indexdef(ix.indexrelid) AS index_def
+		FROM pg_index ix
+		JOIN pg_class t ON t.oid = ix.indrelid
+		JOIN pg_class i ON i.oid = ix.indexrelid
+		JOIN pg_namespace n ON n.oid = t.relnamespace
+		WHERE n.nspname = $1
+		  AND NOT ix.indisprimary
+		ORDER BY t.relname, i.relname;
+	`
+	idxRows, err := tx.QueryContext(ctx, idxQuery, schemaName)
+	if err != nil {
+		return nil, fmt.Errorf("inspecting indexes in schema %q: %w", schemaName, err)
+	}
+	defer func() { _ = idxRows.Close() }()
+
+	for idxRows.Next() {
+		var (
+			tableName string
+			indexName string
+			isUnique  bool
+			indexDef  string
+		)
+		if err := idxRows.Scan(&tableName, &indexName, &isUnique, &indexDef); err != nil {
+			return nil, fmt.Errorf("scanning index in schema %q: %w", schemaName, err)
+		}
+
+		if tbl, exists := schema.Tables[tableName]; exists {
+			tbl.Indexes[indexName] = &IndexIR{
+				Name:       indexName,
+				TableName:  tableName,
+				IsUnique:   isUnique,
+				Definition: indexDef,
+			}
+		}
+	}
+	if err := idxRows.Err(); err != nil {
+		return nil, err
+	}
+	_ = idxRows.Close()
+
+	// 5. Inspect Foreign Keys
+	fkQuery := `
+		SELECT
+			c.relname AS table_name,
+			con.conname AS constraint_name,
+			pg_get_constraintdef(con.oid) AS constraint_def
+		FROM pg_constraint con
+		JOIN pg_class c ON c.oid = con.conrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1
+		  AND con.contype = 'f'
+		ORDER BY c.relname, con.conname;
+	`
+	fkRows, err := tx.QueryContext(ctx, fkQuery, schemaName)
+	if err != nil {
+		return nil, fmt.Errorf("inspecting foreign keys in schema %q: %w", schemaName, err)
+	}
+	defer func() { _ = fkRows.Close() }()
+
+	for fkRows.Next() {
+		var (
+			tableName string
+			fkName    string
+			fkDef     string
+		)
+		if err := fkRows.Scan(&tableName, &fkName, &fkDef); err != nil {
+			return nil, fmt.Errorf("scanning foreign key in schema %q: %w", schemaName, err)
+		}
+
+		if tbl, exists := schema.Tables[tableName]; exists {
+			tbl.ForeignKeys[fkName] = &ForeignKeyIR{
+				Name:       fkName,
+				TableName:  tableName,
+				Definition: fkDef,
+			}
+		}
+	}
+	if err := fkRows.Err(); err != nil {
 		return nil, err
 	}
 

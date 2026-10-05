@@ -8,10 +8,12 @@ func TestDiffSchemas_CreateTable(t *testing.T) {
 	live := &SchemaIR{
 		Name:   "public",
 		Tables: make(map[string]*TableIR),
+		Enums:  make(map[string]*EnumIR),
 	}
 
 	desired := &SchemaIR{
-		Name: "_grizzle_shadow",
+		Name:  "_grizzle_shadow",
+		Enums: make(map[string]*EnumIR),
 		Tables: map[string]*TableIR{
 			"users": {
 				Name: "users",
@@ -37,7 +39,7 @@ func TestDiffSchemas_CreateTable(t *testing.T) {
 		},
 	}
 
-	steps := diffSchemas(live, desired, "public")
+	steps := diffSchemas(live, desired, "public", "_grizzle_shadow")
 	if len(steps) != 1 {
 		t.Fatalf("expected 1 step, got %d", len(steps))
 	}
@@ -52,7 +54,8 @@ func TestDiffSchemas_CreateTable(t *testing.T) {
 
 func TestDiffSchemas_AddColumn(t *testing.T) {
 	live := &SchemaIR{
-		Name: "public",
+		Name:  "public",
+		Enums: make(map[string]*EnumIR),
 		Tables: map[string]*TableIR{
 			"users": {
 				Name: "users",
@@ -64,7 +67,8 @@ func TestDiffSchemas_AddColumn(t *testing.T) {
 	}
 
 	desired := &SchemaIR{
-		Name: "_grizzle_shadow",
+		Name:  "_grizzle_shadow",
+		Enums: make(map[string]*EnumIR),
 		Tables: map[string]*TableIR{
 			"users": {
 				Name: "users",
@@ -76,7 +80,7 @@ func TestDiffSchemas_AddColumn(t *testing.T) {
 		},
 	}
 
-	steps := diffSchemas(live, desired, "public")
+	steps := diffSchemas(live, desired, "public", "_grizzle_shadow")
 	if len(steps) != 1 {
 		t.Fatalf("expected 1 step, got %d", len(steps))
 	}
@@ -91,7 +95,8 @@ func TestDiffSchemas_AddColumn(t *testing.T) {
 
 func TestDiffSchemas_DropColumn_Destructive(t *testing.T) {
 	live := &SchemaIR{
-		Name: "public",
+		Name:  "public",
+		Enums: make(map[string]*EnumIR),
 		Tables: map[string]*TableIR{
 			"users": {
 				Name: "users",
@@ -104,7 +109,8 @@ func TestDiffSchemas_DropColumn_Destructive(t *testing.T) {
 	}
 
 	desired := &SchemaIR{
-		Name: "_grizzle_shadow",
+		Name:  "_grizzle_shadow",
+		Enums: make(map[string]*EnumIR),
 		Tables: map[string]*TableIR{
 			"users": {
 				Name: "users",
@@ -115,7 +121,7 @@ func TestDiffSchemas_DropColumn_Destructive(t *testing.T) {
 		},
 	}
 
-	steps := diffSchemas(live, desired, "public")
+	steps := diffSchemas(live, desired, "public", "_grizzle_shadow")
 	if len(steps) != 1 {
 		t.Fatalf("expected 1 step, got %d", len(steps))
 	}
@@ -125,5 +131,91 @@ func TestDiffSchemas_DropColumn_Destructive(t *testing.T) {
 	}
 	if !steps[0].Destructive {
 		t.Errorf("expected drop column to be marked destructive")
+	}
+}
+
+func TestDiffSchemas_Enums(t *testing.T) {
+	live := &SchemaIR{
+		Name:   "public",
+		Tables: make(map[string]*TableIR),
+		Enums: map[string]*EnumIR{
+			"status": {Name: "status", Values: []string{"active", "inactive"}},
+		},
+	}
+
+	desired := &SchemaIR{
+		Name:   "_grizzle_shadow",
+		Tables: make(map[string]*TableIR),
+		Enums: map[string]*EnumIR{
+			"status": {Name: "status", Values: []string{"active", "inactive", "archived"}},
+			"role":   {Name: "role", Values: []string{"admin", "member"}},
+		},
+	}
+
+	steps := diffSchemas(live, desired, "public", "_grizzle_shadow")
+	if len(steps) != 2 {
+		t.Fatalf("expected 2 steps (1 create enum, 1 alter enum), got %d", len(steps))
+	}
+
+	// Step 1: Create new role enum
+	if steps[0].Type != ChangeCreateEnum || steps[0].Table != "role" {
+		t.Errorf("expected ChangeCreateEnum for role, got %s on %s", steps[0].Type, steps[0].Table)
+	}
+
+	// Step 2: Alter status enum to add archived
+	if steps[1].Type != ChangeAlterEnum || steps[1].Table != "status" {
+		t.Errorf("expected ChangeAlterEnum for status, got %s on %s", steps[1].Type, steps[1].Table)
+	}
+}
+
+func TestDiffSchemas_IndexesAndForeignKeys(t *testing.T) {
+	live := &SchemaIR{
+		Name:  "public",
+		Enums: make(map[string]*EnumIR),
+		Tables: map[string]*TableIR{
+			"users": {
+				Name:        "users",
+				Columns:     map[string]*ColumnIR{"id": {Name: "id", DataType: "bigint", Position: 1}},
+				Indexes:     map[string]*IndexIR{"old_idx": {Name: "old_idx", TableName: "users", Definition: "CREATE INDEX old_idx ON public.users (id)"}},
+				ForeignKeys: make(map[string]*ForeignKeyIR),
+			},
+		},
+	}
+
+	desired := &SchemaIR{
+		Name:  "_grizzle_shadow",
+		Enums: make(map[string]*EnumIR),
+		Tables: map[string]*TableIR{
+			"users": {
+				Name:    "users",
+				Columns: map[string]*ColumnIR{"id": {Name: "id", DataType: "bigint", Position: 1}},
+				Indexes: map[string]*IndexIR{
+					"idx_users_id": {Name: "idx_users_id", TableName: "users", Definition: "CREATE INDEX idx_users_id ON _grizzle_shadow.users (id)"},
+				},
+				ForeignKeys: map[string]*ForeignKeyIR{
+					"fk_users_org": {Name: "fk_users_org", TableName: "users", Definition: "FOREIGN KEY (org_id) REFERENCES _grizzle_shadow.orgs(id)"},
+				},
+			},
+		},
+	}
+
+	steps := diffSchemas(live, desired, "public", "_grizzle_shadow")
+
+	// Expect:
+	// 1. Drop old_idx (Priority 20)
+	// 2. Create idx_users_id (Priority 70)
+	// 3. Add fk_users_org (Priority 80)
+	if len(steps) != 3 {
+		t.Fatalf("expected 3 steps, got %d", len(steps))
+	}
+
+	if steps[0].Type != ChangeDropIndex || steps[0].SQL != `DROP INDEX IF EXISTS "public"."old_idx";` {
+		t.Errorf("expected ChangeDropIndex, got %+v", steps[0])
+	}
+	if steps[1].Type != ChangeCreateIndex {
+		t.Errorf("expected ChangeCreateIndex, got %+v", steps[1])
+	}
+	if steps[2].Type != ChangeAddFK {
+		t.Errorf("expected ChangeAddFK, got %+v", steps[2])
 	}
 }

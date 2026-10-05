@@ -25,6 +25,20 @@ func isSerialColumn(tableName string, col *ColumnIR) (string, bool) {
 	return "", false
 }
 
+// generateCreateEnumSQL constructs a CREATE TYPE ... AS ENUM statement.
+func generateCreateEnumSQL(targetSchema string, e *EnumIR) string {
+	var quotedVals []string
+	for _, v := range e.Values {
+		quotedVals = append(quotedVals, fmt.Sprintf("'%s'", strings.ReplaceAll(v, "'", "''")))
+	}
+	return fmt.Sprintf("CREATE TYPE %q.%q AS ENUM (%s);", targetSchema, e.Name, strings.Join(quotedVals, ", "))
+}
+
+// generateAddEnumValueSQL constructs an ALTER TYPE ... ADD VALUE statement.
+func generateAddEnumValueSQL(targetSchema, enumName, val string) string {
+	return fmt.Sprintf("ALTER TYPE %q.%q ADD VALUE '%s';", targetSchema, enumName, strings.ReplaceAll(val, "'", "''"))
+}
+
 // generateCreateTableSQL constructs a CREATE TABLE statement including columns and primary key.
 func generateCreateTableSQL(targetSchema string, tbl *TableIR) string {
 	// Collect and sort columns by original position using modern slices and maps packages
@@ -114,14 +128,44 @@ func generateAlterColumnSQL(targetSchema, tableName string, live, desired *Colum
 	return fmt.Sprintf("ALTER TABLE %q.%q %s;", targetSchema, tableName, strings.Join(actions, ", "))
 }
 
-// sortSteps applies topological ordering so dependent DDL operations execute in the correct sequence.
+// generateCreateIndexSQL constructs a CREATE [UNIQUE] INDEX statement with terminating semicolon.
+func generateCreateIndexSQL(normalizedIndexDef string) string {
+	def := strings.TrimSpace(normalizedIndexDef)
+	if !strings.HasSuffix(def, ";") {
+		def += ";"
+	}
+	return def
+}
+
+// generateDropIndexSQL constructs a DROP INDEX statement.
+func generateDropIndexSQL(targetSchema, indexName string) string {
+	return fmt.Sprintf("DROP INDEX IF EXISTS %q.%q;", targetSchema, indexName)
+}
+
+// generateAddFKSQL constructs an ALTER TABLE ... ADD CONSTRAINT statement for foreign keys.
+func generateAddFKSQL(targetSchema, tableName, fkName, normalizedFKDef string) string {
+	return fmt.Sprintf("ALTER TABLE %q.%q ADD CONSTRAINT %q %s;", targetSchema, tableName, fkName, normalizedFKDef)
+}
+
+// generateDropFKSQL constructs an ALTER TABLE ... DROP CONSTRAINT statement.
+func generateDropFKSQL(targetSchema, tableName, fkName string) string {
+	return fmt.Sprintf("ALTER TABLE %q.%q DROP CONSTRAINT IF EXISTS %q;", targetSchema, tableName, fkName)
+}
+
+// sortSteps applies topological ordering so dependent DDL operations execute in the correct relational sequence.
 func sortSteps(steps []Step) {
 	priority := map[ChangeType]int{
-		ChangeCreateTable: 10,
-		ChangeAddColumn:   20,
-		ChangeAlterColumn: 30,
-		ChangeDropColumn:  40,
-		ChangeDropTable:   50,
+		ChangeDropFK:      10, // 1. Drop old foreign keys first (unlocks referenced tables)
+		ChangeDropIndex:   20, // 2. Drop obsolete indexes
+		ChangeCreateEnum:  30, // 3. Create new enum types before tables use them
+		ChangeAlterEnum:   35, // 4. Add new enum values before tables insert/alter
+		ChangeCreateTable: 40, // 5. Create bare tables (PKs included, FKs deferred)
+		ChangeAddColumn:   50, // 6. Add new columns
+		ChangeAlterColumn: 60, // 7. Modify column types, nullability, defaults
+		ChangeCreateIndex: 70, // 8. Build new indexes
+		ChangeAddFK:       80, // 9. Add foreign keys now that all tables and columns exist
+		ChangeDropColumn:  90, // 10. Drop columns (if allowed)
+		ChangeDropTable:   100,// 11. Drop tables (if allowed)
 	}
 
 	slices.SortStableFunc(steps, func(a, b Step) int {

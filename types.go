@@ -13,7 +13,7 @@ type Options struct {
 	// Defaults to "_grizzle_shadow".
 	ShadowSchema string
 
-	// AllowDrop permits destructive operations such as DROP TABLE and DROP COLUMN.
+	// AllowDrop permits destructive operations such as DROP TABLE, DROP COLUMN, DROP INDEX, and DROP CONSTRAINT.
 	// Defaults to false to prevent accidental data loss in production.
 	AllowDrop bool
 
@@ -26,11 +26,17 @@ type Options struct {
 type ChangeType string
 
 const (
+	ChangeCreateEnum  ChangeType = "CREATE_ENUM"
+	ChangeAlterEnum   ChangeType = "ALTER_ENUM"
 	ChangeCreateTable ChangeType = "CREATE_TABLE"
 	ChangeDropTable   ChangeType = "DROP_TABLE"
 	ChangeAddColumn   ChangeType = "ADD_COLUMN"
 	ChangeDropColumn  ChangeType = "DROP_COLUMN"
 	ChangeAlterColumn ChangeType = "ALTER_COLUMN"
+	ChangeCreateIndex ChangeType = "CREATE_INDEX"
+	ChangeDropIndex   ChangeType = "DROP_INDEX"
+	ChangeAddFK       ChangeType = "ADD_FK"
+	ChangeDropFK      ChangeType = "DROP_FK"
 )
 
 // Step represents a single atomic DDL migration statement.
@@ -63,13 +69,16 @@ func (p *Plan) HasDestructive() bool {
 type SchemaIR struct {
 	Name   string
 	Tables map[string]*TableIR
+	Enums  map[string]*EnumIR
 }
 
 // TableIR represents a table within a schema.
 type TableIR struct {
-	Name       string
-	Columns    map[string]*ColumnIR
-	PrimaryKey *PrimaryKeyIR
+	Name        string
+	Columns     map[string]*ColumnIR
+	Indexes     map[string]*IndexIR
+	ForeignKeys map[string]*ForeignKeyIR
+	PrimaryKey  *PrimaryKeyIR
 }
 
 // ColumnIR represents a single column within a table.
@@ -81,6 +90,27 @@ type ColumnIR struct {
 	Position     int
 	IsIdentity   bool
 	IdentityType string // "ALWAYS" or "BY DEFAULT"
+}
+
+// IndexIR represents a secondary or unique index on a table.
+type IndexIR struct {
+	Name       string
+	TableName  string
+	IsUnique   bool
+	Definition string // Normalized index DDL (e.g. CREATE [UNIQUE] INDEX ... ON ...)
+}
+
+// ForeignKeyIR represents a foreign key constraint on a table.
+type ForeignKeyIR struct {
+	Name       string
+	TableName  string
+	Definition string // Normalized constraint definition (e.g. FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE)
+}
+
+// EnumIR represents a custom PostgreSQL ENUM type.
+type EnumIR struct {
+	Name   string
+	Values []string
 }
 
 // PrimaryKeyIR represents the primary key constraint of a table.

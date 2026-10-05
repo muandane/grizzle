@@ -240,3 +240,121 @@ func TestSync_Concurrency(t *testing.T) {
 		t.Fatalf("products table not created after concurrent sync")
 	}
 }
+
+func TestSync_Phase2_Relational(t *testing.T) {
+	db := getTestDB(t)
+	defer func() { _ = db.Close() }()
+	resetPublicSchema(t, db)
+
+	ctx := t.Context()
+
+	// 1. Initial schema with Custom Enum, Multi-column Index, Partial Index, and Foreign Key
+	schemaV1 := `
+		CREATE TYPE account_status AS ENUM ('trial', 'active', 'suspended');
+
+		CREATE TABLE orgs (
+			id BIGSERIAL PRIMARY KEY,
+			name VARCHAR(100) NOT NULL
+		);
+
+		CREATE TABLE accounts (
+			id BIGSERIAL PRIMARY KEY,
+			org_id BIGINT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+			name VARCHAR(100) NOT NULL,
+			status account_status NOT NULL DEFAULT 'trial',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
+
+		CREATE INDEX idx_accounts_name_created ON accounts (name, created_at);
+		CREATE UNIQUE INDEX idx_active_accounts_name ON accounts (name) WHERE status = 'active';
+	`
+
+	err := grizzle.Sync(ctx, db, grizzle.Options{
+		SchemaSQL: schemaV1,
+		AllowDrop: false,
+	})
+	if err != nil {
+		t.Fatalf("Phase 2 initial Sync failed: %v", err)
+	}
+
+	// Insert data: create org and accounts
+	var orgID int64
+	err = db.QueryRowContext(ctx, "INSERT INTO orgs (name) VALUES ('Acme Corp') RETURNING id;").Scan(&orgID)
+	if err != nil {
+		t.Fatalf("failed to insert org: %v", err)
+	}
+
+	_, err = db.ExecContext(ctx, "INSERT INTO accounts (org_id, name, status) VALUES ($1, 'Acme Main', 'active');", orgID)
+	if err != nil {
+		t.Fatalf("failed to insert account: %v", err)
+	}
+
+	// Verify partial unique index: inserting duplicate 'Acme Main' with 'active' must fail
+	_, err = db.ExecContext(ctx, "INSERT INTO accounts (org_id, name, status) VALUES ($1, 'Acme Main', 'active');", orgID)
+	if err == nil {
+		t.Fatalf("expected unique index violation on partial index, but insert succeeded")
+	}
+
+	// But inserting 'Acme Main' with 'trial' must succeed because partial index only applies to 'active'
+	_, err = db.ExecContext(ctx, "INSERT INTO accounts (org_id, name, status) VALUES ($1, 'Acme Main', 'trial');", orgID)
+	if err != nil {
+		t.Fatalf("inserting trial account with same name should succeed: %v", err)
+	}
+
+	// 2. Evolve Enum: Add 'archived' value to account_status and remove idx_accounts_name_created
+	schemaV2 := `
+		CREATE TYPE account_status AS ENUM ('trial', 'active', 'suspended', 'archived');
+
+		CREATE TABLE orgs (
+			id BIGSERIAL PRIMARY KEY,
+			name VARCHAR(100) NOT NULL
+		);
+
+		CREATE TABLE accounts (
+			id BIGSERIAL PRIMARY KEY,
+			org_id BIGINT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+			name VARCHAR(100) NOT NULL,
+			status account_status NOT NULL DEFAULT 'trial',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
+
+		CREATE UNIQUE INDEX idx_active_accounts_name ON accounts (name) WHERE status = 'active';
+	`
+
+	// With AllowDrop: false, dropping idx_accounts_name_created must be blocked!
+	err = grizzle.Sync(ctx, db, grizzle.Options{
+		SchemaSQL: schemaV2,
+		AllowDrop: false,
+	})
+	if !errors.Is(err, grizzle.ErrDestructiveBlocked) {
+		t.Fatalf("expected ErrDestructiveBlocked when dropping index with AllowDrop=false, got: %v", err)
+	}
+
+	// Now allow drop
+	err = grizzle.Sync(ctx, db, grizzle.Options{
+		SchemaSQL: schemaV2,
+		AllowDrop: true,
+	})
+	if err != nil {
+		t.Fatalf("Sync with AllowDrop=true (enum evolution + index drop) failed: %v", err)
+	}
+
+	// Verify new enum value 'archived' can now be inserted
+	_, err = db.ExecContext(ctx, "INSERT INTO accounts (org_id, name, status) VALUES ($1, 'Acme Archive', 'archived');", orgID)
+	if err != nil {
+		t.Fatalf("failed to insert row with evolved enum value 'archived': %v", err)
+	}
+
+	// 3. Test Foreign Key ON DELETE CASCADE
+	_, err = db.ExecContext(ctx, "DELETE FROM orgs WHERE id = $1;", orgID)
+	if err != nil {
+		t.Fatalf("failed to delete org: %v", err)
+	}
+
+	// Verify all accounts belonging to this org were cascaded
+	var accountCount int
+	err = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM accounts WHERE org_id = $1;", orgID).Scan(&accountCount)
+	if err != nil || accountCount != 0 {
+		t.Fatalf("expected 0 accounts after cascade delete, got %d (err: %v)", accountCount, err)
+	}
+}

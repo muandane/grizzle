@@ -77,3 +77,14 @@ func normalizeDefault(raw string) string {
 
 	return strings.TrimSpace(d)
 }
+
+// normalizeDefinition replaces references to shadowSchema with targetSchema in DDL expressions.
+func normalizeDefinition(def, shadowSchema, targetSchema string) string {
+	res := def
+	if shadowSchema != "" {
+		res = strings.ReplaceAll(res, shadowSchema+".", targetSchema+".")
+		res = strings.ReplaceAll(res, `"`+shadowSchema+`".`, `"`+targetSchema+`".`)
+	}
+	return strings.TrimSpace(res)
+}
+

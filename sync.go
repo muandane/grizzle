@@ -61,7 +61,7 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error {
 	}
 
 	// 5. Diff schemas
-	steps := diffSchemas(live, desired, opts.TargetSchema)
+	steps := diffSchemas(live, desired, opts.TargetSchema, opts.ShadowSchema)
 	if len(steps) == 0 {
 		// Already in sync!
 		_ = dropShadowSchema(ctx, tx, opts.ShadowSchema)
@@ -132,7 +132,7 @@ func PlanDiff(ctx context.Context, db *sql.DB, opts Options) (*Plan, error) {
 	}
 
 	// 5. Diff
-	steps := diffSchemas(live, desired, opts.TargetSchema)
+	steps := diffSchemas(live, desired, opts.TargetSchema, opts.ShadowSchema)
 
 	return &Plan{
 		TargetSchema: opts.TargetSchema,
