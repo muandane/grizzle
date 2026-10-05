@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 )
 
 func prepareOptions(opts *Options) error {
@@ -27,6 +28,12 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error {
 		return err
 	}
 
+	start := time.Now()
+	logger := opts.Logger
+	if logger != nil {
+		logger.InfoContext(ctx, "grizzle: starting schema synchronization", "target_schema", opts.TargetSchema)
+	}
+
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("grizzle: failed to begin transaction: %w", err)
@@ -35,7 +42,13 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error {
 
 	// 1. Acquire transaction advisory lock
 	if err := acquireAdvisoryLock(ctx, tx, opts.LockID); err != nil {
+		if logger != nil {
+			logger.ErrorContext(ctx, "grizzle: lock acquisition failed", "lock_id", opts.LockID, "error", err)
+		}
 		return err
+	}
+	if logger != nil {
+		logger.DebugContext(ctx, "grizzle: acquired advisory lock", "lock_id", opts.LockID)
 	}
 
 	// 2. Setup shadow schema and ensure it is cleaned up on exit
@@ -45,8 +58,15 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error {
 	defer func() { _ = dropShadowSchema(context.Background(), tx, opts.ShadowSchema) }()
 
 	// 3. Compile user's schema.sql inside shadow schema
+	shadowStart := time.Now()
 	if err := runShadowDDL(ctx, tx, opts.ShadowSchema, opts.TargetSchema, opts.SchemaSQL); err != nil {
+		if logger != nil {
+			logger.ErrorContext(ctx, "grizzle: shadow compilation failed", "error", err)
+		}
 		return err
+	}
+	if logger != nil {
+		logger.DebugContext(ctx, "grizzle: shadow compilation succeeded", "duration", time.Since(shadowStart))
 	}
 
 	// 4. Introspect both live and desired schemas
@@ -62,25 +82,45 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error {
 
 	// 5. Diff schemas
 	steps := diffSchemas(live, desired, opts.TargetSchema, opts.ShadowSchema)
+	policy := resolveDropPolicy(opts)
+
 	if len(steps) == 0 {
-		// Already in sync!
+		if logger != nil {
+			logger.InfoContext(ctx, "grizzle: schema is already in sync", "duration", time.Since(start))
+		}
 		_ = dropShadowSchema(ctx, tx, opts.ShadowSchema)
 		return tx.Commit()
 	}
 
-	// 6. Enforce destructive drop safety
-	if !opts.AllowDrop {
-		for _, s := range steps {
-			if s.Destructive {
-				return fmt.Errorf("%w: operation [%s on %s] is destructive", ErrDestructiveBlocked, s.Type, s.Table)
-			}
+	if logger != nil {
+		logger.InfoContext(ctx, "grizzle: computed migration plan", "steps_count", len(steps))
+	}
+
+	// 6. Enforce fine-grained safety policy
+	var violations []Step
+	for _, s := range steps {
+		if !policy.IsAllowed(s) {
+			violations = append(violations, s)
 		}
+	}
+	if len(violations) > 0 {
+		if logger != nil {
+			logger.WarnContext(ctx, "grizzle: migration blocked by safety policy", "violations_count", len(violations))
+		}
+		return &DestructiveViolationError{Violations: violations}
 	}
 
 	// 7. Apply DDL statements to live schema
-	for _, s := range steps {
+	for i, s := range steps {
+		stepStart := time.Now()
 		if _, err := tx.ExecContext(ctx, s.SQL); err != nil {
+			if logger != nil {
+				logger.ErrorContext(ctx, "grizzle: failed executing step", "step_index", i+1, "sql", s.SQL, "error", err)
+			}
 			return fmt.Errorf("%w: failed executing [%s]: %v", ErrExecutionFailed, s.SQL, err)
+		}
+		if logger != nil {
+			logger.DebugContext(ctx, "grizzle: executed step", "step_index", i+1, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
 		}
 	}
 
@@ -89,7 +129,15 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error {
 		return err
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	if logger != nil {
+		logger.InfoContext(ctx, "grizzle: synchronization finished successfully", "steps_applied", len(steps), "total_duration", time.Since(start))
+	}
+
+	return nil
 }
 
 // PlanDiff inspects the live database and computes the planned migration steps without applying them.
@@ -133,9 +181,11 @@ func PlanDiff(ctx context.Context, db *sql.DB, opts Options) (*Plan, error) {
 
 	// 5. Diff
 	steps := diffSchemas(live, desired, opts.TargetSchema, opts.ShadowSchema)
+	policy := resolveDropPolicy(opts)
 
 	return &Plan{
 		TargetSchema: opts.TargetSchema,
 		Steps:        steps,
+		Policy:       policy,
 	}, nil
 }

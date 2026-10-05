@@ -1,10 +1,13 @@
 package grizzle_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
+	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -356,5 +359,85 @@ func TestSync_Phase2_Relational(t *testing.T) {
 	err = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM accounts WHERE org_id = $1;", orgID).Scan(&accountCount)
 	if err != nil || accountCount != 0 {
 		t.Fatalf("expected 0 accounts after cascade delete, got %d (err: %v)", accountCount, err)
+	}
+}
+
+func TestSync_Phase3_SafetyAndObservability(t *testing.T) {
+	db := getTestDB(t)
+	defer func() { _ = db.Close() }()
+	resetPublicSchema(t, db)
+
+	ctx := t.Context()
+
+	// 1. Initial schema with table, column to drop, and index to drop
+	schemaV1 := `
+		CREATE TABLE telemetry (
+			id BIGSERIAL PRIMARY KEY,
+			device_id VARCHAR(50) NOT NULL,
+			legacy_code INT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
+
+		CREATE INDEX idx_telemetry_legacy ON telemetry (legacy_code);
+	`
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	err := grizzle.Sync(ctx, db, grizzle.Options{
+		SchemaSQL: schemaV1,
+		Logger:    logger,
+	})
+	if err != nil {
+		t.Fatalf("initial Sync failed: %v", err)
+	}
+
+	// Verify structured slog entries were written
+	logStr := logBuf.String()
+	if !strings.Contains(logStr, `"msg":"grizzle: starting schema synchronization"`) {
+		t.Errorf("missing starting log entry: %s", logStr)
+	}
+	if !strings.Contains(logStr, `"msg":"grizzle: synchronization finished successfully"`) {
+		t.Errorf("missing finished log entry: %s", logStr)
+	}
+
+	// 2. Fine-grained drop permissions:
+	// Allow dropping indexes, but FORBID dropping columns!
+	schemaV2 := `
+		CREATE TABLE telemetry (
+			id BIGSERIAL PRIMARY KEY,
+			device_id VARCHAR(50) NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
+	`
+
+	allowDropIndex := true
+	forbidDropCol := false
+
+	err = grizzle.Sync(ctx, db, grizzle.Options{
+		SchemaSQL:       schemaV2,
+		AllowDropIndex:  &allowDropIndex,
+		AllowDropColumn: &forbidDropCol,
+	})
+
+	if err == nil {
+		t.Fatalf("expected error due to forbidden column drop, but Sync succeeded")
+	}
+
+	// Verify structured DestructiveViolationError details
+	var violationErr *grizzle.DestructiveViolationError
+	if !errors.As(err, &violationErr) {
+		t.Fatalf("expected *DestructiveViolationError, got: %T (%v)", err, err)
+	}
+	if !errors.Is(err, grizzle.ErrDestructiveBlocked) {
+		t.Fatalf("expected errors.Is(err, ErrDestructiveBlocked) to be true")
+	}
+
+	// Only the column drop should be blocked (1 violation), since index drop was permitted!
+	if len(violationErr.Violations) != 1 {
+		t.Fatalf("expected exactly 1 violation (column drop), got %d: %+v", len(violationErr.Violations), violationErr.Violations)
+	}
+	if violationErr.Violations[0].Type != grizzle.ChangeDropColumn {
+		t.Errorf("expected blocked step to be ChangeDropColumn, got %s", violationErr.Violations[0].Type)
 	}
 }

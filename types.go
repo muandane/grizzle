@@ -1,5 +1,7 @@
 package grizzle
 
+import "log/slog"
+
 // Options configures the schema synchronization process.
 type Options struct {
 	// SchemaSQL is the complete DDL representing the desired database state.
@@ -13,13 +15,82 @@ type Options struct {
 	// Defaults to "_grizzle_shadow".
 	ShadowSchema string
 
-	// AllowDrop permits destructive operations such as DROP TABLE, DROP COLUMN, DROP INDEX, and DROP CONSTRAINT.
+	// AllowDrop permits all destructive operations (DROP TABLE, DROP COLUMN, DROP INDEX, and DROP CONSTRAINT).
+	// Serves as the master switch / fallback if fine-grained flags are not set.
 	// Defaults to false to prevent accidental data loss in production.
 	AllowDrop bool
+
+	// AllowDropTable permits dropping existing tables. Overrides AllowDrop if non-nil.
+	AllowDropTable *bool
+
+	// AllowDropColumn permits dropping columns or altering columns destructively. Overrides AllowDrop if non-nil.
+	AllowDropColumn *bool
+
+	// AllowDropIndex permits dropping existing secondary indexes. Overrides AllowDrop if non-nil.
+	AllowDropIndex *bool
+
+	// AllowDropFK permits dropping foreign key constraints. Overrides AllowDrop if non-nil.
+	AllowDropFK *bool
 
 	// LockID is a 64-bit integer used for the PostgreSQL advisory lock (pg_advisory_xact_lock).
 	// If 0, Grizzle derives a deterministic lock ID from the TargetSchema.
 	LockID int64
+
+	// Logger accepts an optional structured slog.Logger to trace migration lifecycle and latency.
+	Logger *slog.Logger
+}
+
+// DropPolicy defines the resolved permissions for destructive operations.
+type DropPolicy struct {
+	AllowTable  bool
+	AllowColumn bool
+	AllowIndex  bool
+	AllowFK     bool
+}
+
+// resolveDropPolicy merges global and fine-grained drop permissions into an active policy.
+func resolveDropPolicy(opts Options) DropPolicy {
+	fallback := opts.AllowDrop
+	policy := DropPolicy{
+		AllowTable:  fallback,
+		AllowColumn: fallback,
+		AllowIndex:  fallback,
+		AllowFK:     fallback,
+	}
+
+	if opts.AllowDropTable != nil {
+		policy.AllowTable = *opts.AllowDropTable
+	}
+	if opts.AllowDropColumn != nil {
+		policy.AllowColumn = *opts.AllowDropColumn
+	}
+	if opts.AllowDropIndex != nil {
+		policy.AllowIndex = *opts.AllowDropIndex
+	}
+	if opts.AllowDropFK != nil {
+		policy.AllowFK = *opts.AllowDropFK
+	}
+
+	return policy
+}
+
+// IsAllowed returns true if the step is permitted under the active policy.
+func (p DropPolicy) IsAllowed(s Step) bool {
+	if !s.Destructive {
+		return true
+	}
+	switch s.Type {
+	case ChangeDropTable:
+		return p.AllowTable
+	case ChangeDropColumn, ChangeAlterColumn:
+		return p.AllowColumn
+	case ChangeDropIndex:
+		return p.AllowIndex
+	case ChangeDropFK:
+		return p.AllowFK
+	default:
+		return false
+	}
 }
 
 // ChangeType represents the kind of DDL operation planned or applied.
@@ -49,8 +120,9 @@ type Step struct {
 
 // Plan contains the complete list of sequenced migration steps.
 type Plan struct {
-	TargetSchema string `json:"target_schema"`
-	Steps        []Step `json:"steps"`
+	TargetSchema string     `json:"target_schema"`
+	Steps        []Step     `json:"steps"`
+	Policy       DropPolicy `json:"policy"`
 }
 
 // HasDestructive reports whether any step in the plan is destructive (e.g. DROP).
@@ -61,6 +133,58 @@ func (p *Plan) HasDestructive() bool {
 		}
 	}
 	return false
+}
+
+// Additions returns the number of newly created resources (enums, tables, columns, indexes, FKs).
+func (p *Plan) Additions() int {
+	count := 0
+	for _, s := range p.Steps {
+		switch s.Type {
+		case ChangeCreateEnum, ChangeCreateTable, ChangeAddColumn, ChangeCreateIndex, ChangeAddFK:
+			count++
+		}
+	}
+	return count
+}
+
+// Modifications returns the number of modified resources (altered columns, altered enums).
+func (p *Plan) Modifications() int {
+	count := 0
+	for _, s := range p.Steps {
+		switch s.Type {
+		case ChangeAlterColumn, ChangeAlterEnum:
+			count++
+		}
+	}
+	return count
+}
+
+// Deletions returns the number of dropped resources.
+func (p *Plan) Deletions() int {
+	count := 0
+	for _, s := range p.Steps {
+		switch s.Type {
+		case ChangeDropTable, ChangeDropColumn, ChangeDropIndex, ChangeDropFK:
+			count++
+		}
+	}
+	return count
+}
+
+// Blocked returns the number of destructive steps that are forbidden by the active drop policy.
+func (p *Plan) Blocked() int {
+	count := 0
+	for _, s := range p.Steps {
+		if !p.Policy.IsAllowed(s) {
+			count++
+		}
+	}
+	return count
+}
+
+// Summary returns counts of additions, alterations, deletions, and blocked operations.
+func (p *Plan) Summary() (adds, alters, drops, blocked int) {
+	return p.Additions(), p.Modifications(), p.Deletions(), p.Blocked()
 }
 
 // --- Internal Schema Representation (IR) ---
