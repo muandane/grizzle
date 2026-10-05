@@ -1,0 +1,83 @@
+version: "2"
+run:
+  tests: true
+linters:
+  enable:
+    - depguard
+    - errcheck
+    - gosec
+    - govet
+    - ineffassign
+    - revive
+    - staticcheck
+    - unused
+  settings:
+    depguard:
+      rules:
+        dialect-layer:
+          list-mode: lax
+          files:
+            - '**/internal/dialect/**'
+          deny:
+            - pkg: github.com/muandane/grizzle/internal/exec
+              desc: dialect must not import exec
+            - pkg: github.com/muandane/grizzle/internal/history
+              desc: dialect must not import history
+            - pkg: "^github.com/muandane/grizzle$"
+              desc: dialect must not import root facade
+        exec-layer:
+          list-mode: lax
+          files:
+            - '**/internal/exec/**'
+          deny:
+            - pkg: "^github.com/muandane/grizzle$"
+              desc: exec must not import root facade
+        pure-layers:
+          list-mode: lax
+          files:
+            - '**/internal/schema/**'
+            - '**/internal/scope/**'
+            - '**/internal/plan/**'
+            - '**/internal/diff/**'
+          deny:
+            - pkg: database/sql
+              desc: schema, scope, plan, and diff are pure layers and must not import database/sql
+            - pkg: context
+              desc: schema, scope, plan, and diff are pure layers and must not import context
+            - pkg: github.com/muandane/grizzle/internal/dialect
+              desc: pure layers must not import dialect
+            - pkg: github.com/muandane/grizzle/internal/exec
+              desc: pure layers must not import exec
+            - pkg: github.com/muandane/grizzle/internal/history
+              desc: pure layers must not import history
+            - pkg: "^github.com/muandane/grizzle$"
+              desc: pure layers must not import root facade
+    gosec:
+      excludes:
+        - G101
+        - G115
+    govet:
+      enable-all: false
+    revive:
+      rules:
+        - name: exported
+          arguments:
+            - checkPrivateReceivers
+            - sayRepetitiveInsteadOfStutters
+          disabled: false
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+formatters:
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
