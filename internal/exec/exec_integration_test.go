@@ -361,3 +361,114 @@ func TestConcurrency_LockCoverageAcrossTxAndNonTxGroups(t *testing.T) {
 	}
 }
 
+type attemptTrackerHandler struct {
+	attempts *atomic.Int32
+}
+
+func (h *attemptTrackerHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *attemptTrackerHandler) WithAttrs([]slog.Attr) slog.Handler      { return h }
+func (h *attemptTrackerHandler) WithGroup(string) slog.Handler           { return h }
+func (h *attemptTrackerHandler) Handle(_ context.Context, r slog.Record) error {
+	if r.Message == "grizzle: starting schema synchronization" {
+		h.attempts.Add(1)
+	}
+	return nil
+}
+
+func TestRetry_AbortAfterPartialProgress(t *testing.T) {
+	db := getIntegrationDB(t)
+	defer db.Close()
+
+	schema := fmt.Sprintf("test_retry_part_%d", time.Now().UnixNano())
+	_, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema))
+	if err != nil {
+		t.Fatalf("failed creating schema: %v", err)
+	}
+	defer func() {
+		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schema))
+	}()
+
+	initSQL := `CREATE TABLE accounts (id BIGINT PRIMARY KEY, status TEXT);`
+	err = exec.SyncPostgres(context.Background(), db, exec.PostgresExecConfig{
+		TargetSchema: schema,
+		ShadowSchema: fmt.Sprintf("%s_init_shad", schema),
+		SchemaSQL:    initSQL,
+		LockID:       postgres.GenerateLockID(schema),
+	})
+	if err != nil {
+		t.Fatalf("initial sync failed: %v", err)
+	}
+
+	// Lock accounts table in a conflicting transaction so step 2 (CREATE INDEX CONCURRENTLY on accounts)
+	// will encounter lock timeout
+	lockConn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("failed opening lock conn: %v", err)
+	}
+	defer lockConn.Close()
+
+	_, _ = lockConn.ExecContext(context.Background(), fmt.Sprintf("SET search_path TO %q, public;", schema))
+	_, err = lockConn.ExecContext(context.Background(), "BEGIN; LOCK TABLE accounts IN SHARE UPDATE EXCLUSIVE MODE;")
+	if err != nil {
+		t.Fatalf("failed acquiring conflicting lock: %v", err)
+	}
+	defer func() {
+		_, _ = lockConn.ExecContext(context.Background(), "ROLLBACK;")
+	}()
+
+	// Desired schema: Group 1 creates ledger (tx group), Group 2 creates index on accounts (non-tx group)
+	desiredSQL := `
+		CREATE TABLE accounts (id BIGINT PRIMARY KEY, status TEXT);
+		CREATE TABLE ledger (id BIGINT PRIMARY KEY, amount NUMERIC);
+		CREATE INDEX idx_accounts_status ON accounts(status);
+	`
+
+	var attempts atomic.Int32
+	logger := slog.New(&attemptTrackerHandler{attempts: &attempts})
+
+	cfg := exec.PostgresExecConfig{
+		TargetSchema:     schema,
+		ShadowSchema:     fmt.Sprintf("%s_shad", schema),
+		SchemaSQL:        desiredSQL,
+		LockID:           postgres.GenerateLockID(schema),
+		LockTimeout:      50 * time.Millisecond,
+		StatementTimeout: 5 * time.Second,
+		MaxRetries:       5,
+		Logger:           logger,
+	}
+
+	err = exec.SyncPostgres(context.Background(), db, cfg)
+	if err == nil {
+		t.Fatalf("expected SyncPostgres to fail due to lock conflict on step 2, got nil")
+	}
+
+	// Crucial assertion: Must NOT retry after partial progress!
+	// Attempts must be exactly 1!
+	attemptCount := attempts.Load()
+	if attemptCount > 1 {
+		t.Errorf("expected 0 retries after partial progress (attempts=1), but got attempts=%d", attemptCount)
+	}
+
+	// Verify partial progress: table ledger was committed in group 1
+	var ledgerExists bool
+	err = db.QueryRow(fmt.Sprintf("SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = '%s' AND table_name = 'ledger');", schema)).Scan(&ledgerExists)
+	if err != nil || !ledgerExists {
+		t.Fatalf("expected ledger table to exist from committed group 1, err: %v", err)
+	}
+
+	// Verify history record has status 'partial'
+	latest, err := history.GetLatest(context.Background(), db, "postgres", schema)
+	if err != nil {
+		t.Fatalf("failed reading history: %v", err)
+	}
+	if latest == nil {
+		t.Fatalf("expected history record, got nil")
+	}
+	if latest.Status != "partial" {
+		t.Errorf("expected history status 'partial', got %q", latest.Status)
+	}
+	if latest.FailedStep != 2 {
+		t.Errorf("expected failed_step 2, got %d", latest.FailedStep)
+	}
+}
+

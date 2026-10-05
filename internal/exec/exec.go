@@ -83,19 +83,20 @@ func SyncPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) error
 
 	attempt := 0
 	for {
-		err := syncPostgresOnce(ctx, db, cfg)
+		committed, err := syncPostgresOnce(ctx, db, cfg)
 		if err == nil {
 			return nil
 		}
 
-		if !IsLockTimeout(err) || attempt >= maxRetries {
+		// Only retry before any step has committed. After partial progress: abort, require re-plan.
+		if committed > 0 || !IsLockTimeout(err) || attempt >= maxRetries {
 			return err
 		}
 
 		attempt++
 		backoff := ComputeBackoff(attempt, cfg.RandFloat)
 		if cfg.Logger != nil {
-			cfg.Logger.WarnContext(ctx, "grizzle: lock timeout encountered, retrying migration",
+			cfg.Logger.WarnContext(ctx, "grizzle: lock timeout encountered before progress, retrying migration",
 				"attempt", attempt,
 				"max_retries", maxRetries,
 				"backoff_ms", backoff.Milliseconds(),
@@ -111,7 +112,7 @@ func SyncPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) error
 	}
 }
 
-func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) error {
+func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (int, error) {
 	start := time.Now()
 	logger := cfg.Logger
 	if logger != nil {
@@ -120,7 +121,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) e
 
 	conn, err := db.Conn(ctx)
 	if err != nil {
-		return fmt.Errorf("grizzle: failed to acquire connection: %w", err)
+		return 0, fmt.Errorf("grizzle: failed to acquire connection: %w", err)
 	}
 	defer conn.Close()
 
@@ -136,7 +137,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) e
 		if logger != nil {
 			logger.ErrorContext(ctx, "grizzle: lock acquisition failed", "lock_id", cfg.LockID, "error", err)
 		}
-		return fmt.Errorf("%w: %v", plan.ErrLockAcquisition, err)
+		return 0, fmt.Errorf("%w: %v", plan.ErrLockAcquisition, err)
 	}
 	defer func() {
 		_ = postgres.ReleaseSessionAdvisoryLock(context.Background(), conn, cfg.LockID)
@@ -150,21 +151,21 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) e
 	shadowStart := time.Now()
 	shadowTx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("grizzle: failed to begin shadow tx: %w", err)
+		return 0, fmt.Errorf("grizzle: failed to begin shadow tx: %w", err)
 	}
 	defer func() { _ = shadowTx.Rollback() }()
 
 	_ = ApplyTxTimeouts(ctx, shadowTx, cfg.LockTimeout, cfg.StatementTimeout)
 
 	if err := postgres.SetupShadowSchema(ctx, shadowTx, cfg.ShadowSchema); err != nil {
-		return err
+		return 0, err
 	}
 
 	if err := postgres.RunShadowDDL(ctx, shadowTx, cfg.ShadowSchema, cfg.TargetSchema, cfg.SchemaSQL); err != nil {
 		if logger != nil {
 			logger.ErrorContext(ctx, "grizzle: shadow compilation failed", "error", err)
 		}
-		return fmt.Errorf("%w: %v", plan.ErrCompilationFailed, err)
+		return 0, fmt.Errorf("%w: %v", plan.ErrCompilationFailed, err)
 	}
 	if logger != nil {
 		logger.DebugContext(ctx, "grizzle: shadow compilation succeeded", "duration", time.Since(shadowStart))
@@ -173,7 +174,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) e
 	// 3. Diff schemas post-lock
 	steps, err := DiffPostgres(ctx, shadowTx, cfg)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	_ = shadowTx.Rollback()
 
@@ -193,7 +194,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) e
 		if logger != nil {
 			logger.WarnContext(ctx, "grizzle: plan drift detected post-lock", "expected", cfg.ExpectedHash, "actual", p.Hash())
 		}
-		return fmt.Errorf("%w: expected hash %q, actual post-lock hash %q", plan.ErrPlanDrift, cfg.ExpectedHash, p.Hash())
+		return 0, fmt.Errorf("%w: expected hash %q, actual post-lock hash %q", plan.ErrPlanDrift, cfg.ExpectedHash, p.Hash())
 	}
 
 	if len(steps) == 0 {
@@ -201,7 +202,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) e
 			logger.InfoContext(ctx, "grizzle: schema is already in sync", "duration", time.Since(start))
 		}
 		_ = postgres.DropShadowSchema(ctx, conn, cfg.ShadowSchema)
-		return nil
+		return 0, nil
 	}
 
 	if logger != nil {
@@ -219,7 +220,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) e
 		if logger != nil {
 			logger.WarnContext(ctx, "grizzle: migration blocked by safety policy", "violations_count", len(violations))
 		}
-		return &plan.DestructiveViolationError{Violations: violations}
+		return 0, &plan.DestructiveViolationError{Violations: violations}
 	}
 
 	// 5b. Enforce hazard gating (fails on critical hazards unless explicitly accepted)
@@ -227,7 +228,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) e
 		if logger != nil {
 			logger.WarnContext(ctx, "grizzle: migration blocked by unaccepted critical hazards", "error", err)
 		}
-		return err
+		return 0, err
 	}
 
 	if cfg.DryRun {
@@ -235,12 +236,12 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) e
 			logger.InfoContext(ctx, "grizzle: dry-run mode, skipping statement execution")
 		}
 		_ = postgres.DropShadowSchema(ctx, conn, cfg.ShadowSchema)
-		return nil
+		return 0, nil
 	}
 
 	// 6. Cleanup shadow schema before live execution
 	if err := postgres.DropShadowSchema(ctx, conn, cfg.ShadowSchema); err != nil {
-		return err
+		return 0, err
 	}
 
 	// 7. Apply DDL statements split into transactional and non-transactional groups
@@ -275,7 +276,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) e
 						logger.ErrorContext(ctx, "grizzle: failed executing non-tx step", "step_index", stepIdx, "sql", s.SQL, "error", err)
 					}
 					recordFailureHistory(stepIdx, err, true)
-					return fmt.Errorf("%w: failed executing non-tx [%s]: %v", plan.ErrExecutionFailed, s.SQL, err)
+					return committedSteps + 1, fmt.Errorf("%w: failed executing non-tx [%s]: %v", plan.ErrExecutionFailed, s.SQL, err)
 				}
 				committedSteps++
 				if logger != nil {
@@ -293,7 +294,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) e
 			// Transactional group executed in transaction on dedicated conn
 			tx, err := conn.BeginTx(ctx, nil)
 			if err != nil {
-				return fmt.Errorf("grizzle: failed to begin step transaction: %w", err)
+				return committedSteps, fmt.Errorf("grizzle: failed to begin step transaction: %w", err)
 			}
 			if err := postgres.ValidateIdentifier(cfg.TargetSchema); err == nil {
 				_, _ = tx.ExecContext(ctx, fmt.Sprintf("SET LOCAL search_path TO %q, public;", cfg.TargetSchema))
@@ -309,7 +310,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) e
 						logger.ErrorContext(ctx, "grizzle: failed executing step in tx", "step_index", stepIdx, "sql", s.SQL, "error", err)
 					}
 					recordFailureHistory(stepIdx, err, false)
-					return fmt.Errorf("%w: failed executing [%s]: %v", plan.ErrExecutionFailed, s.SQL, err)
+					return committedSteps, fmt.Errorf("%w: failed executing [%s]: %v", plan.ErrExecutionFailed, s.SQL, err)
 				}
 				if logger != nil {
 					logger.DebugContext(ctx, "grizzle: executed step in tx", "step_index", stepIdx, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
@@ -327,7 +328,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) e
 
 			if err := tx.Commit(); err != nil {
 				recordFailureHistory(stepIdx, err, false)
-				return fmt.Errorf("grizzle: failed committing step transaction: %w", err)
+				return committedSteps, fmt.Errorf("grizzle: failed committing step transaction: %w", err)
 			}
 			committedSteps += len(group.Steps)
 		}
@@ -337,7 +338,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) e
 		logger.InfoContext(ctx, "grizzle: synchronization finished successfully", "steps_applied", len(steps), "total_duration", time.Since(start))
 	}
 
-	return nil
+	return committedSteps, nil
 }
 
 // PlanDiffPostgres generates the plan for PostgreSQL without applying statements.
