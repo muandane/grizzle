@@ -31,6 +31,9 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error
 // Check inspects the live database and returns ErrDrift if the schema differs from opts.SchemaSQL.
 // It is strictly read-only and never modifies the database.
 func Check(ctx context.Context, db *sql.DB, opts Options) error
+
+// Export generates migration artifacts for the plan in the requested format (sql, goose, atlas).
+func Export(p *Plan, format ExportFormat, version string) ([]Artifact, error)
 ```
 
 ### 2.2 Configuration options
@@ -45,8 +48,12 @@ type Options struct {
     // Typically embedded at build time with //go:embed schema.sql.
     SchemaSQL string
 
-    // TargetSchema is the PostgreSQL schema to manage (defaults to "public").
+    // TargetSchema is the schema to manage (defaults to "public" for Postgres, "main" for SQLite).
+    // Deprecated: Use TargetSchemas for multi-schema support.
     TargetSchema string
+
+    // TargetSchemas specifies the database schemas to manage (defaults to [TargetSchema] or ["public"] for Postgres).
+    TargetSchemas []string
 
     // ShadowSchema is the temporary schema name used for validation (defaults to "_grizzle_shadow").
     ShadowSchema string
@@ -61,14 +68,6 @@ type Options struct {
     AllowDropIndex  *bool
     AllowDropFK     *bool
 
-    // AcceptHazards specifies explicitly accepted critical hazards.
-    // Unaccepted critical hazards block execution with ErrHazardBlocked.
-    AcceptHazards []HazardCode
-
-    // ExpectedHash is an optional plan hash expected at apply time.
-    // If the recomputed post-lock plan hash differs, Apply aborts with ErrPlanDrift.
-    ExpectedHash string
-
     // ExcludeTables defines table names or glob patterns (e.g. "spatial_ref_sys", "asynq_*")
     // that Grizzle will never alter, diff, or drop.
     ExcludeTables []string
@@ -79,8 +78,19 @@ type Options struct {
     // StrictScope requires IncludeTables to be non-empty when true, preventing accidental unmanaged operations.
     StrictScope bool
 
+    // AcceptHazards specifies explicitly accepted critical hazards.
+    // Unaccepted critical hazards block execution with ErrHazardBlocked.
+    AcceptHazards []HazardCode
+
     // NonConcurrentIndexes forces PostgreSQL index creations to run transactionally without CONCURRENTLY.
     NonConcurrentIndexes bool
+
+    // LockNamespace specifies application namespace string for PostgreSQL advisory locking (defaults to "grizzle").
+    LockNamespace string
+
+    // LockID is an optional explicit 64-bit integer used for the PostgreSQL advisory lock.
+    // If 0, Grizzle derives 2-int per-schema advisory locks using (hash32(LockNamespace), hash32(schema)).
+    LockID int64
 
     // LockTimeout sets the maximum duration to wait for acquiring the advisory lock (defaults to 5s).
     LockTimeout time.Duration
@@ -88,7 +98,7 @@ type Options struct {
     // StatementTimeout sets the maximum duration for any individual DDL statement (defaults to 5m).
     StatementTimeout time.Duration
 
-    // MaxRetries specifies maximum retry attempts when encountering lock_timeout (defaults to 5).
+    // MaxRetries specifies maximum retry attempts when encountering lock_timeout (defaults to 3).
     MaxRetries int
 
     // RandFloat provides an optional random source func returning in [0.0, 1.0) for deterministic jitter in tests.
@@ -102,13 +112,16 @@ type Options struct {
     ExpandContract bool
 
     // Backfill hook is executed during staged expand migration outside the DDL lock window in batches.
-    Backfill func(ctx context.Context, tx *sql.Tx, table, oldCol, newCol string) error
-
-    // LockID is a 64-bit integer for pg_advisory_xact_lock. Defaults to stable hash of TargetSchema.
-    LockID int64
+    Backfill BackfillFunc
 
     // DryRun outputs planned statements without executing them.
     DryRun bool
+
+    // SQLiteRebuildThreshold defines row count threshold above which SQLite table rebuilds chunk data copying by keyset.
+    SQLiteRebuildThreshold int
+
+    // SQLiteRebuildBatchSize defines chunk size when copying data in batches during SQLite table rebuilds.
+    SQLiteRebuildBatchSize int
 
     // Logger accepts a structured logger (*slog.Logger) for migration events.
     Logger *slog.Logger
@@ -117,7 +130,20 @@ type Options struct {
 type ApplyOpts struct {
     ExpectedHash  string
     AcceptHazards []HazardCode
-    Backfill      func(ctx context.Context, tx *sql.Tx, table, oldCol, newCol string) error
+    Backfill      BackfillFunc
+}
+
+type ExportFormat string
+
+const (
+    FormatSQL   ExportFormat = "sql"
+    FormatGoose ExportFormat = "goose"
+    FormatAtlas ExportFormat = "atlas"
+)
+
+type Artifact struct {
+    Filename string
+    Content  string
 }
 ```
 
@@ -126,6 +152,7 @@ type ApplyOpts struct {
 ```go
 type Plan struct {
     TargetSchema   string
+    TargetSchemas  []string
     Steps          []Step
     Policy         DropPolicy
     IncludeTables  []string
@@ -148,21 +175,26 @@ func (p *Plan) String() string
 type HazardLevel string
 
 const (
-    HazardLevelCritical HazardLevel = "CRITICAL" // Data destruction (DROP TABLE, DROP COLUMN, TYPE_NARROW, RENAME_AMBIGUOUS)
-    HazardLevelWarning  HazardLevel = "WARNING"  // Execution risk (NOT NULL without DEFAULT)
+    HazardLevelCritical HazardLevel = "CRITICAL" // Data destruction (DROP TABLE, DROP COLUMN, TYPE_NARROW, RENAME_AMBIGUOUS, UNMANAGED_DEPENDENCY)
+    HazardLevelWarning  HazardLevel = "WARNING"  // Execution risk (NOT NULL without DEFAULT, GENERATED_REWRITE, PARTITION_ATTACH_SCAN, PARTITION_PENDING_DETACH)
     HazardLevelNotice   HazardLevel = "NOTICE"   // Locking or performance impact (INDEX creation/drop, FK drop)
 )
 
 type HazardCode string
 
 const (
-    HazardDropTable         HazardCode = "DROP_TABLE"
-    HazardDropColumn        HazardCode = "DROP_COLUMN"
-    HazardTypeNarrow        HazardCode = "TYPE_NARROW"
-    HazardNotNullNoDefault  HazardCode = "NOT_NULL_NO_DEFAULT"
-    HazardDropIndex         HazardCode = "DROP_INDEX"
-    HazardDropFK            HazardCode = "DROP_FK"
-    HazardRenameAmbiguous   HazardCode = "RENAME_AMBIGUOUS"
+    HazardDropTable              HazardCode = "DROP_TABLE"
+    HazardDropColumn             HazardCode = "DROP_COLUMN"
+    HazardTypeNarrow             HazardCode = "TYPE_NARROW"
+    HazardNotNullNoDefault       HazardCode = "NOT_NULL_NO_DEFAULT"
+    HazardIndexBuild             HazardCode = "INDEX_BUILD"
+    HazardDropIndex              HazardCode = "DROP_INDEX"
+    HazardDropFK                 HazardCode = "DROP_FK"
+    HazardRenameAmbiguous        HazardCode = "RENAME_AMBIGUOUS"
+    HazardUnmanagedDependency    HazardCode = "UNMANAGED_DEPENDENCY"
+    HazardGeneratedRewrite       HazardCode = "GENERATED_REWRITE"
+    HazardPartitionAttachScan    HazardCode = "PARTITION_ATTACH_SCAN"
+    HazardPartitionPendingDetach HazardCode = "PARTITION_PENDING_DETACH"
 )
 
 type Hazard struct {
@@ -264,9 +296,12 @@ var (
     ErrHazardBlocked      = errors.New("grizzle: migration blocked by unaccepted critical hazards")
     ErrPlanDrift          = errors.New("grizzle: plan drifted from approved state")
     ErrDrift              = errors.New("grizzle: live database schema has drifted from desired schema")
-    ErrLockTimeout        = errors.New("grizzle: lock acquisition timed out")
-    ErrInvalidOptions     = errors.New("grizzle: invalid options")
-    ErrStrictScope        = errors.New("grizzle: strict scope requires non-empty IncludeTables")
+    ErrLockTimeout             = errors.New("grizzle: lock acquisition timed out")
+    ErrInvalidOptions          = errors.New("grizzle: invalid options")
+    ErrStrictScope             = errors.New("grizzle: strict scope requires non-empty IncludeTables")
+    ErrPartitionConversion     = errors.New("grizzle: in-place conversion between regular and partitioned table is unsupported")
+    ErrUnsupportedMultiSchema  = errors.New("grizzle: multi-schema configuration is unsupported on SQLite")
+    ErrPartitionKeyNotInUnique = errors.New("grizzle: primary key or unique constraint must include all partition key columns")
 )
 
 type HazardError struct {

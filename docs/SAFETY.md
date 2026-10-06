@@ -72,7 +72,7 @@ Grizzle combines the safety features of dedicated migration engines with an in-p
 
 Grizzle prevents multi-pod race conditions by acquiring advisory locks before inspecting or modifying the database:
 
-* **PostgreSQL**: Grizzle acquires `pg_advisory_xact_lock(lock_id)` inside the active migration transaction (or a dedicated session-level advisory lock when executing non-transactional statements such as `CREATE INDEX CONCURRENTLY`).
+* **PostgreSQL**: Grizzle acquires dedicated session-level advisory locks (`pg_try_advisory_lock`) on a dedicated connection spanning all non-transactional (`CREATE INDEX CONCURRENTLY`) and transactional migration step groups.
 * **Post-lock re-diffing**: Grizzle inspects the database and computes the diff **after** acquiring the lock. Even if an initial plan was generated prior to lock acquisition, Grizzle re-verifies the live schema post-lock, eliminating Time-of-Check to Time-of-Use (TOCTOU) schema drift.
 * **Waiting pod behavior**: Subsequent pods wait on the advisory lock. Once the first pod commits, waiting pods acquire the lock, inspect the updated schema, discover zero pending diffs, and start immediately without executing redundant statements.
 * **Failure recovery**: If a pod crashes or disconnects during migration, PostgreSQL automatically releases the advisory lock.
@@ -141,8 +141,11 @@ Supported hazard codes:
 | `TYPE_NARROW` | `CRITICAL` | Column type narrowed (e.g. `bigint` to `integer`, risk of numeric overflow) |
 | `RENAME_AMBIGUOUS` | `CRITICAL` | Unmapped column dropped and added with identical type in same table |
 | `UNMANAGED_DEPENDENCY` | `CRITICAL` | Operation on column or table that an unmanaged object (view, trigger, function) depends on |
+| `NOT_NULL_NO_DEFAULT` | `CRITICAL` | Adding non-null column without default to non-empty table |
 | `GENERATED_REWRITE` | `WARNING` | Generated column expression modified; requires table rewrite on PostgreSQL |
-| `NOT_NULL_NO_DEFAULT` | `WARNING` | Adding non-null column without default to non-empty table |
+| `PARTITION_ATTACH_SCAN` | `WARNING` | Attaching existing standalone table to parent partitioned table requires validation scan under `ACCESS EXCLUSIVE` lock |
+| `PARTITION_PENDING_DETACH` | `WARNING` | Interrupted pending-detach partition state requiring finalization (`FINALIZE`) |
+| `INDEX_BUILD` | `NOTICE` | Index creation table locking or execution load |
 | `DROP_INDEX` | `NOTICE` | Index removal impacting query performance |
 | `DROP_FK` | `NOTICE` | Foreign key constraint removal |
 

@@ -130,6 +130,8 @@ Partial and functional indexes follow standard index creation rules:
 
 ## Declarative check constraints
 
+*Status: Implemented*
+
 Check constraints enforce row-level validation predicates on table columns.
 
 ### Declarative syntax
@@ -261,6 +263,8 @@ The following operational characteristics cannot be fully automated in continuou
 ---
 
 ## Dedicated session advisory lock
+
+*Status: Implemented*
 
 PostgreSQL disallows running `CREATE INDEX CONCURRENTLY` inside an explicit transaction block (`ERROR: 25001: CREATE INDEX CONCURRENTLY cannot run inside a transaction block`). Because migration plans frequently interleave non-transactional index creations with transactional table modifications, a transaction-level lock (`pg_advisory_xact_lock`) cannot span both phases.
 

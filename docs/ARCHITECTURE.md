@@ -16,7 +16,7 @@ schema  <--  scope, diff, plan  <--  dialect  <--  exec, history  <--  grizzle (
 | **Logic** | `internal/scope`<br>`internal/diff`<br>`internal/plan` | Scope filtering, AST schema diffing, topological sort, `Plan.Hash()`, structural hazard analysis | **Pure**: Deterministic algorithms, sorted maps/slices for stable hashing |
 | **Dialect** | `internal/dialect`<br>`internal/dialect/postgres`<br>`internal/dialect/sqlite` | SQL DDL rendering, catalog introspection queries, advisory locks, 12-step rebuild | Only layer with dialect-specific SQL syntax knowledge |
 | **Execution** | `internal/exec`<br>`internal/history` | Connection management, shadow schemas, session/transaction locking, statement timeouts, retries, history audit log | Handles I/O, transactions, retries, and errors |
-| **Facade** | root (`grizzle`) | Public API (`Sync`, `PlanDiff`, `Apply`, `Check`), options validation, public type aliases | Wiring only; zero core logic |
+| **Facade** | root (`grizzle`) | Public API (`Sync`, `PlanDiff`, `Apply`, `Check`, `Export`), options validation, public type aliases | Wiring only; zero core logic |
 
 An automated test (`TestArchitecture_DependencyRules`) verifies that no package violates this one-way dependency rule.
 
@@ -97,9 +97,9 @@ sequenceDiagram
 ## 4. Core components
 
 ### 4.1 Lock manager & retry loop
-* **Mechanism**: PostgreSQL session advisory locks on dedicated connections for non-transactional operations (`CREATE INDEX CONCURRENTLY`), and transactional advisory locks (`pg_advisory_xact_lock`) for pure transactional plans.
-* **Conflict handling**: If PostgreSQL returns `55P03` (`lock_not_available` or `lock_timeout`), Grizzle retries with truncated exponential backoff and randomized jitter up to `Options.MaxRetries`.
-* **Connection safety**: Dedicated connections ensure that session locks are released in `defer` handlers or automatically cleaned up if the connection drops.
+* **Mechanism**: PostgreSQL session advisory locks (`pg_try_advisory_lock`) on a dedicated connection spanning all non-transactional (`CREATE INDEX CONCURRENTLY`) and transactional step groups. For multi-schema migrations, 2-integer locks (`hash32(LockNamespace)`, `hash32(schema)`) are acquired in sorted order to prevent deadlocks.
+* **Conflict handling**: Queries `SELECT pg_try_advisory_lock(...)` on a polling ticker bounded client-side with `context.WithTimeout(ctx, LockTimeout)`. If lock acquisition times out, Grizzle retries with truncated exponential backoff and randomized jitter up to `Options.MaxRetries`.
+* **Connection safety**: Dedicated connection pinning ensures that session locks are released in `defer` handlers (via `pg_advisory_unlock`) along with connection reset commands (`RESET search_path; RESET statement_timeout; RESET lock_timeout;`).
 
 ### 4.2 Shadow runner
 * **Mechanism**: Compiles `SchemaSQL` in `_grizzle_shadow` (PostgreSQL) or `:memory:` (SQLite) to validate SQL constraints and syntax before touching production tables.

@@ -4,52 +4,88 @@ This document details the internal data structures, catalog queries, type normal
 
 ## 1. Internal representation data structures
 
-Grizzle normalizes live and desired database schemas into an engine-agnostic schema intermediate representation (`SchemaIR`):
+Grizzle normalizes live and desired database schemas into an engine-agnostic relational schema model (`schema.Schema`):
 
 ```go
-type SchemaIR struct {
-    Name   string
-    Tables map[string]*TableIR
-    Enums  map[string]*EnumIR
+type Schema struct {
+    Name      string                      `json:"name"`
+    Tables    map[string]*Table           `json:"tables"`
+    Enums     map[string]*Enum            `json:"enums"`
+    Unmanaged map[string]*UnmanagedObject `json:"unmanaged,omitempty"`
 }
 
-type TableIR struct {
-    Name        string
-    Columns     map[string]*ColumnIR
-    Indexes     map[string]*IndexIR
-    ForeignKeys map[string]*ForeignKeyIR
-    PrimaryKey  *PrimaryKeyIR
+type Table struct {
+    Schema       string                 `json:"schema,omitempty"`
+    Name         string                 `json:"name"`
+    Columns      map[string]*Column     `json:"columns"`
+    Indexes      map[string]*Index      `json:"indexes"`
+    ForeignKeys  map[string]*ForeignKey `json:"foreign_keys"`
+    PrimaryKey   *PrimaryKey            `json:"primary_key"`
+    PartitionKey *PartitionKey          `json:"partition_key,omitempty"`
+    PartitionOf  *PartitionOf           `json:"partition_of,omitempty"`
 }
 
-type ColumnIR struct {
-    Name         string
-    DataType     string // Normalized (e.g. "bigint", "varchar(255)", "boolean")
-    IsNullable   bool
-    DefaultValue string // Sanitized, stripped of Postgres casts or redundant parens
-    Position     int
+type Column struct {
+    Name         string           `json:"name"`
+    DataType     string           `json:"data_type"`
+    IsNullable   bool             `json:"is_nullable"`
+    DefaultValue string           `json:"default_value"`
+    Position     int              `json:"position"`
+    IsIdentity   bool             `json:"is_identity,omitempty"`
+    IdentityType string           `json:"identity_type,omitempty"`
+    Generated    *GeneratedColumn `json:"generated,omitempty"`
 }
 
-type IndexIR struct {
-    Name       string
-    TableName  string
-    IsUnique   bool
-    Definition string // Normalized DDL expression
+type GeneratedColumn struct {
+    Expr   string `json:"expr"`
+    Stored bool   `json:"stored"`
 }
 
-type ForeignKeyIR struct {
-    Name       string
-    TableName  string
-    Definition string // Normalized constraint definition
+type Index struct {
+    Name       string `json:"name"`
+    TableName  string `json:"table_name"`
+    IsUnique   bool   `json:"is_unique"`
+    Definition string `json:"definition"`
+    IsValid    bool   `json:"is_valid"`
+    Predicate  string `json:"predicate,omitempty"`
 }
 
-type PrimaryKeyIR struct {
-    Name    string
-    Columns []string
+type ForeignKey struct {
+    Name       string `json:"name"`
+    TableName  string `json:"table_name"`
+    RefSchema  string `json:"ref_schema,omitempty"`
+    RefTable   string `json:"ref_table,omitempty"`
+    Definition string `json:"definition"`
+    IsValid    bool   `json:"is_valid"`
 }
 
-type EnumIR struct {
-    Name   string
-    Values []string
+type PrimaryKey struct {
+    Name    string   `json:"name"`
+    Columns []string `json:"columns"`
+}
+
+type Enum struct {
+    Name   string   `json:"name"`
+    Values []string `json:"values"`
+}
+
+type UnmanagedObject struct {
+    Name      string          `json:"name"`
+    Kind      UnmanagedKind   `json:"kind"` // VIEW, MATERIALIZED_VIEW, TRIGGER, FUNCTION, SEQUENCE, ENUM, DOMAIN
+    Table     string          `json:"table,omitempty"`
+    DependsOn []DependencyRef `json:"depends_on,omitempty"`
+    SQL       string          `json:"sql,omitempty"`
+}
+
+type PartitionKey struct {
+    Strategy PartitionStrategy `json:"strategy"` // RANGE, LIST, HASH
+    Def      string            `json:"def"`
+}
+
+type PartitionOf struct {
+    Parent          string `json:"parent"`
+    Bounds          string `json:"bounds"`
+    IsDetachPending bool   `json:"is_detach_pending,omitempty"`
 }
 ```
 
