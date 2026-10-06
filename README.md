@@ -8,20 +8,17 @@ Grizzle is a declarative, in-process database automigration engine for Go applic
 
 ```mermaid
 flowchart LR
-    A["📄 schema.sql"] --> B["🧪 Shadow Sandbox<br/><code>_grizzle_shadow</code>"]
-    B --> C["⚖️ Diff Engine<br/><code>Pure Core</code>"]
-    C --> D{"🛡️️ Hazard Gate<br/><code>Plan.Hazards()</code>"}
-    D -->|Approved| E["🔒 Advisory Lock<br/><code>pg_advisory_lock</code>"]
-    E --> F[("🗄️ Live DB<br/>PostgreSQL / SQLite")]
+    Schema["schema.sql<br/>desired state"] --> Shadow["Shadow sandbox<br/>compile & validate"]
+    Shadow -->|desired| Diff["Diff engine<br/>pure comparison"]
 
-    classDef default fill:#0d1117,stroke:#30363d,stroke-width:1px,color:#e6edf3;
-    classDef gate fill:#161b22,stroke:#f85149,stroke-width:1.5px,color:#ff7b72;
-    classDef lock fill:#161b22,stroke:#d29922,stroke-width:1.5px,color:#e3b341;
-    classDef db fill:#161b22,stroke:#2ea043,stroke-width:1.5px,color:#56d364;
+    Live[("Live database<br/>PostgreSQL / SQLite")] --> Lock["Advisory lock<br/>mutual exclusion"]
+    Lock --> LiveInspect["Catalog inspect<br/>live state"]
+    LiveInspect -->|actual| Diff
 
-    class D gate;
-    class E lock;
-    class F db;
+    Diff --> Plan["Migration plan<br/>steps & hash"]
+    Plan --> Gate{"Hazard gate<br/>safety checks"}
+    Gate -->|Approved| Apply["Apply migration<br/>tx & concurrently"]
+    Apply --> Live
 ```
 
 ---
@@ -190,52 +187,37 @@ Grizzle enforces a strict one-way dependency architecture:
 
 ```mermaid
 graph TD
-    subgraph Facade ["Public API (Facade)"]
-        Grizzle["grizzle (root)<br/>Sync / PlanDiff / Apply / Check / Export"]
-    end
+    classDef pure fill:#e8f5e9,stroke:#2e7d32,stroke-width:1px;
 
-    subgraph Execution ["Execution Layer (I/O, Locks, History)"]
-        Exec["internal/exec<br/>Advisory locks, Tx groups, Retries"]
-        History["internal/history<br/>grizzle_history audit table"]
-    end
+    API["grizzle (public API)<br/>Sync · PlanDiff · Apply · Check · Export"]
 
-    subgraph Dialect ["Dialect Layer (Catalog & SQL Syntax)"]
-        Postgres["internal/dialect/postgres<br/>Catalog introspection, DDL rendering"]
-        SQLite["internal/dialect/sqlite<br/>Catalog introspection, 12-step rebuild"]
-    end
+    API -->|runs| Exec["exec<br/>locks, tx, retries"]
+    API -->|formats| Export["export<br/>SQL / Goose / Atlas"]:::pure
 
-    subgraph PureCore ["Pure Core (Zero I/O, Deterministic)"]
-        Schema["internal/schema<br/>Table, Column, Index models"]
-        Scope["internal/scope<br/>Table filters, unmanaged exclusions"]
-        Diff["internal/diff<br/>Pure schema diffing engine"]
-        Plan["internal/plan<br/>Steps, Hazards, SHA-256 Hash"]
-        Export["internal/export<br/>SQL, Goose, Atlas formatters"]
-    end
+    Exec -->|audits| History["history<br/>audit table"]
+    Exec -->|delegates| Dialect["dialect (postgres, sqlite)<br/>introspect + render DDL"]
+    Exec -->|computes| Diff["diff<br/>desired vs actual"]:::pure
 
-    Grizzle --> Exec
-    Grizzle --> History
-    Grizzle --> Postgres
-    Grizzle --> SQLite
-    Grizzle --> Plan
+    History -->|queries| Dialect
+    Dialect -->|renders| Plan["plan<br/>steps, hazards, hash"]:::pure
+    Dialect -->|builds| Schema["schema + scope<br/>models, filters"]:::pure
 
-    Exec --> Dialect
-    Exec --> Plan
-    History --> Dialect
-
-    Postgres --> Schema
-    Postgres --> Plan
-    Postgres --> Scope
-    SQLite --> Schema
-    SQLite --> Plan
-    SQLite --> Scope
-
-    Diff --> Schema
-    Diff --> Scope
-    Plan --> Schema
-    Export --> Plan
+    Diff -->|generates| Plan
+    Diff -->|compares| Schema
+    Export -->|serializes| Plan
 ```
 
-- **Pure Core** (`schema`, `scope`, `diff`, `plan`, `export`): Free of `database/sql`, context, network, or file I/O. 100% deterministic and unit-testable.
+### Runtime flow
+
+```mermaid
+flowchart LR
+    Introspect["1. Introspect<br/>catalog state"] -->|SchemaIR| Diff["2. Diff<br/>compute delta"]
+    Diff -->|Changes| Plan["3. Plan<br/>hazard gating"]
+    Plan -->|Steps| Render["4. Render<br/>dialect DDL"]
+    Render -->|SQL| Exec["5. Exec<br/>locks & tx groups"]
+```
+
+- **Pure Core** (shaded green: `diff`, `plan`, `schema`, `scope`, `export`): Free of `database/sql`, context, network, or file I/O. Deterministic and unit-testable.
 - **Dialect Layer** (`dialect/postgres`, `dialect/sqlite`): Encapsulates catalog introspection and dialect-specific DDL syntax.
 - **Execution Layer** (`exec`, `history`): Coordinates connection pools, advisory locks, timeouts, transaction grouping, and failure recording.
 - **Public Facade** (`grizzle`): Minimal wiring surface and public type aliases.
