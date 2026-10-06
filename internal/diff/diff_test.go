@@ -343,3 +343,111 @@ func TestDiff_PartitionedTables(t *testing.T) {
 		t.Errorf("expected ErrPartitionConversion, got: %v", err)
 	}
 }
+
+func TestDiff_PartialAndFunctionalIndexes(t *testing.T) {
+	filters := scope.Filters{}
+
+	tests := []struct {
+		name          string
+		liveDef       string
+		desiredDef    string
+		liveValid     bool
+		expectedDrops int
+		expectedAdds  int
+	}{
+		{
+			name:          "identical functional index with shadow schema qualifiers",
+			liveDef:       "CREATE UNIQUE INDEX idx_email ON public.users USING btree (lower((email)::text))",
+			desiredDef:    "CREATE UNIQUE INDEX idx_email ON _shadow.users USING btree (lower((email)::text))",
+			liveValid:     true,
+			expectedDrops: 0,
+			expectedAdds:  0,
+		},
+		{
+			name:          "identical partial index with shadow schema qualifiers",
+			liveDef:       "CREATE INDEX idx_orders ON public.orders USING btree (created_at) WHERE ((status)::text = 'pending'::text)",
+			desiredDef:    "CREATE INDEX idx_orders ON _shadow.orders USING btree (created_at) WHERE ((status)::text = 'pending'::text)",
+			liveValid:     true,
+			expectedDrops: 0,
+			expectedAdds:  0,
+		},
+		{
+			name:          "partial index predicate changed",
+			liveDef:       "CREATE INDEX idx_orders ON public.orders USING btree (created_at) WHERE ((status)::text = 'pending'::text)",
+			desiredDef:    "CREATE INDEX idx_orders ON _shadow.orders USING btree (created_at) WHERE ((status)::text = 'complete'::text)",
+			liveValid:     true,
+			expectedDrops: 1,
+			expectedAdds:  1,
+		},
+		{
+			name:          "functional index expression changed",
+			liveDef:       "CREATE INDEX idx_email ON public.users USING btree (lower((email)::text))",
+			desiredDef:    "CREATE INDEX idx_email ON _shadow.users USING btree (upper((email)::text))",
+			liveValid:     true,
+			expectedDrops: 1,
+			expectedAdds:  1,
+		},
+		{
+			name:          "invalid partial index triggers recovery",
+			liveDef:       "CREATE INDEX idx_orders ON public.orders USING btree (created_at) WHERE ((status)::text = 'pending'::text)",
+			desiredDef:    "CREATE INDEX idx_orders ON _shadow.orders USING btree (created_at) WHERE ((status)::text = 'pending'::text)",
+			liveValid:     false,
+			expectedDrops: 1,
+			expectedAdds:  1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			live := &schema.Schema{
+				Tables: map[string]*schema.Table{
+					"t": {
+						Name: "t",
+						Columns: map[string]*schema.Column{
+							"id": {Name: "id", DataType: "integer"},
+						},
+						Indexes: map[string]*schema.Index{
+							"idx": {Name: "idx", Definition: tt.liveDef, IsValid: tt.liveValid},
+						},
+						ForeignKeys: make(map[string]*schema.ForeignKey),
+					},
+				},
+				Enums: make(map[string]*schema.Enum),
+			}
+			desired := &schema.Schema{
+				Tables: map[string]*schema.Table{
+					"t": {
+						Name: "t",
+						Columns: map[string]*schema.Column{
+							"id": {Name: "id", DataType: "integer"},
+						},
+						Indexes: map[string]*schema.Index{
+							"idx": {Name: "idx", Definition: tt.desiredDef, IsValid: true},
+						},
+						ForeignKeys: make(map[string]*schema.ForeignKey),
+					},
+				},
+				Enums: make(map[string]*schema.Enum),
+			}
+
+			changes, err := diff.Diff(live, desired, "public", "_shadow", filters)
+			if err != nil {
+				t.Fatalf("unexpected diff error: %v", err)
+			}
+
+			var drops, adds int
+			for _, c := range changes {
+				if c.Type == plan.ChangeDropIndex {
+					drops++
+				}
+				if c.Type == plan.ChangeCreateIndex {
+					adds++
+				}
+			}
+
+			if drops != tt.expectedDrops || adds != tt.expectedAdds {
+				t.Errorf("got %d drops, %d adds; want %d drops, %d adds", drops, adds, tt.expectedDrops, tt.expectedAdds)
+			}
+		})
+	}
+}
