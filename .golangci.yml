@@ -39,9 +39,10 @@ linters:
             - '**/internal/scope/**'
             - '**/internal/plan/**'
             - '**/internal/diff/**'
+            - '**/internal/export/**'
           deny:
             - pkg: database/sql
-              desc: schema, scope, plan, and diff are pure layers and must not import database/sql
+              desc: pure layers must not import database/sql
             - pkg: context
               desc: schema, scope, plan, and diff are pure layers and must not import context
             - pkg: github.com/muandane/grizzle/internal/dialect

@@ -227,6 +227,9 @@ func RenderChange(targetSchema string, c diff.Change, nonConcurrent ...bool) pla
 		IsGeneratedRewrite: c.GeneratedChanged,
 		UnmanagedDeps:      c.UnmanagedDeps,
 	}
+	if c.Column != nil {
+		step.Column = c.Column.Name
+	}
 	if c.OldColumn != nil {
 		step.OldColumn = c.OldColumn.Name
 	}

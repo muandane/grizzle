@@ -4,154 +4,359 @@ package main
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/muandane/grizzle"
+	_ "modernc.org/sqlite"
 )
 
+type hazardFlags []string
+
+func (h *hazardFlags) String() string {
+	return strings.Join(*h, ",")
+}
+
+func (h *hazardFlags) Set(val string) error {
+	for p := range strings.SplitSeq(val, ",") {
+		trimmed := strings.TrimSpace(p)
+		if trimmed != "" {
+			*h = append(*h, trimmed)
+		}
+	}
+	return nil
+}
+
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("Usage: grizzle <plan|apply|check> [flags]")
-		os.Exit(1)
+	os.Exit(run(os.Args[1:]))
+}
+
+func getDSN(explicit string) string {
+	if explicit != "" {
+		return explicit
 	}
-
-	command := os.Args[1]
-	fs := flag.NewFlagSet(command, flag.ExitOnError)
-	dsn := fs.String("dsn", os.Getenv("DATABASE_URL"), "Database DSN connection string")
-	schemaFile := fs.String("schema", "schema.sql", "Path to schema SQL file")
-	allowDrop := fs.Bool("allow-drop", false, "Permit destructive operations")
-	outputJSON := fs.Bool("json", false, "Output plan in JSON format")
-	outputFile := fs.String("out", "", "File path to write plan output to")
-	planFile := fs.String("plan", "", "Path to plan JSON file for apply")
-	expectedHash := fs.String("expected-hash", "", "Expected plan approval hash")
-	_ = fs.Parse(os.Args[2:])
-
-	if *dsn == "" {
-		fmt.Fprintln(os.Stderr, "Error: database DSN is required (via -dsn or DATABASE_URL)")
-		os.Exit(1)
+	if env := os.Getenv("GRIZZLE_DSN"); env != "" {
+		return env
 	}
+	return os.Getenv("DATABASE_URL")
+}
 
-	db, err := sql.Open("pgx", *dsn)
+func redactDSN(dsn string) string {
+	if dsn == "" {
+		return ""
+	}
+	u, err := url.Parse(dsn)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error connecting to database: %v\n", err)
-		os.Exit(1)
+		return "<redacted-dsn>"
 	}
-	defer func() { _ = db.Close() }()
+	return u.Redacted()
+}
+
+func openDB(dsn string) (*sql.DB, error) {
+	driver := "pgx"
+	cleanDSN := dsn
+	if strings.HasPrefix(dsn, "sqlite://") {
+		driver = "sqlite"
+		cleanDSN = strings.TrimPrefix(dsn, "sqlite://")
+	} else if strings.HasPrefix(dsn, "sqlite:") {
+		driver = "sqlite"
+		cleanDSN = strings.TrimPrefix(dsn, "sqlite:")
+	} else if strings.HasSuffix(dsn, ".db") || strings.HasSuffix(dsn, ".sqlite") || dsn == ":memory:" {
+		driver = "sqlite"
+	}
+	return sql.Open(driver, cleanDSN)
+}
+
+func setupLogger(jsonLog bool) {
+	var handler slog.Handler
+	if jsonLog {
+		handler = slog.NewJSONHandler(os.Stderr, nil)
+	} else {
+		handler = slog.NewTextHandler(os.Stderr, nil)
+	}
+	slog.SetDefault(slog.New(handler))
+}
+
+func run(args []string) int {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "Usage: grizzle <plan|apply|check|export> [flags]")
+		return 1
+	}
+
+	command := args[0]
+	fs := flag.NewFlagSet(command, flag.ContinueOnError)
+
+	var (
+		dsnFlag      = fs.String("dsn", "", "Database DSN connection string")
+		schemaFile   = fs.String("schema", "schema.sql", "Path to schema SQL file")
+		planFile     = fs.String("plan", "", "Path to plan JSON file")
+		outFile      = fs.String("out", "", "Destination file or directory")
+		formatFlag   = fs.String("format", "sql", "Export format: sql, goose, or atlas")
+		allowDrop    = fs.Bool("allow-drop", false, "Permit destructive operations")
+		jsonOutput   = fs.Bool("json", false, "Output in JSON format")
+		jsonLog      = fs.Bool("json-log", false, "Emit logs in structured JSON format")
+		expectedHash = fs.String("expected-hash", "", "Expected plan approval hash")
+		versionFlag  = fs.String("version", "v0.1.0", "Version string for export headers")
+	)
+
+	var hazards hazardFlags
+	fs.Var(&hazards, "accept-hazard", "Hazard code to accept (can be repeated or comma-separated)")
+
+	if err := fs.Parse(args[1:]); err != nil {
+		return 1
+	}
+
+	setupLogger(*jsonLog)
 
 	ctx := context.Background()
+	dsn := getDSN(*dsnFlag)
 
 	switch command {
 	case "plan":
-		content, err := os.ReadFile(filepath.Clean(*schemaFile)) //nolint:gosec // G703, G304: CLI accepts user-provided schema file path
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error reading schema file %q: %v\n", *schemaFile, err)
-			os.Exit(1)
+		if dsn == "" {
+			slog.Error("database DSN is required (via --dsn, GRIZZLE_DSN, or DATABASE_URL)")
+			return 1
 		}
+		db, err := openDB(dsn)
+		if err != nil {
+			slog.Error("connecting to database", "target", redactDSN(dsn), "err", err)
+			return 1
+		}
+		defer func() { _ = db.Close() }()
+
+		content, err := os.ReadFile(filepath.Clean(*schemaFile)) //nolint:gosec // G304: CLI accepts user-provided schema file path
+		if err != nil {
+			slog.Error("reading schema file", "path", *schemaFile, "err", err)
+			return 1
+		}
+
 		opts := grizzle.Options{
 			SchemaSQL: string(content),
 			AllowDrop: *allowDrop,
 		}
 		p, err := grizzle.PlanDiff(ctx, db, opts)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Plan error: %v\n", err)
-			os.Exit(1)
+			slog.Error("computing plan diff", "err", err)
+			return 1
 		}
 
-		if *outputJSON {
-			data, err := json.MarshalIndent(p, "", "  ")
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "JSON marshal error: %v\n", err)
-				os.Exit(1)
+		data, err := p.ToJSON()
+		if err != nil {
+			slog.Error("serializing plan", "err", err)
+			return 1
+		}
+
+		if *outFile != "" {
+			if err := os.WriteFile(filepath.Clean(*outFile), data, 0600); err != nil { //nolint:gosec // G304: CLI accepts user-provided destination path
+				slog.Error("writing plan file", "path", *outFile, "err", err)
+				return 1
 			}
-			if *outputFile != "" {
-				if err := os.WriteFile(filepath.Clean(*outputFile), data, 0600); err != nil { //nolint:gosec // G703, G304: CLI accepts user-provided output destination file path
-					fmt.Fprintf(os.Stderr, "Writing plan error: %v\n", err)
-					os.Exit(1)
-				}
-			} else {
-				fmt.Println(string(data))
-			}
+			slog.Info("plan written successfully", "out", *outFile, "hash", p.Hash(), "steps", len(p.Steps))
+		} else if *jsonOutput {
+			fmt.Println(string(data))
 		} else {
 			_ = p.Format(os.Stdout, true)
+			fmt.Fprintf(os.Stderr, "Plan Hash: %s\n", p.Hash())
 		}
-		fmt.Fprintf(os.Stderr, "Plan Hash: %s\n", p.Hash())
+		return 0
 
 	case "apply":
+		if dsn == "" {
+			slog.Error("database DSN is required (via --dsn, GRIZZLE_DSN, or DATABASE_URL)")
+			return 1
+		}
+		db, err := openDB(dsn)
+		if err != nil {
+			slog.Error("connecting to database", "target", redactDSN(dsn), "err", err)
+			return 1
+		}
+		defer func() { _ = db.Close() }()
+
+		var p *grizzle.Plan
+		var planHash string
+
+		var acceptedCodes []grizzle.HazardCode
+		for _, h := range hazards {
+			acceptedCodes = append(acceptedCodes, grizzle.HazardCode(h))
+		}
+
 		if *planFile != "" {
-			planData, err := os.ReadFile(filepath.Clean(*planFile)) //nolint:gosec // G703, G304: CLI accepts user-provided plan file path
+			planData, err := os.ReadFile(filepath.Clean(*planFile)) //nolint:gosec // G304: CLI accepts user-provided plan file path
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error reading plan file %q: %v\n", *planFile, err)
-				os.Exit(1)
+				slog.Error("reading plan file", "path", *planFile, "err", err)
+				return 1
 			}
-			var p grizzle.Plan
-			if err := json.Unmarshal(planData, &p); err != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing plan JSON: %v\n", err)
-				os.Exit(1)
+			parsedPlan, recordedHash, err := grizzle.ParsePlanJSON(planData)
+			if err != nil {
+				slog.Error("parsing plan JSON", "err", err)
+				return 1
 			}
-			applyOpts := grizzle.ApplyOpts{
-				ExpectedHash: *expectedHash,
-			}
-			if err := grizzle.Apply(ctx, db, &p, applyOpts); err != nil {
-				fmt.Fprintf(os.Stderr, "Apply error: %v\n", err)
-				os.Exit(1)
-			}
+			p = parsedPlan
+			planHash = recordedHash
 		} else {
-			content, err := os.ReadFile(filepath.Clean(*schemaFile)) //nolint:gosec // G703, G304: CLI accepts user-provided schema file path
+			content, err := os.ReadFile(filepath.Clean(*schemaFile)) //nolint:gosec // G304: CLI accepts user-provided schema file path
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error reading schema file %q: %v\n", *schemaFile, err)
-				os.Exit(1)
+				slog.Error("reading schema file", "path", *schemaFile, "err", err)
+				return 1
+			}
+			opts := grizzle.Options{
+				SchemaSQL:     string(content),
+				AllowDrop:     *allowDrop,
+				AcceptHazards: acceptedCodes,
+			}
+			computedPlan, err := grizzle.PlanDiff(ctx, db, opts)
+			if err != nil {
+				slog.Error("computing plan", "err", err)
+				return 1
+			}
+			p = computedPlan
+			planHash = p.Hash()
+		}
+
+		expHash := planHash
+		if *expectedHash != "" {
+			expHash = *expectedHash
+		}
+
+		applyOpts := grizzle.ApplyOpts{
+			ExpectedHash:  expHash,
+			AcceptHazards: acceptedCodes,
+		}
+
+		if err := grizzle.Apply(ctx, db, p, applyOpts); err != nil {
+			if errors.Is(err, grizzle.ErrPlanDrift) {
+				slog.Error("plan drift detected; database modified since plan approval", "err", err)
+				return 3
+			}
+			var hazardErr *grizzle.HazardError
+			if errors.Is(err, grizzle.ErrHazardBlocked) || errors.As(err, &hazardErr) {
+				slog.Error("migration blocked by unaccepted critical hazard", "err", err)
+				return 2
+			}
+			slog.Error("applying plan", "err", err)
+			return 1
+		}
+
+		slog.Info("schema applied successfully", "hash", planHash, "steps", len(p.Steps))
+		return 0
+
+	case "check":
+		if dsn == "" {
+			slog.Error("database DSN is required (via --dsn, GRIZZLE_DSN, or DATABASE_URL)")
+			return 1
+		}
+		db, err := openDB(dsn)
+		if err != nil {
+			slog.Error("connecting to database", "target", redactDSN(dsn), "err", err)
+			return 1
+		}
+		defer func() { _ = db.Close() }()
+
+		content, err := os.ReadFile(filepath.Clean(*schemaFile)) //nolint:gosec // G304: CLI accepts user-provided schema file path
+		if err != nil {
+			slog.Error("reading schema file", "path", *schemaFile, "err", err)
+			return 1
+		}
+
+		opts := grizzle.Options{
+			SchemaSQL: string(content),
+			AllowDrop: *allowDrop,
+		}
+		p, err := grizzle.PlanDiff(ctx, db, opts)
+		if err != nil {
+			slog.Error("checking schema drift", "err", err)
+			return 1
+		}
+
+		if len(p.Steps) > 0 {
+			slog.Warn("schema drift detected", "steps", len(p.Steps), "hash", p.Hash())
+			fmt.Fprintf(os.Stderr, "Drift detected: %d pending changes (hash: %s)\n", len(p.Steps), p.Hash())
+			return 4
+		}
+
+		slog.Info("database is in sync")
+		fmt.Println("Database is in sync.")
+		return 0
+
+	case "export":
+		var p *grizzle.Plan
+		if *planFile != "" {
+			planData, err := os.ReadFile(filepath.Clean(*planFile)) //nolint:gosec // G304: CLI accepts user-provided plan file path
+			if err != nil {
+				slog.Error("reading plan file", "path", *planFile, "err", err)
+				return 1
+			}
+			parsedPlan, _, err := grizzle.ParsePlanJSON(planData)
+			if err != nil {
+				slog.Error("parsing plan JSON", "err", err)
+				return 1
+			}
+			p = parsedPlan
+		} else {
+			if dsn == "" {
+				slog.Error("database DSN or --plan is required for export")
+				return 1
+			}
+			db, err := openDB(dsn)
+			if err != nil {
+				slog.Error("connecting to database", "target", redactDSN(dsn), "err", err)
+				return 1
+			}
+			defer func() { _ = db.Close() }()
+
+			content, err := os.ReadFile(filepath.Clean(*schemaFile)) //nolint:gosec // G304: CLI accepts user-provided schema file path
+			if err != nil {
+				slog.Error("reading schema file", "path", *schemaFile, "err", err)
+				return 1
 			}
 			opts := grizzle.Options{
 				SchemaSQL: string(content),
 				AllowDrop: *allowDrop,
 			}
-			if *expectedHash != "" {
-				p, err := grizzle.PlanDiff(ctx, db, opts)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Plan error: %v\n", err)
-					os.Exit(1)
-				}
-				if err := grizzle.Apply(ctx, db, p, grizzle.ApplyOpts{ExpectedHash: *expectedHash}); err != nil {
-					fmt.Fprintf(os.Stderr, "Apply error: %v\n", err)
-					os.Exit(1)
-				}
-			} else {
-				if err := grizzle.Sync(ctx, db, opts); err != nil {
-					fmt.Fprintf(os.Stderr, "Apply error: %v\n", err)
-					os.Exit(1)
-				}
+			computedPlan, err := grizzle.PlanDiff(ctx, db, opts)
+			if err != nil {
+				slog.Error("computing plan for export", "err", err)
+				return 1
 			}
+			p = computedPlan
 		}
-		fmt.Println("Schema applied successfully.")
 
-	case "check":
-		content, err := os.ReadFile(filepath.Clean(*schemaFile)) //nolint:gosec // G703, G304: CLI accepts user-provided schema file path
+		artifacts, err := grizzle.Export(p, grizzle.ExportFormat(*formatFlag), *versionFlag)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error reading schema file %q: %v\n", *schemaFile, err)
-			os.Exit(1)
+			slog.Error("export failed", "err", err)
+			return 1
 		}
-		opts := grizzle.Options{
-			SchemaSQL: string(content),
-			AllowDrop: *allowDrop,
+
+		outDir := *outFile
+		if outDir == "" {
+			outDir = "."
 		}
-		p, err := grizzle.PlanDiff(ctx, db, opts)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Check error: %v\n", err)
-			os.Exit(1)
+		if err := os.MkdirAll(filepath.Clean(outDir), 0750); err != nil { //nolint:gosec // G703, G301: CLI creates user-specified export directory
+			slog.Error("creating export directory", "path", outDir, "err", err)
+			return 1
 		}
-		if len(p.Steps) > 0 {
-			fmt.Fprintf(os.Stderr, "Drift detected: %d pending changes (hash: %s)\n", len(p.Steps), p.Hash())
-			os.Exit(2)
+
+		for _, art := range artifacts {
+			targetPath := filepath.Join(filepath.Clean(outDir), art.Filename)
+			if err := os.WriteFile(targetPath, []byte(art.Content), 0600); err != nil { //nolint:gosec // G304: CLI writes generated artifact to user directory
+				slog.Error("writing exported artifact", "path", targetPath, "err", err)
+				return 1
+			}
+			slog.Info("exported migration artifact", "path", targetPath, "format", *formatFlag)
+			fmt.Printf("Exported: %s\n", targetPath)
 		}
-		fmt.Println("Database is in sync.")
+		return 0
 
 	default:
-		fmt.Fprintf(os.Stderr, "Unknown command: %q. Expected plan, apply, or check.\n", command)
-		os.Exit(1)
+		slog.Error("unknown command", "command", command)
+		fmt.Fprintf(os.Stderr, "Unknown command: %q. Expected plan, apply, check, or export.\n", command)
+		return 1
 	}
 }

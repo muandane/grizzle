@@ -6,11 +6,13 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/muandane/grizzle/internal/dialect/postgres"
 	"github.com/muandane/grizzle/internal/dialect/sqlite"
 	"github.com/muandane/grizzle/internal/diff"
 	"github.com/muandane/grizzle/internal/exec"
+	"github.com/muandane/grizzle/internal/export"
 	"github.com/muandane/grizzle/internal/plan"
 	"github.com/muandane/grizzle/internal/schema"
 	"github.com/muandane/grizzle/internal/scope"
@@ -18,6 +20,12 @@ import (
 
 // Plan is the complete migration plan containing sequenced steps, policy, and hashes.
 type Plan = plan.Plan
+
+// PlanDocument represents a complete, serialized migration plan artifact including hash, hazards, scope, and options digest.
+type PlanDocument = plan.Document
+
+// ScopeDocument represents the scope section of a plan document.
+type ScopeDocument = plan.ScopeDocument
 
 // Step represents a single atomic migration step to execute.
 type Step = plan.Step
@@ -461,4 +469,33 @@ func toExecBackfill(fn BackfillFunc) exec.BackfillFunc {
 		return nil
 	}
 	return exec.BackfillFunc(fn)
+}
+
+// ExportFormat defines supported target formats for migration export.
+type ExportFormat = export.Format
+
+const (
+	// ExportFormatSQL targets raw SQL files with transaction markers.
+	ExportFormatSQL = export.FormatSQL
+	// ExportFormatGoose targets Goose-compatible migration files.
+	ExportFormatGoose = export.FormatGoose
+	// ExportFormatAtlas targets Atlas-compatible migration files.
+	ExportFormatAtlas = export.FormatAtlas
+)
+
+// ExportArtifact represents a generated migration file ready to be saved.
+type ExportArtifact = export.Artifact
+
+// Export serializes the given plan into migration files for the requested tool format.
+func Export(p *Plan, format ExportFormat, version string, timestamp ...time.Time) ([]ExportArtifact, error) {
+	var ts time.Time
+	if len(timestamp) > 0 {
+		ts = timestamp[0]
+	}
+	return export.Export(p, format, version, ts)
+}
+
+// ParsePlanJSON parses a serialized plan JSON string or bytes into a *Plan, returning the recorded plan hash.
+func ParsePlanJSON(data []byte) (*Plan, string, error) {
+	return plan.ParsePlanJSON(data)
 }

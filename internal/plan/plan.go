@@ -33,6 +33,7 @@ const (
 type Step struct {
 	Type        ChangeType `json:"type"`
 	Table       string     `json:"table"`
+	Column      string     `json:"column,omitzero"`
 	SQL         string     `json:"sql"`
 	Destructive bool       `json:"destructive,omitzero"`
 	NonTx       bool       `json:"non_tx,omitzero"`

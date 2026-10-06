@@ -38,13 +38,14 @@ func TestArchitecture_DependencyRules(t *testing.T) {
 		scopePkg     = modulePrefix + "/internal/scope"
 		planPkg      = modulePrefix + "/internal/plan"
 		diffPkg      = modulePrefix + "/internal/diff"
+		exportPkg    = modulePrefix + "/internal/export"
 		dialectPkg   = modulePrefix + "/internal/dialect"
 		execPkg      = modulePrefix + "/internal/exec"
 		rootPkg      = modulePrefix
 	)
 
-	// 1. Pure layer rules: schema, scope, plan, diff must NEVER import database/sql or context
-	purePackages := []string{schemaPkg, scopePkg, planPkg, diffPkg}
+	// 1. Pure layer rules: schema, scope, plan, diff, export must NEVER import database/sql or context
+	purePackages := []string{schemaPkg, scopePkg, planPkg, diffPkg, exportPkg}
 	for _, pPath := range purePackages {
 		p, exists := pkgs[pPath]
 		if !exists {
