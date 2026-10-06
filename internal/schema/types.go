@@ -42,13 +42,49 @@ type UnmanagedObject struct {
 	DependsOn []DependencyRef `json:"depends_on,omitempty"`
 }
 
+// PartitionStrategy defines the table partitioning method.
+type PartitionStrategy string
+
+const (
+	// PartitionStrategyRange defines range-based partitioning.
+	PartitionStrategyRange PartitionStrategy = "RANGE"
+	// PartitionStrategyList defines list-based partitioning.
+	PartitionStrategyList PartitionStrategy = "LIST"
+	// PartitionStrategyHash defines hash-based partitioning.
+	PartitionStrategyHash PartitionStrategy = "HASH"
+)
+
+// PartitionKey defines partition method and key definition for a partitioned table.
+type PartitionKey struct {
+	Strategy PartitionStrategy `json:"strategy"`
+	Def      string            `json:"def"` // e.g. "RANGE (log_date)" or "RANGE (city_id, log_date)"
+}
+
+// PartitionOf defines attachment parameters for a partition table to its parent table.
+type PartitionOf struct {
+	Parent string `json:"parent"` // Name of parent partitioned table
+	Bounds string `json:"bounds"` // e.g. "FOR VALUES FROM ('2026-01-01') TO ('2026-02-01')"
+}
+
 // Table represents a table within a schema.
 type Table struct {
-	Name        string                 `json:"name"`
-	Columns     map[string]*Column     `json:"columns"`
-	Indexes     map[string]*Index      `json:"indexes"`
-	ForeignKeys map[string]*ForeignKey `json:"foreign_keys"`
-	PrimaryKey  *PrimaryKey            `json:"primary_key"`
+	Name         string                 `json:"name"`
+	Columns      map[string]*Column     `json:"columns"`
+	Indexes      map[string]*Index      `json:"indexes"`
+	ForeignKeys  map[string]*ForeignKey `json:"foreign_keys"`
+	PrimaryKey   *PrimaryKey            `json:"primary_key"`
+	PartitionKey *PartitionKey          `json:"partition_key,omitempty"`
+	PartitionOf  *PartitionOf           `json:"partition_of,omitempty"`
+}
+
+// IsPartitioned returns true if the table is a partitioned table.
+func (t *Table) IsPartitioned() bool {
+	return t != nil && t.PartitionKey != nil
+}
+
+// IsPartition returns true if the table is a partition of another table.
+func (t *Table) IsPartition() bool {
+	return t != nil && t.PartitionOf != nil
 }
 
 // GeneratedColumn describes a computed or generated column.
