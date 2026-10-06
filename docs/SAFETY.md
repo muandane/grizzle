@@ -140,12 +140,30 @@ Supported hazard codes:
 | `DROP_COLUMN` | `CRITICAL` | Column dropped from table (permanent data loss) |
 | `TYPE_NARROW` | `CRITICAL` | Column type narrowed (e.g. `bigint` to `integer`, risk of numeric overflow) |
 | `RENAME_AMBIGUOUS` | `CRITICAL` | Unmapped column dropped and added with identical type in same table |
+| `UNMANAGED_DEPENDENCY` | `CRITICAL` | Operation on column or table that an unmanaged object (view, trigger, function) depends on |
+| `GENERATED_REWRITE` | `WARNING` | Generated column expression modified; requires table rewrite on PostgreSQL |
 | `NOT_NULL_NO_DEFAULT` | `WARNING` | Adding non-null column without default to non-empty table |
 | `DROP_INDEX` | `NOTICE` | Index removal impacting query performance |
 | `DROP_FK` | `NOTICE` | Foreign key constraint removal |
 
 > [!IMPORTANT]
 > `AllowDrop: false` is a hard safety invariant enforced at the policy gate before hazard evaluation. Setting `AcceptHazards: []HazardCode{HazardDropColumn}` will not bypass a disabled drop policy.
+
+### Invariant 4b: Unmanaged objects policy — detected, protected, not managed
+
+Production databases frequently contain database objects that Grizzle does not manage declaratively:
+* Standard and materialized views (`CREATE VIEW`, `CREATE MATERIALIZED VIEW`)
+* Table triggers and event triggers (`CREATE TRIGGER`)
+* Functions and stored procedures (`CREATE FUNCTION`, `CREATE PROCEDURE`)
+* Standalone sequences not owned by managed tables
+* Custom user domains (`CREATE DOMAIN`)
+
+**Grizzle's invariant for unmanaged objects is: Detected, Protected, Not Managed.**
+
+1. **Introspection & Dependency Graphing**: During PostgreSQL schema introspection, Grizzle queries `pg_depend`, `pg_rewrite`, `pg_trigger`, and `pg_proc` to construct a structural dependency graph connecting unmanaged objects to base tables and columns.
+2. **Never Diff-Dropped**: Grizzle never drops or alters unmanaged views, triggers, or functions. They are excluded from diff drop generation.
+3. **Hazard Gate Protection (`UNMANAGED_DEPENDENCY`)**: If a planned migration step modifies or drops a column or table upon which an unmanaged view, trigger, or function depends, Grizzle flags the step with `HazardUnmanagedDependency` (`CRITICAL`). Execution is blocked unless explicitly accepted via `AcceptHazards`.
+4. **Roadmap Note**: Declarative lifecycle management (diffing, creating, and replacing) of views, triggers, and functions is intentionally omitted from Grizzle automigrations. These database objects carry procedural logic and state dependencies best managed through versioned migration scripts or application code. Support for declarative view migrations will be evaluated in a future major release.
 
 ### Invariant 5: Plan/Apply split with approval hash
 

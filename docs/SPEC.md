@@ -193,6 +193,7 @@ type Hazard struct {
 | `DROP INDEX` | Yes | Guarded by `AllowDropIndex` and `HazardDropIndex` |
 | `FOREIGN KEY` | Yes | Split into `ADD CONSTRAINT ... NOT VALID` and `VALIDATE CONSTRAINT` |
 | `ENUM Types` | Yes | `CREATE TYPE ... AS ENUM`, `ALTER TYPE ... ADD VALUE` |
+| `Generated Columns` | Yes | `GENERATED ALWAYS AS (...) STORED`; expression rewrite triggers `GENERATED_REWRITE` hazard |
 | `Native Types` | Yes | UUID, JSONB, Arrays, Timestamps, Numerics |
 
 ### SQLite
@@ -208,6 +209,20 @@ type Hazard struct {
 | `CREATE INDEX` | Yes | Direct `CREATE INDEX` and `CREATE UNIQUE INDEX` |
 | `DROP INDEX` | Yes | Guarded by `AllowDropIndex` |
 | `FOREIGN KEY` | Yes | Validated with `PRAGMA foreign_key_check` |
+| `Generated Columns` | Yes | `STORED` and `VIRTUAL` supported; rebuild preserves generated definitions |
+
+### Unmanaged database objects (Detected, Protected, Not Managed)
+
+| Construct | Supported | Policy |
+| :--- | :---: | :--- |
+| `Views` & `Materialized Views` | Protected | Introspected and dependency-graphed; destructive changes blocked via `UNMANAGED_DEPENDENCY` |
+| `Triggers` | Protected | Preserved on managed tables; drop/alter operations on dependencies blocked |
+| `Functions` & `Procedures` | Protected | Introspected; column/table dependencies protected from destructive alterations |
+| `Sequences` (unowned) | Protected | Never dropped or managed |
+| `Domains` | Protected | Introspected and protected |
+
+> [!NOTE]
+> **Roadmap Note**: Declarative view, trigger, and function migrations are intentionally out of scope for automigrations. They are detected and protected from collateral damage, but not altered or dropped. Declarative management of view DDL will be evaluated in future releases.
 
 ## 4. Safety model and invariants
 
@@ -218,7 +233,7 @@ If `AllowDrop` is false (the default), Grizzle refuses to execute any plan conta
 PostgreSQL migrations acquire advisory locks (`pg_advisory_xact_lock` or session lock for concurrent indexes). Grizzle recomputes the diff post-lock to avoid TOCTOU races.
 
 ### Invariant 3: Hazard gating
-Critical hazards (`DROP_TABLE`, `DROP_COLUMN`, `TYPE_NARROW`, `RENAME_AMBIGUOUS`) fail execution unless accepted via `AcceptHazards`.
+Critical hazards (`DROP_TABLE`, `DROP_COLUMN`, `TYPE_NARROW`, `RENAME_AMBIGUOUS`, `UNMANAGED_DEPENDENCY`) fail execution unless accepted via `AcceptHazards`. Operational warnings (`GENERATED_REWRITE`) alert callers to full table rewrites.
 
 ### Invariant 4: Plan/Apply approval hash
 `Plan.Hash()` provides a deterministic digest. `Apply` verifies the post-lock hash against `ExpectedHash`, aborting with `ErrPlanDrift` on mismatch.
