@@ -58,7 +58,7 @@ jobs:
         postgres-version: ['14', '15', '16', '17']
     services:
       postgres:
-        image: ${{ env.PG_IMAGE != '' && env.PG_IMAGE || format('postgres:{0}', matrix.postgres-version) }}
+        image: postgres:${{ matrix.postgres-version }}
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: password
