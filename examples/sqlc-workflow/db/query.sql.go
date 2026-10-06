@@ -10,6 +10,7 @@ VALUES ($1)
 RETURNING id, name, created_at
 `
 
+// CreateOrganization inserts a new organization and returns the created record.
 func (q *Queries) CreateOrganization(ctx context.Context, name string) (Organization, error) {
 	row := q.db.QueryRowContext(ctx, createOrganization, name)
 	var i Organization
@@ -23,12 +24,14 @@ VALUES ($1, $2, $3)
 RETURNING id, org_id, email, full_name, created_at
 `
 
+// CreateUserParams contains parameters for creating a new user.
 type CreateUserParams struct {
 	OrgID    int64  `json:"org_id"`
 	Email    string `json:"email"`
 	FullName string `json:"full_name"`
 }
 
+// CreateUser inserts a new user and returns the created record.
 func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, error) {
 	row := q.db.QueryRowContext(ctx, createUser, arg.OrgID, arg.Email, arg.FullName)
 	var i User
@@ -48,6 +51,7 @@ FROM users
 WHERE email = $1
 `
 
+// GetUserByEmail fetches a user matching the provided email address.
 func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error) {
 	row := q.db.QueryRowContext(ctx, getUserByEmail, email)
 	var i User
@@ -68,6 +72,7 @@ WHERE org_id = $1
 ORDER BY id
 `
 
+// ListUsersByOrg returns all users belonging to an organization.
 func (q *Queries) ListUsersByOrg(ctx context.Context, orgID int64) ([]User, error) {
 	rows, err := q.db.QueryContext(ctx, listUsersByOrg, orgID)
 	if err != nil {

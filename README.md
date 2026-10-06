@@ -285,6 +285,14 @@ grizzle export --plan plan.json --format goose --out ./migrations
 - `3`: Plan hash drift during `apply` (`ErrPlanDrift`)
 - `4`: Schema drift detected during `check`
 
+## Examples and deployment patterns
+
+- [Standard Library PostgreSQL](examples/postgres-stdlib): Minimal startup automigration with `database/sql` and `pgx`.
+- [Embedded SQLite](examples/sqlite-embedded): In-process embedded SQLite automigration with zero Cgo.
+- [sqlc Workflow](examples/sqlc-workflow): Single source of truth workflow pairing `schema.sql` with `sqlc` query generation.
+- [Native pgxpool](examples/postgres-pgxpool): Using `*pgxpool.Pool` for application queries with `stdlib.OpenDBFromPool`.
+- [Kubernetes Blueprint](examples/kubernetes-blueprint): Production multi-replica deployment manifest with rolling update coordination.
+
 ---
 
 ## Documentation
@@ -294,6 +302,7 @@ grizzle export --plan plan.json --format goose --out ./migrations
 - [Engine Specification & API Reference](docs/SPEC.md)
 - [Planned Engine Features](docs/ENGINE_FEATURES.md)
 - [Changelog](CHANGELOG.md)
+
 
 
 ---
