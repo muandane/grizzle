@@ -492,10 +492,8 @@ func TestLocking_DirectApply_ConcurrentPodMutualExclusion(t *testing.T) {
 	errs := make(chan error, numPods)
 	barrier := make(chan struct{})
 
-	for i := 0; i < numPods; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range numPods {
+		wg.Go(func() {
 			<-barrier
 
 			planCopy := *p
@@ -504,7 +502,7 @@ func TestLocking_DirectApply_ConcurrentPodMutualExclusion(t *testing.T) {
 			}); err != nil {
 				errs <- err
 			}
-		}()
+		})
 	}
 
 	close(barrier)
@@ -560,10 +558,8 @@ func TestLocking_DeclarativeSync_ConcurrentPodMutualExclusion(t *testing.T) {
 	errs := make(chan error, numPods)
 	barrier := make(chan struct{})
 
-	for i := 0; i < numPods; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range numPods {
+		wg.Go(func() {
 			<-barrier
 
 			if err := grizzle.Sync(context.Background(), db, grizzle.Options{
@@ -573,7 +569,7 @@ func TestLocking_DeclarativeSync_ConcurrentPodMutualExclusion(t *testing.T) {
 			}); err != nil {
 				errs <- err
 			}
-		}()
+		})
 	}
 
 	close(barrier)
@@ -754,4 +750,3 @@ func TestLocking_PgTerminateBackendRecovery(t *testing.T) {
 		t.Fatalf("expected 0 diff steps after recovery, got %d: %+v", len(pFinal.Steps), pFinal.Steps)
 	}
 }
-

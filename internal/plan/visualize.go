@@ -3,6 +3,7 @@ package plan
 import (
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 )
 
@@ -255,13 +256,7 @@ func extractTableColumns(sqlStr string) []string {
 			continue
 		}
 		upperFirst := strings.ToUpper(cleanIdentifier(fields[0]))
-		skip := false
-		for _, sp := range skipPrefixes {
-			if upperFirst == sp {
-				skip = true
-				break
-			}
-		}
+		skip := slices.Contains(skipPrefixes, upperFirst)
 		if skip {
 			continue
 		}
@@ -391,4 +386,3 @@ func stepOperationSummary(s Step) string {
 		return strings.TrimSuffix(strings.TrimSpace(s.SQL), ";")
 	}
 }
-

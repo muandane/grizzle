@@ -164,7 +164,7 @@ func RunMultiShadowDDL(ctx context.Context, dbtx dialect.DBTX, shadowMap map[str
 
 func parseIndexAndTable(stmt string) (idxName, tblName string) {
 	tokens := strings.Fields(stmt)
-	for i := 0; i < len(tokens); i++ {
+	for i := range tokens {
 		tokUpper := strings.ToUpper(tokens[i])
 		if tokUpper == "INDEX" {
 			j := i + 1
@@ -203,8 +203,8 @@ func wrapImmutableIndexError(err error, sqlStr string) error {
 	if !strings.Contains(strings.ToLower(errStr), "must be marked immutable") && !strings.Contains(errStr, "42P17") {
 		return err
 	}
-	statements := strings.Split(sqlStr, ";")
-	for _, stmt := range statements {
+	statements := strings.SplitSeq(sqlStr, ";")
+	for stmt := range statements {
 		stmtTrim := strings.TrimSpace(stmt)
 		upper := strings.ToUpper(stmtTrim)
 		if strings.HasPrefix(upper, "CREATE ") && strings.Contains(upper, "INDEX ") {

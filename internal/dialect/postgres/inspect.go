@@ -12,7 +12,7 @@ import (
 // Inspect reads the relational state of the specified schema directly from pg_catalog.
 func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema.Schema, error) {
 	s := &schema.Schema{
-		Name:   schemaName,
+		Name:      schemaName,
 		Tables:    make(map[string]*schema.Table),
 		Enums:     make(map[string]*schema.Enum),
 		Unmanaged: make(map[string]*schema.UnmanagedObject),
@@ -684,11 +684,11 @@ func qualifyCrossSchemaFK(fkDef, refSchema, refTable string) string {
 		return fkDef
 	}
 	rest := fkDef[idx+len("REFERENCES "):]
-	parenIdx := strings.Index(rest, "(")
-	if parenIdx == -1 {
+	before, _, ok := strings.Cut(rest, "(")
+	if !ok {
 		return fkDef
 	}
-	tblPart := strings.TrimSpace(rest[:parenIdx])
+	tblPart := strings.TrimSpace(before)
 	if strings.Contains(tblPart, ".") {
 		return fkDef
 	}
