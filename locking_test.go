@@ -620,6 +620,7 @@ func TestLocking_PgTerminateBackendRecovery(t *testing.T) {
 	}()
 
 	// 1. Initial table with 50,000 rows
+	//nolint:gosec // G201: test creates randomized test schema and table
 	initialSQL := fmt.Sprintf(`
 		CREATE TABLE %q.large_table (
 			id BIGINT PRIMARY KEY,
@@ -702,6 +703,7 @@ func TestLocking_PgTerminateBackendRecovery(t *testing.T) {
 
 	// 4. Verify invalid index was left behind in pg_index
 	var isInvalid bool
+	//nolint:gosec // G201: test executes query on randomized test schema
 	checkQuery := fmt.Sprintf(`
 		SELECT NOT i.indisvalid
 		FROM pg_index i

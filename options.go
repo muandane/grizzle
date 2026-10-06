@@ -1,12 +1,10 @@
 package grizzle
 
 import (
-	"cmp"
 	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
-	"slices"
 	"strings"
 	"time"
 
@@ -325,21 +323,4 @@ func toScopeFilters(opts Options) scope.Filters {
 		Renames:        opts.Renames,
 		ExpandContract: opts.ExpandContract,
 	}
-}
-
-func defaultPostgresLockID(targetSchema string) int64 {
-	schema := cmp.Or(targetSchema, "public")
-	return GenerateLockID("grizzle", schema)
-}
-
-func defaultPostgresLockIDFromSchemas(targetSchemas []string) int64 {
-	if len(targetSchemas) == 0 {
-		return defaultPostgresLockID("")
-	}
-	if len(targetSchemas) == 1 {
-		return defaultPostgresLockID(targetSchemas[0])
-	}
-	sorted := slices.Clone(targetSchemas)
-	slices.Sort(sorted)
-	return GenerateLockID("grizzle", strings.Join(sorted, ","))
 }

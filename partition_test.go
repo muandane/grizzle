@@ -700,6 +700,7 @@ func TestPartition_DefaultPartition_AttachScanConflict(t *testing.T) {
 	ctx := context.Background()
 
 	// 1. Create partitioned table with a DEFAULT partition and insert row in default partition
+	//nolint:gosec // G201: test constructs setup DDL with randomized schema prefix
 	initialSQL := fmt.Sprintf(`
 		SET search_path TO %q;
 		CREATE TABLE events (
@@ -786,6 +787,7 @@ func TestPartition_WrappedFKError_Context(t *testing.T) {
 	ctx := context.Background()
 
 	// Setup: parent orders table and items table with invalid foreign key data
+	//nolint:gosec // G201: test constructs setup DDL with randomized schema prefix
 	setupSQL := fmt.Sprintf(`
 		SET search_path TO %q;
 		CREATE TABLE orders (

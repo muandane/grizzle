@@ -157,7 +157,7 @@ func TestInteractiveTTY_RealPTY(t *testing.T) {
 		go func() {
 			var buf strings.Builder
 			b := make([]byte, 1024)
-			var sentDetails, sentYes bool
+			var sentDetails bool
 			for {
 				n, err := ptmx.Read(b)
 				if n > 0 {
@@ -166,8 +166,7 @@ func TestInteractiveTTY_RealPTY(t *testing.T) {
 					if strings.Contains(str, "[y/N/details]:") && !sentDetails {
 						sentDetails = true
 						_, _ = ptmx.WriteString("details\n")
-					} else if strings.Contains(str, "Full SQL statements:") && strings.Contains(str, "[y/N]:") && !sentYes {
-						sentYes = true
+					} else if strings.Contains(str, "Full SQL statements:") && strings.Contains(str, "[y/N]:") {
 						_, _ = ptmx.WriteString("y\n")
 						outCh <- str
 						return
@@ -219,7 +218,7 @@ func TestInteractiveTTY_RealPTY(t *testing.T) {
 		go func() {
 			var buf strings.Builder
 			b := make([]byte, 1024)
-			var sentDetails, sentNo bool
+			var sentDetails bool
 			for {
 				n, err := ptmx.Read(b)
 				if n > 0 {
@@ -228,8 +227,7 @@ func TestInteractiveTTY_RealPTY(t *testing.T) {
 					if strings.Contains(str, "[y/N/details]:") && !sentDetails {
 						sentDetails = true
 						_, _ = ptmx.WriteString("details\n")
-					} else if strings.Contains(str, "Full SQL statements:") && strings.Contains(str, "[y/N]:") && !sentNo {
-						sentNo = true
+					} else if strings.Contains(str, "Full SQL statements:") && strings.Contains(str, "[y/N]:") {
 						_, _ = ptmx.WriteString("n\n")
 						outCh <- str
 						return
