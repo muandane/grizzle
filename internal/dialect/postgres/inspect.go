@@ -99,6 +99,7 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 		tbl, exists := s.Tables[tableName]
 		if !exists {
 			tbl = &schema.Table{
+				Schema:      schemaName,
 				Name:        tableName,
 				Columns:     make(map[string]*schema.Column),
 				Indexes:     make(map[string]*schema.Index),
@@ -179,6 +180,7 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 		tbl, exists := s.Tables[tableName]
 		if !exists {
 			tbl = &schema.Table{
+				Schema:      schemaName,
 				Name:        tableName,
 				Columns:     make(map[string]*schema.Column),
 				Indexes:     make(map[string]*schema.Index),
@@ -239,6 +241,7 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 		tbl, exists := s.Tables[childTable]
 		if !exists {
 			tbl = &schema.Table{
+				Schema:      schemaName,
 				Name:        childTable,
 				Columns:     make(map[string]*schema.Column),
 				Indexes:     make(map[string]*schema.Index),
@@ -362,10 +365,14 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 			c.relname AS table_name,
 			con.conname AS constraint_name,
 			pg_get_constraintdef(con.oid) AS constraint_def,
-			con.convalidated AS is_valid
+			con.convalidated AS is_valid,
+			COALESCE(ref_ns.nspname, '') AS ref_schema,
+			COALESCE(ref_c.relname, '') AS ref_table
 		FROM pg_constraint con
 		JOIN pg_class c ON c.oid = con.conrelid
 		JOIN pg_namespace n ON n.oid = c.relnamespace
+		LEFT JOIN pg_class ref_c ON ref_c.oid = con.confrelid
+		LEFT JOIN pg_namespace ref_ns ON ref_ns.oid = ref_c.relnamespace
 		WHERE n.nspname = $1
 		  AND con.contype = 'f'
 		ORDER BY c.relname, con.conname;
@@ -382,8 +389,10 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 			fkName    string
 			fkDef     string
 			isValid   bool
+			refSchema string
+			refTable  string
 		)
-		if err := fkRows.Scan(&tableName, &fkName, &fkDef, &isValid); err != nil {
+		if err := fkRows.Scan(&tableName, &fkName, &fkDef, &isValid, &refSchema, &refTable); err != nil {
 			return nil, fmt.Errorf("scanning foreign key in schema %q: %w", schemaName, err)
 		}
 
@@ -391,6 +400,8 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 			tbl.ForeignKeys[fkName] = &schema.ForeignKey{
 				Name:       fkName,
 				TableName:  tableName,
+				RefSchema:  refSchema,
+				RefTable:   refTable,
 				Definition: fkDef,
 				IsValid:    isValid,
 			}
@@ -629,4 +640,17 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 	}
 
 	return s, nil
+}
+
+// InspectSchemas reads the relational states across all specified schema names.
+func InspectSchemas(ctx context.Context, dbtx dialect.DBTX, schemaNames []string) (map[string]*schema.Schema, error) {
+	schemas := make(map[string]*schema.Schema, len(schemaNames))
+	for _, name := range schemaNames {
+		s, err := Inspect(ctx, dbtx, name)
+		if err != nil {
+			return nil, err
+		}
+		schemas[name] = s
+	}
+	return schemas, nil
 }
