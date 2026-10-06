@@ -51,7 +51,10 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 	var changes []Change
 
 	// 1. Custom ENUM Types Diff
-	for dName, dEnum := range desired.Enums {
+	dEnumNames := slices.Collect(maps.Keys(desired.Enums))
+	slices.Sort(dEnumNames)
+	for _, dName := range dEnumNames {
+		dEnum := desired.Enums[dName]
 		lEnum, exists := live.Enums[dName]
 		if !exists {
 			changes = append(changes, Change{
@@ -77,7 +80,10 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 	}
 
 	// 2. Tables & Columns Diff
-	for tblName, dTable := range desired.Tables {
+	desiredTableNames := slices.Collect(maps.Keys(desired.Tables))
+	slices.Sort(desiredTableNames)
+	for _, tblName := range desiredTableNames {
+		dTable := desired.Tables[tblName]
 		if !scope.IsTableManaged(tblName, filters) {
 			continue
 		}
@@ -414,7 +420,9 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 	}
 
 	// 3. Detect dropped tables
-	for tblName := range live.Tables {
+	liveTableNames := slices.Collect(maps.Keys(live.Tables))
+	slices.Sort(liveTableNames)
+	for _, tblName := range liveTableNames {
 		if !scope.IsTableManaged(tblName, filters) {
 			continue
 		}

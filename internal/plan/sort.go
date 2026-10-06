@@ -1,6 +1,9 @@
 package plan
 
-import "slices"
+import (
+	"slices"
+	"strings"
+)
 
 // SortSteps applies topological ordering so dependent DDL operations execute in the correct relational sequence.
 func SortSteps(steps []Step) {
@@ -29,6 +32,12 @@ func SortSteps(steps []Step) {
 		}
 		// If both are ChangeCreateTable, ensure parent partitioned tables come before child partitions
 		if a.Type == ChangeCreateTable && b.Type == ChangeCreateTable {
+			if a.ParentTable == "" && b.ParentTable != "" {
+				return -1
+			}
+			if a.ParentTable != "" && b.ParentTable == "" {
+				return 1
+			}
 			if b.ParentTable == a.Table {
 				return -1
 			}
@@ -36,6 +45,9 @@ func SortSteps(steps []Step) {
 				return 1
 			}
 		}
-		return 0
+		if a.Table != b.Table {
+			return strings.Compare(a.Table, b.Table)
+		}
+		return strings.Compare(a.SQL, b.SQL)
 	})
 }
