@@ -84,13 +84,24 @@ func setupLogger(jsonLog bool) {
 	slog.SetDefault(slog.New(handler))
 }
 
+var (
+	version = "v0.1.0"
+	commit  = "none"
+	date    = "unknown"
+)
+
 func run(args []string) int {
 	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "Usage: grizzle <plan|apply|check|export> [flags]")
+		fmt.Fprintln(os.Stderr, "Usage: grizzle <plan|apply|check|export|version> [flags]")
 		return 1
 	}
 
 	command := args[0]
+	if command == "version" || command == "--version" || command == "-version" || command == "-v" {
+		fmt.Printf("grizzle %s (commit: %s, date: %s)\n", version, commit, date)
+		return 0
+	}
+
 	fs := flag.NewFlagSet(command, flag.ContinueOnError)
 
 	var (
@@ -103,7 +114,7 @@ func run(args []string) int {
 		jsonOutput   = fs.Bool("json", false, "Output in JSON format")
 		jsonLog      = fs.Bool("json-log", false, "Emit logs in structured JSON format")
 		expectedHash = fs.String("expected-hash", "", "Expected plan approval hash")
-		versionFlag  = fs.String("version", "v0.1.0", "Version string for export headers")
+		versionFlag  = fs.String("version", version, "Version string for export headers")
 	)
 
 	var hazards hazardFlags

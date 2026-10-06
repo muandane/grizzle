@@ -177,3 +177,19 @@ func TestCLI_RedactsDSNCredentials(t *testing.T) {
 		t.Fatalf("found raw password in CLI output: %s", string(out))
 	}
 }
+
+func TestCLI_Version(t *testing.T) {
+	binPath := buildBinary(t)
+
+	for _, flagOrCmd := range []string{"version", "--version", "-v"} {
+		cmd := exec.Command(binPath, flagOrCmd) //nolint:gosec // G204: test executes CLI
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("running %s failed: %v\nOutput: %s", flagOrCmd, err, string(out))
+		}
+		if !strings.Contains(string(out), "grizzle") {
+			t.Fatalf("expected grizzle in output, got: %s", string(out))
+		}
+	}
+}
+
