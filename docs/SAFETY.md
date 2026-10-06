@@ -27,42 +27,42 @@ The following table compares how each tool handles these failure modes:
 
 ### TypeORM (`synchronize: true`)
 
-TypeORM includes a `synchronize` flag intended for rapid local development. As documented in the [official TypeORM documentation](https://typeorm.io/data-source-options) (as of v0.3.x):
+TypeORM includes a `synchronize` option intended for rapid local prototyping. As documented in the [official TypeORM documentation](https://typeorm.io/data-source-options) (v0.3.x):
 > *"synchronize - Indicates if database schema should be auto created on every application launch. Be careful with this option and don't use this in production - otherwise you can lose production data."*
 
-In production environments, running with `synchronize: true` introduces severe operational risks:
+For production environments, TypeORM explicitly directs users away from `synchronize` toward its versioned migration generator and runner (`typeorm migration:generate` and `typeorm migration:run`, see [TypeORM Migrations](https://typeorm.io/migrations)). When teams mistakenly attempt to run `synchronize: true` in production, they encounter severe operational hazards:
 
-1. **No distributed locking.** When multiple Kubernetes pods boot simultaneously, each instance introspects the database concurrently, computes identical or overlapping DDL changes, and executes concurrent `ALTER TABLE` statements. This causes PostgreSQL deadlocks (`deadlock detected`), lock acquisition failures, and failed deployments.
-2. **Silent data loss.** If an entity property is removed, renamed, or temporarily commented out, TypeORM generates `ALTER TABLE ... DROP COLUMN` or drops entire tables on startup without requiring confirmation or hazard acknowledgment.
-3. **No shadow validation.** Statements are executed directly against the live database without prior compilation in a scratch schema. A failing constraint midway through execution leaves tables in a partially altered or corrupted state.
-4. **Unmanaged table deletion.** TypeORM treats any database table not represented by an entity in the running application as obsolete, dropping tables belonging to worker queues (`asynq`, `pgboss`, `temporal`) or database extensions (`spatial_ref_sys`).
+1. **No distributed locking:** When multiple application pods boot simultaneously, each instance introspects the database concurrently and issues overlapping DDL. This triggers PostgreSQL deadlocks (`deadlock detected`), lock acquisition failures, and crash loops.
+2. **Silent data loss:** If an entity property is removed, renamed, or temporarily commented out, TypeORM generates `ALTER TABLE ... DROP COLUMN` or drops unmapped tables on startup without requiring hazard acknowledgment or operator approval.
+3. **No shadow validation:** Statements execute directly against the live database without prior compilation in an isolated scratch schema. A failing constraint midway through execution leaves tables in a partially altered state.
+4. **Unmanaged table deletion:** TypeORM treats database tables not represented by an entity class as obsolete, dropping tables belonging to worker queues (`asynq`, `pgboss`, `temporal`) or spatial extensions (`spatial_ref_sys`).
 
 ### Drizzle ORM (`drizzle-kit push`)
 
-Drizzle ORM provides `drizzle-kit push` for rapid schema prototyping against development databases. As documented in the [official Drizzle Kit documentation](https://orm.drizzle.team/kit-docs/commands#push) (as of Drizzle Kit v0.30+):
+Drizzle ORM provides `drizzle-kit push` for rapid schema prototyping against development and preview databases. As documented in the [official Drizzle Kit documentation](https://orm.drizzle.team/kit-docs/commands#push) (v0.30+):
 
-1. **Interactive terminal dependency.** When `drizzle-kit push` detects schema truncations or deletions, it prompts interactively in the terminal (`Do you want to truncate/drop?`). In headless CI/CD pipelines, Kubernetes init containers, or Docker entrypoints where no interactive TTY is attached, execution blocks unless bypassed.
-2. **Unsafe headless flags.** In non-interactive environments, passing `--force` unconditionally approves all destructive changes. A typo or omitted column definition in a deployed schema file immediately drops production data without granular policy enforcement.
-3. **External runtime requirement.** Running Drizzle requires Node.js, `npm`, or `pnpm` inside production container images, expanding image footprints and increasing the attack surface.
-4. **No multi-pod coordination.** `drizzle-kit push` is designed as a developer CLI tool. It lacks distributed advisory locking to synchronize multiple application replicas starting up concurrently. (For production deployments, Drizzle officially recommends generating discrete SQL migration files via `drizzle-kit generate` and executing them via `drizzle-kit migrate`).
+1. **Design intent & production recommendation:** Drizzle explicitly documents `push` as a developer-facing prototyping command (often paired with ephemeral preview databases or branch-per-PR databases like Neon and Turso). For production deployments, Drizzle officially recommends the declarative-to-migration workflow: generating discrete SQL files via `drizzle-kit generate` and applying them with `drizzle-orm/migrator` or external runners (see [Drizzle Migrations](https://orm.drizzle.team/docs/get-started/migrations)).
+2. **Interactive terminal dependency:** When `drizzle-kit push` detects schema truncations or deletions, it prompts interactively in the terminal (`Do you want to truncate/drop?`). In headless CI/CD pipelines, Kubernetes init containers, or automated entrypoints without a TTY, execution hangs unless bypassed.
+3. **Unsafe headless flags:** In non-interactive environments, passing `--force` unconditionally approves all destructive changes. A typo or omitted column definition in a deployed schema file drops production data without granular policy enforcement.
+4. **External runtime & no multi-pod locking:** Running Drizzle requires Node.js, `npm`, or `pnpm` inside deployment containers, increasing image size and attack surface. Furthermore, `push` lacks distributed advisory locking to coordinate concurrent application replicas booting in parallel.
 
 ### Atlas (`ariga.io/atlas`)
 
-Atlas is an open-source schema management engine written in Go. As documented in the [official Atlas documentation](https://atlasgo.io/lint/analyzers) and [Atlas dev-database guides](https://atlasgo.io/concepts/dev-database) (as of Atlas v0.28+):
+Atlas is a mature, open-source schema management platform written in Go. As documented in the [official Atlas documentation](https://atlasgo.io/declarative/apply), [dev-database architecture](https://atlasgo.io/concepts/dev-database), and [linting analyzers](https://atlasgo.io/lint/analyzers) (v0.28+):
 
-1. **Pre-flight verification.** Atlas validates migrations against a temporary "dev database" (either a local SQLite instance, an ephemeral PostgreSQL container, or a cloud dev database) before executing statements against target environments.
-2. **Advisory locking and linting.** Atlas acquires database advisory locks and checks migration steps for high-risk operations (such as table-locking DDL or missing column defaults).
-3. **Operational trade-offs.** 
-   - Atlas runs as a standalone CLI binary or Docker container rather than an in-process Go library. Incorporating Atlas into a Go application requires maintaining pre-migration CI steps, Kubernetes init containers, or container sidecars.
-   - Core CLI capabilities are licensed under the Business Source License (BSL 1.1) and Ariga Community License. While basic analyzers are available in the open tier, advanced analysis features—such as data-dependent checks, backward-compatibility validation across rolling releases, and team governance policies—require Atlas Pro or Atlas Cloud integration.
+1. **Pre-flight verification:** Atlas validates declarative migrations against a temporary "dev database" (such as a local SQLite instance, an ephemeral PostgreSQL Docker container, or an external database) before executing statements against target environments.
+2. **Advisory locking and linting:** Atlas acquires database migration advisory locks and checks migration steps for high-risk operations (such as table-locking DDL, missing column defaults, or lock timeout risks).
+3. **Operational trade-offs:** 
+   - **Deployment topology:** Atlas runs as a standalone CLI binary, Docker container, Kubernetes Operator, or Terraform provider rather than an in-process Go library. Integrating Atlas into a Go service requires maintaining pre-deployment CI steps, Kubernetes init containers, or container sidecars.
+   - **Licensing and governance:** Core CLI capabilities are licensed under the Business Source License (BSL 1.1) and Ariga Community License. While basic linting analyzers are available in the open tier, advanced analysis features—such as data-dependent checks, backward-compatibility validation across rolling releases, and team governance policies—require Atlas Pro or Atlas Cloud integration.
 
 ### Ent (`entgo.io`)
 
-Ent is an entity framework for Go providing declarative schema migration. As documented in the [official Ent migration documentation](https://entgo.io/docs/migrate/#drop-assets) (as of Ent v0.14+):
+Ent is an entity framework for Go providing declarative schema migration. As documented in the [official Ent migration documentation](https://entgo.io/docs/migrate) and [drop asset controls](https://entgo.io/docs/migrate/#drop-assets) (v0.14+):
 
-1. **Safe default drop policies.** Ent disables destructive column drops by default (`schema.WithDropColumn(false)`) and allows users to restrict migration scope to specific tables using `schema.WithTables(...)`.
-2. **Coupling to code generation.** Schemas must be authored using Ent's Go DSL (`ent/schema`). Teams cannot use plain `schema.sql` files directly, preventing direct interoperability with SQL-centric tooling such as `sqlc` or raw DDL scripts.
-3. **No staged expand-and-contract.** Ent does not provide built-in ambiguous column rename detection or automated staged expand-and-contract primitives from declarative SQL DDL.
+1. **Safe default drop policies:** Ent defaults to non-destructive behavior: destructive column drops are disabled by default (`schema.WithDropColumn(false)`), and migrations can be restricted to specific tables using `schema.WithTables(...)`.
+2. **Coupling to code generation:** Schemas must be defined in Go code using Ent's DSL (`ent/schema`). Teams cannot use standard `schema.sql` files directly, preventing direct interoperability with SQL-centric tooling such as `sqlc` or raw DDL scripts without secondary synchronization.
+3. **Operational ergonomics:** While Ent supports custom migration hooks and advisory locks via custom driver configuration, it does not provide built-in hazard code gating (`CRITICAL` vs `WARNING`), deterministic plan hashing (`Plan.Hash()`), CLI migration export (to Goose or Atlas), or staged expand-and-contract column renames from SQL DDL.
 
 ## Grizzle safety invariants
 
