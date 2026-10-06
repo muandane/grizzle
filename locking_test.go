@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/muandane/grizzle"
 	"github.com/muandane/grizzle/internal/dialect/postgres"
 	"github.com/muandane/grizzle/internal/exec"
@@ -616,16 +617,18 @@ func TestLocking_PgTerminateBackendRecovery(t *testing.T) {
 	}()
 
 	// 1. Initial table with 50,000 rows
-	//nolint:gosec // G201: test creates randomized test schema and table
-	initialSQL := fmt.Sprintf(`
-		CREATE TABLE %q.large_table (
+	schemaIdent := pgx.Identifier{schema}.Sanitize()
+	if _, err := db.Exec("SELECT set_config('search_path', $1, false);", schemaIdent); err != nil {
+		t.Fatalf("failed setting search_path: %v", err)
+	}
+	const initialSQL = `
+		CREATE TABLE large_table (
 			id BIGINT PRIMARY KEY,
 			email TEXT NOT NULL
 		);
-		INSERT INTO %q.large_table (id, email)
+		INSERT INTO large_table (id, email)
 		SELECT g, 'user_' || g || '@example.com' FROM generate_series(1, 120000) g;
-	`, schema, schema)
-
+	`
 	if _, err := db.Exec(initialSQL); err != nil {
 		t.Fatalf("failed setting up initial data: %v", err)
 	}
@@ -726,13 +729,14 @@ func TestLocking_PgTerminateBackendRecovery(t *testing.T) {
 
 	// 6. Final verification: index is now valid and PlanDiff is empty
 	var isValid bool
-	err = db.QueryRow(fmt.Sprintf(`
+	const validQuery = `
 		SELECT i.indisvalid
 		FROM pg_index i
 		JOIN pg_class c ON c.oid = i.indexrelid
 		JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE n.nspname = '%s' AND c.relname = 'idx_term_email';
-	`, schema)).Scan(&isValid)
+		WHERE n.nspname = $1 AND c.relname = $2;
+	`
+	err = db.QueryRow(validQuery, schema, "idx_term_email").Scan(&isValid)
 	if err != nil || !isValid {
 		t.Fatalf("expected recovered index to be valid, err=%v, isValid=%t", err, isValid)
 	}

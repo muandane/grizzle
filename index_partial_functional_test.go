@@ -551,7 +551,13 @@ func TestPartialAndFunctionalIndexes_NonImmutableFunctionRejection(t *testing.T)
 
 	// 3. Assert real database schema is completely untouched
 	var tableExists bool
-	err = db.QueryRow(fmt.Sprintf("SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = '%s' AND table_name = 'orders');", schemaPrefix)).Scan(&tableExists)
+	const checkTableQuery = `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.tables
+			WHERE table_schema = $1 AND table_name = $2
+		);
+	`
+	err = db.QueryRow(checkTableQuery, schemaPrefix, "orders").Scan(&tableExists)
 	if err != nil {
 		t.Fatalf("failed checking table existence: %v", err)
 	}

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/muandane/grizzle"
 	"github.com/muandane/grizzle/internal/dialect/postgres"
@@ -700,9 +701,11 @@ func TestPartition_DefaultPartition_AttachScanConflict(t *testing.T) {
 	ctx := context.Background()
 
 	// 1. Create partitioned table with a DEFAULT partition and insert row in default partition
-	//nolint:gosec // G201: test constructs setup DDL with randomized schema prefix
-	initialSQL := fmt.Sprintf(`
-		SET search_path TO %q;
+	schemaIdent := pgx.Identifier{schemaPrefix}.Sanitize()
+	if _, err := db.Exec("SELECT set_config('search_path', $1, false);", schemaIdent); err != nil {
+		t.Fatalf("set search_path failed: %v", err)
+	}
+	const initialSQL = `
 		CREATE TABLE events (
 			id BIGINT NOT NULL,
 			event_date DATE NOT NULL,
@@ -718,7 +721,7 @@ func TestPartition_DefaultPartition_AttachScanConflict(t *testing.T) {
 		);
 
 		INSERT INTO events (id, event_date) VALUES (1, '2026-06-15');
-	`, schemaPrefix)
+	`
 
 	if _, err := db.Exec(initialSQL); err != nil {
 		t.Fatalf("setup failed: %v", err)
@@ -787,9 +790,11 @@ func TestPartition_WrappedFKError_Context(t *testing.T) {
 	ctx := context.Background()
 
 	// Setup: parent orders table and items table with invalid foreign key data
-	//nolint:gosec // G201: test constructs setup DDL with randomized schema prefix
-	setupSQL := fmt.Sprintf(`
-		SET search_path TO %q;
+	schemaIdent := pgx.Identifier{schemaPrefix}.Sanitize()
+	if _, err := db.Exec("SELECT set_config('search_path', $1, false);", schemaIdent); err != nil {
+		t.Fatalf("set search_path failed: %v", err)
+	}
+	const setupSQL = `
 		CREATE TABLE orders (
 			id BIGINT NOT NULL,
 			created_at DATE NOT NULL,
@@ -803,7 +808,7 @@ func TestPartition_WrappedFKError_Context(t *testing.T) {
 		);
 
 		INSERT INTO items (id, order_id, created_at) VALUES (1, 9999, '2026-01-01');
-	`, schemaPrefix)
+	`
 	if _, err := db.Exec(setupSQL); err != nil {
 		t.Fatalf("setup failed: %v", err)
 	}
@@ -842,3 +847,224 @@ func TestPartition_WrappedFKError_Context(t *testing.T) {
 		t.Errorf("expected error message to contain table and foreign key context, got: %s", errMsg)
 	}
 }
+
+func TestPartition_DetachConcurrently_DefaultPartitionAndTxRejection(t *testing.T) {
+	db, _ := getPostgresDB(t)
+	defer func() { _ = db.Close() }()
+
+	schemaPrefix := fmt.Sprintf("test_detach_def_%d", time.Now().UnixNano())
+	_, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schemaPrefix))
+	if err != nil {
+		t.Fatalf("failed creating schema: %v", err)
+	}
+	defer func() {
+		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schemaPrefix))
+	}()
+
+	ctx := context.Background()
+	schemaIdent := pgx.Identifier{schemaPrefix}.Sanitize()
+	if _, err := db.Exec("SELECT set_config('search_path', $1, false);", schemaIdent); err != nil {
+		t.Fatalf("set search_path failed: %v", err)
+	}
+
+	const setupSQL = `
+		CREATE TABLE logs (
+			id BIGINT NOT NULL,
+			created_at DATE NOT NULL,
+			PRIMARY KEY (id, created_at)
+		) PARTITION BY RANGE (created_at);
+
+		CREATE TABLE logs_default PARTITION OF logs DEFAULT;
+		CREATE TABLE logs_2026_01 PARTITION OF logs FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+	`
+	if _, err := db.Exec(setupSQL); err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+
+	// 1. In Postgres, DETACH CONCURRENTLY inside a transaction block is rejected with 25001
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx failed: %v", err)
+	}
+	_, txErr := tx.ExecContext(ctx, "ALTER TABLE logs DETACH PARTITION logs_2026_01 CONCURRENTLY;")
+	_ = tx.Rollback()
+	if txErr == nil {
+		t.Fatalf("expected DETACH CONCURRENTLY inside transaction block to fail, got nil")
+	}
+	if !strings.Contains(txErr.Error(), "cannot run inside a transaction block") && !strings.Contains(txErr.Error(), "25001") {
+		t.Errorf("unexpected txErr: %v", txErr)
+	}
+
+	// 2. In Postgres, DETACH CONCURRENTLY on table with DEFAULT partition is rejected
+	_, defErr := db.ExecContext(ctx, "ALTER TABLE logs DETACH PARTITION logs_2026_01 CONCURRENTLY;")
+	if defErr == nil {
+		t.Fatalf("expected DETACH CONCURRENTLY on table with DEFAULT partition to fail, got nil")
+	}
+	if !strings.Contains(defErr.Error(), "cannot detach partition concurrently when a default partition exists") && !strings.Contains(defErr.Error(), "55000") {
+		t.Errorf("unexpected defErr: %v", defErr)
+	}
+
+	// 3. Grizzle Diff & Renderer: detects ParentHasDefault and renders plain in-tx DETACH (NonTx=false)
+	desiredSQL := `
+		CREATE TABLE logs (
+			id BIGINT NOT NULL,
+			created_at DATE NOT NULL,
+			PRIMARY KEY (id, created_at)
+		) PARTITION BY RANGE (created_at);
+
+		CREATE TABLE logs_default PARTITION OF logs DEFAULT;
+
+		CREATE TABLE logs_2026_01 (
+			id BIGINT NOT NULL,
+			created_at DATE NOT NULL,
+			PRIMARY KEY (id, created_at)
+		);
+	`
+	p, err := grizzle.PlanDiff(ctx, db, grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: schemaPrefix,
+		SchemaSQL:    desiredSQL,
+	})
+	if err != nil {
+		t.Fatalf("PlanDiff failed: %v", err)
+	}
+	var foundDetachStep bool
+	for _, s := range p.Steps {
+		if s.Type == grizzle.ChangeDetachPartition {
+			foundDetachStep = true
+			if s.NonTx {
+				t.Errorf("expected NonTx=false (plain DETACH in transaction) because table has default partition, got NonTx=true: %s", s.SQL)
+			}
+			if strings.Contains(s.SQL, "CONCURRENTLY") {
+				t.Errorf("expected no CONCURRENTLY keyword because table has default partition, got: %s", s.SQL)
+			}
+		}
+	}
+	if !foundDetachStep {
+		t.Fatalf("expected ChangeDetachPartition step in plan, got: %+v", p.Steps)
+	}
+}
+
+func TestPartition_InterruptedDetachPending_FinalizeAndHazard(t *testing.T) {
+	db, _ := getPostgresDB(t)
+	defer func() { _ = db.Close() }()
+
+	schemaPrefix := fmt.Sprintf("test_detach_pend_%d", time.Now().UnixNano())
+	_, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schemaPrefix))
+	if err != nil {
+		t.Fatalf("failed creating schema: %v", err)
+	}
+	defer func() {
+		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schemaPrefix))
+	}()
+
+	db.SetMaxOpenConns(1)
+
+	ctx := context.Background()
+	schemaIdent := pgx.Identifier{schemaPrefix}.Sanitize()
+	if _, err := db.Exec("SELECT set_config('search_path', $1, false);", schemaIdent); err != nil {
+		t.Fatalf("set search_path failed: %v", err)
+	}
+
+	const setupSQL = `
+		CREATE TABLE telemetry (
+			id BIGINT NOT NULL,
+			recorded_at DATE NOT NULL,
+			PRIMARY KEY (id, recorded_at)
+		) PARTITION BY RANGE (recorded_at);
+
+		CREATE TABLE telemetry_2026_01 PARTITION OF telemetry
+			FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+
+		INSERT INTO telemetry (id, recorded_at) VALUES (1, '2026-01-15');
+	`
+	if _, err := db.Exec(setupSQL); err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+
+	const updateSQL = `UPDATE pg_inherits SET inhdetachpending = true WHERE inhrelid = ($1 || '.telemetry_2026_01')::regclass;`
+	if _, err := db.Exec(updateSQL, schemaIdent); err != nil {
+		t.Fatalf("direct update failed: %v", err)
+	}
+
+	// 3. Inspect pg_inherits directly to confirm inhdetachpending is true on real PG 14+
+	var isPending bool
+	const checkPendingSQL = `
+		SELECT i.inhdetachpending
+		FROM pg_inherits i
+		JOIN pg_class c ON c.oid = i.inhrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relname = 'telemetry_2026_01';
+	`
+	if err := db.QueryRow(checkPendingSQL, schemaPrefix).Scan(&isPending); err != nil {
+		t.Fatalf("querying inhdetachpending failed: %v", err)
+	}
+	if !isPending {
+		t.Fatalf("expected inhdetachpending=true after interrupted detach, got false")
+	}
+
+	// 4. Grizzle PlanDiff: Desired schema treats telemetry_2026_01 as a standalone table.
+	// Introspection must detect pending detach, emit FINALIZE step, and PARTITION_PENDING_DETACH warning hazard.
+	desiredSQL := `
+		CREATE TABLE telemetry (
+			id BIGINT NOT NULL,
+			recorded_at DATE NOT NULL,
+			PRIMARY KEY (id, recorded_at)
+		) PARTITION BY RANGE (recorded_at);
+
+		CREATE TABLE telemetry_2026_01 (
+			id BIGINT NOT NULL,
+			recorded_at DATE NOT NULL,
+			PRIMARY KEY (id, recorded_at)
+		);
+	`
+	p, err := grizzle.PlanDiff(ctx, db, grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: schemaPrefix,
+		SchemaSQL:    desiredSQL,
+	})
+	if err != nil {
+		t.Fatalf("PlanDiff failed: %v", err)
+	}
+
+	var foundFinalizeStep bool
+	for _, s := range p.Steps {
+		if s.Type == grizzle.ChangeDetachPartition {
+			if strings.Contains(s.SQL, "FINALIZE") {
+				foundFinalizeStep = true
+			}
+		}
+	}
+	if !foundFinalizeStep {
+		t.Fatalf("expected FINALIZE step for pending detach, got steps: %+v", p.Steps)
+	}
+
+	var foundHazard bool
+	for _, h := range p.Hazards() {
+		if h.Code == grizzle.HazardPartitionPendingDetach && h.Level == grizzle.HazardLevelWarning {
+			foundHazard = true
+		}
+	}
+	if !foundHazard {
+		t.Fatalf("expected HazardPartitionPendingDetach, got hazards: %+v", p.Hazards())
+	}
+
+	// 5. Apply the plan on real PG 14+: completes the detach cleanly
+	if err := grizzle.Apply(ctx, db, p, grizzle.ApplyOpts{ExpectedHash: p.Hash()}); err != nil {
+		t.Fatalf("Apply with FINALIZE failed: %v", err)
+	}
+
+	// 6. After apply, re-diff must be clean
+	pFinal, err := grizzle.PlanDiff(ctx, db, grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: schemaPrefix,
+		SchemaSQL:    desiredSQL,
+	})
+	if err != nil {
+		t.Fatalf("pFinal PlanDiff failed: %v", err)
+	}
+	if len(pFinal.Steps) != 0 {
+		t.Fatalf("expected 0 steps after FINALIZE apply, got %d: %+v", len(pFinal.Steps), pFinal.Steps)
+	}
+}
+

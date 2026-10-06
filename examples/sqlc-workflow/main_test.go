@@ -31,7 +31,7 @@ func TestExample_SQLCWorkflow(t *testing.T) {
 	_, _ = db.Exec("CREATE SCHEMA IF NOT EXISTS " + schema + ";")
 	defer func() { _, _ = db.Exec("DROP SCHEMA IF EXISTS " + schema + " CASCADE;") }()
 
-	t.Setenv("DATABASE_URL", dsn)
+	t.Setenv("DATABASE_URL", dsn+"&search_path="+schema)
 	t.Setenv("PG_SCHEMA", schema)
 	main()
 }
