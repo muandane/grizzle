@@ -51,7 +51,16 @@ func GenerateCreateTableSQL(targetSchema string, tbl *schema.Table) string {
 		if !strings.HasPrefix(strings.ToUpper(bounds), "FOR VALUES") && strings.ToUpper(bounds) != "DEFAULT" {
 			bounds = "FOR VALUES " + bounds
 		}
-		return fmt.Sprintf("CREATE TABLE %q.%q PARTITION OF %q.%q %s;", targetSchema, tbl.Name, targetSchema, tbl.PartitionOf.Parent, bounds)
+		partitionClause := ""
+		if tbl.IsPartitioned() {
+			partDef := strings.TrimSpace(tbl.PartitionKey.Def)
+			strat := string(tbl.PartitionKey.Strategy)
+			if !strings.HasPrefix(strings.ToUpper(partDef), strat) {
+				partDef = strat + " " + partDef
+			}
+			partitionClause = " PARTITION BY " + partDef
+		}
+		return fmt.Sprintf("CREATE TABLE %q.%q PARTITION OF %q.%q %s%s;", targetSchema, tbl.Name, targetSchema, tbl.PartitionOf.Parent, bounds, partitionClause)
 	}
 
 	cols := slices.Collect(maps.Values(tbl.Columns))
@@ -239,9 +248,25 @@ func GenerateAttachPartitionSQL(targetSchema, parentTable, childTable, bounds st
 	return fmt.Sprintf("ALTER TABLE %q.%q ATTACH PARTITION %q.%q %s;", targetSchema, parentTable, targetSchema, childTable, b)
 }
 
+// RenderOpts configures DDL rendering behavior such as concurrency and server version-specific syntax.
+type RenderOpts struct {
+	NonConcurrentIndexes bool
+	ServerVersion        int
+}
+
 // GenerateDetachPartitionSQL constructs an ALTER TABLE ... DETACH PARTITION statement.
 func GenerateDetachPartitionSQL(targetSchema, parentTable, childTable string) string {
 	return fmt.Sprintf("ALTER TABLE %q.%q DETACH PARTITION %q.%q;", targetSchema, parentTable, targetSchema, childTable)
+}
+
+// GenerateDetachPartitionConcurrentlySQL constructs an ALTER TABLE ... DETACH PARTITION ... CONCURRENTLY statement.
+func GenerateDetachPartitionConcurrentlySQL(targetSchema, parentTable, childTable string) string {
+	return fmt.Sprintf("ALTER TABLE %q.%q DETACH PARTITION %q.%q CONCURRENTLY;", targetSchema, parentTable, targetSchema, childTable)
+}
+
+// GenerateDetachPartitionFinalizeSQL constructs an ALTER TABLE ... DETACH PARTITION ... FINALIZE statement.
+func GenerateDetachPartitionFinalizeSQL(targetSchema, parentTable, childTable string) string {
+	return fmt.Sprintf("ALTER TABLE %q.%q DETACH PARTITION %q.%q FINALIZE;", targetSchema, parentTable, targetSchema, childTable)
 }
 
 func foreignKeyRefTable(fk *schema.ForeignKey, defaultSchema string) string {
@@ -281,12 +306,18 @@ func foreignKeyRefTable(fk *schema.ForeignKey, defaultSchema string) string {
 // RenderChange converts a pure diff.Change into an executable plan.Step with PostgreSQL DDL.
 func RenderChange(targetSchema string, c diff.Change, nonConcurrent ...bool) plan.Step {
 	isNonConcurrent := len(nonConcurrent) > 0 && nonConcurrent[0]
+	return RenderChangeWithOpts(targetSchema, c, RenderOpts{NonConcurrentIndexes: isNonConcurrent})
+}
+
+// RenderChangeWithOpts converts a pure diff.Change into an executable plan.Step using RenderOpts.
+func RenderChangeWithOpts(targetSchema string, c diff.Change, opts RenderOpts) plan.Step {
+	isNonConcurrent := opts.NonConcurrentIndexes
 	effectiveSchema := cmp.Or(c.Schema, targetSchema)
 
 	step := plan.Step{
-		Type:              c.Type,
-		Table:             c.Table,
-		Schema:            c.Schema,
+		Type:               c.Type,
+		Table:              c.Table,
+		Schema:             c.Schema,
 		Destructive:        c.Destructive,
 		ColumnNotNull:      c.ColumnNotNull,
 		ColumnHasDefault:   c.ColumnHasDefault,
@@ -329,8 +360,18 @@ func RenderChange(targetSchema string, c diff.Change, nonConcurrent ...bool) pla
 		step.ParentTable = c.ParentTable
 		step.PartitionBounds = c.PartitionBounds
 	case plan.ChangeDetachPartition:
-		step.SQL = GenerateDetachPartitionSQL(effectiveSchema, c.ParentTable, c.Table)
 		step.ParentTable = c.ParentTable
+		step.IsPendingDetach = c.IsPendingDetach
+		if c.IsPendingDetach {
+			step.SQL = GenerateDetachPartitionFinalizeSQL(effectiveSchema, c.ParentTable, c.Table)
+			step.NonTx = false
+		} else if opts.ServerVersion >= 140000 && !opts.NonConcurrentIndexes && !c.ParentHasDefault {
+			step.SQL = GenerateDetachPartitionConcurrentlySQL(effectiveSchema, c.ParentTable, c.Table)
+			step.NonTx = true
+		} else {
+			step.SQL = GenerateDetachPartitionSQL(effectiveSchema, c.ParentTable, c.Table)
+			step.NonTx = false
+		}
 	case plan.ChangeAddColumn:
 		step.SQL = GenerateAddColumnSQL(effectiveSchema, c.Table, c.Column)
 	case plan.ChangeAlterColumn:
@@ -375,10 +416,15 @@ func RenderChange(targetSchema string, c diff.Change, nonConcurrent ...bool) pla
 // RenderChanges converts a list of pure changes into sequenced, topologically ordered plan steps.
 func RenderChanges(targetSchema string, changes []diff.Change, nonConcurrent ...bool) []plan.Step {
 	isNonConcurrent := len(nonConcurrent) > 0 && nonConcurrent[0]
+	return RenderChangesWithOpts(targetSchema, changes, RenderOpts{NonConcurrentIndexes: isNonConcurrent})
+}
+
+// RenderChangesWithOpts converts a list of pure changes into sequenced, topologically ordered plan steps using RenderOpts.
+func RenderChangesWithOpts(targetSchema string, changes []diff.Change, opts RenderOpts) []plan.Step {
 	var steps []plan.Step
 
 	for _, c := range changes {
-		step := RenderChange(targetSchema, c, isNonConcurrent)
+		step := RenderChangeWithOpts(targetSchema, c, opts)
 		steps = append(steps, step)
 
 		if c.Type == plan.ChangeAddFK {

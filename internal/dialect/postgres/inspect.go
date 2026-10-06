@@ -210,19 +210,30 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 	_ = partRows.Close()
 
 	// 2c. Inspect Attached Partitions
-	inhQuery := `
+	var hasDetachPendingCol bool
+	_ = dbtx.QueryRowContext(ctx, "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'pg_inherits'::regclass AND attname = 'inhdetachpending' AND NOT attisdropped);").Scan(&hasDetachPendingCol)
+
+	detachPendingExpr := "false"
+	if hasDetachPendingCol {
+		detachPendingExpr = "COALESCE(i.inhdetachpending, false)"
+	}
+
+	inhQuery := fmt.Sprintf(`
 		SELECT
 			c.relname AS child_table,
 			p.relname AS parent_table,
-			COALESCE(pg_get_expr(c.relpartbound, c.oid), '') AS partition_bounds
+			COALESCE(pg_get_expr(c.relpartbound, c.oid), '') AS partition_bounds,
+			%s AS is_detach_pending
 		FROM pg_inherits i
 		JOIN pg_class c ON c.oid = i.inhrelid
 		JOIN pg_class p ON p.oid = i.inhparent
 		JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE n.nspname = $1
+		  AND c.relkind IN ('r', 'p')
+		  AND p.relkind IN ('r', 'p')
 		  AND c.relispartition
 		ORDER BY c.relname;
-	`
+	`, detachPendingExpr)
 	inhRows, err := dbtx.QueryContext(ctx, inhQuery, schemaName)
 	if err != nil {
 		return nil, fmt.Errorf("inspecting partition inheritance in schema %q: %w", schemaName, err)
@@ -231,11 +242,12 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 
 	for inhRows.Next() {
 		var (
-			childTable  string
-			parentTable string
-			bounds      string
+			childTable      string
+			parentTable     string
+			bounds          string
+			isDetachPending bool
 		)
-		if err := inhRows.Scan(&childTable, &parentTable, &bounds); err != nil {
+		if err := inhRows.Scan(&childTable, &parentTable, &bounds, &isDetachPending); err != nil {
 			return nil, fmt.Errorf("scanning partition bounds in schema %q: %w", schemaName, err)
 		}
 		tbl, exists := s.Tables[childTable]
@@ -250,8 +262,9 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 			s.Tables[childTable] = tbl
 		}
 		tbl.PartitionOf = &schema.PartitionOf{
-			Parent: parentTable,
-			Bounds: bounds,
+			Parent:          parentTable,
+			Bounds:          bounds,
+			IsDetachPending: isDetachPending,
 		}
 	}
 	if err := inhRows.Err(); err != nil {

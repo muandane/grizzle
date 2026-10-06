@@ -117,7 +117,8 @@ const (
 	HazardRenameAmbiguous     = plan.HazardRenameAmbiguous
 	HazardUnmanagedDependency = plan.HazardUnmanagedDependency
 	HazardGeneratedRewrite    = plan.HazardGeneratedRewrite
-	HazardPartitionAttachScan = plan.HazardPartitionAttachScan
+	HazardPartitionAttachScan    = plan.HazardPartitionAttachScan
+	HazardPartitionPendingDetach = plan.HazardPartitionPendingDetach
 )
 
 // UnmanagedObject represents an unmanaged database object detected during introspection.

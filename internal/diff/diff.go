@@ -43,8 +43,10 @@ type Change struct {
 	UnmanagedDeps []string
 
 	// Partitioning metadata
-	ParentTable     string
-	PartitionBounds string
+	ParentTable      string
+	PartitionBounds  string
+	ParentHasDefault bool
+	IsPendingDetach  bool
 }
 
 // Diff compares live and desired schemas using the given scope filters and returns pure changes.
@@ -93,6 +95,13 @@ func DiffWithMappings(live, desired *schema.Schema, targetSchema, shadowSchema s
 					})
 				}
 			}
+		}
+	}
+
+	// Validate partition structural rules on desired tables
+	for _, dTable := range desired.Tables {
+		if err := validatePartitionStructuralRules(dTable); err != nil {
+			return nil, err
 		}
 	}
 
@@ -181,22 +190,37 @@ func DiffWithMappings(live, desired *schema.Schema, targetSchema, shadowSchema s
 			})
 		} else if !dTable.IsPartition() && lTable.IsPartition() {
 			changes = append(changes, Change{
-				Type:        plan.ChangeDetachPartition,
-				Schema:      targetSchema,
-				Table:       tblName,
-				ParentTable: lTable.PartitionOf.Parent,
-				Destructive: false,
+				Type:             plan.ChangeDetachPartition,
+				Schema:           targetSchema,
+				Table:            tblName,
+				ParentTable:      lTable.PartitionOf.Parent,
+				ParentHasDefault: hasDefaultPartition(lTable.PartitionOf.Parent, live) || hasDefaultPartition(lTable.PartitionOf.Parent, desired),
+				IsPendingDetach:  lTable.PartitionOf.IsDetachPending,
+				Destructive:      false,
 			})
 		} else if dTable.IsPartition() && lTable.IsPartition() {
+			if lTable.PartitionOf.IsDetachPending {
+				changes = append(changes, Change{
+					Type:             plan.ChangeDetachPartition,
+					Schema:           targetSchema,
+					Table:            tblName,
+					ParentTable:      lTable.PartitionOf.Parent,
+					ParentHasDefault: hasDefaultPartition(lTable.PartitionOf.Parent, live) || hasDefaultPartition(lTable.PartitionOf.Parent, desired),
+					IsPendingDetach:  true,
+					Destructive:      false,
+				})
+			}
 			normLiveBounds := normalize(lTable.PartitionOf.Bounds)
 			normDesiredBounds := normalize(dTable.PartitionOf.Bounds)
 			if lTable.PartitionOf.Parent != dTable.PartitionOf.Parent || normLiveBounds != normDesiredBounds {
 				changes = append(changes, Change{
-					Type:        plan.ChangeDetachPartition,
-					Schema:      targetSchema,
-					Table:       tblName,
-					ParentTable: lTable.PartitionOf.Parent,
-					Destructive: false,
+					Type:             plan.ChangeDetachPartition,
+					Schema:           targetSchema,
+					Table:            tblName,
+					ParentTable:      lTable.PartitionOf.Parent,
+					ParentHasDefault: hasDefaultPartition(lTable.PartitionOf.Parent, live) || hasDefaultPartition(lTable.PartitionOf.Parent, desired),
+					IsPendingDetach:  lTable.PartitionOf.IsDetachPending,
+					Destructive:      false,
 				})
 				changes = append(changes, Change{
 					Type:            plan.ChangeAttachPartition,
@@ -508,4 +532,139 @@ func findUnmanagedDeps(unmanaged map[string]*schema.UnmanagedObject, table, colu
 	}
 	slices.Sort(deps)
 	return deps
+}
+
+func extractPartitionColumns(def string) []string {
+	clean := strings.TrimSpace(def)
+	if open := strings.Index(clean, "("); open != -1 {
+		if close := strings.LastIndex(clean, ")"); close > open {
+			clean = clean[open+1 : close]
+		}
+	} else {
+		for _, prefix := range []string{"RANGE", "LIST", "HASH"} {
+			if strings.HasPrefix(strings.ToUpper(clean), prefix) {
+				clean = strings.TrimSpace(clean[len(prefix):])
+			}
+		}
+	}
+	parts := strings.Split(clean, ",")
+	var cols []string
+	for _, p := range parts {
+		col := strings.Trim(strings.TrimSpace(p), `"'`+"`")
+		if col != "" {
+			cols = append(cols, col)
+		}
+	}
+	return cols
+}
+
+func extractIndexColumns(def string) []string {
+	if def == "" {
+		return nil
+	}
+	upper := strings.ToUpper(def)
+	onIdx := strings.Index(upper, " ON ")
+	if onIdx == -1 {
+		return nil
+	}
+	parenStart := strings.Index(def[onIdx:], "(")
+	if parenStart == -1 {
+		return nil
+	}
+	start := onIdx + parenStart
+	depth := 0
+	end := -1
+	for i := start; i < len(def); i++ {
+		if def[i] == '(' {
+			depth++
+		} else if def[i] == ')' {
+			depth--
+			if depth == 0 {
+				end = i
+				break
+			}
+		}
+	}
+	if end == -1 {
+		return nil
+	}
+	colsStr := def[start+1 : end]
+	var rawCols []string
+	depth = 0
+	last := 0
+	for i := 0; i < len(colsStr); i++ {
+		if colsStr[i] == '(' {
+			depth++
+		} else if colsStr[i] == ')' {
+			depth--
+		} else if colsStr[i] == ',' && depth == 0 {
+			rawCols = append(rawCols, colsStr[last:i])
+			last = i + 1
+		}
+	}
+	rawCols = append(rawCols, colsStr[last:])
+
+	var cols []string
+	for _, raw := range rawCols {
+		raw = strings.TrimSpace(raw)
+		parts := strings.Fields(raw)
+		if len(parts) > 0 {
+			col := strings.Trim(parts[0], `"'`+"`")
+			if col != "" {
+				cols = append(cols, col)
+			}
+		}
+	}
+	return cols
+}
+
+func validatePartitionStructuralRules(t *schema.Table) error {
+	if t == nil || !t.IsPartitioned() {
+		return nil
+	}
+	partCols := extractPartitionColumns(t.PartitionKey.Def)
+	if len(partCols) == 0 {
+		return nil
+	}
+
+	// 1. Primary key must include all partition key columns
+	if t.PrimaryKey != nil && len(t.PrimaryKey.Columns) > 0 {
+		for _, pCol := range partCols {
+			if !slices.Contains(t.PrimaryKey.Columns, pCol) {
+				return fmt.Errorf("%w: primary key on partitioned table %q (%v) must include partition key column %q",
+					plan.ErrPartitionKeyNotInUnique, t.Name, t.PrimaryKey.Columns, pCol)
+			}
+		}
+	}
+
+	// 2. Any unique index must include all partition key columns
+	for idxName, idx := range t.Indexes {
+		if idx.IsUnique {
+			idxCols := extractIndexColumns(idx.Definition)
+			if len(idxCols) > 0 {
+				for _, pCol := range partCols {
+					if !slices.Contains(idxCols, pCol) {
+						return fmt.Errorf("%w: unique index %q on partitioned table %q (%v) must include partition key column %q",
+							plan.ErrPartitionKeyNotInUnique, idxName, t.Name, idxCols, pCol)
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func hasDefaultPartition(parentTable string, s *schema.Schema) bool {
+	if s == nil || parentTable == "" {
+		return false
+	}
+	for _, tbl := range s.Tables {
+		if tbl.IsPartition() && tbl.PartitionOf.Parent == parentTable {
+			b := strings.ToUpper(strings.TrimSpace(tbl.PartitionOf.Bounds))
+			if b == "DEFAULT" || strings.Contains(b, "DEFAULT") {
+				return true
+			}
+		}
+	}
+	return false
 }

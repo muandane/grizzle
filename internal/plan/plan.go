@@ -53,6 +53,7 @@ type Step struct {
 	// Partitioning metadata
 	ParentTable     string `json:"parent_table,omitzero"`
 	PartitionBounds string `json:"partition_bounds,omitzero"`
+	IsPendingDetach bool   `json:"is_pending_detach,omitzero"`
 
 	// Relational dependency metadata for multi-schema toposort
 	Schema    string   `json:"schema,omitzero"`
@@ -156,10 +157,14 @@ func (p *Plan) Hash() string {
 		if s.Schema != "" {
 			schemaStr = "|schema:" + s.Schema
 		}
-		write("step:%d|type:%s|table:%s|sql:%s|destructive:%t|non_tx:%t|not_null:%t|default:%t|narrowed:%t|rebuild:%t|rename_cand:%t|gen_rewrite:%t|old_col:%s%s%s%s\n",
+		pendingStr := ""
+		if s.IsPendingDetach {
+			pendingStr = "|pending_detach:true"
+		}
+		write("step:%d|type:%s|table:%s|sql:%s|destructive:%t|non_tx:%t|not_null:%t|default:%t|narrowed:%t|rebuild:%t|rename_cand:%t|gen_rewrite:%t|old_col:%s%s%s%s%s\n",
 			i, s.Type, s.Table, strings.TrimSpace(s.SQL), s.Destructive, s.NonTx,
 			s.ColumnNotNull, s.ColumnHasDefault, s.TypeNarrowed, s.IsTableRebuild,
-			s.IsRenameCandidate, s.IsGeneratedRewrite, s.OldColumn, unmStr, partStr, schemaStr,
+			s.IsRenameCandidate, s.IsGeneratedRewrite, s.OldColumn, unmStr, partStr, schemaStr, pendingStr,
 		)
 	}
 
@@ -254,6 +259,8 @@ const (
 	HazardGeneratedRewrite HazardCode = "GENERATED_REWRITE"
 	// HazardPartitionAttachScan indicates attaching an existing table to a partitioned table requiring table scan.
 	HazardPartitionAttachScan HazardCode = "PARTITION_ATTACH_SCAN"
+	// HazardPartitionPendingDetach indicates an interrupted pending-detach state requiring finalization.
+	HazardPartitionPendingDetach HazardCode = "PARTITION_PENDING_DETACH"
 )
 
 // HazardLevel indicates the operational or data-loss severity of a migration step.
@@ -311,6 +318,17 @@ func stepHazards(s Step) []Hazard {
 		})
 	}
 	switch s.Type {
+	case ChangeDetachPartition:
+		if s.IsPendingDetach {
+			hazards = append(hazards, Hazard{
+				Code:        HazardPartitionPendingDetach,
+				Level:       HazardLevelWarning,
+				Type:        s.Type,
+				Table:       s.Table,
+				Description: fmt.Sprintf("Partition %q is in an interrupted pending-detach state; finalizing detachment", s.Table),
+				SQL:         s.SQL,
+			})
+		}
 	case ChangeAttachPartition:
 		hazards = append(hazards, Hazard{
 			Code:        HazardPartitionAttachScan,

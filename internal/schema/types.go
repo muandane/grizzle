@@ -63,8 +63,9 @@ type PartitionKey struct {
 
 // PartitionOf defines attachment parameters for a partition table to its parent table.
 type PartitionOf struct {
-	Parent string `json:"parent"` // Name of parent partitioned table
-	Bounds string `json:"bounds"` // e.g. "FOR VALUES FROM ('2026-01-01') TO ('2026-02-01')"
+	Parent          string `json:"parent"` // Name of parent partitioned table
+	Bounds          string `json:"bounds"` // e.g. "FOR VALUES FROM ('2026-01-01') TO ('2026-02-01')"
+	IsDetachPending bool   `json:"is_detach_pending,omitempty"`
 }
 
 // Table represents a table within a schema.

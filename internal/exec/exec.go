@@ -80,6 +80,15 @@ func localSearchPathSQL(schemas []string) string {
 
 // DiffPostgres computes the diff and renders the sequenced migration steps for PostgreSQL.
 func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig) ([]plan.Step, error) {
+	var serverVersion int
+	if row := dbtx.QueryRowContext(ctx, "SELECT current_setting('server_version_num')::integer;"); row != nil {
+		_ = row.Scan(&serverVersion)
+	}
+	renderOpts := postgres.RenderOpts{
+		NonConcurrentIndexes: cfg.NonConcurrentIndexes,
+		ServerVersion:        serverVersion,
+	}
+
 	targetSchemas := cfg.targetSchemas()
 	if len(targetSchemas) <= 1 {
 		targetSchema := cfg.primarySchema()
@@ -102,7 +111,7 @@ func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig
 		if err != nil {
 			return nil, err
 		}
-		steps := postgres.RenderChanges(targetSchema, changes, cfg.NonConcurrentIndexes)
+		steps := postgres.RenderChangesWithOpts(targetSchema, changes, renderOpts)
 		return steps, nil
 	}
 
@@ -137,7 +146,7 @@ func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig
 		allChanges = append(allChanges, changes...)
 	}
 
-	steps := postgres.RenderChanges(targetSchemas[0], allChanges, cfg.NonConcurrentIndexes)
+	steps := postgres.RenderChangesWithOpts(targetSchemas[0], allChanges, renderOpts)
 	return steps, nil
 }
 
@@ -425,7 +434,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 						logger.ErrorContext(ctx, "grizzle: failed executing non-tx step", "step_index", stepIdx, "sql", s.SQL, "error", err)
 					}
 					recordFailureHistory(stepIdx, err, true)
-					return committedSteps + 1, fmt.Errorf("%w: failed executing non-tx [%s]: %w", plan.ErrExecutionFailed, s.SQL, err)
+					return committedSteps + 1, wrapStepExecError(s, err, true)
 				}
 				committedSteps++
 				if logger != nil {
@@ -457,7 +466,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 						logger.ErrorContext(ctx, "grizzle: failed executing step in tx", "step_index", stepIdx, "sql", s.SQL, "error", err)
 					}
 					recordFailureHistory(stepIdx, err, false)
-					return committedSteps, fmt.Errorf("%w: failed executing [%s]: %w", plan.ErrExecutionFailed, s.SQL, err)
+					return committedSteps, wrapStepExecError(s, err, false)
 				}
 				if logger != nil {
 					logger.DebugContext(ctx, "grizzle: executed step in tx", "step_index", stepIdx, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
@@ -926,7 +935,7 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 						logger.ErrorContext(ctx, "grizzle: failed executing non-tx step", "step_index", stepIdx, "sql", s.SQL, "error", err)
 					}
 					recordFailureHistory(stepIdx, err, true)
-					return committedSteps + 1, fmt.Errorf("%w: failed executing non-tx [%s]: %w", plan.ErrExecutionFailed, s.SQL, err)
+					return committedSteps + 1, wrapStepExecError(s, err, true)
 				}
 				committedSteps++
 				if logger != nil {
@@ -957,7 +966,7 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 						logger.ErrorContext(ctx, "grizzle: failed executing step in tx", "step_index", stepIdx, "sql", s.SQL, "error", err)
 					}
 					recordFailureHistory(stepIdx, err, false)
-					return committedSteps, fmt.Errorf("%w: failed executing [%s]: %w", plan.ErrExecutionFailed, s.SQL, err)
+					return committedSteps, wrapStepExecError(s, err, false)
 				}
 				if logger != nil {
 					logger.DebugContext(ctx, "grizzle: executed step in tx", "step_index", stepIdx, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
@@ -1262,4 +1271,18 @@ func copyDataKeysetChunks(ctx context.Context, tx *sql.Tx, tempTable, colList, l
 		hasStarted = true
 	}
 	return nil
+}
+
+func wrapStepExecError(s plan.Step, err error, isNonTx bool) error {
+	prefix := ""
+	if isNonTx {
+		prefix = "non-tx "
+	}
+	isFK := s.Type == plan.ChangeAddFK || s.Type == plan.ChangeValidateConstraint || s.RefTable != "" ||
+		strings.Contains(strings.ToLower(err.Error()), "foreign key") ||
+		strings.Contains(strings.ToLower(err.Error()), "fk")
+	if isFK {
+		return fmt.Errorf("%w: table %q foreign key constraint: failed executing %s[%s]: %w", plan.ErrExecutionFailed, s.Table, prefix, s.SQL, err)
+	}
+	return fmt.Errorf("%w: failed executing %s[%s]: %w", plan.ErrExecutionFailed, prefix, s.SQL, err)
 }

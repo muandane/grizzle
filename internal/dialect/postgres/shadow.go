@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/muandane/grizzle/internal/dialect"
+	"github.com/muandane/grizzle/internal/plan"
 )
 
 var validIdentRegex = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
@@ -41,12 +42,18 @@ func RunShadowDDL(ctx context.Context, dbtx dialect.DBTX, shadowSchema, targetSc
 		return err
 	}
 
-	setPathSQL := fmt.Sprintf("SET LOCAL search_path TO %q, public;", shadowSchema)
+	setPathSQL := fmt.Sprintf("SET LOCAL search_path TO %q, %q, public;", shadowSchema, targetSchema)
 	if _, err := dbtx.ExecContext(ctx, setPathSQL); err != nil {
 		return fmt.Errorf("failed setting search_path to %q: %w", shadowSchema, err)
 	}
 
 	if _, err := dbtx.ExecContext(ctx, schemaSQL); err != nil {
+		if immErr := wrapImmutableIndexError(err, schemaSQL); immErr != err {
+			return fmt.Errorf("schema compilation in shadow schema failed: %w", immErr)
+		}
+		if partErr := wrapPartitionShadowError(err); partErr != err {
+			return fmt.Errorf("schema compilation in shadow schema failed: %w", partErr)
+		}
 		return fmt.Errorf("schema compilation in shadow schema failed: %w", err)
 	}
 
@@ -124,16 +131,6 @@ func RunMultiShadowDDL(ctx context.Context, dbtx dialect.DBTX, shadowMap map[str
 		return fmt.Errorf("no shadow schemas configured")
 	}
 
-	setPathSQL := fmt.Sprintf("SET LOCAL search_path TO %s, public;", strings.Join(shadowQuoted, ", "))
-	if _, err := dbtx.ExecContext(ctx, setPathSQL); err != nil {
-		return fmt.Errorf("failed setting multi-schema shadow search_path: %w", err)
-	}
-
-	rewrittenSQL := RewriteShadowSQL(schemaSQL, shadowMap)
-	if _, err := dbtx.ExecContext(ctx, rewrittenSQL); err != nil {
-		return fmt.Errorf("schema compilation in shadow schema failed: %w", err)
-	}
-
 	var targetQuoted []string
 	for _, t := range targetSchemas {
 		if err := ValidateIdentifier(t); err != nil {
@@ -141,12 +138,83 @@ func RunMultiShadowDDL(ctx context.Context, dbtx dialect.DBTX, shadowMap map[str
 		}
 		targetQuoted = append(targetQuoted, fmt.Sprintf("%q", t))
 	}
+	setPathSQL := fmt.Sprintf("SET LOCAL search_path TO %s, %s, public;", strings.Join(shadowQuoted, ", "), strings.Join(targetQuoted, ", "))
+	if _, err := dbtx.ExecContext(ctx, setPathSQL); err != nil {
+		return fmt.Errorf("failed setting multi-schema shadow search_path: %w", err)
+	}
+
+	rewrittenSQL := RewriteShadowSQL(schemaSQL, shadowMap)
+	if _, err := dbtx.ExecContext(ctx, rewrittenSQL); err != nil {
+		if immErr := wrapImmutableIndexError(err, schemaSQL); immErr != err {
+			return fmt.Errorf("schema compilation in shadow schema failed: %w", immErr)
+		}
+		if partErr := wrapPartitionShadowError(err); partErr != err {
+			return fmt.Errorf("schema compilation in shadow schema failed: %w", partErr)
+		}
+		return fmt.Errorf("schema compilation in shadow schema failed: %w", err)
+	}
+
 	restorePathSQL := fmt.Sprintf("SET LOCAL search_path TO %s, public;", strings.Join(targetQuoted, ", "))
 	if _, err := dbtx.ExecContext(ctx, restorePathSQL); err != nil {
 		return fmt.Errorf("failed restoring target search_path: %w", err)
 	}
 
 	return nil
+}
+
+func parseIndexAndTable(stmt string) (idxName, tblName string) {
+	tokens := strings.Fields(stmt)
+	for i := 0; i < len(tokens); i++ {
+		tokUpper := strings.ToUpper(tokens[i])
+		if tokUpper == "INDEX" {
+			j := i + 1
+			for j < len(tokens) {
+				ju := strings.ToUpper(tokens[j])
+				if ju == "CONCURRENTLY" || ju == "IF" || ju == "NOT" || ju == "EXISTS" {
+					j++
+					continue
+				}
+				break
+			}
+			if j < len(tokens) {
+				idxName = strings.Trim(tokens[j], `"'`+"`;")
+				for k := j + 1; k < len(tokens); k++ {
+					if strings.ToUpper(tokens[k]) == "ON" && k+1 < len(tokens) {
+						rawTbl := tokens[k+1]
+						if paren := strings.Index(rawTbl, "("); paren != -1 {
+							rawTbl = rawTbl[:paren]
+						}
+						tblParts := strings.Split(rawTbl, ".")
+						tblName = strings.Trim(tblParts[len(tblParts)-1], `"'`+"`;")
+						return idxName, tblName
+					}
+				}
+			}
+		}
+	}
+	return idxName, tblName
+}
+
+func wrapImmutableIndexError(err error, sqlStr string) error {
+	if err == nil {
+		return nil
+	}
+	errStr := err.Error()
+	if !strings.Contains(strings.ToLower(errStr), "must be marked immutable") && !strings.Contains(errStr, "42P17") {
+		return err
+	}
+	statements := strings.Split(sqlStr, ";")
+	for _, stmt := range statements {
+		stmtTrim := strings.TrimSpace(stmt)
+		upper := strings.ToUpper(stmtTrim)
+		if strings.HasPrefix(upper, "CREATE ") && strings.Contains(upper, "INDEX ") {
+			idxName, tblName := parseIndexAndTable(stmtTrim)
+			if idxName != "" && tblName != "" {
+				return fmt.Errorf("index %q on table %q: expression must be IMMUTABLE: %w", idxName, tblName, err)
+			}
+		}
+	}
+	return fmt.Errorf("index expression must be IMMUTABLE: %w", err)
 }
 
 func isWhitespace(b byte) bool {
@@ -289,4 +357,16 @@ func RewriteShadowSQL(sqlStr string, shadowMap map[string]string) string {
 	}
 
 	return b.String()
+}
+
+func wrapPartitionShadowError(err error) error {
+	if err == nil {
+		return nil
+	}
+	errStr := strings.ToLower(err.Error())
+	if strings.Contains(errStr, "unique constraint on partitioned table must include all partitioning columns") ||
+		strings.Contains(errStr, "primary key on partitioned table must include all partitioning columns") {
+		return fmt.Errorf("%w: %w", plan.ErrPartitionKeyNotInUnique, err)
+	}
+	return err
 }
