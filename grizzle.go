@@ -202,6 +202,9 @@ func prepareOptions(ctx context.Context, db *sql.DB, opts *Options) error {
 	}
 	switch opts.Dialect {
 	case DialectSQLite:
+		if len(opts.TargetSchemas) > 1 {
+			return ErrUnsupportedMultiSchema
+		}
 		opts.TargetSchema = cmp.Or(opts.TargetSchema, "main")
 		if len(opts.TargetSchemas) == 0 {
 			opts.TargetSchemas = []string{opts.TargetSchema}
@@ -213,6 +216,7 @@ func prepareOptions(ctx context.Context, db *sql.DB, opts *Options) error {
 			opts.SQLiteRebuildBatchSize = 10000
 		}
 	case DialectPostgres:
+		opts.LockNamespace = cmp.Or(opts.LockNamespace, "grizzle")
 		if len(opts.TargetSchemas) > 0 {
 			slices.Sort(opts.TargetSchemas)
 			opts.TargetSchemas = slices.Compact(opts.TargetSchemas)
@@ -226,9 +230,6 @@ func prepareOptions(ctx context.Context, db *sql.DB, opts *Options) error {
 			opts.TargetSchemas = []string{"public"}
 		}
 		opts.ShadowSchema = cmp.Or(opts.ShadowSchema, "_grizzle_shadow")
-		if opts.LockID == 0 {
-			opts.LockID = defaultPostgresLockIDFromSchemas(opts.TargetSchemas)
-		}
 		if opts.LockTimeout <= 0 {
 			opts.LockTimeout = exec.DefaultLockTimeout
 		}
@@ -274,6 +275,7 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error {
 		TargetSchemas:        opts.TargetSchemas,
 		ShadowSchema:         opts.ShadowSchema,
 		SchemaSQL:            opts.SchemaSQL,
+		LockNamespace:        opts.LockNamespace,
 		LockID:               opts.LockID,
 		Filters:              filters,
 		Policy:               policy,
@@ -313,6 +315,7 @@ func PlanDiff(ctx context.Context, db *sql.DB, opts Options) (*Plan, error) {
 		TargetSchemas:        opts.TargetSchemas,
 		ShadowSchema:         opts.ShadowSchema,
 		SchemaSQL:            opts.SchemaSQL,
+		LockNamespace:        opts.LockNamespace,
 		LockID:               opts.LockID,
 		Filters:              filters,
 		Policy:               policy,
@@ -346,6 +349,9 @@ type ApplyOpts struct {
 	// SQLiteRebuildBatchSize defines the chunk size when copying data in batches during SQLite table rebuilds.
 	// Defaults to 10000.
 	SQLiteRebuildBatchSize int
+
+	// LockNamespace specifies the application namespace string used for PostgreSQL advisory locking (defaults to "grizzle").
+	LockNamespace string
 }
 
 // Apply applies an approved migration plan to the database.
@@ -378,6 +384,7 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 			Backfill:               opts.Backfill,
 			SQLiteRebuildThreshold: opts.SQLiteRebuildThreshold,
 			SQLiteRebuildBatchSize: opts.SQLiteRebuildBatchSize,
+			LockNamespace:          opts.LockNamespace,
 		}
 		if err := prepareOptions(ctx, db, &syncOpts); err != nil {
 			return err
@@ -405,6 +412,7 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 			TargetSchemas:        syncOpts.TargetSchemas,
 			ShadowSchema:         syncOpts.ShadowSchema,
 			SchemaSQL:            syncOpts.SchemaSQL,
+			LockNamespace:        syncOpts.LockNamespace,
 			LockID:               syncOpts.LockID,
 			Filters:              filters,
 			Policy:               policy,
@@ -443,11 +451,11 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 			targetSchemas = []string{cmp.Or(p.TargetSchema, "public")}
 		}
 		targetSchema := targetSchemas[0]
-		lockID := defaultPostgresLockIDFromSchemas(targetSchemas)
+		lockNs := cmp.Or(opts.LockNamespace, "grizzle")
 		return exec.ApplyPostgres(ctx, db, p, exec.PostgresExecConfig{
 			TargetSchema:     targetSchema,
 			TargetSchemas:    targetSchemas,
-			LockID:           lockID,
+			LockNamespace:    lockNs,
 			Policy:           p.Policy,
 			AcceptHazards:    opts.AcceptHazards,
 			ExpectedHash:     opts.ExpectedHash,

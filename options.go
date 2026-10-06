@@ -75,7 +75,11 @@ type Options struct {
 	// When true, index operations are created inside the transaction.
 	NonConcurrentIndexes bool
 
-	// LockID is a 64-bit integer used for the PostgreSQL advisory lock (pg_advisory_xact_lock).
+	// LockNamespace specifies the application namespace string used for PostgreSQL advisory locking (defaults to "grizzle").
+	LockNamespace string
+
+	// LockID is an optional explicit 64-bit integer used for the PostgreSQL advisory lock (pg_advisory_xact_lock).
+	// If 0, Grizzle derives 2-int per-schema advisory locks using (hash32(LockNamespace), hash32(schema)).
 	LockID int64
 
 	// LockTimeout specifies the maximum time to wait when acquiring locks (defaults to 5s).
@@ -190,6 +194,13 @@ func WithAcceptHazards(hazards ...plan.HazardCode) Option {
 func WithNonConcurrentIndexes(disabled bool) Option {
 	return func(o *Options) {
 		o.NonConcurrentIndexes = disabled
+	}
+}
+
+// WithLockNamespace sets the application namespace string for PostgreSQL advisory locks.
+func WithLockNamespace(ns string) Option {
+	return func(o *Options) {
+		o.LockNamespace = ns
 	}
 }
 

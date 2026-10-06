@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"hash/fnv"
+	"slices"
 	"time"
 
 	"github.com/muandane/grizzle/internal/dialect"
@@ -62,4 +63,90 @@ func ReleaseSessionAdvisoryLock(ctx context.Context, dbtx dialect.DBTX, lockID i
 		return fmt.Errorf("failed to release pg_advisory_unlock: %w", err)
 	}
 	return nil
+}
+
+// Hash32 computes a deterministic 32-bit signed integer hash from a string.
+func Hash32(s string) int32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(s))
+	return int32(h.Sum32())
+}
+
+// AcquireSessionAdvisoryLock2 acquires a PostgreSQL session-level advisory lock using two 32-bit keys (namespace, key).
+func AcquireSessionAdvisoryLock2(ctx context.Context, dbtx dialect.DBTX, key1, key2 int32) error {
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		var acquired bool
+		err := dbtx.QueryRowContext(ctx, "SELECT pg_try_advisory_lock($1, $2);", key1, key2).Scan(&acquired)
+		if err != nil {
+			return fmt.Errorf("failed checking pg_try_advisory_lock($1, $2): %w", err)
+		}
+		if acquired {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%w: %v", plan.ErrLockTimeout, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+// ReleaseSessionAdvisoryLock2 releases a PostgreSQL session-level advisory lock using two 32-bit keys (namespace, key).
+func ReleaseSessionAdvisoryLock2(ctx context.Context, dbtx dialect.DBTX, key1, key2 int32) error {
+	var released bool
+	err := dbtx.QueryRowContext(ctx, "SELECT pg_advisory_unlock($1, $2);", key1, key2).Scan(&released)
+	if err != nil {
+		return fmt.Errorf("failed to release pg_advisory_unlock($1, $2): %w", err)
+	}
+	return nil
+}
+
+// AcquireSchemaLocks acquires session-level advisory locks for the given schemas in sorted, deduped order
+// using the two-int form (hash32(namespace), hash32(schema)).
+// If any lock acquisition fails, all locks acquired so far are released in reverse order before returning the error.
+func AcquireSchemaLocks(ctx context.Context, dbtx dialect.DBTX, namespace string, schemas []string) ([]string, error) {
+	if namespace == "" {
+		namespace = "grizzle"
+	}
+	nsKey := Hash32(namespace)
+
+	sorted := make([]string, len(schemas))
+	copy(sorted, schemas)
+	slices.Sort(sorted)
+	sorted = slices.Compact(sorted)
+
+	acquired := make([]string, 0, len(sorted))
+	for _, s := range sorted {
+		schemaKey := Hash32(s)
+		if err := AcquireSessionAdvisoryLock2(ctx, dbtx, nsKey, schemaKey); err != nil {
+			// Roll back all acquired locks in reverse order
+			for _, a := range slices.Backward(acquired) {
+				_ = ReleaseSessionAdvisoryLock2(context.Background(), dbtx, nsKey, Hash32(a))
+			}
+			return nil, err
+		}
+		acquired = append(acquired, s)
+	}
+	return acquired, nil
+}
+
+// ReleaseSchemaLocks releases session-level advisory locks for the given schemas in reverse order.
+func ReleaseSchemaLocks(ctx context.Context, dbtx dialect.DBTX, namespace string, schemas []string) error {
+	if namespace == "" {
+		namespace = "grizzle"
+	}
+	nsKey := Hash32(namespace)
+
+	var firstErr error
+	for _, schema := range slices.Backward(schemas) {
+		schemaKey := Hash32(schema)
+		if err := ReleaseSessionAdvisoryLock2(ctx, dbtx, nsKey, schemaKey); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }

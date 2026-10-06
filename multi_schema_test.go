@@ -2,7 +2,11 @@ package grizzle_test
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -227,5 +231,253 @@ func TestMultiSchema_AdvisoryLockKeyGeneration(t *testing.T) {
 	}
 	if p1.Hash() != p2.Hash() {
 		t.Errorf("expected plan hash to be invariant to input TargetSchemas order: %s vs %s", p1.Hash(), p2.Hash())
+	}
+}
+
+func TestMultiSchema_ConcurrentOverlappingSync_NoDeadlock(t *testing.T) {
+	db, _ := getPostgresDB(t)
+	defer func() { _ = db.Close() }()
+
+	ts := time.Now().UnixNano()
+	sA := fmt.Sprintf("ms_deadlock_a_%d", ts)
+	sB := fmt.Sprintf("ms_deadlock_b_%d", ts)
+
+	defer func() {
+		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA IF EXISTS %q CASCADE;", sA))
+		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA IF EXISTS %q CASCADE;", sB))
+	}()
+
+	schemaSQL := fmt.Sprintf(`
+		CREATE TABLE %q.t1 (id INT PRIMARY KEY);
+		CREATE TABLE %q.t2 (id INT PRIMARY KEY);
+	`, sA, sB)
+
+	// App 1 specifies {sA, sB}, App 2 specifies {sB, sA} (reversed)
+	opts1 := grizzle.Options{
+		Dialect:       grizzle.DialectPostgres,
+		TargetSchemas: []string{sA, sB},
+		SchemaSQL:     schemaSQL,
+	}
+	opts2 := grizzle.Options{
+		Dialect:       grizzle.DialectPostgres,
+		TargetSchemas: []string{sB, sA},
+		SchemaSQL:     schemaSQL,
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	startBarrier := make(chan struct{})
+
+	runSync := func(opts grizzle.Options) {
+		defer wg.Done()
+		<-startBarrier
+		if err := grizzle.Sync(context.Background(), db, opts); err != nil {
+			errs <- err
+		}
+	}
+
+	wg.Add(2)
+	go runSync(opts1)
+	go runSync(opts2)
+
+	close(startBarrier)
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Fatalf("concurrent sync with reversed schema sets failed: %v", err)
+	}
+}
+
+func TestMultiSchema_LockNamespaceIsolation(t *testing.T) {
+	db, _ := getPostgresDB(t)
+	defer func() { _ = db.Close() }()
+
+	ctx := context.Background()
+	conn1, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("failed acquiring conn1: %v", err)
+	}
+	defer func() { _ = conn1.Close() }()
+
+	conn2, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("failed acquiring conn2: %v", err)
+	}
+	defer func() { _ = conn2.Close() }()
+
+	schema := "shared_schema_test"
+	ns1 := "app_one"
+	ns2 := "app_two"
+
+	key1A := postgres.Hash32(ns1)
+	key1B := postgres.Hash32(schema)
+
+	key2A := postgres.Hash32(ns2)
+	key2B := postgres.Hash32(schema)
+
+	// Acquire lock with namespace ns1 on conn1
+	if err := postgres.AcquireSessionAdvisoryLock2(ctx, conn1, key1A, key1B); err != nil {
+		t.Fatalf("failed acquiring lock on conn1: %v", err)
+	}
+	defer func() { _ = postgres.ReleaseSessionAdvisoryLock2(ctx, conn1, key1A, key1B) }()
+
+	// Conn2 should be able to acquire lock immediately because namespace differs
+	lockCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer cancel()
+
+	if err := postgres.AcquireSessionAdvisoryLock2(lockCtx, conn2, key2A, key2B); err != nil {
+		t.Fatalf("distinct LockNamespace should not block on same schema: %v", err)
+	}
+	_ = postgres.ReleaseSessionAdvisoryLock2(ctx, conn2, key2A, key2B)
+}
+
+func TestMultiSchema_CircularCrossSchemaFKs(t *testing.T) {
+	db, _ := getPostgresDB(t)
+	defer func() { _ = db.Close() }()
+
+	ts := time.Now().UnixNano()
+	s1 := fmt.Sprintf("ms_circ_1_%d", ts)
+	s2 := fmt.Sprintf("ms_circ_2_%d", ts)
+
+	defer func() {
+		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA IF EXISTS %q CASCADE;", s1))
+		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA IF EXISTS %q CASCADE;", s2))
+	}()
+
+	schemaSQL := fmt.Sprintf(`
+		CREATE TABLE %q.table_a (
+			id INT PRIMARY KEY,
+			b_id INT
+		);
+
+		CREATE TABLE %q.table_b (
+			id INT PRIMARY KEY,
+			a_id INT,
+			CONSTRAINT fk_b_a FOREIGN KEY (a_id) REFERENCES %q.table_a(id)
+		);
+
+		CREATE INDEX idx_a_b ON %q.table_a(b_id);
+	`, s1, s2, s1, s1)
+
+	ctx := context.Background()
+
+	// 1. Initial Sync creates tables and cross-schema FK
+	err := grizzle.Sync(ctx, db, grizzle.Options{
+		Dialect:       grizzle.DialectPostgres,
+		TargetSchemas: []string{s1, s2},
+		SchemaSQL:     schemaSQL,
+	})
+	if err != nil {
+		t.Fatalf("initial Sync failed: %v", err)
+	}
+
+	// 2. Add circular FK from table_a -> table_b
+	circularSQL := fmt.Sprintf(`
+		CREATE TABLE %q.table_a (
+			id INT PRIMARY KEY,
+			b_id INT
+		);
+
+		CREATE TABLE %q.table_b (
+			id INT PRIMARY KEY,
+			a_id INT,
+			CONSTRAINT fk_b_a FOREIGN KEY (a_id) REFERENCES %q.table_a(id)
+		);
+
+		ALTER TABLE %q.table_a ADD CONSTRAINT fk_a_b FOREIGN KEY (b_id) REFERENCES %q.table_b(id);
+
+		CREATE INDEX idx_a_b ON %q.table_a(b_id);
+	`, s1, s2, s1, s1, s2, s1)
+
+	p, err := grizzle.PlanDiff(ctx, db, grizzle.Options{
+		Dialect:       grizzle.DialectPostgres,
+		TargetSchemas: []string{s1, s2},
+		SchemaSQL:     circularSQL,
+	})
+	if err != nil {
+		t.Fatalf("PlanDiff for circular FK failed: %v", err)
+	}
+
+	// Verify plan steps contain ADD_FK and VALIDATE_CONSTRAINT
+	var hasAddFK, hasValidate bool
+	for _, s := range p.Steps {
+		if s.Type == plan.ChangeAddFK {
+			hasAddFK = true
+			if !strings.Contains(s.SQL, "NOT VALID") {
+				t.Errorf("expected NOT VALID in ADD_FK, got: %s", s.SQL)
+			}
+		}
+		if s.Type == plan.ChangeValidateConstraint {
+			hasValidate = true
+		}
+	}
+	if !hasAddFK || !hasValidate {
+		t.Fatalf("expected ADD_FK and VALIDATE_CONSTRAINT steps, got: %+v", p.Steps)
+	}
+
+	// Apply circular FK migration
+	if err := grizzle.Apply(ctx, db, p, grizzle.ApplyOpts{ExpectedHash: p.Hash()}); err != nil {
+		t.Fatalf("Apply circular FK failed: %v", err)
+	}
+
+	// Verify plan hash is deterministic
+	pAgain, err := grizzle.PlanDiff(ctx, db, grizzle.Options{
+		Dialect:       grizzle.DialectPostgres,
+		TargetSchemas: []string{s1, s2},
+		SchemaSQL:     circularSQL,
+	})
+	if err != nil {
+		t.Fatalf("recomputed PlanDiff failed: %v", err)
+	}
+	if len(pAgain.Steps) != 0 {
+		t.Fatalf("expected 0 diff steps after applying circular FK, got %d", len(pAgain.Steps))
+	}
+
+	// 3. Drop verification: with AllowDrop: true, dropping both tables must drop FKs before dropping tables
+	dropSQL := fmt.Sprintf(`CREATE TABLE %q.empty_placeholder (id INT);`, s1)
+	dropPlan, err := grizzle.PlanDiff(ctx, db, grizzle.Options{
+		Dialect:       grizzle.DialectPostgres,
+		TargetSchemas: []string{s1, s2},
+		SchemaSQL:     dropSQL,
+		AllowDrop:     true,
+	})
+	if err != nil {
+		t.Fatalf("drop PlanDiff failed: %v", err)
+	}
+
+	var firstTableDropIdx = -1
+	var lastFKDropIdx = -1
+	for i, s := range dropPlan.Steps {
+		if s.Type == plan.ChangeDropFK {
+			lastFKDropIdx = i
+		}
+		if s.Type == plan.ChangeDropTable && firstTableDropIdx == -1 {
+			firstTableDropIdx = i
+		}
+	}
+
+	if lastFKDropIdx != -1 && firstTableDropIdx != -1 && lastFKDropIdx > firstTableDropIdx {
+		t.Errorf("expected all DROP_FK steps before DROP_TABLE steps: lastFK=%d, firstTable=%d", lastFKDropIdx, firstTableDropIdx)
+	}
+}
+
+func TestMultiSchema_SQLiteTypedError(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	err = grizzle.Sync(context.Background(), db, grizzle.Options{
+		Dialect:       grizzle.DialectSQLite,
+		TargetSchemas: []string{"main", "aux"},
+		SchemaSQL:     "CREATE TABLE main.items (id INT);",
+	})
+	if err == nil {
+		t.Fatalf("expected error configuring multiple schemas on SQLite, got nil")
+	}
+	if !errors.Is(err, grizzle.ErrUnsupportedMultiSchema) {
+		t.Fatalf("expected ErrUnsupportedMultiSchema, got: %v", err)
 	}
 }

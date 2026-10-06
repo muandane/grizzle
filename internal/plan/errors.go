@@ -48,6 +48,12 @@ var (
 
 	// ErrPartitionConversion is returned when attempting to alter a regular table into a partitioned table in-place.
 	ErrPartitionConversion = errors.New("grizzle: in-place table partitioning conversion rejected")
+
+	// ErrUnsupportedMultiSchema is returned when multiple schemas (ATTACH) are configured on SQLite.
+	ErrUnsupportedMultiSchema = errors.New("grizzle: multiple schemas are not supported on sqlite")
+
+	// ErrPartitionKeyNotInUnique is returned when a primary key or unique constraint on a partitioned table does not include all partition key columns.
+	ErrPartitionKeyNotInUnique = errors.New("grizzle: primary key or unique constraint on partitioned table must include all partition key columns")
 )
 
 // HazardError reports all critical hazards that were not explicitly accepted.

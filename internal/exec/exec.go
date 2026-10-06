@@ -1,6 +1,7 @@
 package exec
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
@@ -25,6 +26,7 @@ type PostgresExecConfig struct {
 	ShadowSchema         string
 	ShadowSchemas        []string
 	SchemaSQL            string
+	LockNamespace        string
 	LockID               int64
 	Filters              scope.Filters
 	Policy               plan.DropPolicy
@@ -238,21 +240,36 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 		lockTimeout = DefaultLockTimeout
 	}
 	lockCtx, cancelLock := context.WithTimeout(ctx, lockTimeout)
-	err = postgres.AcquireSessionAdvisoryLock(lockCtx, conn, cfg.LockID)
+	var acquiredSchemas []string
+	if cfg.LockID != 0 {
+		err = postgres.AcquireSessionAdvisoryLock(lockCtx, conn, cfg.LockID)
+	} else {
+		lockNs := cmp.Or(cfg.LockNamespace, "grizzle")
+		acquiredSchemas, err = postgres.AcquireSchemaLocks(lockCtx, conn, lockNs, targetSchemas)
+	}
 	cancelLock()
 	if err != nil {
 		if logger != nil {
-			logger.ErrorContext(ctx, "grizzle: lock acquisition failed", "lock_id", cfg.LockID, "error", err)
+			logger.ErrorContext(ctx, "grizzle: lock acquisition failed", "schemas", targetSchemas, "lock_id", cfg.LockID, "error", err)
 		}
 		return 0, fmt.Errorf("%w: %w", plan.ErrLockAcquisition, err)
 	}
 	defer func() {
-		_ = postgres.ReleaseSessionAdvisoryLock(context.Background(), conn, cfg.LockID)
+		if cfg.LockID != 0 {
+			_ = postgres.ReleaseSessionAdvisoryLock(context.Background(), conn, cfg.LockID)
+		} else {
+			lockNs := cmp.Or(cfg.LockNamespace, "grizzle")
+			_ = postgres.ReleaseSchemaLocks(context.Background(), conn, lockNs, acquiredSchemas)
+		}
 		_, _ = conn.ExecContext(context.Background(), "RESET search_path; RESET lock_timeout; RESET statement_timeout;")
 	}()
 
 	if logger != nil {
-		logger.DebugContext(ctx, "grizzle: acquired session advisory lock", "lock_id", cfg.LockID)
+		if cfg.LockID != 0 {
+			logger.DebugContext(ctx, "grizzle: acquired session advisory lock", "lock_id", cfg.LockID)
+		} else {
+			logger.DebugContext(ctx, "grizzle: acquired session advisory locks", "schemas", acquiredSchemas, "namespace", cfg.LockNamespace)
+		}
 	}
 
 	// 2. Setup shadow schema and diff schemas inside an isolated transaction
@@ -839,21 +856,36 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 		lockTimeout = DefaultLockTimeout
 	}
 	lockCtx, cancelLock := context.WithTimeout(ctx, lockTimeout)
-	err = postgres.AcquireSessionAdvisoryLock(lockCtx, conn, cfg.LockID)
+	var acquiredSchemas []string
+	if cfg.LockID != 0 {
+		err = postgres.AcquireSessionAdvisoryLock(lockCtx, conn, cfg.LockID)
+	} else {
+		lockNs := cmp.Or(cfg.LockNamespace, "grizzle")
+		acquiredSchemas, err = postgres.AcquireSchemaLocks(lockCtx, conn, lockNs, targetSchemas)
+	}
 	cancelLock()
 	if err != nil {
 		if logger != nil {
-			logger.ErrorContext(ctx, "grizzle: lock acquisition failed", "lock_id", cfg.LockID, "error", err)
+			logger.ErrorContext(ctx, "grizzle: lock acquisition failed", "schemas", targetSchemas, "lock_id", cfg.LockID, "error", err)
 		}
 		return 0, fmt.Errorf("%w: %w", plan.ErrLockAcquisition, err)
 	}
 	defer func() {
-		_ = postgres.ReleaseSessionAdvisoryLock(context.Background(), conn, cfg.LockID)
+		if cfg.LockID != 0 {
+			_ = postgres.ReleaseSessionAdvisoryLock(context.Background(), conn, cfg.LockID)
+		} else {
+			lockNs := cmp.Or(cfg.LockNamespace, "grizzle")
+			_ = postgres.ReleaseSchemaLocks(context.Background(), conn, lockNs, acquiredSchemas)
+		}
 		_, _ = conn.ExecContext(context.Background(), "RESET search_path; RESET lock_timeout; RESET statement_timeout;")
 	}()
 
 	if logger != nil {
-		logger.DebugContext(ctx, "grizzle: acquired session advisory lock", "lock_id", cfg.LockID)
+		if cfg.LockID != 0 {
+			logger.DebugContext(ctx, "grizzle: acquired session advisory lock", "lock_id", cfg.LockID)
+		} else {
+			logger.DebugContext(ctx, "grizzle: acquired session advisory locks", "schemas", acquiredSchemas, "namespace", cfg.LockNamespace)
+		}
 	}
 
 	// Idempotency: if this plan has already been applied by another process under the lock, skip execution.

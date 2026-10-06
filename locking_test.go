@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/muandane/grizzle"
+	"github.com/muandane/grizzle/internal/dialect/postgres"
 	"github.com/muandane/grizzle/internal/exec"
 	"github.com/muandane/grizzle/internal/plan"
 )
@@ -277,7 +278,8 @@ func TestLocking_DedicatedSessionAdvisoryLock_ContentionRetry(t *testing.T) {
 		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schema))
 	}()
 
-	lockID := grizzle.GenerateLockID("grizzle", schema)
+	nsKey := postgres.Hash32("grizzle")
+	schemaKey := postgres.Hash32(schema)
 
 	// 1. Holder connection grabs the dedicated session advisory lock directly
 	holderConn, err := db.Conn(context.Background())
@@ -287,7 +289,7 @@ func TestLocking_DedicatedSessionAdvisoryLock_ContentionRetry(t *testing.T) {
 	defer func() { _ = holderConn.Close() }()
 
 	var dummy int
-	if err := holderConn.QueryRowContext(context.Background(), "SELECT 1 FROM pg_advisory_lock($1);", lockID).Scan(&dummy); err != nil {
+	if err := holderConn.QueryRowContext(context.Background(), "SELECT 1 FROM pg_advisory_lock($1, $2);", nsKey, schemaKey).Scan(&dummy); err != nil {
 		t.Fatalf("holder failed acquiring pg_advisory_lock: %v", err)
 	}
 
@@ -295,7 +297,7 @@ func TestLocking_DedicatedSessionAdvisoryLock_ContentionRetry(t *testing.T) {
 	go func() {
 		time.Sleep(150 * time.Millisecond)
 		var released bool
-		_ = holderConn.QueryRowContext(context.Background(), "SELECT pg_advisory_unlock($1);", lockID).Scan(&released)
+		_ = holderConn.QueryRowContext(context.Background(), "SELECT pg_advisory_unlock($1, $2);", nsKey, schemaKey).Scan(&released)
 	}()
 
 	// 3. Migration attempts Sync with a 50ms lock timeout and MaxRetries=5
@@ -339,7 +341,8 @@ func TestLocking_DedicatedSessionAdvisoryLock_ExhaustRetriesFails(t *testing.T) 
 		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schema))
 	}()
 
-	lockID := grizzle.GenerateLockID("grizzle", schema)
+	nsKey := postgres.Hash32("grizzle")
+	schemaKey := postgres.Hash32(schema)
 
 	holderConn, err := db.Conn(context.Background())
 	if err != nil {
@@ -347,12 +350,12 @@ func TestLocking_DedicatedSessionAdvisoryLock_ExhaustRetriesFails(t *testing.T) 
 	}
 	defer func() {
 		var released bool
-		_ = holderConn.QueryRowContext(context.Background(), "SELECT pg_advisory_unlock($1);", lockID).Scan(&released)
+		_ = holderConn.QueryRowContext(context.Background(), "SELECT pg_advisory_unlock($1, $2);", nsKey, schemaKey).Scan(&released)
 		_ = holderConn.Close()
 	}()
 
 	var dummy int
-	if err := holderConn.QueryRowContext(context.Background(), "SELECT 1 FROM pg_advisory_lock($1);", lockID).Scan(&dummy); err != nil {
+	if err := holderConn.QueryRowContext(context.Background(), "SELECT 1 FROM pg_advisory_lock($1, $2);", nsKey, schemaKey).Scan(&dummy); err != nil {
 		t.Fatalf("holder failed acquiring pg_advisory_lock: %v", err)
 	}
 
@@ -592,6 +595,161 @@ func TestLocking_DeclarativeSync_ConcurrentPodMutualExclusion(t *testing.T) {
 	}
 	if len(pAfter.Steps) != 0 {
 		t.Errorf("expected 0 diff steps after concurrent apply, got %d: %+v", len(pAfter.Steps), pAfter.Steps)
+	}
+}
+
+func TestLocking_PgTerminateBackendRecovery(t *testing.T) {
+	connStr := getTestDSN()
+	db, err := sql.Open("pgx", connStr)
+	if err != nil {
+		t.Fatalf("failed to open pg: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := db.Ping(); err != nil {
+		t.Skipf("skipping postgres locking test, database not reachable: %v", err)
+	}
+
+	schema := fmt.Sprintf("test_term_rec_%d", time.Now().UnixNano())
+	_, err = db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema))
+	if err != nil {
+		t.Fatalf("failed creating schema: %v", err)
+	}
+	defer func() {
+		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schema))
+	}()
+
+	// 1. Initial table with 50,000 rows
+	initialSQL := fmt.Sprintf(`
+		CREATE TABLE %q.large_table (
+			id BIGINT PRIMARY KEY,
+			email TEXT NOT NULL
+		);
+		INSERT INTO %q.large_table (id, email)
+		SELECT g, 'user_' || g || '@example.com' FROM generate_series(1, 120000) g;
+	`, schema, schema)
+
+	if _, err := db.Exec(initialSQL); err != nil {
+		t.Fatalf("failed setting up initial data: %v", err)
+	}
+
+	desiredSQL := `
+		CREATE TABLE large_table (
+			id BIGINT PRIMARY KEY,
+			email TEXT NOT NULL
+		);
+		CREATE INDEX idx_term_email ON large_table(email);
+	`
+
+	// Watcher goroutine to terminate backend mid-CREATE INDEX CONCURRENTLY
+	terminateCtx, cancelTerminate := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelTerminate()
+
+	terminated := make(chan bool, 1)
+	go func() {
+		ticker := time.NewTicker(2 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-terminateCtx.Done():
+				return
+			case <-ticker.C:
+				var pid int
+				query := `
+					SELECT pid FROM pg_stat_activity
+					WHERE state = 'active'
+					  AND query LIKE '%CREATE INDEX CONCURRENTLY%'
+					  AND pid <> pg_backend_pid()
+					LIMIT 1;
+				`
+				if err := db.QueryRow(query).Scan(&pid); err == nil && pid > 0 {
+					time.Sleep(20 * time.Millisecond)
+					var success bool
+					_ = db.QueryRow("SELECT pg_terminate_backend($1);", pid).Scan(&success)
+					terminated <- true
+					return
+				}
+			}
+		}
+	}()
+
+	// 2. Sync attempt should fail because the backend is terminated
+	syncErr := grizzle.Sync(context.Background(), db, grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: schema,
+		SchemaSQL:    desiredSQL,
+	})
+	if syncErr == nil {
+		t.Fatalf("expected error from terminated backend, but sync succeeded")
+	}
+	t.Logf("syncErr was: %v", syncErr)
+
+	// 3. Verify advisory lock is freed
+	testConn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("failed acquiring test conn: %v", err)
+	}
+	defer func() { _ = testConn.Close() }()
+
+	key1 := postgres.Hash32("grizzle")
+	key2 := postgres.Hash32(schema)
+	lockCtx, cancelLock := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancelLock()
+	if err := postgres.AcquireSessionAdvisoryLock2(lockCtx, testConn, key1, key2); err != nil {
+		t.Fatalf("advisory lock should be freed after backend termination, but failed: %v", err)
+	}
+	_ = postgres.ReleaseSessionAdvisoryLock2(context.Background(), testConn, key1, key2)
+
+	// 4. Verify invalid index was left behind in pg_index
+	var isInvalid bool
+	checkQuery := fmt.Sprintf(`
+		SELECT NOT i.indisvalid
+		FROM pg_index i
+		JOIN pg_class c ON c.oid = i.indexrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = '%s' AND c.relname = 'idx_term_email';
+	`, schema)
+	err = db.QueryRow(checkQuery).Scan(&isInvalid)
+	if err != nil {
+		t.Fatalf("querying invalid index failed: %v", err)
+	}
+	if !isInvalid {
+		t.Fatalf("expected index to be marked invalid (indisvalid=false) after interrupted creation")
+	}
+
+	// 5. Rerun Sync: auto-recovery should drop invalid index and recreate it cleanly
+	err = grizzle.Sync(context.Background(), db, grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: schema,
+		SchemaSQL:    desiredSQL,
+	})
+	if err != nil {
+		t.Fatalf("rerun Sync after invalid index failed: %v", err)
+	}
+
+	// 6. Final verification: index is now valid and PlanDiff is empty
+	var isValid bool
+	err = db.QueryRow(fmt.Sprintf(`
+		SELECT i.indisvalid
+		FROM pg_index i
+		JOIN pg_class c ON c.oid = i.indexrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = '%s' AND c.relname = 'idx_term_email';
+	`, schema)).Scan(&isValid)
+	if err != nil || !isValid {
+		t.Fatalf("expected recovered index to be valid, err=%v, isValid=%t", err, isValid)
+	}
+
+	pFinal, err := grizzle.PlanDiff(context.Background(), db, grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: schema,
+		SchemaSQL:    desiredSQL,
+	})
+	if err != nil {
+		t.Fatalf("final PlanDiff failed: %v", err)
+	}
+	if len(pFinal.Steps) != 0 {
+		t.Fatalf("expected 0 diff steps after recovery, got %d: %+v", len(pFinal.Steps), pFinal.Steps)
 	}
 }
 
