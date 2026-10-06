@@ -11,7 +11,6 @@ import (
 
 	"github.com/muandane/grizzle"
 	"github.com/muandane/grizzle/internal/diff"
-	"github.com/muandane/grizzle/internal/exec"
 	"github.com/muandane/grizzle/internal/plan"
 	"github.com/muandane/grizzle/internal/schema"
 	"github.com/muandane/grizzle/internal/scope"
@@ -103,15 +102,15 @@ func TestUnmanaged_HazardOnDropColumn_PureUnit(t *testing.T) {
 	}
 
 	// Gating: without accepting UNMANAGED_DEPENDENCY, execution must be blocked
-	err := exec.GateHazards(p, []plan.HazardCode{plan.HazardDropColumn})
+	err := p.ValidateHazards([]plan.HazardCode{plan.HazardDropColumn})
 	if !errors.Is(err, plan.ErrHazardBlocked) {
 		t.Fatalf("expected ErrHazardBlocked when UNMANAGED_DEPENDENCY is not accepted, got: %v", err)
 	}
 
 	// Gating: with UNMANAGED_DEPENDENCY accepted, passes
-	err = exec.GateHazards(p, []plan.HazardCode{plan.HazardDropColumn, plan.HazardUnmanagedDependency})
+	err = p.ValidateHazards([]plan.HazardCode{plan.HazardDropColumn, plan.HazardUnmanagedDependency})
 	if err != nil {
-		t.Fatalf("expected GateHazards to pass when accepted, got: %v", err)
+		t.Fatalf("expected ValidateHazards to pass when accepted, got: %v", err)
 	}
 }
 

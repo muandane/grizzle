@@ -364,3 +364,33 @@ func (p *Plan) Hazards() []Hazard {
 	return hazards
 }
 
+// ValidateHazards checks whether any critical hazards in the plan are not explicitly accepted.
+func (p *Plan) ValidateHazards(accept []HazardCode) error {
+	var unaccepted []Hazard
+	for _, h := range p.Hazards() {
+		if h.Level == HazardLevelCritical {
+			if !slices.Contains(accept, h.Code) {
+				unaccepted = append(unaccepted, h)
+			}
+		}
+	}
+	if len(unaccepted) > 0 {
+		return &HazardError{Hazards: unaccepted}
+	}
+	return nil
+}
+
+// ValidatePolicy checks whether all planned migration steps comply with the configured drop safety policy.
+func (p *Plan) ValidatePolicy() error {
+	var violations []Step
+	for _, s := range p.Steps {
+		if !p.Policy.IsAllowed(s) {
+			violations = append(violations, s)
+		}
+	}
+	if len(violations) > 0 {
+		return &DestructiveViolationError{Violations: violations}
+	}
+	return nil
+}
+

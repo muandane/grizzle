@@ -362,7 +362,10 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 	}
 
 	// Direct execution fallback if SchemaSQL was not retained
-	if err := exec.GateHazards(p, opts.AcceptHazards); err != nil {
+	if err := p.ValidatePolicy(); err != nil {
+		return err
+	}
+	if err := p.ValidateHazards(opts.AcceptHazards); err != nil {
 		return err
 	}
 	tx, err := db.BeginTx(ctx, nil)
@@ -371,9 +374,6 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 	for _, s := range p.Steps {
-		if !p.Policy.IsAllowed(s) {
-			return &plan.DestructiveViolationError{Violations: []plan.Step{s}}
-		}
 		if _, err := tx.ExecContext(ctx, s.SQL); err != nil {
 			return fmt.Errorf("%w: failed executing [%s]: %v", plan.ErrExecutionFailed, s.SQL, err)
 		}

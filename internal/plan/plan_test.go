@@ -2,6 +2,7 @@ package plan_test
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 
@@ -156,6 +157,87 @@ func TestPlan_ErrorTypes(t *testing.T) {
 	}
 	if driftWithPlan.Unwrap() != plan.ErrDrift {
 		t.Errorf("expected Unwrap to return ErrDrift")
+	}
+}
+
+func TestPlan_ValidateHazards(t *testing.T) {
+	p := &plan.Plan{
+		Steps: []plan.Step{
+			{Type: plan.ChangeDropTable, Table: "users", Destructive: true},
+			{Type: plan.ChangeDropColumn, Table: "orders", Destructive: true},
+		},
+	}
+
+	// 1. Blocked when hazards not accepted
+	err := p.ValidateHazards(nil)
+	if err == nil {
+		t.Fatalf("expected ValidateHazards to return error, got nil")
+	}
+	var herr *plan.HazardError
+	if !errors.As(err, &herr) {
+		t.Fatalf("expected *HazardError, got: %T (%v)", err, err)
+	}
+	if len(herr.Hazards) != 2 {
+		t.Errorf("expected 2 unaccepted hazards, got %d", len(herr.Hazards))
+	}
+
+	// 2. Partially accepted still blocks
+	err = p.ValidateHazards([]plan.HazardCode{plan.HazardDropTable})
+	if err == nil {
+		t.Fatalf("expected partial accept to still return error, got nil")
+	}
+
+	// 3. Fully accepted passes
+	err = p.ValidateHazards([]plan.HazardCode{plan.HazardDropTable, plan.HazardDropColumn})
+	if err != nil {
+		t.Errorf("expected fully accepted hazards to pass, got: %v", err)
+	}
+}
+
+func TestPlan_ValidatePolicy(t *testing.T) {
+	p := &plan.Plan{
+		Steps: []plan.Step{
+			{Type: plan.ChangeCreateTable, Table: "users", Destructive: false},
+			{Type: plan.ChangeDropTable, Table: "old_users", Destructive: true},
+			{Type: plan.ChangeDropColumn, Table: "orders", Destructive: true},
+		},
+		Policy: plan.DropPolicy{
+			AllowTable:  false,
+			AllowColumn: true,
+		},
+	}
+
+	// 1. One violation
+	err := p.ValidatePolicy()
+	if err == nil {
+		t.Fatalf("expected ValidatePolicy to return error, got nil")
+	}
+	var verr *plan.DestructiveViolationError
+	if !errors.As(err, &verr) {
+		t.Fatalf("expected *DestructiveViolationError, got: %T (%v)", err, err)
+	}
+	if len(verr.Violations) != 1 {
+		t.Fatalf("expected 1 violation, got %d", len(verr.Violations))
+	}
+	if verr.Violations[0].Table != "old_users" {
+		t.Errorf("expected violation table old_users, got %s", verr.Violations[0].Table)
+	}
+
+	// 2. All disallowed -> multiple violations collected
+	p.Policy.AllowColumn = false
+	err = p.ValidatePolicy()
+	if !errors.As(err, &verr) {
+		t.Fatalf("expected *DestructiveViolationError, got: %T (%v)", err, err)
+	}
+	if len(verr.Violations) != 2 {
+		t.Fatalf("expected 2 violations, got %d", len(verr.Violations))
+	}
+
+	// 3. All allowed -> nil
+	p.Policy.AllowTable = true
+	p.Policy.AllowColumn = true
+	if err := p.ValidatePolicy(); err != nil {
+		t.Errorf("expected ValidatePolicy to pass when policy allows, got: %v", err)
 	}
 }
 

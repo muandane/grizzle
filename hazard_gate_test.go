@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/muandane/grizzle"
-	"github.com/muandane/grizzle/internal/exec"
 	"github.com/muandane/grizzle/internal/plan"
 	_ "modernc.org/sqlite"
 )
@@ -134,7 +133,7 @@ func TestHazardGate_DirectUnit(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			err := exec.GateHazards(tt.plan, tt.accept)
+			err := tt.plan.ValidateHazards(tt.accept)
 			if tt.expectBlocked {
 				if err == nil {
 					t.Fatalf("expected error, got nil")

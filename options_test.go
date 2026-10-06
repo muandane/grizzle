@@ -172,6 +172,26 @@ func TestApply_EdgeCases(t *testing.T) {
 		t.Errorf("expected destructive violation error, got nil")
 	}
 
+	// Direct execution with multiple destructive violations collects all violations upfront
+	multiBlockedPlan := &grizzle.Plan{
+		Steps: []plan.Step{
+			{Type: plan.ChangeDropTable, Table: "t1", SQL: "DROP TABLE t1;", Destructive: true},
+			{Type: plan.ChangeDropColumn, Table: "t2", SQL: "ALTER TABLE t2 DROP COLUMN c1;", Destructive: true},
+		},
+		Policy: plan.DropPolicy{AllowTable: false, AllowColumn: false},
+	}
+	err = grizzle.Apply(ctx, db, multiBlockedPlan, grizzle.ApplyOpts{})
+	if err == nil {
+		t.Fatalf("expected destructive violation error, got nil")
+	}
+	var multiViolationErr *grizzle.DestructiveViolationError
+	if !errors.As(err, &multiViolationErr) {
+		t.Fatalf("expected *DestructiveViolationError, got: %T (%v)", err, err)
+	}
+	if len(multiViolationErr.Violations) != 2 {
+		t.Errorf("expected exactly 2 violations collected upfront, got %d", len(multiViolationErr.Violations))
+	}
+
 	// Direct execution with hazard blocked
 	hazardPlan := &grizzle.Plan{
 		Steps: []plan.Step{

@@ -3,9 +3,9 @@ package exec
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
-	"slices"
 	"strings"
 	"time"
 
@@ -220,21 +220,20 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 	}
 
 	// 5. Enforce safety policy (policy check hard-blocks drops regardless of AcceptHazards)
-	var violations []plan.Step
-	for _, s := range steps {
-		if !cfg.Policy.IsAllowed(s) {
-			violations = append(violations, s)
-		}
-	}
-	if len(violations) > 0 {
+	if err := p.ValidatePolicy(); err != nil {
 		if logger != nil {
-			logger.WarnContext(ctx, "grizzle: migration blocked by safety policy", "violations_count", len(violations))
+			var vErr *plan.DestructiveViolationError
+			if errors.As(err, &vErr) {
+				logger.WarnContext(ctx, "grizzle: migration blocked by safety policy", "violations_count", len(vErr.Violations))
+			} else {
+				logger.WarnContext(ctx, "grizzle: migration blocked by safety policy", "error", err)
+			}
 		}
-		return 0, &plan.DestructiveViolationError{Violations: violations}
+		return 0, err
 	}
 
 	// 5b. Enforce hazard gating (fails on critical hazards unless explicitly accepted)
-	if err := GateHazards(p, cfg.AcceptHazards); err != nil {
+	if err := p.ValidateHazards(cfg.AcceptHazards); err != nil {
 		if logger != nil {
 			logger.WarnContext(ctx, "grizzle: migration blocked by unaccepted critical hazards", "error", err)
 		}
@@ -456,21 +455,20 @@ func SyncSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) error {
 	}
 
 	// 4. Enforce safety policy (policy check hard-blocks drops regardless of AcceptHazards)
-	var violations []plan.Step
-	for _, s := range steps {
-		if !cfg.Policy.IsAllowed(s) {
-			violations = append(violations, s)
-		}
-	}
-	if len(violations) > 0 {
+	if err := p.ValidatePolicy(); err != nil {
 		if logger != nil {
-			logger.WarnContext(ctx, "sqlite: migration blocked by safety policy", "violations_count", len(violations))
+			var vErr *plan.DestructiveViolationError
+			if errors.As(err, &vErr) {
+				logger.WarnContext(ctx, "sqlite: migration blocked by safety policy", "violations_count", len(vErr.Violations))
+			} else {
+				logger.WarnContext(ctx, "sqlite: migration blocked by safety policy", "error", err)
+			}
 		}
-		return &plan.DestructiveViolationError{Violations: violations}
+		return err
 	}
 
 	// 4b. Enforce hazard gating (fails on critical hazards unless explicitly accepted)
-	if err := GateHazards(p, cfg.AcceptHazards); err != nil {
+	if err := p.ValidateHazards(cfg.AcceptHazards); err != nil {
 		if logger != nil {
 			logger.WarnContext(ctx, "sqlite: migration blocked by unaccepted critical hazards", "error", err)
 		}
@@ -568,20 +566,4 @@ func PlanDiffSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) (*pla
 		ExpandContract: cfg.Filters.ExpandContract,
 		SchemaSQL:      cfg.SchemaSQL,
 	}, nil
-}
-
-// GateHazards checks whether any critical hazards in the plan are not accepted.
-func GateHazards(p *plan.Plan, accept []plan.HazardCode) error {
-	var unaccepted []plan.Hazard
-	for _, h := range p.Hazards() {
-		if h.Level == plan.HazardLevelCritical {
-			if !slices.Contains(accept, h.Code) {
-				unaccepted = append(unaccepted, h)
-			}
-		}
-	}
-	if len(unaccepted) > 0 {
-		return &plan.HazardError{Hazards: unaccepted}
-	}
-	return nil
 }
