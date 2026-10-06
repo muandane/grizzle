@@ -32,10 +32,11 @@ type Change struct {
 	ColumnHasDefault bool
 
 	// Column change flags
-	TypeChanged    bool
-	TypeNarrowed   bool
-	NullChanged    bool
-	DefaultChanged bool
+	TypeChanged      bool
+	TypeNarrowed     bool
+	NullChanged      bool
+	DefaultChanged   bool
+	GeneratedChanged bool
 
 	// Unmanaged object dependencies (views, triggers, functions depending on this table/column)
 	UnmanagedDeps []string
@@ -118,11 +119,20 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 			if !colExists {
 				addedCols[colName] = dCol
 			} else {
-				typeChanged := dCol.DataType != lCol.DataType
+				typeChanged := schema.NormalizeType(dCol.DataType) != schema.NormalizeType(lCol.DataType)
 				nullChanged := dCol.IsNullable != lCol.IsNullable
 				defChanged := dCol.DefaultValue != lCol.DefaultValue
+				genChanged := false
+				if (lCol.Generated == nil) != (dCol.Generated == nil) {
+					genChanged = true
+				} else if lCol.Generated != nil && dCol.Generated != nil {
+					if schema.NormalizeGeneratedExpr(lCol.Generated.Expr) != schema.NormalizeGeneratedExpr(dCol.Generated.Expr) ||
+						lCol.Generated.Stored != dCol.Generated.Stored {
+						genChanged = true
+					}
+				}
 
-				if typeChanged || nullChanged || defChanged {
+				if typeChanged || nullChanged || defChanged || genChanged {
 					typeNarrowed := typeChanged && schema.IsTypeNarrowing(lCol.DataType, dCol.DataType)
 					destructive := typeNarrowed || (!dCol.IsNullable && lCol.IsNullable)
 					var unmDeps []string
@@ -138,6 +148,7 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 						TypeNarrowed:     typeNarrowed,
 						NullChanged:      nullChanged,
 						DefaultChanged:   defChanged,
+						GeneratedChanged: genChanged,
 						Destructive:      destructive,
 						ColumnNotNull:    !dCol.IsNullable,
 						ColumnHasDefault: dCol.DefaultValue != "",

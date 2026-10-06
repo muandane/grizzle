@@ -51,15 +51,22 @@ type Table struct {
 	PrimaryKey  *PrimaryKey            `json:"primary_key"`
 }
 
+// GeneratedColumn describes a computed or generated column.
+type GeneratedColumn struct {
+	Expr   string `json:"expr"`
+	Stored bool   `json:"stored"`
+}
+
 // Column represents a single column within a table.
 type Column struct {
-	Name         string `json:"name"`
-	DataType     string `json:"data_type"`
-	IsNullable   bool   `json:"is_nullable"`
-	DefaultValue string `json:"default_value"`
-	Position     int    `json:"position"`
-	IsIdentity   bool   `json:"is_identity,omitempty"`
-	IdentityType string `json:"identity_type,omitempty"`
+	Name         string           `json:"name"`
+	DataType     string           `json:"data_type"`
+	IsNullable   bool             `json:"is_nullable"`
+	DefaultValue string           `json:"default_value"`
+	Position     int              `json:"position"`
+	IsIdentity   bool             `json:"is_identity,omitempty"`
+	IdentityType string           `json:"identity_type,omitempty"`
+	Generated    *GeneratedColumn `json:"generated,omitempty"`
 }
 
 // Index represents a secondary or unique index on a table.

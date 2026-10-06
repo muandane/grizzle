@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/muandane/grizzle/internal/dialect"
@@ -18,20 +19,25 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX) (*schema.Schema, error) {
 		Enums:  make(map[string]*schema.Enum),
 	}
 
-	// 1. Get Table names
-	tblRows, err := dbtx.QueryContext(ctx, "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_grizzle_%' ORDER BY name;")
+	// 1. Get Table names and DDL SQL
+	tblRows, err := dbtx.QueryContext(ctx, "SELECT name, sql FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_grizzle_%' ORDER BY name;")
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: querying tables: %w", err)
 	}
 	defer func() { _ = tblRows.Close() }()
 
 	var tableNames []string
+	tableSQLMap := make(map[string]string)
 	for tblRows.Next() {
 		var name string
-		if err := tblRows.Scan(&name); err != nil {
+		var tableSQL sql.NullString
+		if err := tblRows.Scan(&name, &tableSQL); err != nil {
 			return nil, err
 		}
 		tableNames = append(tableNames, name)
+		if tableSQL.Valid {
+			tableSQLMap[name] = tableSQL.String
+		}
 	}
 	_ = tblRows.Close()
 
@@ -43,9 +49,10 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX) (*schema.Schema, error) {
 			ForeignKeys: make(map[string]*schema.ForeignKey),
 		}
 		s.Tables[tblName] = tbl
+		tableDDL := tableSQLMap[tblName]
 
-		// 2. Query columns using PRAGMA table_info
-		colRows, err := dbtx.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%q);", tblName))
+		// 2. Query columns using PRAGMA table_xinfo (includes generated columns and hidden flag)
+		colRows, err := dbtx.QueryContext(ctx, fmt.Sprintf("PRAGMA table_xinfo(%q);", tblName))
 		if err != nil {
 			return nil, fmt.Errorf("sqlite: querying columns for %q: %w", tblName, err)
 		}
@@ -59,8 +66,9 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX) (*schema.Schema, error) {
 				notnull   int
 				dfltValue sql.NullString
 				pk        int
+				hidden    int
 			)
-			if err := colRows.Scan(&cid, &name, &colType, &notnull, &dfltValue, &pk); err != nil {
+			if err := colRows.Scan(&cid, &name, &colType, &notnull, &dfltValue, &pk, &hidden); err != nil {
 				_ = colRows.Close()
 				return nil, err
 			}
@@ -71,13 +79,25 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX) (*schema.Schema, error) {
 				defVal = NormalizeDefault(dfltValue.String)
 			}
 
-			tbl.Columns[name] = &schema.Column{
+			col := &schema.Column{
 				Name:         name,
 				DataType:     normType,
 				IsNullable:   notnull == 0,
 				DefaultValue: defVal,
 				Position:     cid,
 			}
+
+			// hidden == 2 is VIRTUAL generated column, hidden == 3 is STORED generated column
+			if hidden == 2 || hidden == 3 {
+				expr := extractSQLiteGeneratedExpr(tableDDL, name)
+				col.Generated = &schema.GeneratedColumn{
+					Expr:   schema.NormalizeGeneratedExpr(expr),
+					Stored: hidden == 3,
+				}
+				col.DefaultValue = ""
+			}
+
+			tbl.Columns[name] = col
 
 			if pk > 0 {
 				pkCols = append(pkCols, name)
@@ -211,4 +231,36 @@ func NormalizeType(t string) string {
 // NormalizeDefault standardizes default expressions in SQLite.
 func NormalizeDefault(d string) string {
 	return strings.TrimSpace(d)
+}
+
+func extractSQLiteGeneratedExpr(tableSQL, colName string) string {
+	pattern := fmt.Sprintf(`(?i)(?:["'`+"`"+`]%s["'`+"`"+`]|\b%s\b)[^,;]*?(?:GENERATED\s+ALWAYS\s+)?AS\s*\(`, regexp.QuoteMeta(colName), regexp.QuoteMeta(colName))
+	re := regexp.MustCompile(pattern)
+	loc := re.FindStringIndex(tableSQL)
+	if loc == nil {
+		return ""
+	}
+	start := loc[1] - 1 // points to '('
+	count := 0
+	inQuote := false
+	for i := start; i < len(tableSQL); i++ {
+		c := tableSQL[i]
+		if c == '\'' {
+			inQuote = !inQuote
+			continue
+		}
+		if inQuote {
+			continue
+		}
+		switch c {
+		case '(':
+			count++
+		case ')':
+			count--
+			if count == 0 {
+				return schema.NormalizeGeneratedExpr(tableSQL[start+1 : i])
+			}
+		}
+	}
+	return ""
 }

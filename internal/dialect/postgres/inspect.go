@@ -61,7 +61,8 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 			NOT a.attnotnull AS is_nullable,
 			COALESCE(pg_get_expr(d.adbin, d.adrelid), '') AS column_default,
 			a.attnum AS ordinal_position,
-			a.attidentity AS identity_type
+			a.attidentity AS identity_type,
+			a.attgenerated AS generated_type
 		FROM pg_attribute a
 		JOIN pg_class c ON c.oid = a.attrelid
 		JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -81,16 +82,17 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 
 	for rows.Next() {
 		var (
-			tableName    string
-			colName      string
-			rawType      string
-			isNullable   bool
-			rawDefault   string
-			position     int
-			identityType string
+			tableName     string
+			colName       string
+			rawType       string
+			isNullable    bool
+			rawDefault    string
+			position      int
+			identityType  string
+			generatedType string
 		)
 
-		if err := rows.Scan(&tableName, &colName, &rawType, &isNullable, &rawDefault, &position, &identityType); err != nil {
+		if err := rows.Scan(&tableName, &colName, &rawType, &isNullable, &rawDefault, &position, &identityType, &generatedType); err != nil {
 			return nil, fmt.Errorf("scanning column data in schema %q: %w", schemaName, err)
 		}
 
@@ -114,6 +116,21 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 			IsNullable:   isNullable,
 			DefaultValue: schema.NormalizeDefault(rawDefault),
 			Position:     position,
+		}
+
+		switch strings.TrimSpace(generatedType) {
+		case "s":
+			col.Generated = &schema.GeneratedColumn{
+				Expr:   schema.NormalizeGeneratedExpr(rawDefault),
+				Stored: true,
+			}
+			col.DefaultValue = ""
+		case "v":
+			col.Generated = &schema.GeneratedColumn{
+				Expr:   schema.NormalizeGeneratedExpr(rawDefault),
+				Stored: false,
+			}
+			col.DefaultValue = ""
 		}
 
 		switch identityType {

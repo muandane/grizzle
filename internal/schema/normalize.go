@@ -19,6 +19,12 @@ var (
 	numParenRegex  = regexp.MustCompile(`^\(?(-?\d+(?:\.\d+)?)(?:::[\w\."\s]+)?\)?$`)
 )
 
+// NormalizeGeneratedExpr sanitizes generated column expressions by stripping outer parentheses and excess whitespace.
+func NormalizeGeneratedExpr(expr string) string {
+	s := strings.TrimSpace(expr)
+	return StripOuterParens(s)
+}
+
 // StripOuterParens strips surrounding balanced parentheses while respecting quotes.
 func StripOuterParens(s string) string {
 	s = strings.TrimSpace(s)

@@ -42,9 +42,10 @@ type Step struct {
 	ColumnHasDefault  bool     `json:"column_has_default,omitzero"`
 	TypeNarrowed      bool     `json:"type_narrowed,omitzero"`
 	IsTableRebuild    bool     `json:"is_table_rebuild,omitzero"`
-	IsRenameCandidate bool     `json:"is_rename_candidate,omitzero"`
-	OldColumn         string   `json:"old_column,omitzero"`
-	UnmanagedDeps     []string `json:"unmanaged_deps,omitzero"`
+	IsRenameCandidate  bool     `json:"is_rename_candidate,omitzero"`
+	IsGeneratedRewrite bool     `json:"is_generated_rewrite,omitzero"`
+	OldColumn          string   `json:"old_column,omitzero"`
+	UnmanagedDeps      []string `json:"unmanaged_deps,omitzero"`
 }
 
 // DropPolicy defines fine-grained permissions for destructive operations.
@@ -121,10 +122,10 @@ func (p *Plan) Hash() string {
 		if len(s.UnmanagedDeps) > 0 {
 			unmStr = "|unmanaged_deps:" + strings.Join(s.UnmanagedDeps, ",")
 		}
-		write("step:%d|type:%s|table:%s|sql:%s|destructive:%t|non_tx:%t|not_null:%t|default:%t|narrowed:%t|rebuild:%t|rename_cand:%t|old_col:%s%s\n",
+		write("step:%d|type:%s|table:%s|sql:%s|destructive:%t|non_tx:%t|not_null:%t|default:%t|narrowed:%t|rebuild:%t|rename_cand:%t|gen_rewrite:%t|old_col:%s%s\n",
 			i, s.Type, s.Table, strings.TrimSpace(s.SQL), s.Destructive, s.NonTx,
 			s.ColumnNotNull, s.ColumnHasDefault, s.TypeNarrowed, s.IsTableRebuild,
-			s.IsRenameCandidate, s.OldColumn, unmStr,
+			s.IsRenameCandidate, s.IsGeneratedRewrite, s.OldColumn, unmStr,
 		)
 	}
 
@@ -215,6 +216,8 @@ const (
 	HazardRenameAmbiguous HazardCode = "RENAME_AMBIGUOUS"
 	// HazardUnmanagedDependency indicates a drop or type change touches a column/table that an unmanaged object depends on.
 	HazardUnmanagedDependency HazardCode = "UNMANAGED_DEPENDENCY"
+	// HazardGeneratedRewrite indicates changing a generated column expression requiring table rewrite.
+	HazardGeneratedRewrite HazardCode = "GENERATED_REWRITE"
 )
 
 // HazardLevel indicates the operational or data-loss severity of a migration step.
@@ -250,6 +253,16 @@ func (p *Plan) Hazards() []Hazard {
 				Type:        s.Type,
 				Table:       s.Table,
 				Description: fmt.Sprintf("Table %q operation affects unmanaged dependent object(s) [%s]", s.Table, strings.Join(s.UnmanagedDeps, ", ")),
+				SQL:         s.SQL,
+			})
+		}
+		if s.IsGeneratedRewrite {
+			hazards = append(hazards, Hazard{
+				Code:        HazardGeneratedRewrite,
+				Level:       HazardLevelWarning,
+				Type:        s.Type,
+				Table:       s.Table,
+				Description: fmt.Sprintf("Generated column on table %q expression modified; requires table rewrite", s.Table),
 				SQL:         s.SQL,
 			})
 		}
@@ -297,7 +310,7 @@ func (p *Plan) Hazards() []Hazard {
 					Description: fmt.Sprintf("Column on table %q has a destructive type change that may cause data loss or truncation", s.Table),
 					SQL:         s.SQL,
 				})
-			} else {
+			} else if !s.IsGeneratedRewrite {
 				hazards = append(hazards, Hazard{
 					Code:        "ALTER_COLUMN",
 					Level:       HazardLevelNotice,

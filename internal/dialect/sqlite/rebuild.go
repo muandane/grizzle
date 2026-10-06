@@ -27,6 +27,12 @@ func GenerateSQLiteCreateTable(tbl *schema.Table) string {
 		line := fmt.Sprintf("  %q %s", c.Name, c.DataType)
 		if isSinglePK && c.Name == tbl.PrimaryKey.Columns[0] && strings.EqualFold(c.DataType, "INTEGER") {
 			line += " PRIMARY KEY AUTOINCREMENT"
+		} else if c.Generated != nil {
+			stored := "STORED"
+			if !c.Generated.Stored {
+				stored = "VIRTUAL"
+			}
+			line += fmt.Sprintf(" GENERATED ALWAYS AS (%s) %s", c.Generated.Expr, stored)
 		} else {
 			if !c.IsNullable {
 				line += " NOT NULL"
@@ -64,8 +70,11 @@ func GenerateSQLiteRebuildPlan(liveTable, desiredTable *schema.Table) (string, b
 	var commonCols []string
 	var droppedCols []string
 	for colName := range liveTable.Columns {
-		if _, exists := desiredTable.Columns[colName]; exists {
-			commonCols = append(commonCols, fmt.Sprintf("%q", colName))
+		if dCol, exists := desiredTable.Columns[colName]; exists {
+			// Generated columns cannot be inserted into in SQLite
+			if dCol.Generated == nil {
+				commonCols = append(commonCols, fmt.Sprintf("%q", colName))
+			}
 		} else {
 			droppedCols = append(droppedCols, colName)
 		}
@@ -224,12 +233,25 @@ func Diff(live, desired *schema.Schema, filters scope.Filters) []plan.Step {
 			isDestructive = true
 		}
 
+		isGeneratedRewrite := false
 		if !needsRebuild {
 			for colName, dCol := range dTable.Columns {
 				lCol, inLive := lTable.Columns[colName]
 				if inLive {
-					if dCol.DataType != lCol.DataType || dCol.IsNullable != lCol.IsNullable || dCol.DefaultValue != lCol.DefaultValue {
+					genChanged := false
+					if (lCol.Generated == nil) != (dCol.Generated == nil) {
+						genChanged = true
+					} else if lCol.Generated != nil && dCol.Generated != nil {
+						if schema.NormalizeGeneratedExpr(lCol.Generated.Expr) != schema.NormalizeGeneratedExpr(dCol.Generated.Expr) ||
+							lCol.Generated.Stored != dCol.Generated.Stored {
+							genChanged = true
+						}
+					}
+					if dCol.DataType != lCol.DataType || dCol.IsNullable != lCol.IsNullable || dCol.DefaultValue != lCol.DefaultValue || genChanged {
 						needsRebuild = true
+						if genChanged {
+							isGeneratedRewrite = true
+						}
 						if schema.IsTypeNarrowing(lCol.DataType, dCol.DataType) {
 							typeNarrowed = true
 							isDestructive = true
@@ -249,14 +271,15 @@ func Diff(live, desired *schema.Schema, filters scope.Filters) []plan.Step {
 				changeType = plan.ChangeDropColumn
 			}
 			steps = append(steps, plan.Step{
-				Type:              changeType,
-				Table:             tblName,
-				SQL:               rebuildSQL,
-				Destructive:       isDestructive || destructive,
-				TypeNarrowed:      typeNarrowed,
-				IsTableRebuild:    true,
-				IsRenameCandidate: isRenameCandidate,
-				OldColumn:         renameCandidateOldCol,
+				Type:               changeType,
+				Table:              tblName,
+				SQL:                rebuildSQL,
+				Destructive:        isDestructive || destructive,
+				TypeNarrowed:       typeNarrowed,
+				IsTableRebuild:     true,
+				IsRenameCandidate:  isRenameCandidate,
+				IsGeneratedRewrite: isGeneratedRewrite,
+				OldColumn:          renameCandidateOldCol,
 			})
 
 			for _, idx := range dTable.Indexes {
@@ -275,19 +298,27 @@ func Diff(live, desired *schema.Schema, filters scope.Filters) []plan.Step {
 			for colName, dCol := range dTable.Columns {
 				if _, inLive := lTable.Columns[colName]; !inLive {
 					clause := fmt.Sprintf("%q %s", dCol.Name, dCol.DataType)
-					isStaged := stagedExpandCols != nil && stagedExpandCols[colName]
-					if !dCol.IsNullable && !isStaged {
-						clause += " NOT NULL"
-					}
-					if dCol.DefaultValue != "" {
-						clause += " DEFAULT " + dCol.DefaultValue
+					if dCol.Generated != nil {
+						stored := "STORED"
+						if !dCol.Generated.Stored {
+							stored = "VIRTUAL"
+						}
+						clause += fmt.Sprintf(" GENERATED ALWAYS AS (%s) %s", dCol.Generated.Expr, stored)
+					} else {
+						isStaged := stagedExpandCols != nil && stagedExpandCols[colName]
+						if !dCol.IsNullable && !isStaged {
+							clause += " NOT NULL"
+						}
+						if dCol.DefaultValue != "" {
+							clause += " DEFAULT " + dCol.DefaultValue
+						}
 					}
 					steps = append(steps, plan.Step{
 						Type:             plan.ChangeAddColumn,
 						Table:            tblName,
 						SQL:              fmt.Sprintf("ALTER TABLE %q ADD COLUMN %s;", tblName, clause),
 						Destructive:      false,
-						ColumnNotNull:    !dCol.IsNullable && !isStaged,
+						ColumnNotNull:    dCol.Generated == nil && !dCol.IsNullable && (stagedExpandCols == nil || !stagedExpandCols[colName]),
 						ColumnHasDefault: dCol.DefaultValue != "",
 					})
 				}

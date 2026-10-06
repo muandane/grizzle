@@ -58,6 +58,9 @@ type PrimaryKeyIR = schema.PrimaryKey
 // EnumIR represents the intermediate representation of an enum type.
 type EnumIR = schema.Enum
 
+// GeneratedColumn describes a computed or generated column.
+type GeneratedColumn = schema.GeneratedColumn
+
 
 // ChangeType constants
 const (
@@ -78,15 +81,16 @@ const (
 
 // HazardCode constants
 const (
-	HazardDropTable        = plan.HazardDropTable
-	HazardDropColumn       = plan.HazardDropColumn
-	HazardTypeNarrow       = plan.HazardTypeNarrow
-	HazardNotNullNoDefault = plan.HazardNotNullNoDefault
-	HazardIndexBuild       = plan.HazardIndexBuild
-	HazardDropIndex        = plan.HazardDropIndex
-	HazardDropFK           = plan.HazardDropFK
-	HazardRenameAmbiguous  = plan.HazardRenameAmbiguous
+	HazardDropTable           = plan.HazardDropTable
+	HazardDropColumn          = plan.HazardDropColumn
+	HazardTypeNarrow          = plan.HazardTypeNarrow
+	HazardNotNullNoDefault    = plan.HazardNotNullNoDefault
+	HazardIndexBuild          = plan.HazardIndexBuild
+	HazardDropIndex           = plan.HazardDropIndex
+	HazardDropFK              = plan.HazardDropFK
+	HazardRenameAmbiguous     = plan.HazardRenameAmbiguous
 	HazardUnmanagedDependency = plan.HazardUnmanagedDependency
+	HazardGeneratedRewrite    = plan.HazardGeneratedRewrite
 )
 
 // UnmanagedObject represents an unmanaged database object detected during introspection.

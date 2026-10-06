@@ -58,6 +58,12 @@ func GenerateCreateTableSQL(targetSchema string, tbl *schema.Table) string {
 			line = fmt.Sprintf("  %q %s", c.Name, serialType)
 		} else if c.IsIdentity {
 			line = fmt.Sprintf("  %q %s GENERATED %s AS IDENTITY", c.Name, c.DataType, c.IdentityType)
+		} else if c.Generated != nil {
+			stored := "STORED"
+			if !c.Generated.Stored {
+				stored = "VIRTUAL"
+			}
+			line = fmt.Sprintf("  %q %s GENERATED ALWAYS AS (%s) %s", c.Name, c.DataType, c.Generated.Expr, stored)
 		} else {
 			line = fmt.Sprintf("  %q %s", c.Name, c.DataType)
 			if !c.IsNullable {
@@ -89,6 +95,12 @@ func GenerateAddColumnSQL(targetSchema, tableName string, col *schema.Column) st
 		clause = fmt.Sprintf("%q %s", col.Name, serialType)
 	} else if col.IsIdentity {
 		clause = fmt.Sprintf("%q %s GENERATED %s AS IDENTITY", col.Name, col.DataType, col.IdentityType)
+	} else if col.Generated != nil {
+		stored := "STORED"
+		if !col.Generated.Stored {
+			stored = "VIRTUAL"
+		}
+		clause = fmt.Sprintf("%q %s GENERATED ALWAYS AS (%s) %s", col.Name, col.DataType, col.Generated.Expr, stored)
 	} else {
 		clause = fmt.Sprintf("%q %s", col.Name, col.DataType)
 		if !col.IsNullable {
@@ -103,6 +115,32 @@ func GenerateAddColumnSQL(targetSchema, tableName string, col *schema.Column) st
 
 // GenerateAlterColumnSQL constructs an ALTER TABLE ... ALTER COLUMN statement for modified columns.
 func GenerateAlterColumnSQL(targetSchema, tableName string, live, desired *schema.Column) string {
+	if desired.Generated != nil || live.Generated != nil {
+		stored := "STORED"
+		expr := ""
+		if desired.Generated != nil {
+			expr = desired.Generated.Expr
+			if !desired.Generated.Stored {
+				stored = "VIRTUAL"
+			}
+		}
+		if expr != "" {
+			return fmt.Sprintf("ALTER TABLE %q.%q DROP COLUMN %q; ALTER TABLE %q.%q ADD COLUMN %q %s GENERATED ALWAYS AS (%s) %s;",
+				targetSchema, tableName, desired.Name,
+				targetSchema, tableName, desired.Name, desired.DataType, expr, stored)
+		}
+		clause := fmt.Sprintf("%q %s", desired.Name, desired.DataType)
+		if !desired.IsNullable {
+			clause += " NOT NULL"
+		}
+		if desired.DefaultValue != "" {
+			clause += " DEFAULT " + desired.DefaultValue
+		}
+		return fmt.Sprintf("ALTER TABLE %q.%q DROP COLUMN %q; ALTER TABLE %q.%q ADD COLUMN %s;",
+			targetSchema, tableName, desired.Name,
+			targetSchema, tableName, clause)
+	}
+
 	var actions []string
 
 	if desired.DataType != live.DataType {
@@ -181,12 +219,13 @@ func RenderChange(targetSchema string, c diff.Change, nonConcurrent ...bool) pla
 	step := plan.Step{
 		Type:              c.Type,
 		Table:             c.Table,
-		Destructive:       c.Destructive,
-		ColumnNotNull:     c.ColumnNotNull,
-		ColumnHasDefault:  c.ColumnHasDefault,
-		TypeNarrowed:      c.TypeNarrowed,
-		IsRenameCandidate: c.IsRenameCandidate,
-		UnmanagedDeps:     c.UnmanagedDeps,
+		Destructive:        c.Destructive,
+		ColumnNotNull:      c.ColumnNotNull,
+		ColumnHasDefault:   c.ColumnHasDefault,
+		TypeNarrowed:       c.TypeNarrowed,
+		IsRenameCandidate:  c.IsRenameCandidate,
+		IsGeneratedRewrite: c.GeneratedChanged,
+		UnmanagedDeps:      c.UnmanagedDeps,
 	}
 	if c.OldColumn != nil {
 		step.OldColumn = c.OldColumn.Name
