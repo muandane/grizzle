@@ -40,6 +40,7 @@ type UnmanagedObject struct {
 	Kind      UnmanagedKind   `json:"kind"`
 	Table     string          `json:"table,omitempty"`
 	DependsOn []DependencyRef `json:"depends_on,omitempty"`
+	SQL       string          `json:"sql,omitempty"`
 }
 
 // PartitionStrategy defines the table partitioning method.

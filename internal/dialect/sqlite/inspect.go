@@ -14,9 +14,10 @@ import (
 // Inspect extracts the complete relational schema from an SQLite database connection.
 func Inspect(ctx context.Context, dbtx dialect.DBTX) (*schema.Schema, error) {
 	s := &schema.Schema{
-		Name:   "main",
-		Tables: make(map[string]*schema.Table),
-		Enums:  make(map[string]*schema.Enum),
+		Name:      "main",
+		Tables:    make(map[string]*schema.Table),
+		Enums:     make(map[string]*schema.Enum),
+		Unmanaged: make(map[string]*schema.UnmanagedObject),
 	}
 
 	// 1. Get Table names and DDL SQL
@@ -213,7 +214,50 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX) (*schema.Schema, error) {
 				IsValid:    true,
 			}
 		}
-		_ = idxRows.Close()
+	}
+
+	// 5. Query Triggers
+	trigRows, err := dbtx.QueryContext(ctx, "SELECT name, tbl_name, sql FROM sqlite_schema WHERE type='trigger' AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%';")
+	if err == nil {
+		for trigRows.Next() {
+			var name, tblName, sqlDef string
+			if err := trigRows.Scan(&name, &tblName, &sqlDef); err == nil {
+				s.Unmanaged["trigger:"+name] = &schema.UnmanagedObject{
+					Name:  name,
+					Kind:  schema.UnmanagedTrigger,
+					Table: tblName,
+					SQL:   sqlDef,
+					DependsOn: []schema.DependencyRef{
+						{Table: tblName},
+					},
+				}
+			}
+		}
+		_ = trigRows.Close()
+	}
+
+	// 6. Query Views
+	viewRows, err := dbtx.QueryContext(ctx, "SELECT name, sql FROM sqlite_schema WHERE type='view' AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%';")
+	if err == nil {
+		for viewRows.Next() {
+			var name, sqlDef string
+			if err := viewRows.Scan(&name, &sqlDef); err == nil {
+				var refs []schema.DependencyRef
+				for tblName := range s.Tables {
+					pattern := fmt.Sprintf(`(?i)(?:["'`+"`"+`]%s["'`+"`"+`]|\b%s\b)`, regexp.QuoteMeta(tblName), regexp.QuoteMeta(tblName))
+					if matched, _ := regexp.MatchString(pattern, sqlDef); matched {
+						refs = append(refs, schema.DependencyRef{Table: tblName})
+					}
+				}
+				s.Unmanaged["view:"+name] = &schema.UnmanagedObject{
+					Name:      name,
+					Kind:      schema.UnmanagedView,
+					SQL:       sqlDef,
+					DependsOn: refs,
+				}
+			}
+		}
+		_ = viewRows.Close()
 	}
 
 	return s, nil

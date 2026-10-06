@@ -59,8 +59,9 @@ func GenerateSQLiteCreateTable(tbl *schema.Table) string {
 	return fmt.Sprintf("CREATE TABLE %q (\n%s\n);", tbl.Name, strings.Join(lines, ",\n"))
 }
 
-// GenerateSQLiteRebuildPlan generates the standard 12-step atomic table replacement plan.
-func GenerateSQLiteRebuildPlan(liveTable, desiredTable *schema.Table) (string, bool) {
+// GenerateSQLiteRebuildPlan generates the standard 12-step atomic table replacement plan,
+// preserving and rebinding referencing views and triggers across table recreation.
+func GenerateSQLiteRebuildPlan(liveTable, desiredTable *schema.Table, refViews, refTriggers []*schema.UnmanagedObject) (string, bool) {
 	tempTable := "_grizzle_new_" + desiredTable.Name
 
 	rebuiltTable := *desiredTable
@@ -95,7 +96,32 @@ func GenerateSQLiteRebuildPlan(liveTable, desiredTable *schema.Table) (string, b
 	if copyDataSQL != "" {
 		statements = append(statements, copyDataSQL)
 	}
+
+	// 1. Drop referencing views before dropping old table so SQLite ALTER TABLE ... RENAME does not fail on broken views
+	for _, v := range refViews {
+		statements = append(statements, fmt.Sprintf("DROP VIEW IF EXISTS %q;", v.Name))
+	}
+
+	// 2. Drop old table and rename temp table
 	statements = append(statements, dropOldSQL, renameSQL)
+
+	// 3. Rebind referencing views to recreated table
+	for _, v := range refViews {
+		def := strings.TrimSpace(v.SQL)
+		if !strings.HasSuffix(def, ";") {
+			def += ";"
+		}
+		statements = append(statements, def)
+	}
+
+	// 4. Rebind triggers to recreated table
+	for _, trg := range refTriggers {
+		def := strings.TrimSpace(trg.SQL)
+		if !strings.HasSuffix(def, ";") {
+			def += ";"
+		}
+		statements = append(statements, def)
+	}
 
 	isDestructive := len(droppedCols) > 0
 	return strings.Join(statements, "\n"), isDestructive
@@ -265,7 +291,26 @@ func Diff(live, desired *schema.Schema, filters scope.Filters) []plan.Step {
 		}
 
 		if needsRebuild {
-			rebuildSQL, destructive := GenerateSQLiteRebuildPlan(lTable, dTable)
+			var refViews []*schema.UnmanagedObject
+			var refTriggers []*schema.UnmanagedObject
+			if live.Unmanaged != nil {
+				for _, obj := range live.Unmanaged {
+					if obj.Kind == schema.UnmanagedTrigger && obj.Table == tblName {
+						refTriggers = append(refTriggers, obj)
+					} else if obj.Kind == schema.UnmanagedView {
+						for _, ref := range obj.DependsOn {
+							if ref.Table == tblName {
+								refViews = append(refViews, obj)
+								break
+							}
+						}
+					}
+				}
+			}
+			slices.SortFunc(refViews, func(a, b *schema.UnmanagedObject) int { return cmp.Compare(a.Name, b.Name) })
+			slices.SortFunc(refTriggers, func(a, b *schema.UnmanagedObject) int { return cmp.Compare(a.Name, b.Name) })
+
+			rebuildSQL, destructive := GenerateSQLiteRebuildPlan(lTable, dTable, refViews, refTriggers)
 			changeType := plan.ChangeAlterColumn
 			if len(droppedCols) > 0 {
 				changeType = plan.ChangeDropColumn
