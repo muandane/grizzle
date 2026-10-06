@@ -372,6 +372,7 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 		return exec.ApplySQLite(ctx, db, p, exec.SQLiteExecConfig{
 			Policy:        p.Policy,
 			AcceptHazards: opts.AcceptHazards,
+			ExpectedHash:  opts.ExpectedHash,
 			Backfill:      toExecBackfill(opts.Backfill),
 		})
 	case DialectPostgres:
@@ -382,6 +383,7 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 			LockID:           lockID,
 			Policy:           p.Policy,
 			AcceptHazards:    opts.AcceptHazards,
+			ExpectedHash:     opts.ExpectedHash,
 			LockTimeout:      exec.DefaultLockTimeout,
 			StatementTimeout: exec.DefaultStatementTimeout,
 			MaxRetries:       exec.DefaultMaxRetries,

@@ -270,3 +270,35 @@ func List(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName string
 	}
 	return records, rows.Err()
 }
+
+// IsApplied checks whether a migration plan with the given planHash has already been successfully applied.
+func IsApplied(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName, planHash string) bool {
+	if planHash == "" {
+		return false
+	}
+	var query string
+	switch dialectName {
+	case "postgres":
+		targetSchema := "public"
+		if schemaName != "" {
+			targetSchema = schemaName
+		}
+		query = fmt.Sprintf(`
+			SELECT 1 FROM %q.grizzle_history
+			WHERE plan_hash = $1 AND status = 'applied'
+			LIMIT 1;
+		`, targetSchema)
+	case "sqlite":
+		query = `
+			SELECT 1 FROM grizzle_history
+			WHERE plan_hash = ? AND status = 'applied'
+			LIMIT 1;
+		`
+	default:
+		return false
+	}
+
+	var dummy int
+	err := dbtx.QueryRowContext(ctx, query, planHash).Scan(&dummy)
+	return err == nil
+}

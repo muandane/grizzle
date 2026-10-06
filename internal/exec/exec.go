@@ -686,6 +686,14 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 		logger.DebugContext(ctx, "grizzle: acquired session advisory lock", "lock_id", cfg.LockID)
 	}
 
+	// Idempotency: if this plan has already been applied by another process under the lock, skip execution.
+	if history.IsApplied(ctx, conn, "postgres", cfg.TargetSchema, p.Hash()) {
+		if logger != nil {
+			logger.InfoContext(ctx, "grizzle: plan already applied by another process, skipping", "plan_hash", p.Hash())
+		}
+		return 0, nil
+	}
+
 	// Apply DDL statements split into transactional and non-transactional groups
 	groups := GroupSteps(p.Steps)
 	stepIdx := 0
@@ -818,6 +826,14 @@ func ApplySQLite(ctx context.Context, db *sql.DB, p *plan.Plan, cfg SQLiteExecCo
 		return fmt.Errorf("sqlite: failed to begin transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	// Idempotency: if this plan has already been applied by another process, skip execution.
+	if history.IsApplied(ctx, tx, "sqlite", "", p.Hash()) {
+		if logger != nil {
+			logger.InfoContext(ctx, "sqlite: plan already applied by another process, skipping", "plan_hash", p.Hash())
+		}
+		return nil
+	}
 
 	if _, err := tx.ExecContext(ctx, "PRAGMA foreign_keys = OFF;"); err != nil {
 		return fmt.Errorf("sqlite: failed to disable foreign keys: %w", err)
