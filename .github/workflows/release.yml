@@ -71,3 +71,19 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-goproxy:
+    name: Publish to pkg.go.dev (Go Proxy)
+    needs: goreleaser
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Index on pkg.go.dev
+        run: |
+          VERSION="${{ github.ref_name }}"
+          echo "Pinging proxy.golang.org for github.com/muandane/grizzle@${VERSION}..."
+          GOPROXY=https://proxy.golang.org go list -m "github.com/muandane/grizzle@${VERSION}"

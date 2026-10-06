@@ -1,0 +1,36 @@
+name: "Update Changelog"
+
+on:
+  release:
+    types: [released]
+
+permissions: read-all
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - name: Update Changelog
+        uses: stefanzweifel/changelog-updater-action@v1
+        with:
+          latest-version: ${{ github.event.release.name }}
+          release-notes: ${{ github.event.release.body }}
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v8
+        with:
+          branch: chore/update-changelog-${{ github.event.release.tag_name }}
+          title: "chore: update CHANGELOG for ${{ github.event.release.tag_name }}"
+          body: "Automated changelog update for release ${{ github.event.release.tag_name }}."
+          commit-message: "chore: update CHANGELOG for ${{ github.event.release.tag_name }}"
+          delete-branch: true

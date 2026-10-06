@@ -4,15 +4,19 @@ all: test
 
 fmt:
 	go fmt ./...
+	(cd otelgrizzle && go fmt ./...)
 
 vet:
 	go vet ./...
+	(cd otelgrizzle && go vet ./...)
 
 lint:
 	golangci-lint run ./...
+	(cd otelgrizzle && golangci-lint run ./...)
 
 test:
 	go test -race -count=1 ./...
+	(cd otelgrizzle && go test -race -count=1 ./...)
 
 test-integration:
 	@echo "Running integration tests..."
