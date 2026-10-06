@@ -4,6 +4,8 @@ This document specifies features planned for the Grizzle migration engine. Each 
 
 ## PostgreSQL partitioned tables
 
+*Status: Implemented*
+
 Partitioned tables divide large tables into smaller physical tables while preserving a single logical table interface.
 
 ### Declarative syntax

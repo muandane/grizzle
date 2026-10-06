@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0] - 2026-10-06
 
 ### Added
+- **PostgreSQL Partitioned Tables**:
+  - Declarative support for range (`RANGE`), list (`LIST`), and hash (`HASH`) partitioned tables and attached partitions (`PARTITION OF ... FOR VALUES ...`).
+  - Catalog introspection of partitioning strategies, partition keys, and partition inheritance bounds from `pg_partitioned_table`, `pg_inherits`, and `pg_class`.
+  - Invariant enforcement: strictly rejects in-place conversion between regular tables and partitioned tables (`ErrPartitionConversion`).
+  - Emits `PARTITION_ATTACH_SCAN` (`WARNING`) hazard when attaching an existing standalone table to a partitioned table to flag table validation scans under `ACCESS EXCLUSIVE` lock.
+  - Safe partition detachment (`DETACH_PARTITION`) to standalone managed tables.
+  - Skips direct column alterations on child partitions to ensure schema alterations route cleanly through parent partitioned tables.
 - **Unmanaged Object Detection & Protection**:
   - PostgreSQL introspection catalogs unmanaged database entities including views, materialized views, triggers, functions, procedures, external sequences, and unmanaged domains.
   - Structural dependency graph resolved via `pg_depend` and `pg_rewrite`.
