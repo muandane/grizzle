@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,6 +14,17 @@ import (
 	"github.com/muandane/grizzle/internal/exec"
 	"github.com/muandane/grizzle/internal/plan"
 )
+
+func getTestDSN() string {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		dsn = os.Getenv("POSTGRES_DSN")
+	}
+	if dsn == "" {
+		dsn = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable"
+	}
+	return dsn
+}
 
 func TestLocking_StepGrouping(t *testing.T) {
 	steps := []plan.Step{
@@ -40,10 +52,7 @@ func TestLocking_StepGrouping(t *testing.T) {
 }
 
 func TestLocking_ForeignKeyNotValidAndValidate(t *testing.T) {
-	connStr := os.Getenv("POSTGRES_DSN")
-	if connStr == "" {
-		connStr = "postgres://postgres:postgres@localhost:5432/grizzle_test?sslmode=disable"
-	}
+	connStr := getTestDSN()
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {
 		t.Fatalf("failed to open pg: %v", err)
@@ -122,10 +131,7 @@ func TestLocking_ForeignKeyNotValidAndValidate(t *testing.T) {
 }
 
 func TestLocking_RecomputeDiffPostLock(t *testing.T) {
-	connStr := os.Getenv("POSTGRES_DSN")
-	if connStr == "" {
-		connStr = "postgres://postgres:postgres@localhost:5432/grizzle_test?sslmode=disable"
-	}
+	connStr := getTestDSN()
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {
 		t.Fatalf("failed to open pg: %v", err)
@@ -187,10 +193,7 @@ func TestLocking_RecomputeDiffPostLock(t *testing.T) {
 }
 
 func TestLocking_NonConcurrentIndexes(t *testing.T) {
-	connStr := os.Getenv("POSTGRES_DSN")
-	if connStr == "" {
-		connStr = "postgres://postgres:postgres@localhost:5432/grizzle_test?sslmode=disable"
-	}
+	connStr := getTestDSN()
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {
 		t.Fatalf("failed to open pg: %v", err)
@@ -252,3 +255,343 @@ func TestLocking_NonConcurrentIndexes(t *testing.T) {
 		t.Errorf("expected standard index step without CONCURRENTLY and NonTx=false, got: %+v", planNonConcurrent.Steps)
 	}
 }
+
+func TestLocking_DedicatedSessionAdvisoryLock_ContentionRetry(t *testing.T) {
+	connStr := getTestDSN()
+	db, err := sql.Open("pgx", connStr)
+	if err != nil {
+		t.Fatalf("failed to open pg: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := db.Ping(); err != nil {
+		t.Skipf("skipping postgres locking test, database not reachable: %v", err)
+	}
+
+	schema := fmt.Sprintf("test_adv_retry_%d", time.Now().UnixNano())
+	_, err = db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema))
+	if err != nil {
+		t.Fatalf("failed creating schema: %v", err)
+	}
+	defer func() {
+		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schema))
+	}()
+
+	lockID := grizzle.GenerateLockID("grizzle", schema)
+
+	// 1. Holder connection grabs the dedicated session advisory lock directly
+	holderConn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("failed acquiring holder conn: %v", err)
+	}
+	defer func() { _ = holderConn.Close() }()
+
+	var dummy int
+	if err := holderConn.QueryRowContext(context.Background(), "SELECT 1 FROM pg_advisory_lock($1);", lockID).Scan(&dummy); err != nil {
+		t.Fatalf("holder failed acquiring pg_advisory_lock: %v", err)
+	}
+
+	// 2. Release holder lock after 150ms
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		var released bool
+		_ = holderConn.QueryRowContext(context.Background(), "SELECT pg_advisory_unlock($1);", lockID).Scan(&released)
+	}()
+
+	// 3. Migration attempts Sync with a 50ms lock timeout and MaxRetries=5
+	desiredSQL := `CREATE TABLE products (id BIGINT PRIMARY KEY, name TEXT);`
+	start := time.Now()
+	err = grizzle.Sync(context.Background(), db, grizzle.Options{
+		Dialect:          grizzle.DialectPostgres,
+		TargetSchema:     schema,
+		SchemaSQL:        desiredSQL,
+		LockTimeout:      50 * time.Millisecond,
+		StatementTimeout: 5 * time.Second,
+		MaxRetries:       5,
+	})
+	if err != nil {
+		t.Fatalf("migration failed despite retries on advisory lock contention: %v", err)
+	}
+
+	if time.Since(start) < 150*time.Millisecond {
+		t.Errorf("migration should have waited for advisory lock release (expected >= 150ms, took %v)", time.Since(start))
+	}
+}
+
+func TestLocking_DedicatedSessionAdvisoryLock_ExhaustRetriesFails(t *testing.T) {
+	connStr := getTestDSN()
+	db, err := sql.Open("pgx", connStr)
+	if err != nil {
+		t.Fatalf("failed to open pg: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := db.Ping(); err != nil {
+		t.Skipf("skipping postgres locking test, database not reachable: %v", err)
+	}
+
+	schema := fmt.Sprintf("test_adv_fail_%d", time.Now().UnixNano())
+	_, err = db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema))
+	if err != nil {
+		t.Fatalf("failed creating schema: %v", err)
+	}
+	defer func() {
+		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schema))
+	}()
+
+	lockID := grizzle.GenerateLockID("grizzle", schema)
+
+	holderConn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("failed acquiring holder conn: %v", err)
+	}
+	defer func() {
+		var released bool
+		_ = holderConn.QueryRowContext(context.Background(), "SELECT pg_advisory_unlock($1);", lockID).Scan(&released)
+		_ = holderConn.Close()
+	}()
+
+	var dummy int
+	if err := holderConn.QueryRowContext(context.Background(), "SELECT 1 FROM pg_advisory_lock($1);", lockID).Scan(&dummy); err != nil {
+		t.Fatalf("holder failed acquiring pg_advisory_lock: %v", err)
+	}
+
+	// Migration attempts Sync with a 40ms lock timeout and MaxRetries=2; must fail
+	desiredSQL := `CREATE TABLE gadgets (id BIGINT PRIMARY KEY);`
+	err = grizzle.Sync(context.Background(), db, grizzle.Options{
+		Dialect:          grizzle.DialectPostgres,
+		TargetSchema:     schema,
+		SchemaSQL:        desiredSQL,
+		LockTimeout:      40 * time.Millisecond,
+		StatementTimeout: 2 * time.Second,
+		MaxRetries:       2,
+	})
+	if err == nil {
+		t.Fatalf("expected migration to fail due to advisory lock contention timeout, got nil")
+	}
+
+	if !exec.IsLockTimeout(err) && !strings.Contains(err.Error(), "lock") {
+		t.Errorf("expected lock timeout error, got: %v", err)
+	}
+}
+
+func TestLocking_DirectApply_DedicatedSessionLockAndNonTx(t *testing.T) {
+	connStr := getTestDSN()
+	db, err := sql.Open("pgx", connStr)
+	if err != nil {
+		t.Fatalf("failed to open pg: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := db.Ping(); err != nil {
+		t.Skipf("skipping postgres locking test, database not reachable: %v", err)
+	}
+
+	schema := fmt.Sprintf("test_direct_apply_%d", time.Now().UnixNano())
+	_, err = db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema))
+	if err != nil {
+		t.Fatalf("failed creating schema: %v", err)
+	}
+	defer func() {
+		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schema))
+	}()
+
+	desiredSQL := `
+		CREATE TABLE books (id BIGINT PRIMARY KEY, title TEXT);
+		CREATE INDEX idx_books_title ON books(title);
+	`
+
+	p, err := grizzle.PlanDiff(context.Background(), db, grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: schema,
+		SchemaSQL:    desiredSQL,
+	})
+	if err != nil {
+		t.Fatalf("PlanDiff failed: %v", err)
+	}
+
+	// Verify plan contains both Tx and NonTx steps
+	var hasNonTx bool
+	for _, s := range p.Steps {
+		if s.NonTx {
+			hasNonTx = true
+		}
+	}
+	if !hasNonTx {
+		t.Fatalf("expected plan to have at least one NonTx step (CONCURRENTLY index)")
+	}
+
+	// Strip SchemaSQL to force direct Apply fallback execution
+	p.SchemaSQL = ""
+
+	err = grizzle.Apply(context.Background(), db, p, grizzle.ApplyOpts{
+		ExpectedHash: p.Hash(),
+	})
+	if err != nil {
+		t.Fatalf("direct Apply failed: %v", err)
+	}
+
+	// Verify idempotency: re-diffing against desired SQL yields zero steps
+	pAfter, err := grizzle.PlanDiff(context.Background(), db, grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: schema,
+		SchemaSQL:    desiredSQL,
+	})
+	if err != nil {
+		t.Fatalf("post-apply PlanDiff failed: %v", err)
+	}
+	if len(pAfter.Steps) != 0 {
+		t.Fatalf("expected 0 steps after direct apply, got %d: %+v", len(pAfter.Steps), pAfter.Steps)
+	}
+}
+
+func TestLocking_DirectApply_ConcurrentPodMutualExclusion(t *testing.T) {
+	connStr := getTestDSN()
+	db, err := sql.Open("pgx", connStr)
+	if err != nil {
+		t.Fatalf("failed to open pg: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := db.Ping(); err != nil {
+		t.Skipf("skipping postgres locking test, database not reachable: %v", err)
+	}
+
+	schema := fmt.Sprintf("test_direct_conc_%d", time.Now().UnixNano())
+	_, err = db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema))
+	if err != nil {
+		t.Fatalf("failed creating schema: %v", err)
+	}
+	defer func() {
+		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schema))
+	}()
+
+	desiredSQL := `
+		CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT NOT NULL);
+		CREATE INDEX idx_items_name ON items(name);
+	`
+
+	p, err := grizzle.PlanDiff(context.Background(), db, grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: schema,
+		SchemaSQL:    desiredSQL,
+	})
+	if err != nil {
+		t.Fatalf("PlanDiff failed: %v", err)
+	}
+
+	// Strip SchemaSQL to test direct Apply path under concurrency
+	p.SchemaSQL = ""
+	approvedHash := p.Hash()
+
+	const numPods = 5
+	var wg sync.WaitGroup
+	errs := make(chan error, numPods)
+	barrier := make(chan struct{})
+
+	for i := 0; i < numPods; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-barrier
+
+			planCopy := *p
+			if err := grizzle.Apply(context.Background(), db, &planCopy, grizzle.ApplyOpts{
+				ExpectedHash: approvedHash,
+			}); err != nil {
+				errs <- err
+			}
+		}()
+	}
+
+	close(barrier)
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Errorf("concurrent direct Apply error: %v", err)
+	}
+
+	// Verify idempotency
+	pAfter, err := grizzle.PlanDiff(context.Background(), db, grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: schema,
+		SchemaSQL:    desiredSQL,
+	})
+	if err != nil {
+		t.Fatalf("PlanDiff after concurrent apply failed: %v", err)
+	}
+	if len(pAfter.Steps) != 0 {
+		t.Errorf("expected 0 diff steps after concurrent apply, got %d: %+v", len(pAfter.Steps), pAfter.Steps)
+	}
+}
+
+func TestLocking_DeclarativeSync_ConcurrentPodMutualExclusion(t *testing.T) {
+	connStr := getTestDSN()
+	db, err := sql.Open("pgx", connStr)
+	if err != nil {
+		t.Fatalf("failed to open pg: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := db.Ping(); err != nil {
+		t.Skipf("skipping postgres locking test, database not reachable: %v", err)
+	}
+
+	schema := fmt.Sprintf("test_decl_conc_%d", time.Now().UnixNano())
+	_, err = db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema))
+	if err != nil {
+		t.Fatalf("failed creating schema: %v", err)
+	}
+	defer func() {
+		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schema))
+	}()
+
+	desiredSQL := `
+		CREATE TABLE accounts (id BIGINT PRIMARY KEY, email TEXT NOT NULL);
+		CREATE INDEX idx_accounts_email ON accounts(email);
+	`
+
+	const numPods = 5
+	var wg sync.WaitGroup
+	errs := make(chan error, numPods)
+	barrier := make(chan struct{})
+
+	for i := 0; i < numPods; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-barrier
+
+			if err := grizzle.Sync(context.Background(), db, grizzle.Options{
+				Dialect:      grizzle.DialectPostgres,
+				TargetSchema: schema,
+				SchemaSQL:    desiredSQL,
+			}); err != nil {
+				errs <- err
+			}
+		}()
+	}
+
+	close(barrier)
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Errorf("concurrent declarative Apply error: %v", err)
+	}
+
+	// Verify idempotency
+	pAfter, err := grizzle.PlanDiff(context.Background(), db, grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: schema,
+		SchemaSQL:    desiredSQL,
+	})
+	if err != nil {
+		t.Fatalf("PlanDiff after concurrent apply failed: %v", err)
+	}
+	if len(pAfter.Steps) != 0 {
+		t.Errorf("expected 0 diff steps after concurrent apply, got %d: %+v", len(pAfter.Steps), pAfter.Steps)
+	}
+}
+
