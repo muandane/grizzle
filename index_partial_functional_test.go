@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
 	"github.com/muandane/grizzle"
@@ -336,13 +337,12 @@ func TestPartialAndFunctionalIndexes_PostgresIntegration(t *testing.T) {
 	}
 
 	// 5. Invalidation recovery: simulate failed CONCURRENTLY build leaving indisvalid = false
-	//nolint:gosec // G201: test executes setup query on generated schema
-	_, err = db.Exec(fmt.Sprintf(`
+	const updateInvalidSQL = `
 		UPDATE pg_index
 		SET indisvalid = false
-		WHERE indexrelid = '%s.idx_users_email_lower'::regclass;
-	`, schemaPrefix))
-	if err != nil {
+		WHERE indexrelid = ($1 || '.idx_users_email_lower')::regclass;
+	`
+	if _, err = db.Exec(updateInvalidSQL, schemaPrefix); err != nil {
 		t.Fatalf("marking functional index as invalid failed: %v", err)
 	}
 
@@ -441,15 +441,20 @@ func TestPartialAndFunctionalIndexes_CustomFunction(t *testing.T) {
 		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schemaPrefix))
 	}()
 
-	//nolint:gosec // G201: test executes setup query on generated schema
-	setupSQL := fmt.Sprintf(`
-		SET search_path TO %q;
+	db.SetMaxOpenConns(1)
+
+	schemaIdent := pgx.Identifier{schemaPrefix}.Sanitize()
+	if _, err := db.Exec("SELECT set_config('search_path', $1, false);", schemaIdent); err != nil {
+		t.Fatalf("set search_path failed: %v", err)
+	}
+
+	const setupSQL = `
 		CREATE OR REPLACE FUNCTION custom_hash(t text) RETURNS text AS $$
 		BEGIN
 			RETURN md5(t);
 		END;
 		$$ LANGUAGE plpgsql IMMUTABLE;
-	`, schemaPrefix)
+	`
 	if _, err := db.Exec(setupSQL); err != nil {
 		t.Fatalf("setup custom function failed: %v", err)
 	}

@@ -51,9 +51,14 @@ func TestPartition_PostgresIntrospection(t *testing.T) {
 		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schemaPrefix))
 	}()
 
-	//nolint:gosec // G201: test constructs setup DDL with randomized schema prefix
-	setupSQL := fmt.Sprintf(`
-		SET search_path TO %q;
+	db.SetMaxOpenConns(1)
+
+	schemaIdent := pgx.Identifier{schemaPrefix}.Sanitize()
+	if _, err := db.Exec("SELECT set_config('search_path', $1, false);", schemaIdent); err != nil {
+		t.Fatalf("set search_path failed: %v", err)
+	}
+
+	const setupSQL = `
 		CREATE TABLE measurements (
 			city_id INT NOT NULL,
 			log_date DATE NOT NULL,
@@ -62,7 +67,7 @@ func TestPartition_PostgresIntrospection(t *testing.T) {
 
 		CREATE TABLE measurements_y2026m01 PARTITION OF measurements
 			FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
-	`, schemaPrefix)
+	`
 
 	if _, err := db.Exec(setupSQL); err != nil {
 		t.Fatalf("failed setup: %v", err)
@@ -215,10 +220,14 @@ func TestPartition_AttachScanHazard(t *testing.T) {
 		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schemaPrefix))
 	}()
 
-	// 1. Initial live database has parent partitioned table and standalone measurements_extra table
-	//nolint:gosec // G201: test constructs setup DDL with randomized schema prefix
-	setupSQL := fmt.Sprintf(`
-		SET search_path TO %q;
+	db.SetMaxOpenConns(1)
+
+	schemaIdent := pgx.Identifier{schemaPrefix}.Sanitize()
+	if _, err := db.Exec("SELECT set_config('search_path', $1, false);", schemaIdent); err != nil {
+		t.Fatalf("set search_path failed: %v", err)
+	}
+
+	const setupSQL = `
 		CREATE TABLE measurements (
 			city_id INT NOT NULL,
 			log_date DATE NOT NULL
@@ -228,7 +237,7 @@ func TestPartition_AttachScanHazard(t *testing.T) {
 			city_id INT NOT NULL,
 			log_date DATE NOT NULL
 		);
-	`, schemaPrefix)
+	`
 	if _, err := db.Exec(setupSQL); err != nil {
 		t.Fatalf("failed setup: %v", err)
 	}
@@ -308,10 +317,14 @@ func TestPartition_Detach(t *testing.T) {
 		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schemaPrefix))
 	}()
 
-	// 1. Initial live database has attached partition
-	//nolint:gosec // G201: test constructs setup DDL with randomized schema prefix
-	setupSQL := fmt.Sprintf(`
-		SET search_path TO %q;
+	db.SetMaxOpenConns(1)
+
+	schemaIdent := pgx.Identifier{schemaPrefix}.Sanitize()
+	if _, err := db.Exec("SELECT set_config('search_path', $1, false);", schemaIdent); err != nil {
+		t.Fatalf("set search_path failed: %v", err)
+	}
+
+	const setupSQL = `
 		CREATE TABLE logs (
 			id INT NOT NULL,
 			created_at DATE NOT NULL
@@ -319,7 +332,7 @@ func TestPartition_Detach(t *testing.T) {
 
 		CREATE TABLE logs_2026 PARTITION OF logs
 			FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
-	`, schemaPrefix)
+	`
 	if _, err := db.Exec(setupSQL); err != nil {
 		t.Fatalf("failed setup: %v", err)
 	}
@@ -388,15 +401,20 @@ func TestPartition_RejectInPlaceConversion(t *testing.T) {
 		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schemaPrefix))
 	}()
 
+	db.SetMaxOpenConns(1)
+
 	// 1. Initial live table is a regular table
-	//nolint:gosec // G201: test constructs setup DDL with randomized schema prefix
-	setupSQL := fmt.Sprintf(`
-		SET search_path TO %q;
+	schemaIdent := pgx.Identifier{schemaPrefix}.Sanitize()
+	if _, err := db.Exec("SELECT set_config('search_path', $1, false);", schemaIdent); err != nil {
+		t.Fatalf("set search_path failed: %v", err)
+	}
+
+	const setupSQL = `
 		CREATE TABLE orders (
 			id INT PRIMARY KEY,
 			order_date DATE NOT NULL
 		);
-	`, schemaPrefix)
+	`
 	if _, err := db.Exec(setupSQL); err != nil {
 		t.Fatalf("failed setup: %v", err)
 	}
@@ -433,14 +451,17 @@ func TestPartition_RejectInPlaceConversion(t *testing.T) {
 		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schemaPrefixRev))
 	}()
 
-	//nolint:gosec // G201: test constructs setup DDL with randomized schema prefix
-	setupSQLRev := fmt.Sprintf(`
-		SET search_path TO %q;
+	schemaIdentRev := pgx.Identifier{schemaPrefixRev}.Sanitize()
+	if _, err := db.Exec("SELECT set_config('search_path', $1, false);", schemaIdentRev); err != nil {
+		t.Fatalf("set search_path failed: %v", err)
+	}
+
+	const setupSQLRev = `
 		CREATE TABLE orders (
 			id INT NOT NULL,
 			order_date DATE NOT NULL
 		) PARTITION BY RANGE (order_date);
-	`, schemaPrefixRev)
+	`
 	if _, err := db.Exec(setupSQLRev); err != nil {
 		t.Fatalf("failed setup: %v", err)
 	}
