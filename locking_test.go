@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -15,18 +14,8 @@ import (
 	"github.com/muandane/grizzle/internal/dialect/postgres"
 	"github.com/muandane/grizzle/internal/exec"
 	"github.com/muandane/grizzle/internal/plan"
+	"github.com/muandane/grizzle/internal/testutil"
 )
-
-func getTestDSN() string {
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		dsn = os.Getenv("POSTGRES_DSN")
-	}
-	if dsn == "" {
-		dsn = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable"
-	}
-	return dsn
-}
 
 func TestLocking_StepGrouping(t *testing.T) {
 	steps := []plan.Step{
@@ -54,7 +43,7 @@ func TestLocking_StepGrouping(t *testing.T) {
 }
 
 func TestLocking_ForeignKeyNotValidAndValidate(t *testing.T) {
-	connStr := getTestDSN()
+	connStr := testutil.PostgresDSN()
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {
 		t.Fatalf("failed to open pg: %v", err)
@@ -133,7 +122,7 @@ func TestLocking_ForeignKeyNotValidAndValidate(t *testing.T) {
 }
 
 func TestLocking_RecomputeDiffPostLock(t *testing.T) {
-	connStr := getTestDSN()
+	connStr := testutil.PostgresDSN()
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {
 		t.Fatalf("failed to open pg: %v", err)
@@ -195,7 +184,7 @@ func TestLocking_RecomputeDiffPostLock(t *testing.T) {
 }
 
 func TestLocking_NonConcurrentIndexes(t *testing.T) {
-	connStr := getTestDSN()
+	connStr := testutil.PostgresDSN()
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {
 		t.Fatalf("failed to open pg: %v", err)
@@ -259,7 +248,7 @@ func TestLocking_NonConcurrentIndexes(t *testing.T) {
 }
 
 func TestLocking_DedicatedSessionAdvisoryLock_ContentionRetry(t *testing.T) {
-	connStr := getTestDSN()
+	connStr := testutil.PostgresDSN()
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {
 		t.Fatalf("failed to open pg: %v", err)
@@ -322,7 +311,7 @@ func TestLocking_DedicatedSessionAdvisoryLock_ContentionRetry(t *testing.T) {
 }
 
 func TestLocking_DedicatedSessionAdvisoryLock_ExhaustRetriesFails(t *testing.T) {
-	connStr := getTestDSN()
+	connStr := testutil.PostgresDSN()
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {
 		t.Fatalf("failed to open pg: %v", err)
@@ -380,7 +369,7 @@ func TestLocking_DedicatedSessionAdvisoryLock_ExhaustRetriesFails(t *testing.T) 
 }
 
 func TestLocking_DirectApply_DedicatedSessionLockAndNonTx(t *testing.T) {
-	connStr := getTestDSN()
+	connStr := testutil.PostgresDSN()
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {
 		t.Fatalf("failed to open pg: %v", err)
@@ -450,7 +439,7 @@ func TestLocking_DirectApply_DedicatedSessionLockAndNonTx(t *testing.T) {
 }
 
 func TestLocking_DirectApply_ConcurrentPodMutualExclusion(t *testing.T) {
-	connStr := getTestDSN()
+	connStr := testutil.PostgresDSN()
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {
 		t.Fatalf("failed to open pg: %v", err)
@@ -529,7 +518,7 @@ func TestLocking_DirectApply_ConcurrentPodMutualExclusion(t *testing.T) {
 }
 
 func TestLocking_DeclarativeSync_ConcurrentPodMutualExclusion(t *testing.T) {
-	connStr := getTestDSN()
+	connStr := testutil.PostgresDSN()
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {
 		t.Fatalf("failed to open pg: %v", err)
@@ -596,7 +585,7 @@ func TestLocking_DeclarativeSync_ConcurrentPodMutualExclusion(t *testing.T) {
 }
 
 func TestLocking_PgTerminateBackendRecovery(t *testing.T) {
-	connStr := getTestDSN()
+	connStr := testutil.PostgresDSN()
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {
 		t.Fatalf("failed to open pg: %v", err)

@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +16,7 @@ import (
 	"github.com/muandane/grizzle/internal/plan"
 	"github.com/muandane/grizzle/internal/schema"
 	"github.com/muandane/grizzle/internal/scope"
+	"github.com/muandane/grizzle/internal/testutil"
 )
 
 func TestPartialAndFunctionalIndexes_PureUnit(t *testing.T) {
@@ -194,13 +194,7 @@ func TestPartialAndFunctionalIndexes_PureUnit(t *testing.T) {
 }
 
 func TestPartialAndFunctionalIndexes_PostgresIntegration(t *testing.T) {
-	connStr := os.Getenv("DATABASE_URL")
-	if connStr == "" {
-		connStr = os.Getenv("POSTGRES_DSN")
-	}
-	if connStr == "" {
-		connStr = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable"
-	}
+	connStr := testutil.PostgresDSN()
 
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {
@@ -413,13 +407,7 @@ func TestPartialAndFunctionalIndexes_SQLite_Parity(t *testing.T) {
 }
 
 func TestPartialAndFunctionalIndexes_CustomFunction(t *testing.T) {
-	connStr := os.Getenv("DATABASE_URL")
-	if connStr == "" {
-		connStr = os.Getenv("POSTGRES_DSN")
-	}
-	if connStr == "" {
-		connStr = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable"
-	}
+	connStr := testutil.PostgresDSN()
 
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {
@@ -493,13 +481,7 @@ func TestPartialAndFunctionalIndexes_CustomFunction(t *testing.T) {
 }
 
 func TestPartialAndFunctionalIndexes_NonImmutableFunctionRejection(t *testing.T) {
-	connStr := os.Getenv("DATABASE_URL")
-	if connStr == "" {
-		connStr = os.Getenv("POSTGRES_DSN")
-	}
-	if connStr == "" {
-		connStr = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable"
-	}
+	connStr := testutil.PostgresDSN()
 
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {
@@ -572,13 +554,7 @@ func TestPartialAndFunctionalIndexes_NonImmutableFunctionRejection(t *testing.T)
 }
 
 func TestPartialAndFunctionalIndexes_FunctionInNonTableNonShadowSchema(t *testing.T) {
-	connStr := os.Getenv("DATABASE_URL")
-	if connStr == "" {
-		connStr = os.Getenv("POSTGRES_DSN")
-	}
-	if connStr == "" {
-		connStr = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable"
-	}
+	connStr := testutil.PostgresDSN()
 
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {
@@ -648,13 +624,7 @@ func TestPartialAndFunctionalIndexes_FunctionInNonTableNonShadowSchema(t *testin
 }
 
 func TestPartialAndFunctionalIndexes_RoundtripIdempotency_Normalizations(t *testing.T) {
-	connStr := os.Getenv("DATABASE_URL")
-	if connStr == "" {
-		connStr = os.Getenv("POSTGRES_DSN")
-	}
-	if connStr == "" {
-		connStr = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable"
-	}
+	connStr := testutil.PostgresDSN()
 
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {

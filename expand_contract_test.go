@@ -5,12 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/muandane/grizzle"
+	"github.com/muandane/grizzle/internal/testutil"
 )
 
 func TestExpandContract_AmbiguousRenameEmitsHazard(t *testing.T) {
@@ -150,13 +150,7 @@ func TestExpandContract_SingleStepRenameWithMapping(t *testing.T) {
 }
 
 func TestExpandContract_PostgresStagedExpand(t *testing.T) {
-	connStr := os.Getenv("DATABASE_URL")
-	if connStr == "" {
-		connStr = os.Getenv("POSTGRES_DSN")
-	}
-	if connStr == "" {
-		connStr = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable"
-	}
+	connStr := testutil.PostgresDSN()
 
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {
@@ -399,13 +393,7 @@ func TestExpandContract_StagedPlansAndBackfill(t *testing.T) {
 }
 
 func TestExpandContract_PostgresStagedPlansAndBackfill(t *testing.T) {
-	connStr := os.Getenv("DATABASE_URL")
-	if connStr == "" {
-		connStr = os.Getenv("POSTGRES_DSN")
-	}
-	if connStr == "" {
-		connStr = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable"
-	}
+	connStr := testutil.PostgresDSN()
 
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {

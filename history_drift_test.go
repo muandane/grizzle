@@ -5,12 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"os"
 	"testing"
 	"time"
 
 	"github.com/muandane/grizzle"
 	"github.com/muandane/grizzle/internal/history"
+	"github.com/muandane/grizzle/internal/testutil"
 )
 
 func TestDrift_CheckDetectsDifferenceWithoutApplying(t *testing.T) {
@@ -133,13 +133,7 @@ func TestHistory_RecordedOnSync(t *testing.T) {
 }
 
 func TestHistory_PostgresRecording(t *testing.T) {
-	connStr := os.Getenv("DATABASE_URL")
-	if connStr == "" {
-		connStr = os.Getenv("POSTGRES_DSN")
-	}
-	if connStr == "" {
-		connStr = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable"
-	}
+	connStr := testutil.PostgresDSN()
 
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {
@@ -187,13 +181,7 @@ func TestHistory_PostgresRecording(t *testing.T) {
 }
 
 func TestHistory_PartialOnKilledNonTxStep(t *testing.T) {
-	connStr := os.Getenv("DATABASE_URL")
-	if connStr == "" {
-		connStr = os.Getenv("POSTGRES_DSN")
-	}
-	if connStr == "" {
-		connStr = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable"
-	}
+	connStr := testutil.PostgresDSN()
 
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {

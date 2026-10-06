@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"errors"
 	"log/slog"
-	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -14,26 +13,29 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/muandane/grizzle"
+	"github.com/muandane/grizzle/internal/testutil"
 )
 
 func getTestDB(t *testing.T) *sql.DB {
 	t.Helper()
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		dsn = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable"
-	}
+	dsn := testutil.PostgresDSN()
 
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		t.Fatalf("failed to open database: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
 
 	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
 		t.Skipf("skipping integration test; PostgreSQL not available at %s: %v", dsn, err)
 	}
+
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
 
 	return db
 }
@@ -48,7 +50,6 @@ func resetPublicSchema(t *testing.T, db *sql.DB) {
 
 func TestSync_EndToEnd(t *testing.T) {
 	db := getTestDB(t)
-	defer func() { _ = db.Close() }()
 	resetPublicSchema(t, db)
 
 	ctx := t.Context()
@@ -162,7 +163,6 @@ func TestSync_EndToEnd(t *testing.T) {
 
 func TestPlanDiff(t *testing.T) {
 	db := getTestDB(t)
-	defer func() { _ = db.Close() }()
 	resetPublicSchema(t, db)
 
 	ctx := t.Context()
@@ -199,7 +199,6 @@ func TestPlanDiff(t *testing.T) {
 
 func TestSync_Concurrency(t *testing.T) {
 	db := getTestDB(t)
-	defer func() { _ = db.Close() }()
 	resetPublicSchema(t, db)
 
 	schema := `
@@ -247,7 +246,6 @@ func TestSync_Concurrency(t *testing.T) {
 
 func TestSync_Phase2_Relational(t *testing.T) {
 	db := getTestDB(t)
-	defer func() { _ = db.Close() }()
 	resetPublicSchema(t, db)
 
 	ctx := t.Context()
@@ -365,7 +363,6 @@ func TestSync_Phase2_Relational(t *testing.T) {
 
 func TestSync_Phase3_SafetyAndObservability(t *testing.T) {
 	db := getTestDB(t)
-	defer func() { _ = db.Close() }()
 	resetPublicSchema(t, db)
 
 	ctx := t.Context()

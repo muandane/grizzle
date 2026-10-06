@@ -4,10 +4,8 @@ package exec_test
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"log/slog"
-	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -19,33 +17,9 @@ import (
 	"github.com/muandane/grizzle/internal/history"
 	"github.com/muandane/grizzle/internal/plan"
 	"github.com/muandane/grizzle/internal/scope"
+	"github.com/muandane/grizzle/internal/testutil"
 )
 
-func getIntegrationDB(t *testing.T) *sql.DB {
-	t.Helper()
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		dsn = os.Getenv("POSTGRES_DSN")
-	}
-	if dsn == "" {
-		dsn = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable"
-	}
-
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("failed to open database: %v", err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	if err := db.PingContext(ctx); err != nil {
-		t.Fatalf("integration test failed: PostgreSQL/Docker is unavailable at %s: %v (no silent skip allowed under the integration tag)", dsn, err)
-	}
-
-	t.Logf("CI: running integration test %s against PostgreSQL at %s", t.Name(), dsn)
-	return db
-}
 
 // captureHandler tracks log message records for asserting synchronization metrics.
 type captureHandler struct {
@@ -72,8 +46,7 @@ func (h *captureHandler) Handle(_ context.Context, r slog.Record) error {
 }
 
 func TestConcurrency_MultiPodRealPG(t *testing.T) {
-	db := getIntegrationDB(t)
-	defer db.Close()
+	db := testutil.TestDatabase(t)
 
 	schema := fmt.Sprintf("test_concurrency_%d", time.Now().UnixNano())
 	_, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema))
@@ -188,8 +161,7 @@ func TestConcurrency_MultiPodRealPG(t *testing.T) {
 }
 
 func TestConcurrency_LockTimeoutRetryAndConcurrent(t *testing.T) {
-	db := getIntegrationDB(t)
-	defer db.Close()
+	db := testutil.TestDatabase(t)
 
 	schema := fmt.Sprintf("test_lock_retry_%d", time.Now().UnixNano())
 	_, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema))
@@ -266,8 +238,7 @@ func TestConcurrency_LockTimeoutRetryAndConcurrent(t *testing.T) {
 }
 
 func TestConcurrency_LockCoverageAcrossTxAndNonTxGroups(t *testing.T) {
-	db := getIntegrationDB(t)
-	defer db.Close()
+	db := testutil.TestDatabase(t)
 
 	schema := fmt.Sprintf("test_lock_cov_%d", time.Now().UnixNano())
 	_, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema))
@@ -377,8 +348,7 @@ func (h *attemptTrackerHandler) Handle(_ context.Context, r slog.Record) error {
 }
 
 func TestRetry_AbortAfterPartialProgress(t *testing.T) {
-	db := getIntegrationDB(t)
-	defer db.Close()
+	db := testutil.TestDatabase(t)
 
 	schema := fmt.Sprintf("test_retry_part_%d", time.Now().UnixNano())
 	_, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema))
@@ -474,8 +444,7 @@ func TestRetry_AbortAfterPartialProgress(t *testing.T) {
 }
 
 func TestFK_ValidateConstraintRunsInSeparateTxAfterCommit(t *testing.T) {
-	db := getIntegrationDB(t)
-	defer db.Close()
+	db := testutil.TestDatabase(t)
 
 	schema := fmt.Sprintf("test_fk_sep_%d", time.Now().UnixNano())
 	_, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema))

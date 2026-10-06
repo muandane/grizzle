@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -16,17 +15,12 @@ import (
 	"github.com/muandane/grizzle/internal/dialect/postgres"
 	"github.com/muandane/grizzle/internal/diff"
 	"github.com/muandane/grizzle/internal/plan"
+	"github.com/muandane/grizzle/internal/testutil"
 )
 
 func getPostgresDB(t *testing.T) (*sql.DB, string) {
 	t.Helper()
-	connStr := os.Getenv("DATABASE_URL")
-	if connStr == "" {
-		connStr = os.Getenv("POSTGRES_DSN")
-	}
-	if connStr == "" {
-		connStr = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable"
-	}
+	connStr := testutil.PostgresDSN()
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {
 		t.Fatalf("failed to open postgres: %v", err)
@@ -35,12 +29,14 @@ func getPostgresDB(t *testing.T) (*sql.DB, string) {
 		_ = db.Close()
 		t.Skipf("skipping postgres partition test, db unavailable: %v", err)
 	}
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
 	return db, connStr
 }
 
 func TestPartition_PostgresIntrospection(t *testing.T) {
 	db, _ := getPostgresDB(t)
-	defer func() { _ = db.Close() }()
 
 	schemaPrefix := fmt.Sprintf("test_part_intro_%d", time.Now().UnixNano())
 	_, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schemaPrefix))
@@ -103,7 +99,6 @@ func TestPartition_PostgresIntrospection(t *testing.T) {
 
 func TestPartition_DeclarativeCreationAndIdempotency(t *testing.T) {
 	db, _ := getPostgresDB(t)
-	defer func() { _ = db.Close() }()
 
 	schemaPrefix := fmt.Sprintf("test_part_idemp_%d", time.Now().UnixNano())
 	_, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schemaPrefix))
@@ -152,7 +147,6 @@ func TestPartition_DeclarativeCreationAndIdempotency(t *testing.T) {
 
 func TestPartition_ListAndHashPartitions(t *testing.T) {
 	db, _ := getPostgresDB(t)
-	defer func() { _ = db.Close() }()
 
 	schemaPrefix := fmt.Sprintf("test_part_list_hash_%d", time.Now().UnixNano())
 	_, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schemaPrefix))
@@ -209,7 +203,6 @@ func TestPartition_ListAndHashPartitions(t *testing.T) {
 
 func TestPartition_AttachScanHazard(t *testing.T) {
 	db, _ := getPostgresDB(t)
-	defer func() { _ = db.Close() }()
 
 	schemaPrefix := fmt.Sprintf("test_part_attach_%d", time.Now().UnixNano())
 	_, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schemaPrefix))
@@ -306,7 +299,6 @@ func TestPartition_AttachScanHazard(t *testing.T) {
 
 func TestPartition_Detach(t *testing.T) {
 	db, _ := getPostgresDB(t)
-	defer func() { _ = db.Close() }()
 
 	schemaPrefix := fmt.Sprintf("test_part_detach_%d", time.Now().UnixNano())
 	_, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schemaPrefix))
@@ -390,7 +382,6 @@ func TestPartition_Detach(t *testing.T) {
 
 func TestPartition_RejectInPlaceConversion(t *testing.T) {
 	db, _ := getPostgresDB(t)
-	defer func() { _ = db.Close() }()
 
 	schemaPrefix := fmt.Sprintf("test_part_reject_%d", time.Now().UnixNano())
 	_, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schemaPrefix))
@@ -490,7 +481,6 @@ func TestPartition_RejectInPlaceConversion(t *testing.T) {
 
 func TestPartition_StructuralValidation_PKUniqueRules(t *testing.T) {
 	db, _ := getPostgresDB(t)
-	defer func() { _ = db.Close() }()
 
 	schemaPrefix := fmt.Sprintf("test_part_struct_%d", time.Now().UnixNano())
 	_, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schemaPrefix))
@@ -652,7 +642,6 @@ func TestPartition_DetachConcurrently_RenderVariants(t *testing.T) {
 
 func TestPartition_ThreeLevelNesting_Postgres(t *testing.T) {
 	db, _ := getPostgresDB(t)
-	defer func() { _ = db.Close() }()
 
 	schemaPrefix := fmt.Sprintf("test_part_3level_%d", time.Now().UnixNano())
 	_, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schemaPrefix))
@@ -708,7 +697,6 @@ func TestPartition_ThreeLevelNesting_Postgres(t *testing.T) {
 
 func TestPartition_DefaultPartition_AttachScanConflict(t *testing.T) {
 	db, _ := getPostgresDB(t)
-	defer func() { _ = db.Close() }()
 
 	schemaPrefix := fmt.Sprintf("test_part_def_scan_%d", time.Now().UnixNano())
 	_, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schemaPrefix))
@@ -797,7 +785,6 @@ func TestPartition_DefaultPartition_AttachScanConflict(t *testing.T) {
 
 func TestPartition_WrappedFKError_Context(t *testing.T) {
 	db, _ := getPostgresDB(t)
-	defer func() { _ = db.Close() }()
 
 	schemaPrefix := fmt.Sprintf("test_part_fk_err_%d", time.Now().UnixNano())
 	_, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schemaPrefix))
@@ -871,7 +858,6 @@ func TestPartition_WrappedFKError_Context(t *testing.T) {
 
 func TestPartition_DetachConcurrently_DefaultPartitionAndTxRejection(t *testing.T) {
 	db, _ := getPostgresDB(t)
-	defer func() { _ = db.Close() }()
 
 	schemaPrefix := fmt.Sprintf("test_detach_def_%d", time.Now().UnixNano())
 	_, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schemaPrefix))
@@ -968,7 +954,6 @@ func TestPartition_DetachConcurrently_DefaultPartitionAndTxRejection(t *testing.
 
 func TestPartition_InterruptedDetachPending_FinalizeAndHazard(t *testing.T) {
 	db, _ := getPostgresDB(t)
-	defer func() { _ = db.Close() }()
 
 	schemaPrefix := fmt.Sprintf("test_detach_pend_%d", time.Now().UnixNano())
 	_, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schemaPrefix))
@@ -1091,7 +1076,6 @@ func TestPartition_InterruptedDetachPending_FinalizeAndHazard(t *testing.T) {
 
 func TestPartition_InterruptedDetach_RealPgCancelBackend(t *testing.T) {
 	db, _ := getPostgresDB(t)
-	defer func() { _ = db.Close() }()
 
 	var serverVersion int
 	if err := db.QueryRow("SHOW server_version_num;").Scan(&serverVersion); err != nil {

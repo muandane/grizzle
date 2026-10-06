@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"os"
 	"testing"
 	"time"
 
@@ -13,6 +12,7 @@ import (
 	"github.com/muandane/grizzle/internal/plan"
 	"github.com/muandane/grizzle/internal/schema"
 	"github.com/muandane/grizzle/internal/scope"
+	"github.com/muandane/grizzle/internal/testutil"
 )
 
 func TestGeneratedColumn_PureUnit_AddAndDrop(t *testing.T) {
@@ -310,13 +310,7 @@ func TestGeneratedColumn_SQLite_Parity(t *testing.T) {
 }
 
 func TestGeneratedColumn_Postgres_Integration(t *testing.T) {
-	connStr := os.Getenv("DATABASE_URL")
-	if connStr == "" {
-		connStr = os.Getenv("POSTGRES_DSN")
-	}
-	if connStr == "" {
-		connStr = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable"
-	}
+	connStr := testutil.PostgresDSN()
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {
 		t.Fatalf("failed to open pg: %v", err)

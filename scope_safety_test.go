@@ -5,11 +5,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"os"
 	"testing"
 	"time"
 
 	"github.com/muandane/grizzle"
+	"github.com/muandane/grizzle/internal/testutil"
 )
 
 func TestScopeSafety_StrictScopeRequiresIncludeTables(t *testing.T) {
@@ -77,13 +77,7 @@ func TestScopeSafety_StrictScopeWithIncludeTablesSucceeds(t *testing.T) {
 }
 
 func TestScopeSafety_BuiltinExtensionExclusions(t *testing.T) {
-	connStr := os.Getenv("DATABASE_URL")
-	if connStr == "" {
-		connStr = os.Getenv("POSTGRES_DSN")
-	}
-	if connStr == "" {
-		connStr = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable"
-	}
+	connStr := testutil.PostgresDSN()
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {
 		t.Fatalf("failed to open pg: %v", err)

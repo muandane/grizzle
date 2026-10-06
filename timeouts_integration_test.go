@@ -6,23 +6,17 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/muandane/grizzle"
 	"github.com/muandane/grizzle/internal/exec"
+	"github.com/muandane/grizzle/internal/testutil"
 )
 
 func TestTimeouts_ConflictingHolder_RetrySucceeds(t *testing.T) {
-	connStr := os.Getenv("DATABASE_URL")
-	if connStr == "" {
-		connStr = os.Getenv("POSTGRES_DSN")
-	}
-	if connStr == "" {
-		connStr = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable"
-	}
+	connStr := testutil.PostgresDSN()
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {
 		t.Fatalf("failed to open pg: %v", err)
@@ -101,13 +95,7 @@ func TestTimeouts_ConflictingHolder_RetrySucceeds(t *testing.T) {
 }
 
 func TestTimeouts_ConflictingHolder_ExhaustRetriesFails(t *testing.T) {
-	connStr := os.Getenv("DATABASE_URL")
-	if connStr == "" {
-		connStr = os.Getenv("POSTGRES_DSN")
-	}
-	if connStr == "" {
-		connStr = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable"
-	}
+	connStr := testutil.PostgresDSN()
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {
 		t.Fatalf("failed to open pg: %v", err)

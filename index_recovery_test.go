@@ -4,22 +4,16 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"os"
 	"testing"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/muandane/grizzle"
+	"github.com/muandane/grizzle/internal/testutil"
 )
 
 func TestInvalidIndexRecovery_Postgres(t *testing.T) {
-	connStr := os.Getenv("DATABASE_URL")
-	if connStr == "" {
-		connStr = os.Getenv("POSTGRES_DSN")
-	}
-	if connStr == "" {
-		connStr = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable"
-	}
+	connStr := testutil.PostgresDSN()
 
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {

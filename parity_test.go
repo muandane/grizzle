@@ -5,12 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"os"
 	"testing"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/muandane/grizzle"
+	"github.com/muandane/grizzle/internal/testutil"
 	_ "modernc.org/sqlite"
 )
 
@@ -99,13 +99,7 @@ func TestParity_Renames_AmbiguousAndExplicit(t *testing.T) {
 	})
 
 	t.Run("Postgres", func(t *testing.T) {
-		dsn := os.Getenv("DATABASE_URL")
-		if dsn == "" {
-			dsn = os.Getenv("POSTGRES_DSN")
-		}
-		if dsn == "" {
-			dsn = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable"
-		}
+		dsn := testutil.PostgresDSN()
 		db, err := sql.Open("pgx", dsn)
 		if err != nil {
 			t.Fatalf("failed opening postgres: %v", err)
@@ -200,13 +194,7 @@ func TestParity_Hazards_TypeNarrowing(t *testing.T) {
 	})
 
 	t.Run("Postgres", func(t *testing.T) {
-		dsn := os.Getenv("DATABASE_URL")
-		if dsn == "" {
-			dsn = os.Getenv("POSTGRES_DSN")
-		}
-		if dsn == "" {
-			dsn = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable"
-		}
+		dsn := testutil.PostgresDSN()
 		db, err := sql.Open("pgx", dsn)
 		if err != nil {
 			t.Fatalf("failed opening postgres: %v", err)
@@ -326,13 +314,7 @@ func TestParity_StrictScope(t *testing.T) {
 	})
 
 	t.Run("Postgres", func(t *testing.T) {
-		dsn := os.Getenv("DATABASE_URL")
-		if dsn == "" {
-			dsn = os.Getenv("POSTGRES_DSN")
-		}
-		if dsn == "" {
-			dsn = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable"
-		}
+		dsn := testutil.PostgresDSN()
 		db, err := sql.Open("pgx", dsn)
 		if err != nil {
 			t.Fatalf("failed opening postgres: %v", err)
