@@ -19,10 +19,11 @@ import (
 )
 
 // PostgresExecConfig specifies the execution options for PostgreSQL synchronization.
-// PostgresExecConfig specifies the execution options for PostgreSQL synchronization.
 type PostgresExecConfig struct {
 	TargetSchema         string
+	TargetSchemas        []string
 	ShadowSchema         string
+	ShadowSchemas        []string
 	SchemaSQL            string
 	LockID               int64
 	Filters              scope.Filters
@@ -39,23 +40,102 @@ type PostgresExecConfig struct {
 	Backfill             BackfillFunc
 }
 
+func (cfg PostgresExecConfig) targetSchemas() []string {
+	if len(cfg.TargetSchemas) > 0 {
+		return cfg.TargetSchemas
+	}
+	if cfg.TargetSchema != "" {
+		return []string{cfg.TargetSchema}
+	}
+	return []string{"public"}
+}
+
+func (cfg PostgresExecConfig) primarySchema() string {
+	return cfg.targetSchemas()[0]
+}
+
+func searchPathSQL(schemas []string) string {
+	var parts []string
+	for _, s := range schemas {
+		if err := postgres.ValidateIdentifier(s); err == nil {
+			parts = append(parts, fmt.Sprintf("%q", s))
+		}
+	}
+	parts = append(parts, "public")
+	return fmt.Sprintf("SET search_path TO %s;", strings.Join(parts, ", "))
+}
+
+func localSearchPathSQL(schemas []string) string {
+	var parts []string
+	for _, s := range schemas {
+		if err := postgres.ValidateIdentifier(s); err == nil {
+			parts = append(parts, fmt.Sprintf("%q", s))
+		}
+	}
+	parts = append(parts, "public")
+	return fmt.Sprintf("SET LOCAL search_path TO %s;", strings.Join(parts, ", "))
+}
+
 // DiffPostgres computes the diff and renders the sequenced migration steps for PostgreSQL.
 func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig) ([]plan.Step, error) {
-	live, err := postgres.Inspect(ctx, dbtx, cfg.TargetSchema)
-	if err != nil {
-		return nil, fmt.Errorf("%w: live schema: %w", plan.ErrInspectionFailed, err)
+	targetSchemas := cfg.targetSchemas()
+	if len(targetSchemas) <= 1 {
+		targetSchema := cfg.primarySchema()
+		shadowSchema := cfg.ShadowSchema
+		if shadowSchema == "" {
+			shadowSchema = "_grizzle_shadow"
+		}
+
+		live, err := postgres.Inspect(ctx, dbtx, targetSchema)
+		if err != nil {
+			return nil, fmt.Errorf("%w: live schema: %w", plan.ErrInspectionFailed, err)
+		}
+
+		desired, err := postgres.Inspect(ctx, dbtx, shadowSchema)
+		if err != nil {
+			return nil, fmt.Errorf("%w: shadow schema: %w", plan.ErrInspectionFailed, err)
+		}
+
+		changes, err := diff.Diff(live, desired, targetSchema, shadowSchema, cfg.Filters)
+		if err != nil {
+			return nil, err
+		}
+		steps := postgres.RenderChanges(targetSchema, changes, cfg.NonConcurrentIndexes)
+		return steps, nil
 	}
 
-	desired, err := postgres.Inspect(ctx, dbtx, cfg.ShadowSchema)
-	if err != nil {
-		return nil, fmt.Errorf("%w: shadow schema: %w", plan.ErrInspectionFailed, err)
+	// Multi-schema diffing
+	shadowMap := postgres.ComputeShadowSchemas(cfg.ShadowSchema, targetSchemas)
+	shadowToTarget := make(map[string]string, len(shadowMap))
+	var shadowSchemas []string
+	for target, shadow := range shadowMap {
+		shadowToTarget[shadow] = target
+		shadowSchemas = append(shadowSchemas, shadow)
 	}
 
-	changes, err := diff.Diff(live, desired, cfg.TargetSchema, cfg.ShadowSchema, cfg.Filters)
+	liveMap, err := postgres.InspectSchemas(ctx, dbtx, targetSchemas)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: live schemas: %w", plan.ErrInspectionFailed, err)
 	}
-	steps := postgres.RenderChanges(cfg.TargetSchema, changes, cfg.NonConcurrentIndexes)
+
+	desiredMap, err := postgres.InspectSchemas(ctx, dbtx, shadowSchemas)
+	if err != nil {
+		return nil, fmt.Errorf("%w: shadow schemas: %w", plan.ErrInspectionFailed, err)
+	}
+
+	var allChanges []diff.Change
+	for _, target := range targetSchemas {
+		shadow := shadowMap[target]
+		live := liveMap[target]
+		desired := desiredMap[shadow]
+		changes, err := diff.DiffWithMappings(live, desired, target, shadow, cfg.Filters, shadowToTarget)
+		if err != nil {
+			return nil, err
+		}
+		allChanges = append(allChanges, changes...)
+	}
+
+	steps := postgres.RenderChanges(targetSchemas[0], allChanges, cfg.NonConcurrentIndexes)
 	return steps, nil
 }
 
@@ -128,8 +208,12 @@ func SyncPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) error
 func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (int, error) {
 	start := time.Now()
 	logger := cfg.Logger
+	targetSchemas := cfg.targetSchemas()
+	primarySchema := cfg.primarySchema()
+	isMulti := len(targetSchemas) > 1
+
 	if logger != nil {
-		logger.InfoContext(ctx, "grizzle: starting schema synchronization", "target_schema", cfg.TargetSchema)
+		logger.InfoContext(ctx, "grizzle: starting schema synchronization", "target_schemas", targetSchemas)
 	}
 
 	conn, err := db.Conn(ctx)
@@ -138,9 +222,12 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 	}
 	defer func() { _ = conn.Close() }()
 
-	if err := postgres.ValidateIdentifier(cfg.TargetSchema); err == nil {
-		_, _ = conn.ExecContext(ctx, fmt.Sprintf("SET search_path TO %q, public;", cfg.TargetSchema))
+	for _, s := range targetSchemas {
+		if err := postgres.ValidateIdentifier(s); err == nil && s != "public" {
+			_, _ = conn.ExecContext(ctx, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %q;", s))
+		}
 	}
+	_, _ = conn.ExecContext(ctx, searchPathSQL(targetSchemas))
 
 	// Apply session-level timeouts
 	_ = ApplySessionTimeouts(ctx, conn, cfg.LockTimeout, cfg.StatementTimeout)
@@ -178,15 +265,40 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 
 	_ = ApplyTxTimeouts(ctx, shadowTx, cfg.LockTimeout, cfg.StatementTimeout)
 
-	if err := postgres.SetupShadowSchema(ctx, shadowTx, cfg.ShadowSchema); err != nil {
-		return 0, err
-	}
-
-	if err := postgres.RunShadowDDL(ctx, shadowTx, cfg.ShadowSchema, cfg.TargetSchema, cfg.SchemaSQL); err != nil {
-		if logger != nil {
-			logger.ErrorContext(ctx, "grizzle: shadow compilation failed", "error", err)
+	var shadowSchemas []string
+	if !isMulti {
+		shadowSchema := cfg.ShadowSchema
+		if shadowSchema == "" {
+			shadowSchema = "_grizzle_shadow"
 		}
-		return 0, fmt.Errorf("%w: %w", plan.ErrCompilationFailed, err)
+		shadowSchemas = []string{shadowSchema}
+
+		if err := postgres.SetupShadowSchema(ctx, shadowTx, shadowSchema); err != nil {
+			return 0, err
+		}
+
+		if err := postgres.RunShadowDDL(ctx, shadowTx, shadowSchema, primarySchema, cfg.SchemaSQL); err != nil {
+			if logger != nil {
+				logger.ErrorContext(ctx, "grizzle: shadow compilation failed", "error", err)
+			}
+			return 0, fmt.Errorf("%w: %w", plan.ErrCompilationFailed, err)
+		}
+	} else {
+		shadowMap := postgres.ComputeShadowSchemas(cfg.ShadowSchema, targetSchemas)
+		for _, shadow := range shadowMap {
+			shadowSchemas = append(shadowSchemas, shadow)
+		}
+
+		if err := postgres.SetupShadowSchemas(ctx, shadowTx, shadowSchemas); err != nil {
+			return 0, err
+		}
+
+		if err := postgres.RunMultiShadowDDL(ctx, shadowTx, shadowMap, targetSchemas, cfg.SchemaSQL); err != nil {
+			if logger != nil {
+				logger.ErrorContext(ctx, "grizzle: shadow compilation failed", "error", err)
+			}
+			return 0, fmt.Errorf("%w: %w", plan.ErrCompilationFailed, err)
+		}
 	}
 	if logger != nil {
 		logger.DebugContext(ctx, "grizzle: shadow compilation succeeded", "duration", time.Since(shadowStart))
@@ -200,7 +312,8 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 	_ = shadowTx.Rollback()
 
 	p := &plan.Plan{
-		TargetSchema:   cfg.TargetSchema,
+		TargetSchema:   primarySchema,
+		TargetSchemas:  targetSchemas,
 		Steps:          steps,
 		Policy:         cfg.Policy,
 		IncludeTables:  cfg.Filters.Includes,
@@ -222,7 +335,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 		if logger != nil {
 			logger.InfoContext(ctx, "grizzle: schema is already in sync", "duration", time.Since(start))
 		}
-		_ = postgres.DropShadowSchema(ctx, conn, cfg.ShadowSchema)
+		_ = postgres.DropShadowSchemas(ctx, conn, shadowSchemas)
 		return 0, nil
 	}
 
@@ -254,12 +367,12 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 		if logger != nil {
 			logger.InfoContext(ctx, "grizzle: dry-run mode, skipping statement execution")
 		}
-		_ = postgres.DropShadowSchema(ctx, conn, cfg.ShadowSchema)
+		_ = postgres.DropShadowSchemas(ctx, conn, shadowSchemas)
 		return 0, nil
 	}
 
 	// 6. Cleanup shadow schema before live execution
-	if err := postgres.DropShadowSchema(ctx, conn, cfg.ShadowSchema); err != nil {
+	if err := postgres.DropShadowSchemas(ctx, conn, shadowSchemas); err != nil {
 		return 0, err
 	}
 
@@ -279,7 +392,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 		histConn, err := db.Conn(histCtx)
 		if err == nil {
 			defer func() { _ = histConn.Close() }()
-			_ = history.RecordProgress(histCtx, histConn, "postgres", cfg.TargetSchema, p, status, failedStep, execErr, time.Since(start))
+			_ = history.RecordProgress(histCtx, histConn, "postgres", primarySchema, p, status, failedStep, execErr, time.Since(start))
 		}
 	}
 
@@ -303,7 +416,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 				}
 			}
 			if isLastGroup {
-				if err := history.RecordPlan(ctx, conn, "postgres", cfg.TargetSchema, p, time.Since(start)); err != nil {
+				if err := history.RecordPlan(ctx, conn, "postgres", primarySchema, p, time.Since(start)); err != nil {
 					if logger != nil {
 						logger.WarnContext(ctx, "grizzle: failed recording history on conn", "error", err)
 					}
@@ -315,9 +428,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 			if err != nil {
 				return committedSteps, fmt.Errorf("grizzle: failed to begin step transaction: %w", err)
 			}
-			if err := postgres.ValidateIdentifier(cfg.TargetSchema); err == nil {
-				_, _ = tx.ExecContext(ctx, fmt.Sprintf("SET LOCAL search_path TO %q, public;", cfg.TargetSchema))
-			}
+			_, _ = tx.ExecContext(ctx, localSearchPathSQL(targetSchemas))
 			_ = ApplyTxTimeouts(ctx, tx, cfg.LockTimeout, cfg.StatementTimeout)
 
 			for _, s := range group.Steps {
@@ -338,7 +449,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 
 			// Record history in same transaction before commit where possible
 			if isLastGroup {
-				if err := history.RecordPlan(ctx, tx, "postgres", cfg.TargetSchema, p, time.Since(start)); err != nil {
+				if err := history.RecordPlan(ctx, tx, "postgres", primarySchema, p, time.Since(start)); err != nil {
 					if logger != nil {
 						logger.WarnContext(ctx, "grizzle: failed recording history in tx", "error", err)
 					}
@@ -362,6 +473,10 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 
 // PlanDiffPostgres generates the plan for PostgreSQL without applying statements.
 func PlanDiffPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (*plan.Plan, error) {
+	targetSchemas := cfg.targetSchemas()
+	primarySchema := cfg.primarySchema()
+	isMulti := len(targetSchemas) > 1
+
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("grizzle: failed to begin transaction: %w", err)
@@ -370,13 +485,36 @@ func PlanDiffPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 
 	_ = ApplyTxTimeouts(ctx, tx, cfg.LockTimeout, cfg.StatementTimeout)
 
-	if err := postgres.SetupShadowSchema(ctx, tx, cfg.ShadowSchema); err != nil {
-		return nil, err
-	}
-	defer func() { _ = postgres.DropShadowSchema(context.Background(), tx, cfg.ShadowSchema) }()
+	var shadowSchemas []string
+	if !isMulti {
+		shadowSchema := cfg.ShadowSchema
+		if shadowSchema == "" {
+			shadowSchema = "_grizzle_shadow"
+		}
+		shadowSchemas = []string{shadowSchema}
 
-	if err := postgres.RunShadowDDL(ctx, tx, cfg.ShadowSchema, cfg.TargetSchema, cfg.SchemaSQL); err != nil {
-		return nil, fmt.Errorf("%w: %w", plan.ErrCompilationFailed, err)
+		if err := postgres.SetupShadowSchema(ctx, tx, shadowSchema); err != nil {
+			return nil, err
+		}
+		defer func() { _ = postgres.DropShadowSchema(context.Background(), tx, shadowSchema) }()
+
+		if err := postgres.RunShadowDDL(ctx, tx, shadowSchema, primarySchema, cfg.SchemaSQL); err != nil {
+			return nil, fmt.Errorf("%w: %w", plan.ErrCompilationFailed, err)
+		}
+	} else {
+		shadowMap := postgres.ComputeShadowSchemas(cfg.ShadowSchema, targetSchemas)
+		for _, shadow := range shadowMap {
+			shadowSchemas = append(shadowSchemas, shadow)
+		}
+
+		if err := postgres.SetupShadowSchemas(ctx, tx, shadowSchemas); err != nil {
+			return nil, err
+		}
+		defer func() { _ = postgres.DropShadowSchemas(context.Background(), tx, shadowSchemas) }()
+
+		if err := postgres.RunMultiShadowDDL(ctx, tx, shadowMap, targetSchemas, cfg.SchemaSQL); err != nil {
+			return nil, fmt.Errorf("%w: %w", plan.ErrCompilationFailed, err)
+		}
 	}
 
 	steps, err := DiffPostgres(ctx, tx, cfg)
@@ -385,7 +523,8 @@ func PlanDiffPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 	}
 
 	return &plan.Plan{
-		TargetSchema:   cfg.TargetSchema,
+		TargetSchema:   primarySchema,
+		TargetSchemas:  targetSchemas,
 		Steps:          steps,
 		Policy:         cfg.Policy,
 		IncludeTables:  cfg.Filters.Includes,
@@ -649,8 +788,11 @@ func ApplyPostgres(ctx context.Context, db *sql.DB, p *plan.Plan, cfg PostgresEx
 func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg PostgresExecConfig) (int, error) {
 	start := time.Now()
 	logger := cfg.Logger
+	targetSchemas := cfg.targetSchemas()
+	primarySchema := cfg.primarySchema()
+
 	if logger != nil {
-		logger.InfoContext(ctx, "grizzle: starting plan execution", "target_schema", cfg.TargetSchema, "steps_count", len(p.Steps))
+		logger.InfoContext(ctx, "grizzle: starting plan execution", "target_schemas", targetSchemas, "steps_count", len(p.Steps))
 	}
 
 	conn, err := db.Conn(ctx)
@@ -659,9 +801,12 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 	}
 	defer func() { _ = conn.Close() }()
 
-	if err := postgres.ValidateIdentifier(cfg.TargetSchema); err == nil {
-		_, _ = conn.ExecContext(ctx, fmt.Sprintf("SET search_path TO %q, public;", cfg.TargetSchema))
+	for _, s := range targetSchemas {
+		if err := postgres.ValidateIdentifier(s); err == nil && s != "public" {
+			_, _ = conn.ExecContext(ctx, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %q;", s))
+		}
 	}
+	_, _ = conn.ExecContext(ctx, searchPathSQL(targetSchemas))
 
 	// Apply session-level timeouts
 	_ = ApplySessionTimeouts(ctx, conn, cfg.LockTimeout, cfg.StatementTimeout)
@@ -690,7 +835,7 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 	}
 
 	// Idempotency: if this plan has already been applied by another process under the lock, skip execution.
-	if history.IsApplied(ctx, conn, "postgres", cfg.TargetSchema, p.Hash()) {
+	if history.IsApplied(ctx, conn, "postgres", primarySchema, p.Hash()) {
 		if logger != nil {
 			logger.InfoContext(ctx, "grizzle: plan already applied by another process, skipping", "plan_hash", p.Hash())
 		}
@@ -712,7 +857,7 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 		histConn, err := db.Conn(histCtx)
 		if err == nil {
 			defer func() { _ = histConn.Close() }()
-			_ = history.RecordProgress(histCtx, histConn, "postgres", cfg.TargetSchema, p, status, failedStep, execErr, time.Since(start))
+			_ = history.RecordProgress(histCtx, histConn, "postgres", primarySchema, p, status, failedStep, execErr, time.Since(start))
 		}
 	}
 
@@ -735,7 +880,7 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 				}
 			}
 			if isLastGroup {
-				if err := history.RecordPlan(ctx, conn, "postgres", cfg.TargetSchema, p, time.Since(start)); err != nil {
+				if err := history.RecordPlan(ctx, conn, "postgres", primarySchema, p, time.Since(start)); err != nil {
 					if logger != nil {
 						logger.WarnContext(ctx, "grizzle: failed recording history on conn", "error", err)
 					}
@@ -746,9 +891,7 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 			if err != nil {
 				return committedSteps, fmt.Errorf("grizzle: failed to begin step transaction: %w", err)
 			}
-			if err := postgres.ValidateIdentifier(cfg.TargetSchema); err == nil {
-				_, _ = tx.ExecContext(ctx, fmt.Sprintf("SET LOCAL search_path TO %q, public;", cfg.TargetSchema))
-			}
+			_, _ = tx.ExecContext(ctx, localSearchPathSQL(targetSchemas))
 			_ = ApplyTxTimeouts(ctx, tx, cfg.LockTimeout, cfg.StatementTimeout)
 
 			for _, s := range group.Steps {
@@ -768,7 +911,7 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 			}
 
 			if isLastGroup {
-				if err := history.RecordPlan(ctx, tx, "postgres", cfg.TargetSchema, p, time.Since(start)); err != nil {
+				if err := history.RecordPlan(ctx, tx, "postgres", primarySchema, p, time.Since(start)); err != nil {
 					if logger != nil {
 						logger.WarnContext(ctx, "grizzle: failed recording history in tx", "error", err)
 					}
