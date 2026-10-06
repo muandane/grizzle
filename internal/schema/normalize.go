@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -167,8 +168,19 @@ func NormalizeDefault(raw string) string {
 }
 
 // NormalizeDefinition standardizes index and constraint definitions between live and shadow schemas.
+// NormalizeDefinition standardizes index and constraint definitions between live and shadow schemas.
 // It restricts ON <schema>. stripping to the index header to avoid mutating string literals in WHERE predicates.
 func NormalizeDefinition(def, shadowSchema, targetSchema string) string {
+	mapping := make(map[string]string)
+	if shadowSchema != "" {
+		mapping[shadowSchema] = targetSchema
+	}
+	return NormalizeDefinitionWithMappings(def, mapping, targetSchema)
+}
+
+// NormalizeDefinitionWithMappings standardizes index and constraint definitions across multiple shadow and target schema pairs.
+// It maps shadow schemas to their live target schema equivalents and strips current schema prefixes where applicable.
+func NormalizeDefinitionWithMappings(def string, mappings map[string]string, currentSchema ...string) string {
 	res := def
 
 	// Split index header from WHERE predicate if present, preserving predicate literals
@@ -182,8 +194,40 @@ func NormalizeDefinition(def, shadowSchema, targetSchema string) string {
 		hasPred = true
 	}
 
-	schemas := []string{shadowSchema, targetSchema}
-	for _, s := range schemas {
+	curr := ""
+	if len(currentSchema) > 0 {
+		curr = currentSchema[0]
+	}
+
+	// 1. Replace all shadow schema occurrences with their target schemas
+	for shadow, target := range mappings {
+		if shadow == "" || target == "" {
+			continue
+		}
+		head = strings.ReplaceAll(head, shadow+".", target+".")
+		head = strings.ReplaceAll(head, `"`+shadow+`".`, `"`+target+`".`)
+		if hasPred {
+			pred = strings.ReplaceAll(pred, shadow+".", target+".")
+			pred = strings.ReplaceAll(pred, `"`+shadow+`".`, `"`+target+`".`)
+		}
+	}
+
+	// 2. Strip schema from ON/REFERENCES and typecasts
+	// For REFERENCES: only strip if referencing currentSchema (same schema), or if currentSchema not specified
+	stripSchemas := make([]string, 0, len(mappings)*2+2)
+	if curr != "" {
+		stripSchemas = append(stripSchemas, curr)
+	}
+	for shadow, target := range mappings {
+		if target != "" && !slices.Contains(stripSchemas, target) {
+			stripSchemas = append(stripSchemas, target)
+		}
+		if shadow != "" && !slices.Contains(stripSchemas, shadow) {
+			stripSchemas = append(stripSchemas, shadow)
+		}
+	}
+
+	for _, s := range stripSchemas {
 		if s == "" {
 			continue
 		}
@@ -193,11 +237,13 @@ func NormalizeDefinition(def, shadowSchema, targetSchema string) string {
 		head = strings.ReplaceAll(head, " on "+s+".", " on ")
 		head = strings.ReplaceAll(head, " on \""+s+"\".", " on ")
 
-		// Strip schema from "REFERENCES <schema>."
-		head = strings.ReplaceAll(head, "REFERENCES "+s+".", "REFERENCES ")
-		head = strings.ReplaceAll(head, "REFERENCES \""+s+"\".", "REFERENCES ")
-		head = strings.ReplaceAll(head, "references "+s+".", "references ")
-		head = strings.ReplaceAll(head, "references \""+s+"\".", "references ")
+		// Strip schema from "REFERENCES <schema>." ONLY IF s == curr or curr == ""
+		if curr == "" || s == curr {
+			head = strings.ReplaceAll(head, "REFERENCES "+s+".", "REFERENCES ")
+			head = strings.ReplaceAll(head, "REFERENCES \""+s+"\".", "REFERENCES ")
+			head = strings.ReplaceAll(head, "references "+s+".", "references ")
+			head = strings.ReplaceAll(head, "references \""+s+"\".", "references ")
+		}
 
 		// Strip schema from functional expressions in head: "(<schema>." -> "(", ",<schema>." -> ","
 		head = strings.ReplaceAll(head, "("+s+".", "(")
@@ -223,12 +269,6 @@ func NormalizeDefinition(def, shadowSchema, targetSchema string) string {
 		res = head + pred
 	} else {
 		res = head
-	}
-
-	// Also replace any remaining occurrences of shadowSchema with targetSchema in non-stripped positions
-	if shadowSchema != "" && targetSchema != "" {
-		res = strings.ReplaceAll(res, shadowSchema+".", targetSchema+".")
-		res = strings.ReplaceAll(res, `"`+shadowSchema+`".`, `"`+targetSchema+`".`)
 	}
 
 	return strings.TrimSpace(res)

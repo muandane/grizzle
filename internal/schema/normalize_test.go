@@ -105,6 +105,39 @@ func TestNormalizeDefinition(t *testing.T) {
 	}
 }
 
+func TestNormalizeDefinitionWithMappings_MultiSchema(t *testing.T) {
+	mappings := map[string]string{
+		"_grizzle_shadow_identity": "identity",
+		"_grizzle_shadow_billing":  "billing",
+		"_grizzle_shadow_public":   "public",
+	}
+
+	// 1. Cross-schema foreign key: table in billing referencing table in identity
+	shadowFK := "FOREIGN KEY (user_id) REFERENCES _grizzle_shadow_identity.users(id) ON DELETE CASCADE"
+	liveFK := "FOREIGN KEY (user_id) REFERENCES identity.users(id) ON DELETE CASCADE"
+
+	normShadowFK := schema.NormalizeDefinitionWithMappings(shadowFK, mappings, "billing")
+	normLiveFK := schema.NormalizeDefinitionWithMappings(liveFK, mappings, "billing")
+
+	if normShadowFK != normLiveFK {
+		t.Fatalf("cross-schema foreign keys did not normalize symmetrically:\nshadow: %q\nlive:   %q", normShadowFK, normLiveFK)
+	}
+	if normShadowFK != liveFK {
+		t.Errorf("expected cross-schema reference to identity.users to be preserved: got %q, want %q", normShadowFK, liveFK)
+	}
+
+	// 2. Intra-schema foreign key: table in billing referencing table in billing
+	shadowIntraFK := "FOREIGN KEY (account_id) REFERENCES _grizzle_shadow_billing.accounts(id)"
+	liveIntraFK := "FOREIGN KEY (account_id) REFERENCES accounts(id)"
+
+	normShadowIntra := schema.NormalizeDefinitionWithMappings(shadowIntraFK, mappings, "billing")
+	normLiveIntra := schema.NormalizeDefinitionWithMappings(liveIntraFK, mappings, "billing")
+
+	if normShadowIntra != normLiveIntra {
+		t.Fatalf("intra-schema foreign keys did not normalize symmetrically:\nshadow: %q\nlive:   %q", normShadowIntra, normLiveIntra)
+	}
+}
+
 func TestIsTypeNarrowing(t *testing.T) {
 	tests := []struct {
 		oldType  string

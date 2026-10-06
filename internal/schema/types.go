@@ -68,6 +68,7 @@ type PartitionOf struct {
 
 // Table represents a table within a schema.
 type Table struct {
+	Schema       string                 `json:"schema,omitempty"`
 	Name         string                 `json:"name"`
 	Columns      map[string]*Column     `json:"columns"`
 	Indexes      map[string]*Index      `json:"indexes"`
@@ -124,6 +125,8 @@ func (idx *Index) IsPartial() bool {
 type ForeignKey struct {
 	Name       string `json:"name"`
 	TableName  string `json:"table_name"`
+	RefSchema  string `json:"ref_schema,omitempty"`
+	RefTable   string `json:"ref_table,omitempty"`
 	Definition string `json:"definition"`
 	IsValid    bool   `json:"is_valid"`
 }
