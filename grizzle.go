@@ -9,13 +9,10 @@ import (
 	"time"
 
 	"github.com/muandane/grizzle/internal/dialect/postgres"
-	"github.com/muandane/grizzle/internal/dialect/sqlite"
-	"github.com/muandane/grizzle/internal/diff"
 	"github.com/muandane/grizzle/internal/exec"
 	"github.com/muandane/grizzle/internal/export"
 	"github.com/muandane/grizzle/internal/plan"
 	"github.com/muandane/grizzle/internal/schema"
-	"github.com/muandane/grizzle/internal/scope"
 )
 
 // Plan is the complete migration plan containing sequenced steps, policy, and hashes.
@@ -132,15 +129,6 @@ const (
 	HazardLevelCritical = plan.HazardLevelCritical
 	HazardLevelWarning  = plan.HazardLevelWarning
 	HazardLevelNotice   = plan.HazardLevelNotice
-)
-
-const (
-	colorReset  = "\033[0m"
-	colorGreen  = "\033[32m"
-	colorYellow = "\033[33m"
-	colorRed    = "\033[31m"
-	colorBold   = "\033[1m"
-	colorCyan   = "\033[36m"
 )
 
 // GenerateLockID produces a deterministic 64-bit integer lock ID from db and schema names.
@@ -407,61 +395,6 @@ func Check(ctx context.Context, db *sql.DB, opts Options) error {
 	}
 
 	return nil
-}
-
-// tableFilters bridges internal scope filters for existing root test suites.
-type tableFilters struct {
-	includes []string
-	excludes []string
-}
-
-func (tf tableFilters) toScope() scope.Filters {
-	return scope.Filters{
-		Includes: tf.includes,
-		Excludes: tf.excludes,
-	}
-}
-
-// diffSchemas is an internal test helper preserving backward compatibility for root-level tests.
-func diffSchemas(live, desired *schema.Schema, targetSchema, shadowSchema string, filters ...any) []plan.Step {
-	var f scope.Filters
-	if len(filters) > 0 {
-		if tf, ok := filters[0].(tableFilters); ok {
-			f = tf.toScope()
-		} else if sf, ok := filters[0].(scope.Filters); ok {
-			f = sf
-		}
-	}
-	changes := diff.Diff(live, desired, targetSchema, shadowSchema, f)
-	return postgres.RenderChanges(targetSchema, changes)
-}
-
-// diffSQLiteSchemas is an internal test helper preserving backward compatibility for root-level tests.
-func diffSQLiteSchemas(live, desired *schema.Schema, filters ...any) []plan.Step {
-	var f scope.Filters
-	if len(filters) > 0 {
-		if tf, ok := filters[0].(tableFilters); ok {
-			f = tf.toScope()
-		} else if sf, ok := filters[0].(scope.Filters); ok {
-			f = sf
-		}
-	}
-	return sqlite.Diff(live, desired, f)
-}
-
-// normalizeType is an internal test helper preserving backward compatibility.
-func normalizeType(raw string) string {
-	return schema.NormalizeType(raw)
-}
-
-// normalizeDefault is an internal test helper preserving backward compatibility.
-func normalizeDefault(raw string) string {
-	return schema.NormalizeDefault(raw)
-}
-
-// normalizeDefinition is an internal test helper preserving backward compatibility.
-func normalizeDefinition(def, shadowSchema, targetSchema string) string {
-	return schema.NormalizeDefinition(def, shadowSchema, targetSchema)
 }
 
 func toExecBackfill(fn BackfillFunc) exec.BackfillFunc {

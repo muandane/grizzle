@@ -265,33 +265,33 @@ func IsTypeNarrowing(oldType, newType string) bool {
 	}
 
 	// 3. String types (varchar, char, text)
-	parseStr := func(t string) (base string, length int, isStr bool) {
+	parseStr := func(t string) (length int, isStr bool) {
 		t = strings.ToLower(strings.TrimSpace(t))
 		if t == "text" {
-			return "text", math.MaxInt, true
+			return math.MaxInt, true
 		}
 		if t == "varchar" {
-			return "varchar", math.MaxInt, true
+			return math.MaxInt, true
 		}
 		if after, ok := strings.CutPrefix(t, "varchar("); ok {
 			if numStr, _, ok := strings.Cut(after, ")"); ok {
 				if n, err := strconv.Atoi(strings.TrimSpace(numStr)); err == nil {
-					return "varchar", n, true
+					return n, true
 				}
 			}
 		}
 		if after, ok := strings.CutPrefix(t, "char("); ok {
 			if numStr, _, ok := strings.Cut(after, ")"); ok {
 				if n, err := strconv.Atoi(strings.TrimSpace(numStr)); err == nil {
-					return "char", n, true
+					return n, true
 				}
 			}
 		}
-		return "", 0, false
+		return 0, false
 	}
 
-	_, oldLen, isOldStr := parseStr(oldT)
-	_, newLen, isNewStr := parseStr(newT)
+	oldLen, isOldStr := parseStr(oldT)
+	newLen, isNewStr := parseStr(newT)
 	if isOldStr && isNewStr {
 		return newLen < oldLen
 	}
@@ -340,4 +340,3 @@ func IsTypeNarrowing(oldType, newType string) bool {
 	// Default fallback: any other non-identical type transition carries risk/narrowing
 	return true
 }
-

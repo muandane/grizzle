@@ -85,16 +85,16 @@ type Options struct {
 	// RandFloat provides an optional random source func returning in [0.0, 1.0) for deterministic jitter in tests.
 	RandFloat func() float64
 
-	// Renames maps old column names to new column names (e.g. "users.old_col": "new_col" or "old_col": "new_col")
+	// Experimental: Renames maps old column names to new column names (e.g. "users.old_col": "new_col" or "old_col": "new_col")
 	// to explicitly disambiguate column renames instead of treating them as DROP + ADD.
 	Renames map[string]string
 
-	// ExpandContract enables staged expand-and-contract zero-downtime migrations.
+	// Experimental: ExpandContract enables staged expand-and-contract zero-downtime migrations.
 	// In expand mode, renamed or modified columns are added alongside existing columns,
 	// delaying destructive drops to a later, separately approved plan.
 	ExpandContract bool
 
-	// Backfill hook function run outside the DDL lock window in batches during staged expand migration.
+	// Experimental: Backfill hook function run outside the DDL lock window in batches during staged expand migration.
 	Backfill BackfillFunc
 
 	// DryRun returns the planned SQL statements without executing them on the live database.
@@ -249,6 +249,7 @@ func resolveDropPolicy(opts Options) plan.DropPolicy {
 }
 
 // WithRenames sets the explicit column rename mapping.
+// Experimental: Column remapping APIs may change before 1.0.
 func WithRenames(renames map[string]string) Option {
 	return func(o *Options) {
 		o.Renames = renames
@@ -256,6 +257,7 @@ func WithRenames(renames map[string]string) Option {
 }
 
 // WithExpandContract enables or disables staged expand-and-contract zero-downtime migrations.
+// Experimental: Staged migrations API may change before 1.0.
 func WithExpandContract(expand bool) Option {
 	return func(o *Options) {
 		o.ExpandContract = expand
@@ -263,6 +265,7 @@ func WithExpandContract(expand bool) Option {
 }
 
 // WithBackfill configures the batch backfill hook function for staged expand migrations.
+// Experimental: Staged backfill hook signature may change before 1.0.
 func WithBackfill(fn BackfillFunc) Option {
 	return func(o *Options) {
 		o.Backfill = fn

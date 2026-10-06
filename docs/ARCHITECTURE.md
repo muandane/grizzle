@@ -18,7 +18,7 @@ schema  <--  scope, diff, plan  <--  dialect  <--  exec, history  <--  grizzle (
 | **Execution** | `internal/exec`<br>`internal/history` | Connection management, shadow schemas, session/transaction locking, statement timeouts, retries, history audit log | Handles I/O, transactions, retries, and errors |
 | **Facade** | root (`grizzle`) | Public API (`Sync`, `PlanDiff`, `Apply`, `Check`), options validation, public type aliases | Wiring only; zero core logic |
 
-An automated test (`TestArchitecture_LayeredDependencies`) verifies that no package violates this one-way dependency rule.
+An automated test (`TestArchitecture_DependencyRules`) verifies that no package violates this one-way dependency rule.
 
 ## 2. High-level execution flow
 
