@@ -545,6 +545,9 @@ type SQLiteExecConfig struct {
 	Logger        *slog.Logger
 	DryRun        bool
 	Backfill      BackfillFunc
+
+	RebuildThreshold int
+	RebuildBatchSize int
 }
 
 // SyncSQLite synchronizes SQLite in a single transaction with foreign keys handling.
@@ -628,6 +631,11 @@ func SyncSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) error {
 	}
 
 	// 5. Execute in transaction
+	_, _ = db.ExecContext(ctx, "PRAGMA foreign_keys = OFF;")
+	defer func() {
+		_, _ = db.ExecContext(ctx, "PRAGMA foreign_keys = ON;")
+	}()
+
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("sqlite: failed to begin transaction: %w", err)
@@ -644,7 +652,7 @@ func SyncSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) error {
 		if sqlToExec == "" {
 			continue
 		}
-		if _, err := tx.ExecContext(ctx, sqlToExec); err != nil {
+		if err := executeSQLiteStep(ctx, tx, s, cfg); err != nil {
 			_ = tx.Rollback()
 			if logger != nil {
 				logger.ErrorContext(ctx, "sqlite: failed executing step", "step_index", i+1, "sql", sqlToExec, "error", err)
@@ -659,9 +667,23 @@ func SyncSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) error {
 		}
 	}
 
-	if _, err := tx.ExecContext(ctx, "PRAGMA foreign_key_check;"); err != nil {
+	finalFKRows, err := tx.QueryContext(ctx, "PRAGMA foreign_key_check;")
+	if err != nil {
 		return fmt.Errorf("sqlite: foreign key check failed: %w", err)
 	}
+	var fkViolations []string
+	for finalFKRows.Next() {
+		var vTbl, vParent string
+		var vRowID, vFKID int64
+		if err := finalFKRows.Scan(&vTbl, &vRowID, &vParent, &vFKID); err == nil {
+			fkViolations = append(fkViolations, fmt.Sprintf("table %q row %d -> %q", vTbl, vRowID, vParent))
+		}
+	}
+	_ = finalFKRows.Close()
+	if len(fkViolations) > 0 {
+		return fmt.Errorf("sqlite: foreign key constraint violation: %s", strings.Join(fkViolations, "; "))
+	}
+
 	if _, err := tx.ExecContext(ctx, "PRAGMA foreign_keys = ON;"); err != nil {
 		return fmt.Errorf("sqlite: failed to re-enable foreign keys: %w", err)
 	}
@@ -967,6 +989,11 @@ func ApplySQLite(ctx context.Context, db *sql.DB, p *plan.Plan, cfg SQLiteExecCo
 		logger.InfoContext(ctx, "sqlite: starting SQLite plan application")
 	}
 
+	_, _ = db.ExecContext(ctx, "PRAGMA foreign_keys = OFF;")
+	defer func() {
+		_, _ = db.ExecContext(ctx, "PRAGMA foreign_keys = ON;")
+	}()
+
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("sqlite: failed to begin transaction: %w", err)
@@ -991,7 +1018,7 @@ func ApplySQLite(ctx context.Context, db *sql.DB, p *plan.Plan, cfg SQLiteExecCo
 		if sqlToExec == "" {
 			continue
 		}
-		if _, err := tx.ExecContext(ctx, sqlToExec); err != nil {
+		if err := executeSQLiteStep(ctx, tx, s, cfg); err != nil {
 			_ = tx.Rollback()
 			if logger != nil {
 				logger.ErrorContext(ctx, "sqlite: failed executing step", "step_index", i+1, "sql", sqlToExec, "error", err)
@@ -1006,9 +1033,23 @@ func ApplySQLite(ctx context.Context, db *sql.DB, p *plan.Plan, cfg SQLiteExecCo
 		}
 	}
 
-	if _, err := tx.ExecContext(ctx, "PRAGMA foreign_key_check;"); err != nil {
+	finalFKRows, err := tx.QueryContext(ctx, "PRAGMA foreign_key_check;")
+	if err != nil {
 		return fmt.Errorf("sqlite: foreign key check failed: %w", err)
 	}
+	var fkViolations []string
+	for finalFKRows.Next() {
+		var vTbl, vParent string
+		var vRowID, vFKID int64
+		if err := finalFKRows.Scan(&vTbl, &vRowID, &vParent, &vFKID); err == nil {
+			fkViolations = append(fkViolations, fmt.Sprintf("table %q row %d -> %q", vTbl, vRowID, vParent))
+		}
+	}
+	_ = finalFKRows.Close()
+	if len(fkViolations) > 0 {
+		return fmt.Errorf("sqlite: foreign key constraint violation: %s", strings.Join(fkViolations, "; "))
+	}
+
 	if _, err := tx.ExecContext(ctx, "PRAGMA foreign_keys = ON;"); err != nil {
 		return fmt.Errorf("sqlite: failed to re-enable foreign keys: %w", err)
 	}
@@ -1033,5 +1074,160 @@ func ApplySQLite(ctx context.Context, db *sql.DB, p *plan.Plan, cfg SQLiteExecCo
 		logger.InfoContext(ctx, "sqlite: plan application finished successfully", "steps_applied", len(p.Steps), "total_duration", time.Since(start))
 	}
 
+	return nil
+}
+
+func executeSQLiteStep(ctx context.Context, tx *sql.Tx, s plan.Step, cfg SQLiteExecConfig) error {
+	if !s.IsTableRebuild {
+		sqlToExec := strings.TrimSpace(s.SQL)
+		if sqlToExec == "" {
+			return nil
+		}
+		_, err := tx.ExecContext(ctx, sqlToExec)
+		return err
+	}
+
+	// Table rebuild step: wrap in SAVEPOINT grizzle_rebuild
+	if _, err := tx.ExecContext(ctx, "SAVEPOINT grizzle_rebuild;"); err != nil {
+		return fmt.Errorf("creating savepoint: %w", err)
+	}
+
+	threshold := cfg.RebuildThreshold
+	if threshold == 0 {
+		threshold = 100000
+	}
+	batchSize := cfg.RebuildBatchSize
+	if batchSize <= 0 {
+		batchSize = 10000
+	}
+
+	var rowCount int64
+	_ = tx.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %q;", s.Table)).Scan(&rowCount)
+
+	tempTable := "_grizzle_new_" + s.Table
+	copyDataPrefix := fmt.Sprintf("INSERT INTO %q", tempTable)
+	idx := strings.Index(s.SQL, copyDataPrefix)
+
+	needsChunked := threshold > 0 && rowCount > int64(threshold) && idx != -1
+
+	if needsChunked {
+		beforeCopy := strings.TrimSpace(s.SQL[:idx])
+		rest := s.SQL[idx:]
+		semiIdx := strings.Index(rest, ";")
+		if semiIdx == -1 {
+			_, _ = tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT grizzle_rebuild;")
+			_, _ = tx.ExecContext(ctx, "RELEASE SAVEPOINT grizzle_rebuild;")
+			return fmt.Errorf("malformed copy statement in rebuild SQL")
+		}
+		copyStmt := rest[:semiIdx+1]
+		afterCopy := strings.TrimSpace(rest[semiIdx+1:])
+
+		if beforeCopy != "" {
+			if _, err := tx.ExecContext(ctx, beforeCopy); err != nil {
+				_, _ = tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT grizzle_rebuild;")
+				_, _ = tx.ExecContext(ctx, "RELEASE SAVEPOINT grizzle_rebuild;")
+				return fmt.Errorf("executing create temp table: %w", err)
+			}
+		}
+
+		colStart := strings.Index(copyStmt, "(")
+		colEnd := strings.Index(copyStmt, ")")
+		if colStart != -1 && colEnd != -1 && colEnd > colStart {
+			colList := strings.TrimSpace(copyStmt[colStart+1 : colEnd])
+			if colList != "" {
+				if err := copyDataKeysetChunks(ctx, tx, tempTable, colList, s.Table, batchSize); err != nil {
+					_, _ = tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT grizzle_rebuild;")
+					_, _ = tx.ExecContext(ctx, "RELEASE SAVEPOINT grizzle_rebuild;")
+					return err
+				}
+			}
+		}
+
+		if afterCopy != "" {
+			if _, err := tx.ExecContext(ctx, afterCopy); err != nil {
+				_, _ = tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT grizzle_rebuild;")
+				_, _ = tx.ExecContext(ctx, "RELEASE SAVEPOINT grizzle_rebuild;")
+				return fmt.Errorf("executing post-copy rebuild statements: %w", err)
+			}
+		}
+	} else {
+		if _, err := tx.ExecContext(ctx, s.SQL); err != nil {
+			_, _ = tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT grizzle_rebuild;")
+			_, _ = tx.ExecContext(ctx, "RELEASE SAVEPOINT grizzle_rebuild;")
+			return fmt.Errorf("executing rebuild SQL: %w", err)
+		}
+	}
+
+	// Validate foreign keys under the savepoint
+	fkRows, err := tx.QueryContext(ctx, "PRAGMA foreign_key_check;")
+	if err != nil {
+		_, _ = tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT grizzle_rebuild;")
+		_, _ = tx.ExecContext(ctx, "RELEASE SAVEPOINT grizzle_rebuild;")
+		return fmt.Errorf("foreign key check query failed: %w", err)
+	}
+	var fkViolations []string
+	for fkRows.Next() {
+		var vTbl, vParent string
+		var vRowID, vFKID int64
+		if err := fkRows.Scan(&vTbl, &vRowID, &vParent, &vFKID); err == nil {
+			fkViolations = append(fkViolations, fmt.Sprintf("table %q row %d -> %q", vTbl, vRowID, vParent))
+		}
+	}
+	_ = fkRows.Close()
+
+	if len(fkViolations) > 0 {
+		_, _ = tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT grizzle_rebuild;")
+		_, _ = tx.ExecContext(ctx, "RELEASE SAVEPOINT grizzle_rebuild;")
+		return fmt.Errorf("foreign key constraint violation detected after rebuilding table %q: %s", s.Table, strings.Join(fkViolations, ", "))
+	}
+
+	if _, err := tx.ExecContext(ctx, "RELEASE SAVEPOINT grizzle_rebuild;"); err != nil {
+		return fmt.Errorf("releasing savepoint grizzle_rebuild: %w", err)
+	}
+
+	return nil
+}
+
+func copyDataKeysetChunks(ctx context.Context, tx *sql.Tx, tempTable, colList, liveTable string, batchSize int) error {
+	var lastRowID int64
+	var hasStarted bool
+
+	for {
+		var query string
+		var args []any
+		if !hasStarted {
+			query = fmt.Sprintf("INSERT INTO %q (%s) SELECT %s FROM %q ORDER BY rowid ASC LIMIT ?;", tempTable, colList, colList, liveTable)
+			args = []any{batchSize}
+		} else {
+			query = fmt.Sprintf("INSERT INTO %q (%s) SELECT %s FROM %q WHERE rowid > ? ORDER BY rowid ASC LIMIT ?;", tempTable, colList, colList, liveTable)
+			args = []any{lastRowID, batchSize}
+		}
+
+		res, err := tx.ExecContext(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("sqlite: chunked keyset copy failed: %w", err)
+		}
+		affected, err := res.RowsAffected()
+		if err != nil || affected == 0 {
+			break
+		}
+
+		var maxRowID int64
+		var maxQuery string
+		var maxArgs []any
+		if !hasStarted {
+			maxQuery = fmt.Sprintf("SELECT MAX(rowid) FROM (SELECT rowid FROM %q ORDER BY rowid ASC LIMIT ?);", liveTable)
+			maxArgs = []any{batchSize}
+		} else {
+			maxQuery = fmt.Sprintf("SELECT MAX(rowid) FROM (SELECT rowid FROM %q WHERE rowid > ? ORDER BY rowid ASC LIMIT ?);", liveTable)
+			maxArgs = []any{lastRowID, batchSize}
+		}
+
+		if err := tx.QueryRowContext(ctx, maxQuery, maxArgs...).Scan(&maxRowID); err != nil {
+			break
+		}
+		lastRowID = maxRowID
+		hasStarted = true
+	}
 	return nil
 }

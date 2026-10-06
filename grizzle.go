@@ -206,6 +206,12 @@ func prepareOptions(ctx context.Context, db *sql.DB, opts *Options) error {
 		if len(opts.TargetSchemas) == 0 {
 			opts.TargetSchemas = []string{opts.TargetSchema}
 		}
+		if opts.SQLiteRebuildThreshold == 0 {
+			opts.SQLiteRebuildThreshold = 100000
+		}
+		if opts.SQLiteRebuildBatchSize <= 0 {
+			opts.SQLiteRebuildBatchSize = 10000
+		}
 	case DialectPostgres:
 		if len(opts.TargetSchemas) > 0 {
 			slices.Sort(opts.TargetSchemas)
@@ -251,13 +257,15 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error {
 
 	if opts.Dialect == DialectSQLite {
 		return exec.SyncSQLite(ctx, db, exec.SQLiteExecConfig{
-			SchemaSQL:     opts.SchemaSQL,
-			Filters:       filters,
-			Policy:        policy,
-			AcceptHazards: opts.AcceptHazards,
-			Logger:        opts.Logger,
-			DryRun:        opts.DryRun,
-			Backfill:      toExecBackfill(opts.Backfill),
+			SchemaSQL:        opts.SchemaSQL,
+			Filters:          filters,
+			Policy:           policy,
+			AcceptHazards:    opts.AcceptHazards,
+			Logger:           opts.Logger,
+			DryRun:           opts.DryRun,
+			Backfill:         toExecBackfill(opts.Backfill),
+			RebuildThreshold: opts.SQLiteRebuildThreshold,
+			RebuildBatchSize: opts.SQLiteRebuildBatchSize,
 		})
 	}
 
@@ -330,6 +338,14 @@ type ApplyOpts struct {
 
 	// Backfill hook function run outside the DDL lock window in batches during staged expand migration.
 	Backfill BackfillFunc
+
+	// SQLiteRebuildThreshold defines the row count threshold above which SQLite table rebuilds
+	// chunk data copying by keyset. Defaults to 100000.
+	SQLiteRebuildThreshold int
+
+	// SQLiteRebuildBatchSize defines the chunk size when copying data in batches during SQLite table rebuilds.
+	// Defaults to 10000.
+	SQLiteRebuildBatchSize int
 }
 
 // Apply applies an approved migration plan to the database.
@@ -358,8 +374,10 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 			AllowDropColumn: &p.Policy.AllowColumn,
 			AllowDropIndex:  &p.Policy.AllowIndex,
 			AllowDropFK:     &p.Policy.AllowFK,
-			AcceptHazards:   opts.AcceptHazards,
-			Backfill:        opts.Backfill,
+			AcceptHazards:          opts.AcceptHazards,
+			Backfill:               opts.Backfill,
+			SQLiteRebuildThreshold: opts.SQLiteRebuildThreshold,
+			SQLiteRebuildBatchSize: opts.SQLiteRebuildBatchSize,
 		}
 		if err := prepareOptions(ctx, db, &syncOpts); err != nil {
 			return err
@@ -369,14 +387,16 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 
 		if syncOpts.Dialect == DialectSQLite {
 			return exec.SyncSQLite(ctx, db, exec.SQLiteExecConfig{
-				SchemaSQL:     syncOpts.SchemaSQL,
-				Filters:       filters,
-				Policy:        policy,
-				AcceptHazards: opts.AcceptHazards,
-				ExpectedHash:  opts.ExpectedHash,
-				Logger:        syncOpts.Logger,
-				DryRun:        syncOpts.DryRun,
-				Backfill:      toExecBackfill(opts.Backfill),
+				SchemaSQL:        syncOpts.SchemaSQL,
+				Filters:          filters,
+				Policy:           policy,
+				AcceptHazards:    opts.AcceptHazards,
+				ExpectedHash:     opts.ExpectedHash,
+				Logger:           syncOpts.Logger,
+				DryRun:           syncOpts.DryRun,
+				Backfill:         toExecBackfill(opts.Backfill),
+				RebuildThreshold: syncOpts.SQLiteRebuildThreshold,
+				RebuildBatchSize: syncOpts.SQLiteRebuildBatchSize,
 			})
 		}
 
@@ -410,10 +430,12 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 	switch dialect {
 	case DialectSQLite:
 		return exec.ApplySQLite(ctx, db, p, exec.SQLiteExecConfig{
-			Policy:        p.Policy,
-			AcceptHazards: opts.AcceptHazards,
-			ExpectedHash:  opts.ExpectedHash,
-			Backfill:      toExecBackfill(opts.Backfill),
+			Policy:           p.Policy,
+			AcceptHazards:    opts.AcceptHazards,
+			ExpectedHash:     opts.ExpectedHash,
+			Backfill:         toExecBackfill(opts.Backfill),
+			RebuildThreshold: opts.SQLiteRebuildThreshold,
+			RebuildBatchSize: opts.SQLiteRebuildBatchSize,
 		})
 	case DialectPostgres:
 		targetSchemas := p.TargetSchemas

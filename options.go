@@ -105,6 +105,15 @@ type Options struct {
 	// DryRun returns the planned SQL statements without executing them on the live database.
 	DryRun bool
 
+	// SQLiteRebuildThreshold defines the row count threshold above which SQLite table rebuilds
+	// chunk data copying by keyset to prevent journal memory exhaustion.
+	// Defaults to 100000. Set to 0 to disable batching.
+	SQLiteRebuildThreshold int
+
+	// SQLiteRebuildBatchSize defines the chunk size when copying data in batches during SQLite table rebuilds.
+	// Defaults to 10000.
+	SQLiteRebuildBatchSize int
+
 	// Logger accepts a structured logger (*slog.Logger) for migration events.
 	Logger *slog.Logger
 }
@@ -216,6 +225,14 @@ func WithRandFloat(fn func() float64) Option {
 func WithStrictScope(strict bool) Option {
 	return func(o *Options) {
 		o.StrictScope = strict
+	}
+}
+
+// WithSQLiteRebuildBatching sets the threshold and batch size for chunked keyset copying during SQLite rebuilds.
+func WithSQLiteRebuildBatching(threshold, batchSize int) Option {
+	return func(o *Options) {
+		o.SQLiteRebuildThreshold = threshold
+		o.SQLiteRebuildBatchSize = batchSize
 	}
 }
 
