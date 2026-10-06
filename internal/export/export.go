@@ -161,7 +161,7 @@ func renderGoose(p *plan.Plan, version string) string {
 
 func isStepReversible(s plan.Step) bool {
 	switch s.Type {
-	case plan.ChangeCreateTable, plan.ChangeAddColumn, plan.ChangeCreateIndex, plan.ChangeAddFK, plan.ChangeRenameColumn:
+	case plan.ChangeCreateTable, plan.ChangeAddColumn, plan.ChangeCreateIndex, plan.ChangeAddFK, plan.ChangeRenameColumn, plan.ChangeAttachPartition:
 		return true
 	default:
 		return false
@@ -211,6 +211,9 @@ func reverseStepSQL(s plan.Step) string {
 
 	case plan.ChangeRenameColumn:
 		return fmt.Sprintf("ALTER TABLE %s RENAME COLUMN %s TO %s;", s.Table, s.Column, s.OldColumn)
+
+	case plan.ChangeAttachPartition:
+		return fmt.Sprintf("ALTER TABLE %s DETACH PARTITION %s;", s.ParentTable, s.Table)
 
 	default:
 		return fmt.Sprintf("-- Reversal not supported for %s", s.Type)
