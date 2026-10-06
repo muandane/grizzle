@@ -7,8 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"github.com/muandane/grizzle"
 )
 
 type templateFile struct {
@@ -16,21 +14,62 @@ type templateFile struct {
 	Content string
 }
 
-func getTemplateFiles(template string) []templateFile {
-	switch template {
-	case "sqlc":
-		return []templateFile{
-			{
-				Name: "schema.sql",
-				Content: `-- schema.sql: Single source of truth for database schema
+const (
+	postgresSchemaTemplate = `-- schema.sql: Single source of truth for database schema
 CREATE TABLE users (
     id BIGSERIAL PRIMARY KEY,
     email TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-`,
-			},
+`
+
+	postgresMainTemplate = `package main
+
+import (
+	"context"
+	"database/sql"
+	_ "embed"
+	"log"
+	"os"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/muandane/grizzle"
+)
+
+//go:embed schema.sql
+var schemaSQL string
+
+func main() {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		dsn = "postgres://postgres:postgres@localhost:5432/myapp?sslmode=disable"
+	}
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		log.Fatalf("failed opening database: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := grizzle.Sync(ctx, db, grizzle.Options{
+		SchemaSQL: schemaSQL,
+		AllowDrop: false,
+	}); err != nil {
+		log.Fatalf("grizzle schema sync failed: %v", err)
+	}
+
+	log.Println("Database schema synchronized successfully with Grizzle.")
+}
+`
+)
+
+func getTemplateFiles(template string) []templateFile {
+	switch template {
+	case "sqlc":
+		return []templateFile{
+			{Name: "schema.sql", Content: postgresSchemaTemplate},
 			{
 				Name: "queries.sql",
 				Content: `-- queries.sql: Type-safe SQL queries compiled by sqlc
@@ -62,104 +101,12 @@ sql:
         sql_package: "pgx/v5"
 `,
 			},
-			{
-				Name: "main.go",
-				Content: `package main
-
-import (
-	"context"
-	"database/sql"
-	_ "embed"
-	"log"
-	"os"
-
-	_ "github.com/jackc/pgx/v5/stdlib"
-	"github.com/muandane/grizzle"
-)
-
-//go:embed schema.sql
-var schemaSQL string
-
-func main() {
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		dsn = "postgres://postgres:postgres@localhost:5432/myapp?sslmode=disable"
-	}
-
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		log.Fatalf("failed opening database: %v", err)
-	}
-	defer db.Close()
-
-	ctx := context.Background()
-	if err := grizzle.Sync(ctx, db, grizzle.Options{
-		SchemaSQL: schemaSQL,
-		AllowDrop: false,
-	}); err != nil {
-		log.Fatalf("grizzle schema sync failed: %v", err)
-	}
-
-	log.Println("Database schema synchronized successfully with Grizzle.")
-}
-`,
-			},
+			{Name: "main.go", Content: postgresMainTemplate},
 		}
 	case "stdlib":
 		return []templateFile{
-			{
-				Name: "schema.sql",
-				Content: `-- schema.sql: Single source of truth for database schema
-CREATE TABLE users (
-    id BIGSERIAL PRIMARY KEY,
-    email TEXT NOT NULL UNIQUE,
-    name TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-`,
-			},
-			{
-				Name: "main.go",
-				Content: `package main
-
-import (
-	"context"
-	"database/sql"
-	_ "embed"
-	"log"
-	"os"
-
-	_ "github.com/jackc/pgx/v5/stdlib"
-	"github.com/muandane/grizzle"
-)
-
-//go:embed schema.sql
-var schemaSQL string
-
-func main() {
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		dsn = "postgres://postgres:postgres@localhost:5432/myapp?sslmode=disable"
-	}
-
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		log.Fatalf("failed opening database: %v", err)
-	}
-	defer db.Close()
-
-	ctx := context.Background()
-	if err := grizzle.Sync(ctx, db, grizzle.Options{
-		SchemaSQL: schemaSQL,
-		AllowDrop: false,
-	}); err != nil {
-		log.Fatalf("grizzle schema sync failed: %v", err)
-	}
-
-	log.Println("Database schema synchronized successfully with Grizzle.")
-}
-`,
-			},
+			{Name: "schema.sql", Content: postgresSchemaTemplate},
+			{Name: "main.go", Content: postgresMainTemplate},
 		}
 	case "sqlite":
 		return []templateFile{
@@ -295,17 +242,3 @@ func runInit(template, dir string, force bool) int {
 	return 0
 }
 
-func outputGitHubActions(w io.Writer, p *grizzle.Plan, schemaFile string) {
-	summary := fmt.Sprintf("Adds: %d, Alters: %d, Drops: %d (Plan Hash: %s)", p.Additions(), p.Modifications(), p.Deletions(), p.Hash())
-	_, _ = fmt.Fprintf(w, "::notice title=Grizzle Migration Plan::%s\n", summary)
-	for _, h := range p.Hazards() {
-		switch h.Level {
-		case grizzle.HazardLevelCritical:
-			_, _ = fmt.Fprintf(w, "::error file=%s,title=Critical Hazard (%s)::%s\n", schemaFile, h.Code, h.Description)
-		case grizzle.HazardLevelWarning:
-			_, _ = fmt.Fprintf(w, "::warning file=%s,title=Hazard Warning (%s)::%s\n", schemaFile, h.Code, h.Description)
-		case grizzle.HazardLevelNotice:
-			_, _ = fmt.Fprintf(w, "::notice file=%s,title=Hazard Notice (%s)::%s\n", schemaFile, h.Code, h.Description)
-		}
-	}
-}

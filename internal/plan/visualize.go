@@ -386,3 +386,21 @@ func stepOperationSummary(s Step) string {
 		return strings.TrimSuffix(strings.TrimSpace(s.SQL), ";")
 	}
 }
+
+// FormatGitHubActions formats plan summary and hazards into GitHub Actions workflow commands.
+func (p *Plan) FormatGitHubActions(w io.Writer, schemaFile string) error {
+	summary := fmt.Sprintf("Adds: %d, Alters: %d, Drops: %d (Plan Hash: %s)", p.Additions(), p.Modifications(), p.Deletions(), p.Hash())
+	_, _ = fmt.Fprintf(w, "::notice title=Grizzle Migration Plan::%s\n", summary)
+	for _, h := range p.Hazards() {
+		switch h.Level {
+		case HazardLevelCritical:
+			_, _ = fmt.Fprintf(w, "::error file=%s,title=Critical Hazard (%s)::%s\n", schemaFile, h.Code, h.Description)
+		case HazardLevelWarning:
+			_, _ = fmt.Fprintf(w, "::warning file=%s,title=Hazard Warning (%s)::%s\n", schemaFile, h.Code, h.Description)
+		case HazardLevelNotice:
+			_, _ = fmt.Fprintf(w, "::notice file=%s,title=Hazard Notice (%s)::%s\n", schemaFile, h.Code, h.Description)
+		}
+	}
+	return nil
+}
+

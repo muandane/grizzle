@@ -16,6 +16,7 @@ import (
 	"github.com/muandane/grizzle/internal/diff"
 	"github.com/muandane/grizzle/internal/history"
 	"github.com/muandane/grizzle/internal/plan"
+	"github.com/muandane/grizzle/internal/schema"
 	"github.com/muandane/grizzle/internal/scope"
 )
 
@@ -115,12 +116,12 @@ func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig
 			shadowSchema = "_grizzle_shadow"
 		}
 
-		live, err := postgres.Inspect(ctx, dbtx, targetSchema)
+		live, err := inspectPostgresSchema(ctx, dbtx, targetSchema, cfg.Tracer)
 		if err != nil {
 			return nil, fmt.Errorf("%w: live schema: %w", plan.ErrInspectionFailed, err)
 		}
 
-		desired, err := postgres.Inspect(ctx, dbtx, shadowSchema)
+		desired, err := inspectPostgresSchema(ctx, dbtx, shadowSchema, cfg.Tracer)
 		if err != nil {
 			return nil, fmt.Errorf("%w: shadow schema: %w", plan.ErrInspectionFailed, err)
 		}
@@ -142,12 +143,12 @@ func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig
 		shadowSchemas = append(shadowSchemas, shadow)
 	}
 
-	liveMap, err := postgres.InspectSchemas(ctx, dbtx, targetSchemas)
+	liveMap, err := inspectPostgresSchemas(ctx, dbtx, targetSchemas, cfg.Tracer)
 	if err != nil {
 		return nil, fmt.Errorf("%w: live schemas: %w", plan.ErrInspectionFailed, err)
 	}
 
-	desiredMap, err := postgres.InspectSchemas(ctx, dbtx, shadowSchemas)
+	desiredMap, err := inspectPostgresSchemas(ctx, dbtx, shadowSchemas, cfg.Tracer)
 	if err != nil {
 		return nil, fmt.Errorf("%w: shadow schemas: %w", plan.ErrInspectionFailed, err)
 	}
@@ -166,6 +167,45 @@ func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig
 
 	steps := postgres.RenderChangesWithOpts(targetSchemas[0], allChanges, renderOpts)
 	return steps, nil
+}
+
+func inspectPostgresSchema(ctx context.Context, dbtx dialect.DBTX, schema string, tracer Tracer) (*schema.Schema, error) {
+	if tracer != nil {
+		var span Span
+		ctx, span = tracer.Start(ctx, "grizzle.inspect_schema")
+		span.SetAttribute("schema", schema)
+		defer span.End()
+	}
+	return postgres.Inspect(ctx, dbtx, schema)
+}
+
+func inspectPostgresSchemas(ctx context.Context, dbtx dialect.DBTX, schemas []string, tracer Tracer) (map[string]*schema.Schema, error) {
+	if tracer != nil {
+		var span Span
+		ctx, span = tracer.Start(ctx, "grizzle.inspect_schema")
+		span.SetAttribute("schemas", strings.Join(schemas, ","))
+		defer span.End()
+	}
+	return postgres.InspectSchemas(ctx, dbtx, schemas)
+}
+
+func execStepWithTracing(ctx context.Context, execer dialect.DBTX, s plan.Step, isNonTx bool, tracer Tracer) error {
+	var span Span
+	if tracer != nil {
+		_, span = tracer.Start(ctx, "grizzle.exec_step")
+		span.SetAttribute("step.type", string(s.Type))
+		span.SetAttribute("step.table", s.Table)
+		span.SetAttribute("step.sql", s.SQL)
+		span.SetAttribute("step.non_tx", isNonTx)
+	}
+	_, err := execer.ExecContext(ctx, s.SQL)
+	if span != nil {
+		if err != nil {
+			span.RecordError(err)
+		}
+		span.End()
+	}
+	return err
 }
 
 // StepGroup partitions contiguous steps into transactional and non-transactional execution batches.
@@ -457,26 +497,12 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 			for _, s := range group.Steps {
 				stepIdx++
 				stepStart := time.Now()
-				var stepSpan Span
-				if cfg.Tracer != nil {
-					_, stepSpan = cfg.Tracer.Start(ctx, "grizzle.exec_step")
-					stepSpan.SetAttribute("step.type", string(s.Type))
-					stepSpan.SetAttribute("step.table", s.Table)
-					stepSpan.SetAttribute("step.non_tx", true)
-				}
-				if _, err := conn.ExecContext(ctx, s.SQL); err != nil {
-					if stepSpan != nil {
-						stepSpan.RecordError(err)
-						stepSpan.End()
-					}
+				if err := execStepWithTracing(ctx, conn, s, true, cfg.Tracer); err != nil {
 					if logger != nil {
 						logger.ErrorContext(ctx, "grizzle: failed executing non-tx step", "step_index", stepIdx, "sql", s.SQL, "error", err)
 					}
 					recordFailureHistory(stepIdx, err, true)
 					return committedSteps + 1, wrapStepExecError(s, err, true)
-				}
-				if stepSpan != nil {
-					stepSpan.End()
 				}
 				committedSteps++
 				if logger != nil {
@@ -502,27 +528,13 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 			for _, s := range group.Steps {
 				stepIdx++
 				stepStart := time.Now()
-				var stepSpan Span
-				if cfg.Tracer != nil {
-					_, stepSpan = cfg.Tracer.Start(ctx, "grizzle.exec_step")
-					stepSpan.SetAttribute("step.type", string(s.Type))
-					stepSpan.SetAttribute("step.table", s.Table)
-					stepSpan.SetAttribute("step.non_tx", false)
-				}
-				if _, err := tx.ExecContext(ctx, s.SQL); err != nil {
-					if stepSpan != nil {
-						stepSpan.RecordError(err)
-						stepSpan.End()
-					}
+				if err := execStepWithTracing(ctx, tx, s, false, cfg.Tracer); err != nil {
 					_ = tx.Rollback()
 					if logger != nil {
 						logger.ErrorContext(ctx, "grizzle: failed executing step in tx", "step_index", stepIdx, "sql", s.SQL, "error", err)
 					}
 					recordFailureHistory(stepIdx, err, false)
 					return committedSteps, wrapStepExecError(s, err, false)
-				}
-				if stepSpan != nil {
-					stepSpan.End()
 				}
 				if logger != nil {
 					logger.DebugContext(ctx, "grizzle: executed step in tx", "step_index", stepIdx, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
@@ -997,26 +1009,12 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 			for _, s := range group.Steps {
 				stepIdx++
 				stepStart := time.Now()
-				var stepSpan Span
-				if cfg.Tracer != nil {
-					_, stepSpan = cfg.Tracer.Start(ctx, "grizzle.exec_step")
-					stepSpan.SetAttribute("step.type", string(s.Type))
-					stepSpan.SetAttribute("step.table", s.Table)
-					stepSpan.SetAttribute("step.non_tx", true)
-				}
-				if _, err := conn.ExecContext(ctx, s.SQL); err != nil {
-					if stepSpan != nil {
-						stepSpan.RecordError(err)
-						stepSpan.End()
-					}
+				if err := execStepWithTracing(ctx, conn, s, true, cfg.Tracer); err != nil {
 					if logger != nil {
 						logger.ErrorContext(ctx, "grizzle: failed executing non-tx step", "step_index", stepIdx, "sql", s.SQL, "error", err)
 					}
 					recordFailureHistory(stepIdx, err, true)
 					return committedSteps + 1, wrapStepExecError(s, err, true)
-				}
-				if stepSpan != nil {
-					stepSpan.End()
 				}
 				committedSteps++
 				if logger != nil {
@@ -1041,27 +1039,13 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 			for _, s := range group.Steps {
 				stepIdx++
 				stepStart := time.Now()
-				var stepSpan Span
-				if cfg.Tracer != nil {
-					_, stepSpan = cfg.Tracer.Start(ctx, "grizzle.exec_step")
-					stepSpan.SetAttribute("step.type", string(s.Type))
-					stepSpan.SetAttribute("step.table", s.Table)
-					stepSpan.SetAttribute("step.non_tx", false)
-				}
-				if _, err := tx.ExecContext(ctx, s.SQL); err != nil {
-					if stepSpan != nil {
-						stepSpan.RecordError(err)
-						stepSpan.End()
-					}
+				if err := execStepWithTracing(ctx, tx, s, false, cfg.Tracer); err != nil {
 					_ = tx.Rollback()
 					if logger != nil {
 						logger.ErrorContext(ctx, "grizzle: failed executing step in tx", "step_index", stepIdx, "sql", s.SQL, "error", err)
 					}
 					recordFailureHistory(stepIdx, err, false)
 					return committedSteps, wrapStepExecError(s, err, false)
-				}
-				if stepSpan != nil {
-					stepSpan.End()
 				}
 				if logger != nil {
 					logger.DebugContext(ctx, "grizzle: executed step in tx", "step_index", stepIdx, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
@@ -1214,6 +1198,25 @@ func ApplySQLite(ctx context.Context, db *sql.DB, p *plan.Plan, cfg SQLiteExecCo
 }
 
 func executeSQLiteStep(ctx context.Context, tx *sql.Tx, s plan.Step, cfg SQLiteExecConfig) error {
+	var span Span
+	if cfg.Tracer != nil {
+		_, span = cfg.Tracer.Start(ctx, "grizzle.exec_step")
+		span.SetAttribute("step.type", string(s.Type))
+		span.SetAttribute("step.table", s.Table)
+		span.SetAttribute("step.sql", s.SQL)
+		span.SetAttribute("step.non_tx", false)
+	}
+	err := executeSQLiteStepInner(ctx, tx, s, cfg)
+	if span != nil {
+		if err != nil {
+			span.RecordError(err)
+		}
+		span.End()
+	}
+	return err
+}
+
+func executeSQLiteStepInner(ctx context.Context, tx *sql.Tx, s plan.Step, cfg SQLiteExecConfig) error {
 	if !s.IsTableRebuild {
 		sqlToExec := strings.TrimSpace(s.SQL)
 		if sqlToExec == "" {

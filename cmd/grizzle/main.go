@@ -138,7 +138,8 @@ func run(args []string) int {
 		return runInit(*templateFlag, *dirFlag, *forceFlag)
 	case "plan":
 		isGitHub := *githubOutput || *formatFlag == "github"
-		return runPlan(ctx, dsn, *schemaFile, *outFile, *allowDrop, *jsonOutput, isGitHub)
+		isJSON := *jsonOutput || *formatFlag == "json"
+		return runPlan(ctx, dsn, *schemaFile, *outFile, *allowDrop, isJSON, isGitHub)
 	case "apply":
 		return runApply(ctx, dsn, *planFile, *schemaFile, *expectedHash, *allowDrop, hazards)
 	case "check":
@@ -236,7 +237,7 @@ func runPlan(ctx context.Context, dsn, schemaFile, outFile string, allowDrop, js
 	} else if jsonOutput {
 		fmt.Println(string(data))
 	} else if githubOutput {
-		outputGitHubActions(os.Stdout, p, schemaFile)
+		_ = p.FormatGitHubActions(os.Stdout, schemaFile)
 	} else {
 		_ = p.Format(os.Stdout, true)
 		fmt.Fprintf(os.Stderr, "Plan Hash: %s\n", p.Hash())
