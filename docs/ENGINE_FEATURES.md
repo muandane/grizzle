@@ -196,6 +196,8 @@ The engine applies these rules:
 
 ## Interactive terminal inspection
 
+*Status: Implemented*
+
 For local development outside automated CI pipelines, the CLI will support an interactive terminal mode.
 
 ### Behavior

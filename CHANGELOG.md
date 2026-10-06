@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0] - 2026-10-06
 
 ### Added
+- **Interactive Terminal Inspection**:
+  - Interactive TTY confirmation flow for `grizzle apply` without `--plan` when connected to an interactive terminal (`os.Stdin`).
+  - Terminal summary table rendering planned changes with operation badges (`+`, `~`, `!`), target tables/columns, and hazard severity markers (`[CODE: LEVEL]`).
+  - Detailed critical hazard explanations listing specific data loss risks and consequences prior to confirmation.
+  - Interactive prompts (`[y/N/details]`) supporting confirmation, full SQL statement inspection (`details` / `d`), and safe cancellation (`n` / `N` / default empty line) exiting with code 1.
+  - Preserves strict headless / CI behavior: interactive prompts disabled without TTY, requiring explicit `--accept-hazard <CODE>` and exiting immediately with code 2 on unaccepted critical hazards.
 - **Multi-Schema Support (PostgreSQL)**:
   - Declarative management across multiple PostgreSQL schemas via `Options.TargetSchemas` (with `Options.TargetSchema` maintained as a deprecated alias).
   - Isolated per-schema shadow environments (`_grizzle_shadow_<schema>`) and SQL qualifier rewriting (`RewriteShadowSQL`) isolating DDL statements during shadow compilation.

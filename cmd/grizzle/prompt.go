@@ -26,8 +26,8 @@ func readPromptLine(reader *bufio.Reader) (string, error) {
 // prompting the user for confirmation before applying.
 func promptInteractiveApply(in io.Reader, out io.Writer, p *grizzle.Plan) (bool, error) {
 	if p == nil || len(p.Steps) == 0 {
-		fmt.Fprintln(out, "Planned changes:")
-		fmt.Fprintln(out, "  No changes. Database schema is already in sync.")
+		_, _ = fmt.Fprintln(out, "Planned changes:")
+		_, _ = fmt.Fprintln(out, "  No changes. Database schema is already in sync.")
 		return false, nil
 	}
 
@@ -35,12 +35,12 @@ func promptInteractiveApply(in io.Reader, out io.Writer, p *grizzle.Plan) (bool,
 		return false, err
 	}
 
-	fmt.Fprint(out, "\nApply these changes? [y/N/details]: ")
+	_, _ = fmt.Fprint(out, "\nApply these changes? [y/N/details]: ")
 
 	reader := bufio.NewReader(in)
 	line, err := readPromptLine(reader)
 	if err != nil || line == "" {
-		fmt.Fprintln(out, "Migration aborted.")
+		_, _ = fmt.Fprintln(out, "Migration aborted.")
 		return false, nil
 	}
 
@@ -49,24 +49,24 @@ func promptInteractiveApply(in io.Reader, out io.Writer, p *grizzle.Plan) (bool,
 	case "y", "yes":
 		return true, nil
 	case "d", "details":
-		fmt.Fprintln(out, "\nFull SQL statements:")
+		_, _ = fmt.Fprintln(out, "\nFull SQL statements:")
 		for i, s := range p.Steps {
-			fmt.Fprintf(out, "  %d. %s\n", i+1, strings.TrimSpace(s.SQL))
+			_, _ = fmt.Fprintf(out, "  %d. %s\n", i+1, strings.TrimSpace(s.SQL))
 		}
-		fmt.Fprint(out, "\nApply these changes? [y/N]: ")
+		_, _ = fmt.Fprint(out, "\nApply these changes? [y/N]: ")
 		secondLine, err := readPromptLine(reader)
 		if err != nil || secondLine == "" {
-			fmt.Fprintln(out, "Migration aborted.")
+			_, _ = fmt.Fprintln(out, "Migration aborted.")
 			return false, nil
 		}
 		secondAns := strings.ToLower(secondLine)
 		if secondAns == "y" || secondAns == "yes" {
 			return true, nil
 		}
-		fmt.Fprintln(out, "Migration aborted.")
+		_, _ = fmt.Fprintln(out, "Migration aborted.")
 		return false, nil
 	default:
-		fmt.Fprintln(out, "Migration aborted.")
+		_, _ = fmt.Fprintln(out, "Migration aborted.")
 		return false, nil
 	}
 }
