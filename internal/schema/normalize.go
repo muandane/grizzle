@@ -199,10 +199,20 @@ func NormalizeDefinition(def, shadowSchema, targetSchema string) string {
 		head = strings.ReplaceAll(head, "references "+s+".", "references ")
 		head = strings.ReplaceAll(head, "references \""+s+"\".", "references ")
 
+		// Strip schema from functional expressions in head: "(<schema>." -> "(", ",<schema>." -> ","
+		head = strings.ReplaceAll(head, "("+s+".", "(")
+		head = strings.ReplaceAll(head, "(\""+s+"\".", "(")
+		head = strings.ReplaceAll(head, ","+s+".", ",")
+		head = strings.ReplaceAll(head, ",\""+s+"\".", ",")
+
 		// Normalize type casts "::<schema>." in predicate and header
 		if hasPred {
 			pred = strings.ReplaceAll(pred, "::"+s+".", "::")
 			pred = strings.ReplaceAll(pred, "::\""+s+"\".", "::")
+			pred = strings.ReplaceAll(pred, "("+s+".", "(")
+			pred = strings.ReplaceAll(pred, "(\""+s+"\".", "(")
+			pred = strings.ReplaceAll(pred, ","+s+".", ",")
+			pred = strings.ReplaceAll(pred, ",\""+s+"\".", ",")
 		} else {
 			head = strings.ReplaceAll(head, "::"+s+".", "::")
 			head = strings.ReplaceAll(head, "::\""+s+"\".", "::")
