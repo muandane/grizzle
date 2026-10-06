@@ -143,7 +143,14 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 	_ = ApplySessionTimeouts(ctx, conn, cfg.LockTimeout, cfg.StatementTimeout)
 
 	// 1. Acquire session-level advisory lock on dedicated connection
-	if err := postgres.AcquireSessionAdvisoryLock(ctx, conn, cfg.LockID); err != nil {
+	lockTimeout := cfg.LockTimeout
+	if lockTimeout <= 0 {
+		lockTimeout = DefaultLockTimeout
+	}
+	lockCtx, cancelLock := context.WithTimeout(ctx, lockTimeout)
+	err = postgres.AcquireSessionAdvisoryLock(lockCtx, conn, cfg.LockID)
+	cancelLock()
+	if err != nil {
 		if logger != nil {
 			logger.ErrorContext(ctx, "grizzle: lock acquisition failed", "lock_id", cfg.LockID, "error", err)
 		}
@@ -151,6 +158,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 	}
 	defer func() {
 		_ = postgres.ReleaseSessionAdvisoryLock(context.Background(), conn, cfg.LockID)
+		_, _ = conn.ExecContext(context.Background(), "RESET search_path; RESET lock_timeout; RESET statement_timeout;")
 	}()
 
 	if logger != nil {
@@ -564,4 +572,304 @@ func PlanDiffSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) (*pla
 		ExpandContract: cfg.Filters.ExpandContract,
 		SchemaSQL:      cfg.SchemaSQL,
 	}, nil
+}
+
+// ApplyPostgres applies a precomputed plan to PostgreSQL using a dedicated connection,
+// session-level advisory locking, step grouping (NonTx vs Tx), timeouts, and retry logic.
+func ApplyPostgres(ctx context.Context, db *sql.DB, p *plan.Plan, cfg PostgresExecConfig) error {
+	if p == nil {
+		return fmt.Errorf("grizzle: plan cannot be nil")
+	}
+
+	// 1. Enforce safety policy (policy check hard-blocks drops regardless of AcceptHazards)
+	if err := p.ValidatePolicy(); err != nil {
+		if cfg.Logger != nil {
+			if vErr, ok := errors.AsType[*plan.DestructiveViolationError](err); ok {
+				cfg.Logger.WarnContext(ctx, "grizzle: migration blocked by safety policy", "violations_count", len(vErr.Violations))
+			} else {
+				cfg.Logger.WarnContext(ctx, "grizzle: migration blocked by safety policy", "error", err)
+			}
+		}
+		return err
+	}
+
+	// 1b. Enforce hazard gating (fails on critical hazards unless explicitly accepted)
+	if err := p.ValidateHazards(cfg.AcceptHazards); err != nil {
+		if cfg.Logger != nil {
+			cfg.Logger.WarnContext(ctx, "grizzle: migration blocked by unaccepted critical hazards", "error", err)
+		}
+		return err
+	}
+
+	if cfg.DryRun || len(p.Steps) == 0 {
+		return nil
+	}
+
+	maxRetries := max(cfg.MaxRetries, 0)
+	attempt := 0
+
+	for {
+		committed, err := applyPostgresOnce(ctx, db, p, cfg)
+		if err == nil {
+			if cfg.Backfill != nil && p.ExpandContract {
+				if err := RunBackfill(ctx, db, cfg.TargetSchema, p.Renames, nil, cfg.Backfill, cfg.Logger); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+
+		// Only retry before any step has committed. After partial progress: abort, require re-plan.
+		if committed > 0 || !IsLockTimeout(err) || attempt >= maxRetries {
+			return err
+		}
+
+		attempt++
+		backoff := ComputeBackoff(attempt, cfg.RandFloat)
+		if cfg.Logger != nil {
+			cfg.Logger.WarnContext(ctx, "grizzle: lock timeout encountered before progress, retrying plan apply",
+				"attempt", attempt,
+				"max_retries", maxRetries,
+				"backoff_ms", backoff.Milliseconds(),
+				"error", err,
+			)
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("context cancelled during lock retry: %w", ctx.Err())
+		case <-time.After(backoff):
+		}
+	}
+}
+
+func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg PostgresExecConfig) (int, error) {
+	start := time.Now()
+	logger := cfg.Logger
+	if logger != nil {
+		logger.InfoContext(ctx, "grizzle: starting plan execution", "target_schema", cfg.TargetSchema, "steps_count", len(p.Steps))
+	}
+
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("grizzle: failed to acquire connection: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if err := postgres.ValidateIdentifier(cfg.TargetSchema); err == nil {
+		_, _ = conn.ExecContext(ctx, fmt.Sprintf("SET search_path TO %q, public;", cfg.TargetSchema))
+	}
+
+	// Apply session-level timeouts
+	_ = ApplySessionTimeouts(ctx, conn, cfg.LockTimeout, cfg.StatementTimeout)
+
+	// Acquire session-level advisory lock on dedicated connection
+	lockTimeout := cfg.LockTimeout
+	if lockTimeout <= 0 {
+		lockTimeout = DefaultLockTimeout
+	}
+	lockCtx, cancelLock := context.WithTimeout(ctx, lockTimeout)
+	err = postgres.AcquireSessionAdvisoryLock(lockCtx, conn, cfg.LockID)
+	cancelLock()
+	if err != nil {
+		if logger != nil {
+			logger.ErrorContext(ctx, "grizzle: lock acquisition failed", "lock_id", cfg.LockID, "error", err)
+		}
+		return 0, fmt.Errorf("%w: %w", plan.ErrLockAcquisition, err)
+	}
+	defer func() {
+		_ = postgres.ReleaseSessionAdvisoryLock(context.Background(), conn, cfg.LockID)
+		_, _ = conn.ExecContext(context.Background(), "RESET search_path; RESET lock_timeout; RESET statement_timeout;")
+	}()
+
+	if logger != nil {
+		logger.DebugContext(ctx, "grizzle: acquired session advisory lock", "lock_id", cfg.LockID)
+	}
+
+	// Apply DDL statements split into transactional and non-transactional groups
+	groups := GroupSteps(p.Steps)
+	stepIdx := 0
+	committedSteps := 0
+
+	recordFailureHistory := func(failedStep int, execErr error, isNonTx bool) {
+		status := "failed"
+		if committedSteps > 0 || isNonTx {
+			status = "partial"
+		}
+		histCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		histConn, err := db.Conn(histCtx)
+		if err == nil {
+			defer func() { _ = histConn.Close() }()
+			_ = history.RecordProgress(histCtx, histConn, "postgres", cfg.TargetSchema, p, status, failedStep, execErr, time.Since(start))
+		}
+	}
+
+	for groupIdx, group := range groups {
+		isLastGroup := groupIdx == len(groups)-1
+		if group.NonTx {
+			for _, s := range group.Steps {
+				stepIdx++
+				stepStart := time.Now()
+				if _, err := conn.ExecContext(ctx, s.SQL); err != nil {
+					if logger != nil {
+						logger.ErrorContext(ctx, "grizzle: failed executing non-tx step", "step_index", stepIdx, "sql", s.SQL, "error", err)
+					}
+					recordFailureHistory(stepIdx, err, true)
+					return committedSteps + 1, fmt.Errorf("%w: failed executing non-tx [%s]: %w", plan.ErrExecutionFailed, s.SQL, err)
+				}
+				committedSteps++
+				if logger != nil {
+					logger.DebugContext(ctx, "grizzle: executed non-tx step", "step_index", stepIdx, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
+				}
+			}
+			if isLastGroup {
+				if err := history.RecordPlan(ctx, conn, "postgres", cfg.TargetSchema, p, time.Since(start)); err != nil {
+					if logger != nil {
+						logger.WarnContext(ctx, "grizzle: failed recording history on conn", "error", err)
+					}
+				}
+			}
+		} else {
+			tx, err := conn.BeginTx(ctx, nil)
+			if err != nil {
+				return committedSteps, fmt.Errorf("grizzle: failed to begin step transaction: %w", err)
+			}
+			if err := postgres.ValidateIdentifier(cfg.TargetSchema); err == nil {
+				_, _ = tx.ExecContext(ctx, fmt.Sprintf("SET LOCAL search_path TO %q, public;", cfg.TargetSchema))
+			}
+			_ = ApplyTxTimeouts(ctx, tx, cfg.LockTimeout, cfg.StatementTimeout)
+
+			for _, s := range group.Steps {
+				stepIdx++
+				stepStart := time.Now()
+				if _, err := tx.ExecContext(ctx, s.SQL); err != nil {
+					_ = tx.Rollback()
+					if logger != nil {
+						logger.ErrorContext(ctx, "grizzle: failed executing step in tx", "step_index", stepIdx, "sql", s.SQL, "error", err)
+					}
+					recordFailureHistory(stepIdx, err, false)
+					return committedSteps, fmt.Errorf("%w: failed executing [%s]: %w", plan.ErrExecutionFailed, s.SQL, err)
+				}
+				if logger != nil {
+					logger.DebugContext(ctx, "grizzle: executed step in tx", "step_index", stepIdx, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
+				}
+			}
+
+			if isLastGroup {
+				if err := history.RecordPlan(ctx, tx, "postgres", cfg.TargetSchema, p, time.Since(start)); err != nil {
+					if logger != nil {
+						logger.WarnContext(ctx, "grizzle: failed recording history in tx", "error", err)
+					}
+				}
+			}
+
+			if err := tx.Commit(); err != nil {
+				recordFailureHistory(stepIdx, err, false)
+				return committedSteps, fmt.Errorf("grizzle: failed committing step transaction: %w", err)
+			}
+			committedSteps += len(group.Steps)
+		}
+	}
+
+	if logger != nil {
+		logger.InfoContext(ctx, "grizzle: plan execution finished successfully", "steps_applied", len(p.Steps), "total_duration", time.Since(start))
+	}
+
+	return committedSteps, nil
+}
+
+// ApplySQLite applies a precomputed plan to SQLite in a single transaction with foreign keys handling.
+func ApplySQLite(ctx context.Context, db *sql.DB, p *plan.Plan, cfg SQLiteExecConfig) error {
+	if p == nil {
+		return fmt.Errorf("sqlite: plan cannot be nil")
+	}
+
+	if err := p.ValidatePolicy(); err != nil {
+		if cfg.Logger != nil {
+			if vErr, ok := errors.AsType[*plan.DestructiveViolationError](err); ok {
+				cfg.Logger.WarnContext(ctx, "sqlite: migration blocked by safety policy", "violations_count", len(vErr.Violations))
+			} else {
+				cfg.Logger.WarnContext(ctx, "sqlite: migration blocked by safety policy", "error", err)
+			}
+		}
+		return err
+	}
+
+	if err := p.ValidateHazards(cfg.AcceptHazards); err != nil {
+		if cfg.Logger != nil {
+			cfg.Logger.WarnContext(ctx, "sqlite: migration blocked by unaccepted critical hazards", "error", err)
+		}
+		return err
+	}
+
+	if cfg.DryRun || len(p.Steps) == 0 {
+		return nil
+	}
+
+	start := time.Now()
+	logger := cfg.Logger
+	if logger != nil {
+		logger.InfoContext(ctx, "sqlite: starting SQLite plan application")
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("sqlite: failed to begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, "PRAGMA foreign_keys = OFF;"); err != nil {
+		return fmt.Errorf("sqlite: failed to disable foreign keys: %w", err)
+	}
+
+	for i, s := range p.Steps {
+		stepStart := time.Now()
+		sqlToExec := strings.TrimSpace(s.SQL)
+		if sqlToExec == "" {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, sqlToExec); err != nil {
+			_ = tx.Rollback()
+			if logger != nil {
+				logger.ErrorContext(ctx, "sqlite: failed executing step", "step_index", i+1, "sql", sqlToExec, "error", err)
+			}
+			histCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = history.RecordProgress(histCtx, db, "sqlite", "", p, "failed", i+1, err, time.Since(start))
+			return fmt.Errorf("%w: failed executing [%s]: %w", plan.ErrExecutionFailed, sqlToExec, err)
+		}
+		if logger != nil {
+			logger.DebugContext(ctx, "sqlite: executed step", "step_index", i+1, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx, "PRAGMA foreign_key_check;"); err != nil {
+		return fmt.Errorf("sqlite: foreign key check failed: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, "PRAGMA foreign_keys = ON;"); err != nil {
+		return fmt.Errorf("sqlite: failed to re-enable foreign keys: %w", err)
+	}
+
+	if err := history.RecordPlan(ctx, tx, "sqlite", "", p, time.Since(start)); err != nil {
+		if logger != nil {
+			logger.WarnContext(ctx, "sqlite: failed recording history in tx", "error", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	if cfg.Backfill != nil && p.ExpandContract {
+		if err := RunBackfill(ctx, db, "main", p.Renames, p.Steps, cfg.Backfill, cfg.Logger); err != nil {
+			return err
+		}
+	}
+
+	if logger != nil {
+		logger.InfoContext(ctx, "sqlite: plan application finished successfully", "steps_applied", len(p.Steps), "total_duration", time.Since(start))
+	}
+
+	return nil
 }
