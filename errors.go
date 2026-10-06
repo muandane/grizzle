@@ -42,6 +42,9 @@ var (
 
 	// ErrStrictScope is returned when StrictScope is enabled but no IncludeTables are specified.
 	ErrStrictScope = plan.ErrStrictScope
+
+	// ErrPartitionConversion is returned when attempting to convert a regular table to a partitioned table or vice versa in-place.
+	ErrPartitionConversion = plan.ErrPartitionConversion
 )
 
 // HazardError reports all critical hazards that were not explicitly accepted.

@@ -66,22 +66,42 @@ type EnumIR = schema.Enum
 // GeneratedColumn describes a computed or generated column.
 type GeneratedColumn = schema.GeneratedColumn
 
+// PartitionStrategy represents the partitioning method used by a partitioned table.
+type PartitionStrategy = schema.PartitionStrategy
+
+// PartitionKey defines how a partitioned table is divided.
+type PartitionKey = schema.PartitionKey
+
+// PartitionOf defines the relationship of a partition table to its parent partitioned table.
+type PartitionOf = schema.PartitionOf
+
+// PartitionStrategy constants
+const (
+	// PartitionStrategyRange indicates range-based partitioning.
+	PartitionStrategyRange = schema.PartitionStrategyRange
+	// PartitionStrategyList indicates list-based partitioning.
+	PartitionStrategyList = schema.PartitionStrategyList
+	// PartitionStrategyHash indicates hash-based partitioning.
+	PartitionStrategyHash = schema.PartitionStrategyHash
+)
 
 // ChangeType constants
 const (
-	ChangeCreateEnum  = plan.ChangeCreateEnum
-	ChangeAlterEnum   = plan.ChangeAlterEnum
-	ChangeCreateTable = plan.ChangeCreateTable
-	ChangeDropTable   = plan.ChangeDropTable
-	ChangeAddColumn   = plan.ChangeAddColumn
-	ChangeDropColumn  = plan.ChangeDropColumn
-	ChangeAlterColumn = plan.ChangeAlterColumn
-	ChangeCreateIndex = plan.ChangeCreateIndex
-	ChangeDropIndex   = plan.ChangeDropIndex
+	ChangeCreateEnum         = plan.ChangeCreateEnum
+	ChangeAlterEnum          = plan.ChangeAlterEnum
+	ChangeCreateTable        = plan.ChangeCreateTable
+	ChangeDropTable          = plan.ChangeDropTable
+	ChangeAddColumn          = plan.ChangeAddColumn
+	ChangeDropColumn         = plan.ChangeDropColumn
+	ChangeAlterColumn        = plan.ChangeAlterColumn
+	ChangeCreateIndex        = plan.ChangeCreateIndex
+	ChangeDropIndex          = plan.ChangeDropIndex
 	ChangeAddFK              = plan.ChangeAddFK
 	ChangeDropFK             = plan.ChangeDropFK
 	ChangeValidateConstraint = plan.ChangeValidateConstraint
 	ChangeRenameColumn       = plan.ChangeRenameColumn
+	ChangeAttachPartition    = plan.ChangeAttachPartition
+	ChangeDetachPartition    = plan.ChangeDetachPartition
 )
 
 // HazardCode constants
@@ -96,6 +116,7 @@ const (
 	HazardRenameAmbiguous     = plan.HazardRenameAmbiguous
 	HazardUnmanagedDependency = plan.HazardUnmanagedDependency
 	HazardGeneratedRewrite    = plan.HazardGeneratedRewrite
+	HazardPartitionAttachScan = plan.HazardPartitionAttachScan
 )
 
 // UnmanagedObject represents an unmanaged database object detected during introspection.
