@@ -43,7 +43,10 @@ func diffSchemas(live, desired *schema.Schema, targetSchema, shadowSchema string
 			f = sf
 		}
 	}
-	changes := diff.Diff(live, desired, targetSchema, shadowSchema, f)
+	changes, err := diff.Diff(live, desired, targetSchema, shadowSchema, f)
+	if err != nil {
+		panic(err)
+	}
 	return postgres.RenderChanges(targetSchema, changes)
 }
 

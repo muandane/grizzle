@@ -40,10 +40,14 @@ type Change struct {
 
 	// Unmanaged object dependencies (views, triggers, functions depending on this table/column)
 	UnmanagedDeps []string
+
+	// Partitioning metadata
+	ParentTable     string
+	PartitionBounds string
 }
 
 // Diff compares live and desired schemas using the given scope filters and returns pure changes.
-func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filters scope.Filters) []Change {
+func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filters scope.Filters) ([]Change, error) {
 	var changes []Change
 
 	// 1. Custom ENUM Types Diff
@@ -79,12 +83,17 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 		}
 		lTable, exists := live.Tables[tblName]
 		if !exists {
-			changes = append(changes, Change{
+			createChange := Change{
 				Type:        plan.ChangeCreateTable,
 				Table:       tblName,
 				TableData:   dTable,
 				Destructive: false,
-			})
+			}
+			if dTable.IsPartition() {
+				createChange.ParentTable = dTable.PartitionOf.Parent
+				createChange.PartitionBounds = schema.NormalizeDefinition(dTable.PartitionOf.Bounds, shadowSchema, targetSchema)
+			}
+			changes = append(changes, createChange)
 
 			for _, dIdx := range dTable.Indexes {
 				normDef := schema.NormalizeDefinition(dIdx.Definition, shadowSchema, targetSchema)
@@ -112,141 +121,193 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 			continue
 		}
 
-		// Existing table: Diff columns
-		addedCols := make(map[string]*schema.Column)
-		for colName, dCol := range dTable.Columns {
-			lCol, colExists := lTable.Columns[colName]
-			if !colExists {
-				addedCols[colName] = dCol
-			} else {
-				typeChanged := schema.NormalizeType(dCol.DataType) != schema.NormalizeType(lCol.DataType)
-				nullChanged := dCol.IsNullable != lCol.IsNullable
-				defChanged := dCol.DefaultValue != lCol.DefaultValue
-				genChanged := false
-				if (lCol.Generated == nil) != (dCol.Generated == nil) {
-					genChanged = true
-				} else if lCol.Generated != nil && dCol.Generated != nil {
-					if schema.NormalizeGeneratedExpr(lCol.Generated.Expr) != schema.NormalizeGeneratedExpr(dCol.Generated.Expr) ||
-						lCol.Generated.Stored != dCol.Generated.Stored {
+		// Reject in-place table <-> partitioned table conversion
+		if lTable.IsPartitioned() != dTable.IsPartitioned() {
+			return nil, fmt.Errorf("%w: table %q cannot be converted in-place between regular and partitioned table", plan.ErrPartitionConversion, tblName)
+		}
+		if lTable.IsPartitioned() && dTable.IsPartitioned() {
+			lKey := schema.NormalizeDefinition(lTable.PartitionKey.Def, shadowSchema, targetSchema)
+			dKey := schema.NormalizeDefinition(dTable.PartitionKey.Def, shadowSchema, targetSchema)
+			if lTable.PartitionKey.Strategy != dTable.PartitionKey.Strategy || lKey != dKey {
+				return nil, fmt.Errorf("%w: table %q cannot change partition strategy or key in-place", plan.ErrPartitionConversion, tblName)
+			}
+		}
+
+		// Partition attachment or detachment transitions
+		if dTable.IsPartition() && !lTable.IsPartition() {
+			normBounds := schema.NormalizeDefinition(dTable.PartitionOf.Bounds, shadowSchema, targetSchema)
+			changes = append(changes, Change{
+				Type:            plan.ChangeAttachPartition,
+				Table:           tblName,
+				ParentTable:     dTable.PartitionOf.Parent,
+				PartitionBounds: normBounds,
+				Destructive:     false,
+			})
+		} else if !dTable.IsPartition() && lTable.IsPartition() {
+			changes = append(changes, Change{
+				Type:        plan.ChangeDetachPartition,
+				Table:       tblName,
+				ParentTable: lTable.PartitionOf.Parent,
+				Destructive: false,
+			})
+		} else if dTable.IsPartition() && lTable.IsPartition() {
+			normLiveBounds := schema.NormalizeDefinition(lTable.PartitionOf.Bounds, shadowSchema, targetSchema)
+			normDesiredBounds := schema.NormalizeDefinition(dTable.PartitionOf.Bounds, shadowSchema, targetSchema)
+			if lTable.PartitionOf.Parent != dTable.PartitionOf.Parent || normLiveBounds != normDesiredBounds {
+				changes = append(changes, Change{
+					Type:        plan.ChangeDetachPartition,
+					Table:       tblName,
+					ParentTable: lTable.PartitionOf.Parent,
+					Destructive: false,
+				})
+				changes = append(changes, Change{
+					Type:            plan.ChangeAttachPartition,
+					Table:           tblName,
+					ParentTable:     dTable.PartitionOf.Parent,
+					PartitionBounds: normDesiredBounds,
+					Destructive:     false,
+				})
+			}
+		}
+
+		// Attached partitions inherit and manage columns through the parent partitioned table
+		if !dTable.IsPartition() {
+			// Existing table: Diff columns
+			addedCols := make(map[string]*schema.Column)
+			for colName, dCol := range dTable.Columns {
+				lCol, colExists := lTable.Columns[colName]
+				if !colExists {
+					addedCols[colName] = dCol
+				} else {
+					typeChanged := schema.NormalizeType(dCol.DataType) != schema.NormalizeType(lCol.DataType)
+					nullChanged := dCol.IsNullable != lCol.IsNullable
+					defChanged := dCol.DefaultValue != lCol.DefaultValue
+					genChanged := false
+					if (lCol.Generated == nil) != (dCol.Generated == nil) {
 						genChanged = true
+					} else if lCol.Generated != nil && dCol.Generated != nil {
+						if schema.NormalizeGeneratedExpr(lCol.Generated.Expr) != schema.NormalizeGeneratedExpr(dCol.Generated.Expr) ||
+							lCol.Generated.Stored != dCol.Generated.Stored {
+							genChanged = true
+						}
 					}
-				}
 
-				if typeChanged || nullChanged || defChanged || genChanged {
-					typeNarrowed := typeChanged && schema.IsTypeNarrowing(lCol.DataType, dCol.DataType)
-					destructive := typeNarrowed || (!dCol.IsNullable && lCol.IsNullable)
-					var unmDeps []string
-					if typeChanged || typeNarrowed {
-						unmDeps = findUnmanagedDeps(live.Unmanaged, tblName, colName)
-					}
-					changes = append(changes, Change{
-						Type:             plan.ChangeAlterColumn,
-						Table:            tblName,
-						Column:           dCol,
-						OldColumn:        lCol,
-						TypeChanged:      typeChanged,
-						TypeNarrowed:     typeNarrowed,
-						NullChanged:      nullChanged,
-						DefaultChanged:   defChanged,
-						GeneratedChanged: genChanged,
-						Destructive:      destructive,
-						ColumnNotNull:    !dCol.IsNullable,
-						ColumnHasDefault: dCol.DefaultValue != "",
-						UnmanagedDeps:    unmDeps,
-					})
-				}
-			}
-		}
-
-		// Dropped columns
-		droppedCols := make(map[string]*schema.Column)
-		for colName, lCol := range lTable.Columns {
-			if _, inDesired := dTable.Columns[colName]; !inDesired {
-				droppedCols[colName] = lCol
-			}
-		}
-
-		// Check for explicit rename mappings from filters.Renames
-		droppedKeys := slices.Collect(maps.Keys(droppedCols))
-		slices.Sort(droppedKeys)
-
-		for _, lColName := range droppedKeys {
-			lCol := droppedCols[lColName]
-			var mappedNew string
-			if target, ok := filters.Renames[fmt.Sprintf("%s.%s", tblName, lColName)]; ok {
-				mappedNew = target
-			} else if target, ok := filters.Renames[lColName]; ok {
-				mappedNew = target
-			}
-
-			if mappedNew != "" {
-				if dCol, ok := addedCols[mappedNew]; ok {
-					// Disambiguated rename match found!
-					delete(droppedCols, lColName)
-					delete(addedCols, mappedNew)
-
-					if filters.ExpandContract {
-						// Staged Expand phase: add new column (forced nullable during expand), keep old column in place
-						expandedCol := *dCol
-						expandedCol.IsNullable = true
+					if typeChanged || nullChanged || defChanged || genChanged {
+						typeNarrowed := typeChanged && schema.IsTypeNarrowing(lCol.DataType, dCol.DataType)
+						destructive := typeNarrowed || (!dCol.IsNullable && lCol.IsNullable)
+						var unmDeps []string
+						if typeChanged || typeNarrowed {
+							unmDeps = findUnmanagedDeps(live.Unmanaged, tblName, colName)
+						}
 						changes = append(changes, Change{
-							Type:             plan.ChangeAddColumn,
+							Type:             plan.ChangeAlterColumn,
 							Table:            tblName,
-							Column:           &expandedCol,
-							Destructive:      false,
-							ColumnNotNull:    false,
+							Column:           dCol,
+							OldColumn:        lCol,
+							TypeChanged:      typeChanged,
+							TypeNarrowed:     typeNarrowed,
+							NullChanged:      nullChanged,
+							DefaultChanged:   defChanged,
+							GeneratedChanged: genChanged,
+							Destructive:      destructive,
+							ColumnNotNull:    !dCol.IsNullable,
 							ColumnHasDefault: dCol.DefaultValue != "",
-						})
-					} else {
-						// Single-step atomic rename
-						changes = append(changes, Change{
-							Type:        plan.ChangeRenameColumn,
-							Table:       tblName,
-							Column:      dCol,
-							OldColumn:   lCol,
-							Destructive: false,
+							UnmanagedDeps:    unmDeps,
 						})
 					}
 				}
 			}
-		}
 
-		// Process remaining added columns in sorted order
-		addedKeys := slices.Collect(maps.Keys(addedCols))
-		slices.Sort(addedKeys)
-		for _, colName := range addedKeys {
-			dCol := addedCols[colName]
-			changes = append(changes, Change{
-				Type:             plan.ChangeAddColumn,
-				Table:            tblName,
-				Column:           dCol,
-				Destructive:      false,
-				ColumnNotNull:    !dCol.IsNullable,
-				ColumnHasDefault: dCol.DefaultValue != "",
-			})
-		}
-
-		// Process remaining dropped columns (detecting unmapped ambiguous rename candidates)
-		remainingDropped := slices.Collect(maps.Keys(droppedCols))
-		slices.Sort(remainingDropped)
-		for _, colName := range remainingDropped {
-			lCol := droppedCols[colName]
-			isAmbiguousCandidate := false
-			for _, dCol := range addedCols {
-				if schema.NormalizeType(dCol.DataType) == schema.NormalizeType(lCol.DataType) {
-					isAmbiguousCandidate = true
-					break
+			// Dropped columns
+			droppedCols := make(map[string]*schema.Column)
+			for colName, lCol := range lTable.Columns {
+				if _, inDesired := dTable.Columns[colName]; !inDesired {
+					droppedCols[colName] = lCol
 				}
 			}
-			changes = append(changes, Change{
-				Type:              plan.ChangeDropColumn,
-				Table:             tblName,
-				Column:            lCol,
-				OldColumn:         lCol,
-				Destructive:       true,
-				IsRenameCandidate: isAmbiguousCandidate,
-				UnmanagedDeps:     findUnmanagedDeps(live.Unmanaged, tblName, colName),
-			})
+
+			// Check for explicit rename mappings from filters.Renames
+			droppedKeys := slices.Collect(maps.Keys(droppedCols))
+			slices.Sort(droppedKeys)
+
+			for _, lColName := range droppedKeys {
+				lCol := droppedCols[lColName]
+				var mappedNew string
+				if target, ok := filters.Renames[fmt.Sprintf("%s.%s", tblName, lColName)]; ok {
+					mappedNew = target
+				} else if target, ok := filters.Renames[lColName]; ok {
+					mappedNew = target
+				}
+
+				if mappedNew != "" {
+					if dCol, ok := addedCols[mappedNew]; ok {
+						// Disambiguated rename match found!
+						delete(droppedCols, lColName)
+						delete(addedCols, mappedNew)
+
+						if filters.ExpandContract {
+							// Staged Expand phase: add new column (forced nullable during expand), keep old column in place
+							expandedCol := *dCol
+							expandedCol.IsNullable = true
+							changes = append(changes, Change{
+								Type:             plan.ChangeAddColumn,
+								Table:            tblName,
+								Column:           &expandedCol,
+								Destructive:      false,
+								ColumnNotNull:    false,
+								ColumnHasDefault: dCol.DefaultValue != "",
+							})
+						} else {
+							// Single-step atomic rename
+							changes = append(changes, Change{
+								Type:        plan.ChangeRenameColumn,
+								Table:       tblName,
+								Column:      dCol,
+								OldColumn:   lCol,
+								Destructive: false,
+							})
+						}
+					}
+				}
+			}
+
+			// Process remaining added columns in sorted order
+			addedKeys := slices.Collect(maps.Keys(addedCols))
+			slices.Sort(addedKeys)
+			for _, colName := range addedKeys {
+				dCol := addedCols[colName]
+				changes = append(changes, Change{
+					Type:             plan.ChangeAddColumn,
+					Table:            tblName,
+					Column:           dCol,
+					Destructive:      false,
+					ColumnNotNull:    !dCol.IsNullable,
+					ColumnHasDefault: dCol.DefaultValue != "",
+				})
+			}
+
+			// Process remaining dropped columns (detecting unmapped ambiguous rename candidates)
+			remainingDropped := slices.Collect(maps.Keys(droppedCols))
+			slices.Sort(remainingDropped)
+			for _, colName := range remainingDropped {
+				lCol := droppedCols[colName]
+				isAmbiguousCandidate := false
+				for _, dCol := range addedCols {
+					if schema.NormalizeType(dCol.DataType) == schema.NormalizeType(lCol.DataType) {
+						isAmbiguousCandidate = true
+						break
+					}
+				}
+				changes = append(changes, Change{
+					Type:              plan.ChangeDropColumn,
+					Table:             tblName,
+					Column:            lCol,
+					OldColumn:         lCol,
+					Destructive:       true,
+					IsRenameCandidate: isAmbiguousCandidate,
+					UnmanagedDeps:     findUnmanagedDeps(live.Unmanaged, tblName, colName),
+				})
+			}
 		}
 
 		// Indexes Diff
@@ -367,7 +428,7 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 		}
 	}
 
-	return changes
+	return changes, nil
 }
 
 func findUnmanagedDeps(unmanaged map[string]*schema.UnmanagedObject, table, column string) []string {

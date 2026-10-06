@@ -51,7 +51,10 @@ func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig
 		return nil, fmt.Errorf("%w: shadow schema: %w", plan.ErrInspectionFailed, err)
 	}
 
-	changes := diff.Diff(live, desired, cfg.TargetSchema, cfg.ShadowSchema, cfg.Filters)
+	changes, err := diff.Diff(live, desired, cfg.TargetSchema, cfg.ShadowSchema, cfg.Filters)
+	if err != nil {
+		return nil, err
+	}
 	steps := postgres.RenderChanges(cfg.TargetSchema, changes, cfg.NonConcurrentIndexes)
 	return steps, nil
 }

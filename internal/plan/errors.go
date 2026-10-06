@@ -45,6 +45,9 @@ var (
 
 	// ErrStrictScope is returned when StrictScope is enabled but no IncludeTables are specified.
 	ErrStrictScope = errors.New("grizzle: strict scope violation (IncludeTables required)")
+
+	// ErrPartitionConversion is returned when attempting to alter a regular table into a partitioned table in-place.
+	ErrPartitionConversion = errors.New("grizzle: in-place table partitioning conversion rejected")
 )
 
 // HazardError reports all critical hazards that were not explicitly accepted.

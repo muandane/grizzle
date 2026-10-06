@@ -61,7 +61,10 @@ func TestUnmanaged_HazardOnDropColumn_PureUnit(t *testing.T) {
 		Enums: make(map[string]*schema.Enum),
 	}
 
-	changes := diff.Diff(live, desired, "public", "_shadow", scope.Filters{})
+	changes, err := diff.Diff(live, desired, "public", "_shadow", scope.Filters{})
+	if err != nil {
+		t.Fatalf("unexpected diff error: %v", err)
+	}
 	var dropCol *diff.Change
 	for i := range changes {
 		if changes[i].Type == plan.ChangeDropColumn && changes[i].OldColumn != nil && changes[i].OldColumn.Name == "email" {
@@ -102,7 +105,7 @@ func TestUnmanaged_HazardOnDropColumn_PureUnit(t *testing.T) {
 	}
 
 	// Gating: without accepting UNMANAGED_DEPENDENCY, execution must be blocked
-	err := p.ValidateHazards([]plan.HazardCode{plan.HazardDropColumn})
+	err = p.ValidateHazards([]plan.HazardCode{plan.HazardDropColumn})
 	if !errors.Is(err, plan.ErrHazardBlocked) {
 		t.Fatalf("expected ErrHazardBlocked when UNMANAGED_DEPENDENCY is not accepted, got: %v", err)
 	}
@@ -157,7 +160,10 @@ func TestUnmanaged_UnrelatedViewIgnored_PureUnit(t *testing.T) {
 		Enums: make(map[string]*schema.Enum),
 	}
 
-	changes := diff.Diff(live, desired, "public", "_shadow", scope.Filters{})
+	changes, err := diff.Diff(live, desired, "public", "_shadow", scope.Filters{})
+	if err != nil {
+		t.Fatalf("unexpected diff error: %v", err)
+	}
 	for _, c := range changes {
 		if len(c.UnmanagedDeps) > 0 {
 			t.Fatalf("expected 0 UnmanagedDeps for unrelated view, got: %+v", c.UnmanagedDeps)
@@ -216,7 +222,10 @@ func TestUnmanaged_NeverDiffDropped_PureUnit(t *testing.T) {
 		Enums: make(map[string]*schema.Enum),
 	}
 
-	changes := diff.Diff(live, desired, "public", "_shadow", scope.Filters{})
+	changes, err := diff.Diff(live, desired, "public", "_shadow", scope.Filters{})
+	if err != nil {
+		t.Fatalf("unexpected diff error: %v", err)
+	}
 	if len(changes) != 0 {
 		t.Fatalf("expected 0 diff changes for unmanaged objects, got %d: %+v", len(changes), changes)
 	}

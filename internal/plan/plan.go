@@ -27,6 +27,8 @@ const (
 	ChangeAddFK              ChangeType = "ADD_FK"
 	ChangeDropFK             ChangeType = "DROP_FK"
 	ChangeValidateConstraint ChangeType = "VALIDATE_CONSTRAINT"
+	ChangeAttachPartition    ChangeType = "ATTACH_PARTITION"
+	ChangeDetachPartition    ChangeType = "DETACH_PARTITION"
 )
 
 // Step represents a single atomic DDL migration statement.
@@ -39,14 +41,18 @@ type Step struct {
 	NonTx       bool       `json:"non_tx,omitzero"`
 
 	// Structural column metadata for precise hazard analysis
-	ColumnNotNull     bool     `json:"column_not_null,omitzero"`
-	ColumnHasDefault  bool     `json:"column_has_default,omitzero"`
-	TypeNarrowed      bool     `json:"type_narrowed,omitzero"`
-	IsTableRebuild    bool     `json:"is_table_rebuild,omitzero"`
+	ColumnNotNull      bool     `json:"column_not_null,omitzero"`
+	ColumnHasDefault   bool     `json:"column_has_default,omitzero"`
+	TypeNarrowed       bool     `json:"type_narrowed,omitzero"`
+	IsTableRebuild     bool     `json:"is_table_rebuild,omitzero"`
 	IsRenameCandidate  bool     `json:"is_rename_candidate,omitzero"`
 	IsGeneratedRewrite bool     `json:"is_generated_rewrite,omitzero"`
 	OldColumn          string   `json:"old_column,omitzero"`
 	UnmanagedDeps      []string `json:"unmanaged_deps,omitzero"`
+
+	// Partitioning metadata
+	ParentTable     string `json:"parent_table,omitzero"`
+	PartitionBounds string `json:"partition_bounds,omitzero"`
 }
 
 // DropPolicy defines fine-grained permissions for destructive operations.
@@ -123,10 +129,17 @@ func (p *Plan) Hash() string {
 		if len(s.UnmanagedDeps) > 0 {
 			unmStr = "|unmanaged_deps:" + strings.Join(s.UnmanagedDeps, ",")
 		}
-		write("step:%d|type:%s|table:%s|sql:%s|destructive:%t|non_tx:%t|not_null:%t|default:%t|narrowed:%t|rebuild:%t|rename_cand:%t|gen_rewrite:%t|old_col:%s%s\n",
+		partStr := ""
+		if s.ParentTable != "" {
+			partStr = "|parent:" + s.ParentTable
+		}
+		if s.PartitionBounds != "" {
+			partStr += "|bounds:" + s.PartitionBounds
+		}
+		write("step:%d|type:%s|table:%s|sql:%s|destructive:%t|non_tx:%t|not_null:%t|default:%t|narrowed:%t|rebuild:%t|rename_cand:%t|gen_rewrite:%t|old_col:%s%s%s\n",
 			i, s.Type, s.Table, strings.TrimSpace(s.SQL), s.Destructive, s.NonTx,
 			s.ColumnNotNull, s.ColumnHasDefault, s.TypeNarrowed, s.IsTableRebuild,
-			s.IsRenameCandidate, s.IsGeneratedRewrite, s.OldColumn, unmStr,
+			s.IsRenameCandidate, s.IsGeneratedRewrite, s.OldColumn, unmStr, partStr,
 		)
 	}
 
@@ -219,6 +232,8 @@ const (
 	HazardUnmanagedDependency HazardCode = "UNMANAGED_DEPENDENCY"
 	// HazardGeneratedRewrite indicates changing a generated column expression requiring table rewrite.
 	HazardGeneratedRewrite HazardCode = "GENERATED_REWRITE"
+	// HazardPartitionAttachScan indicates attaching an existing table to a partitioned table requiring table scan.
+	HazardPartitionAttachScan HazardCode = "PARTITION_ATTACH_SCAN"
 )
 
 // HazardLevel indicates the operational or data-loss severity of a migration step.
@@ -268,6 +283,15 @@ func (p *Plan) Hazards() []Hazard {
 			})
 		}
 		switch s.Type {
+		case ChangeAttachPartition:
+			hazards = append(hazards, Hazard{
+				Code:        HazardPartitionAttachScan,
+				Level:       HazardLevelWarning,
+				Type:        s.Type,
+				Table:       s.Table,
+				Description: fmt.Sprintf("Attaching existing table %q to parent %q requires a table validation scan under ACCESS EXCLUSIVE lock", s.Table, s.ParentTable),
+				SQL:         s.SQL,
+			})
 		case ChangeDropTable:
 			hazards = append(hazards, Hazard{
 				Code:        HazardDropTable,

@@ -60,7 +60,10 @@ func TestGeneratedColumn_PureUnit_AddAndDrop(t *testing.T) {
 	}
 
 	// 1. Add generated column
-	changes := diff.Diff(live, desired, "public", "_shadow", scope.Filters{})
+	changes, err := diff.Diff(live, desired, "public", "_shadow", scope.Filters{})
+	if err != nil {
+		t.Fatalf("unexpected diff error: %v", err)
+	}
 	if len(changes) != 1 {
 		t.Fatalf("expected 1 change adding generated column, got %d", len(changes))
 	}
@@ -73,7 +76,10 @@ func TestGeneratedColumn_PureUnit_AddAndDrop(t *testing.T) {
 	}
 
 	// 2. Drop generated column
-	dropChanges := diff.Diff(desired, live, "public", "_shadow", scope.Filters{})
+	dropChanges, err := diff.Diff(desired, live, "public", "_shadow", scope.Filters{})
+	if err != nil {
+		t.Fatalf("unexpected diff error: %v", err)
+	}
 	if len(dropChanges) != 1 {
 		t.Fatalf("expected 1 change dropping generated column, got %d", len(dropChanges))
 	}
@@ -136,7 +142,10 @@ func TestGeneratedColumn_PureUnit_ChangeExprEmitsHazard(t *testing.T) {
 		Enums: make(map[string]*schema.Enum),
 	}
 
-	changes := diff.Diff(live, desired, "public", "_shadow", scope.Filters{})
+	changes, err := diff.Diff(live, desired, "public", "_shadow", scope.Filters{})
+	if err != nil {
+		t.Fatalf("unexpected diff error: %v", err)
+	}
 	if len(changes) != 1 {
 		t.Fatalf("expected 1 change modifying generated expression, got %d", len(changes))
 	}
@@ -226,7 +235,10 @@ func TestGeneratedColumn_PureUnit_NoopRoundTrip(t *testing.T) {
 		Enums: make(map[string]*schema.Enum),
 	}
 
-	changes := diff.Diff(live, desired, "public", "_shadow", scope.Filters{})
+	changes, err := diff.Diff(live, desired, "public", "_shadow", scope.Filters{})
+	if err != nil {
+		t.Fatalf("unexpected diff error: %v", err)
+	}
 	if len(changes) != 0 {
 		t.Fatalf("expected 0 diff changes for identical normalized expression, got %d: %+v", len(changes), changes)
 	}
