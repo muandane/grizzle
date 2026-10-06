@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -483,5 +484,216 @@ func TestPartialAndFunctionalIndexes_CustomFunction(t *testing.T) {
 	}
 	if len(p.Steps) != 0 {
 		t.Fatalf("expected 0 steps on re-diff with custom function index (idempotency), got %d: %+v", len(p.Steps), p.Steps)
+	}
+}
+
+func TestPartialAndFunctionalIndexes_NonImmutableFunctionRejection(t *testing.T) {
+	connStr := os.Getenv("DATABASE_URL")
+	if connStr == "" {
+		connStr = os.Getenv("POSTGRES_DSN")
+	}
+	if connStr == "" {
+		connStr = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable"
+	}
+
+	db, err := sql.Open("pgx", connStr)
+	if err != nil {
+		t.Fatalf("failed opening pg: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := db.Ping(); err != nil {
+		t.Skipf("skipping postgres non-immutable function test, db unavailable: %v", err)
+	}
+
+	ctx := context.Background()
+	schemaPrefix := fmt.Sprintf("test_idx_non_imm_%d", time.Now().UnixNano())
+	_, err = db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schemaPrefix))
+	if err != nil {
+		t.Fatalf("failed creating schema: %v", err)
+	}
+	defer func() {
+		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schemaPrefix))
+	}()
+
+	// Volatile function in index: now() or clock_timestamp()
+	badSchemaSQL := `
+		CREATE TABLE orders (
+			id BIGINT PRIMARY KEY,
+			amount NUMERIC(10,2) NOT NULL
+		);
+		CREATE INDEX idx_orders_created ON orders ((clock_timestamp()));
+	`
+
+	opts := grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: schemaPrefix,
+		SchemaSQL:    badSchemaSQL,
+	}
+
+	// 1. Sync must fail at shadow pre-flight
+	err = grizzle.Sync(ctx, db, opts)
+	if err == nil {
+		t.Fatalf("expected Sync to fail when index uses non-IMMUTABLE function, got nil")
+	}
+
+	// 2. Error message must contain index name, table name, and "expression must be IMMUTABLE"
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "idx_orders_created") {
+		t.Errorf("expected error message to contain index name 'idx_orders_created', got: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "orders") {
+		t.Errorf("expected error message to contain table name 'orders', got: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "expression must be IMMUTABLE") {
+		t.Errorf("expected error message to contain 'expression must be IMMUTABLE', got: %s", errMsg)
+	}
+
+	// 3. Assert real database schema is completely untouched
+	var tableExists bool
+	err = db.QueryRow(fmt.Sprintf("SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = '%s' AND table_name = 'orders');", schemaPrefix)).Scan(&tableExists)
+	if err != nil {
+		t.Fatalf("failed checking table existence: %v", err)
+	}
+	if tableExists {
+		t.Errorf("expected orders table to NOT exist in target schema, but it was created")
+	}
+}
+
+func TestPartialAndFunctionalIndexes_FunctionInNonTableNonShadowSchema(t *testing.T) {
+	connStr := os.Getenv("DATABASE_URL")
+	if connStr == "" {
+		connStr = os.Getenv("POSTGRES_DSN")
+	}
+	if connStr == "" {
+		connStr = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable"
+	}
+
+	db, err := sql.Open("pgx", connStr)
+	if err != nil {
+		t.Fatalf("failed opening pg: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := db.Ping(); err != nil {
+		t.Skipf("skipping postgres non-table schema function test, db unavailable: %v", err)
+	}
+
+	ctx := context.Background()
+	timeTag := time.Now().UnixNano()
+	utilsSchema := fmt.Sprintf("test_utils_%d", timeTag)
+	targetSchema := fmt.Sprintf("test_app_%d", timeTag)
+
+	_, err = db.Exec(fmt.Sprintf("CREATE SCHEMA %s; CREATE SCHEMA %s;", utilsSchema, targetSchema))
+	if err != nil {
+		t.Fatalf("failed creating schemas: %v", err)
+	}
+	defer func() {
+		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE; DROP SCHEMA %s CASCADE;", utilsSchema, targetSchema))
+	}()
+
+	// 1. Create an immutable function in the non-target utilsSchema
+	createFuncSQL := fmt.Sprintf(`
+		CREATE OR REPLACE FUNCTION %s.hash_code(val text) RETURNS text AS $$
+		BEGIN
+			RETURN encode(digest(val, 'sha256'), 'hex');
+		EXCEPTION WHEN undefined_function THEN
+			RETURN md5(val);
+		END;
+		$$ LANGUAGE plpgsql IMMUTABLE;
+	`, utilsSchema)
+	if _, err := db.Exec(createFuncSQL); err != nil {
+		t.Fatalf("failed creating function in utils schema: %v", err)
+	}
+
+	// 2. Define table and functional index in targetSchema qualifying the external function
+	schemaSQL := fmt.Sprintf(`
+		CREATE TABLE items (
+			id BIGINT PRIMARY KEY,
+			code TEXT NOT NULL
+		);
+		CREATE INDEX idx_items_code_hash ON items (%s.hash_code(code));
+	`, utilsSchema)
+
+	opts := grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: targetSchema,
+		SchemaSQL:    schemaSQL,
+	}
+
+	// 3. Sync must succeed because the external function in utilsSchema is resolvable
+	if err := grizzle.Sync(ctx, db, opts); err != nil {
+		t.Fatalf("Sync failed with function in external schema: %v", err)
+	}
+
+	// 4. PlanDiff must detect 0 steps (roundtrip idempotency)
+	planDiff, err := grizzle.PlanDiff(ctx, db, opts)
+	if err != nil {
+		t.Fatalf("PlanDiff failed: %v", err)
+	}
+	if len(planDiff.Steps) != 0 {
+		t.Fatalf("expected 0 steps on re-diff, got %d: %+v", len(planDiff.Steps), planDiff.Steps)
+	}
+}
+
+func TestPartialAndFunctionalIndexes_RoundtripIdempotency_Normalizations(t *testing.T) {
+	connStr := os.Getenv("DATABASE_URL")
+	if connStr == "" {
+		connStr = os.Getenv("POSTGRES_DSN")
+	}
+	if connStr == "" {
+		connStr = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable"
+	}
+
+	db, err := sql.Open("pgx", connStr)
+	if err != nil {
+		t.Fatalf("failed opening pg: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := db.Ping(); err != nil {
+		t.Skipf("skipping postgres normalization test, db unavailable: %v", err)
+	}
+
+	ctx := context.Background()
+	schemaPrefix := fmt.Sprintf("test_idx_norm_%d", time.Now().UnixNano())
+	_, err = db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schemaPrefix))
+	if err != nil {
+		t.Fatalf("failed creating schema: %v", err)
+	}
+	defer func() {
+		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schemaPrefix))
+	}()
+
+	// Schema with functional index with implicit text casts and WHERE predicate with mixed whitespace
+	schemaSQL := `
+		CREATE TABLE users (
+			id BIGINT PRIMARY KEY,
+			email TEXT NOT NULL,
+			status VARCHAR(50) NOT NULL,
+			score INT NOT NULL
+		);
+		CREATE UNIQUE INDEX idx_users_email_lower ON users (lower(email));
+		CREATE INDEX idx_users_active ON users (id) WHERE status = 'active' AND score > 0;
+	`
+
+	opts := grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: schemaPrefix,
+		SchemaSQL:    schemaSQL,
+	}
+
+	// 1. Initial Sync
+	if err := grizzle.Sync(ctx, db, opts); err != nil {
+		t.Fatalf("initial Sync failed: %v", err)
+	}
+
+	// 2. Re-diff must produce zero steps (exact pg_get_indexdef normalization match)
+	p, err := grizzle.PlanDiff(ctx, db, opts)
+	if err != nil {
+		t.Fatalf("PlanDiff failed: %v", err)
+	}
+	if len(p.Steps) != 0 {
+		t.Fatalf("expected 0 steps on re-diff due to indexdef normalization, got %d: %+v", len(p.Steps), p.Steps)
 	}
 }
