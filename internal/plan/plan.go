@@ -282,128 +282,135 @@ type Hazard struct {
 func (p *Plan) Hazards() []Hazard {
 	var hazards []Hazard
 	for _, s := range p.Steps {
-		if len(s.UnmanagedDeps) > 0 {
+		hazards = append(hazards, stepHazards(s)...)
+	}
+	return hazards
+}
+
+// stepHazards analyzes an individual planned step and returns detected operational and data-loss risks.
+func stepHazards(s Step) []Hazard {
+	var hazards []Hazard
+	if len(s.UnmanagedDeps) > 0 {
+		hazards = append(hazards, Hazard{
+			Code:        HazardUnmanagedDependency,
+			Level:       HazardLevelCritical,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Table %q operation affects unmanaged dependent object(s) [%s]", s.Table, strings.Join(s.UnmanagedDeps, ", ")),
+			SQL:         s.SQL,
+		})
+	}
+	if s.IsGeneratedRewrite {
+		hazards = append(hazards, Hazard{
+			Code:        HazardGeneratedRewrite,
+			Level:       HazardLevelWarning,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Generated column on table %q expression modified; requires table rewrite", s.Table),
+			SQL:         s.SQL,
+		})
+	}
+	switch s.Type {
+	case ChangeAttachPartition:
+		hazards = append(hazards, Hazard{
+			Code:        HazardPartitionAttachScan,
+			Level:       HazardLevelWarning,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Attaching existing table %q to parent %q requires a table validation scan under ACCESS EXCLUSIVE lock", s.Table, s.ParentTable),
+			SQL:         s.SQL,
+		})
+	case ChangeDropTable:
+		hazards = append(hazards, Hazard{
+			Code:        HazardDropTable,
+			Level:       HazardLevelCritical,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Table %q will be dropped with all its data and dependent objects", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeDropColumn:
+		desc := fmt.Sprintf("Column on table %q will be dropped with all existing row values", s.Table)
+		if s.IsTableRebuild {
+			// SQLite rebuild path: whole table is dropped and recreated.
+			desc = fmt.Sprintf("Table %q will be dropped and recreated; only matching columns are copied back", s.Table)
+		}
+		hazards = append(hazards, Hazard{
+			Code:        HazardDropColumn,
+			Level:       HazardLevelCritical,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: desc,
+			SQL:         s.SQL,
+		})
+		if s.IsRenameCandidate {
 			hazards = append(hazards, Hazard{
-				Code:        HazardUnmanagedDependency,
+				Code:        HazardRenameAmbiguous,
 				Level:       HazardLevelCritical,
 				Type:        s.Type,
 				Table:       s.Table,
-				Description: fmt.Sprintf("Table %q operation affects unmanaged dependent object(s) [%s]", s.Table, strings.Join(s.UnmanagedDeps, ", ")),
+				Description: fmt.Sprintf("Table %q has ambiguous column rename candidate for dropped column %q; requires explicit mapping in Options.Renames or separate plans", s.Table, s.OldColumn),
 				SQL:         s.SQL,
 			})
 		}
-		if s.IsGeneratedRewrite {
+	case ChangeAlterColumn:
+		if s.TypeNarrowed {
 			hazards = append(hazards, Hazard{
-				Code:        HazardGeneratedRewrite,
-				Level:       HazardLevelWarning,
-				Type:        s.Type,
-				Table:       s.Table,
-				Description: fmt.Sprintf("Generated column on table %q expression modified; requires table rewrite", s.Table),
-				SQL:         s.SQL,
-			})
-		}
-		switch s.Type {
-		case ChangeAttachPartition:
-			hazards = append(hazards, Hazard{
-				Code:        HazardPartitionAttachScan,
-				Level:       HazardLevelWarning,
-				Type:        s.Type,
-				Table:       s.Table,
-				Description: fmt.Sprintf("Attaching existing table %q to parent %q requires a table validation scan under ACCESS EXCLUSIVE lock", s.Table, s.ParentTable),
-				SQL:         s.SQL,
-			})
-		case ChangeDropTable:
-			hazards = append(hazards, Hazard{
-				Code:        HazardDropTable,
+				Code:        HazardTypeNarrow,
 				Level:       HazardLevelCritical,
 				Type:        s.Type,
 				Table:       s.Table,
-				Description: fmt.Sprintf("Table %q will be dropped with all its data and dependent objects", s.Table),
+				Description: fmt.Sprintf("Column on table %q has a destructive type change that may cause data loss or truncation", s.Table),
 				SQL:         s.SQL,
 			})
-		case ChangeDropColumn:
-			desc := fmt.Sprintf("Column on table %q will be dropped with all existing row values", s.Table)
-			if s.IsTableRebuild {
-				// SQLite rebuild path: whole table is dropped and recreated.
-				desc = fmt.Sprintf("Table %q will be dropped and recreated; only matching columns are copied back", s.Table)
-			}
+		} else if !s.IsGeneratedRewrite {
 			hazards = append(hazards, Hazard{
-				Code:        HazardDropColumn,
-				Level:       HazardLevelCritical,
-				Type:        s.Type,
-				Table:       s.Table,
-				Description: desc,
-				SQL:         s.SQL,
-			})
-			if s.IsRenameCandidate {
-				hazards = append(hazards, Hazard{
-					Code:        HazardRenameAmbiguous,
-					Level:       HazardLevelCritical,
-					Type:        s.Type,
-					Table:       s.Table,
-					Description: fmt.Sprintf("Table %q has ambiguous column rename candidate for dropped column %q; requires explicit mapping in Options.Renames or separate plans", s.Table, s.OldColumn),
-					SQL:         s.SQL,
-				})
-			}
-		case ChangeAlterColumn:
-			if s.TypeNarrowed {
-				hazards = append(hazards, Hazard{
-					Code:        HazardTypeNarrow,
-					Level:       HazardLevelCritical,
-					Type:        s.Type,
-					Table:       s.Table,
-					Description: fmt.Sprintf("Column on table %q has a destructive type change that may cause data loss or truncation", s.Table),
-					SQL:         s.SQL,
-				})
-			} else if !s.IsGeneratedRewrite {
-				hazards = append(hazards, Hazard{
-					Code:        "ALTER_COLUMN",
-					Level:       HazardLevelNotice,
-					Type:        s.Type,
-					Table:       s.Table,
-					Description: fmt.Sprintf("Column on table %q will be modified", s.Table),
-					SQL:         s.SQL,
-				})
-			}
-		case ChangeAddColumn:
-			if s.ColumnNotNull && !s.ColumnHasDefault {
-				hazards = append(hazards, Hazard{
-					Code:        HazardNotNullNoDefault,
-					Level:       HazardLevelCritical,
-					Type:        s.Type,
-					Table:       s.Table,
-					Description: fmt.Sprintf("Adding NOT NULL column without DEFAULT to existing table %q will fail if the table contains rows", s.Table),
-					SQL:         s.SQL,
-				})
-			}
-		case ChangeCreateIndex:
-			hazards = append(hazards, Hazard{
-				Code:        HazardIndexBuild,
+				Code:        "ALTER_COLUMN",
 				Level:       HazardLevelNotice,
 				Type:        s.Type,
 				Table:       s.Table,
-				Description: fmt.Sprintf("Index creation on table %q acquires a ShareLock unless created concurrently", s.Table),
-				SQL:         s.SQL,
-			})
-		case ChangeDropIndex:
-			hazards = append(hazards, Hazard{
-				Code:        HazardDropIndex,
-				Level:       HazardLevelNotice,
-				Type:        s.Type,
-				Table:       s.Table,
-				Description: fmt.Sprintf("Dropping index on table %q may degrade active query performance", s.Table),
-				SQL:         s.SQL,
-			})
-		case ChangeDropFK:
-			hazards = append(hazards, Hazard{
-				Code:        HazardDropFK,
-				Level:       HazardLevelNotice,
-				Type:        s.Type,
-				Table:       s.Table,
-				Description: fmt.Sprintf("Dropping foreign key constraint on table %q removes referential integrity enforcement", s.Table),
+				Description: fmt.Sprintf("Column on table %q will be modified", s.Table),
 				SQL:         s.SQL,
 			})
 		}
+	case ChangeAddColumn:
+		if s.ColumnNotNull && !s.ColumnHasDefault {
+			hazards = append(hazards, Hazard{
+				Code:        HazardNotNullNoDefault,
+				Level:       HazardLevelCritical,
+				Type:        s.Type,
+				Table:       s.Table,
+				Description: fmt.Sprintf("Adding NOT NULL column without DEFAULT to existing table %q will fail if the table contains rows", s.Table),
+				SQL:         s.SQL,
+			})
+		}
+	case ChangeCreateIndex:
+		hazards = append(hazards, Hazard{
+			Code:        HazardIndexBuild,
+			Level:       HazardLevelNotice,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Index creation on table %q acquires a ShareLock unless created concurrently", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeDropIndex:
+		hazards = append(hazards, Hazard{
+			Code:        HazardDropIndex,
+			Level:       HazardLevelNotice,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Dropping index on table %q may degrade active query performance", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeDropFK:
+		hazards = append(hazards, Hazard{
+			Code:        HazardDropFK,
+			Level:       HazardLevelNotice,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Dropping foreign key constraint on table %q removes referential integrity enforcement", s.Table),
+			SQL:         s.SQL,
+		})
 	}
 	return hazards
 }
