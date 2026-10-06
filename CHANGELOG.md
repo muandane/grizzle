@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0] - 2026-10-06
 
 ### Added
+- **SQLite Table Rebuild Engine Improvements**:
+  - **Trigger and View Preservation**: Introspects triggers (`sqlite_schema` where `type='trigger'`) and views (`sqlite_schema` where `type='view'`) referencing target tables, drops views prior to table recreation to prevent SQLite rename errors, and rebinds all views and triggers to the recreated table after renaming.
+  - **Chunked Keyset Batch Copying**: Supports keyset pagination (`ORDER BY rowid ASC LIMIT ?` / `WHERE rowid > ? ORDER BY rowid ASC LIMIT ?`) during rebuild data copying for tables exceeding configured size thresholds (`Options.SQLiteRebuildThreshold`, default 100,000; `Options.SQLiteRebuildBatchSize`, default 10,000), preventing SQLite journal memory exhaustion on large tables.
+  - **Savepoint Isolation & FK Validation**: Encloses each table rebuild execution inside `SAVEPOINT grizzle_rebuild` and validates `PRAGMA foreign_key_check` under the savepoint. Rolls back directly to the savepoint and aborts on any constraint violations before committing the transaction.
 - **Interactive Terminal Inspection**:
   - Interactive TTY confirmation flow for `grizzle apply` without `--plan` when connected to an interactive terminal (`os.Stdin`).
   - Terminal summary table rendering planned changes with operation badges (`+`, `~`, `!`), target tables/columns, and hazard severity markers (`[CODE: LEVEL]`).

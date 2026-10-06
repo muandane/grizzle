@@ -295,3 +295,251 @@ func TestSQLite_PlanVisualizer(t *testing.T) {
 		t.Fatal("expected non-empty plan formatting")
 	}
 }
+
+func TestSQLite_RebuildPreservesViewsAndTriggers(t *testing.T) {
+	db := getSQLiteDB(t)
+	db.SetMaxOpenConns(1)
+	ctx := t.Context()
+
+	// Initial schema with products and audit_log
+	schemaV1 := `
+		CREATE TABLE products (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL,
+			description TEXT
+		);
+		CREATE TABLE audit_log (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			product_id INTEGER,
+			action TEXT
+		);
+	`
+	if err := grizzle.Sync(ctx, db, grizzle.Options{
+		Dialect:   grizzle.DialectSQLite,
+		SchemaSQL: schemaV1,
+	}); err != nil {
+		t.Fatalf("Sync V1 failed: %v", err)
+	}
+
+	// Create view and trigger directly on live database
+	viewSQL := `CREATE VIEW product_names AS SELECT id, name FROM products;`
+	if _, err := db.ExecContext(ctx, viewSQL); err != nil {
+		t.Fatalf("failed to create view: %v", err)
+	}
+
+	triggerSQL := `CREATE TRIGGER trg_product_audit AFTER UPDATE ON products
+BEGIN
+	INSERT INTO audit_log (product_id, action) VALUES (NEW.id, 'updated');
+END;`
+	if _, err := db.ExecContext(ctx, triggerSQL); err != nil {
+		t.Fatalf("failed to create trigger: %v", err)
+	}
+
+	// Insert test data
+	if _, err := db.ExecContext(ctx, "INSERT INTO products (name, description) VALUES ('gadget', 'great device');"); err != nil {
+		t.Fatalf("failed to insert product: %v", err)
+	}
+
+	// Schema V2: Drop column 'description' from products, requiring a table rebuild
+	schemaV2 := `
+		CREATE TABLE products (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL
+		);
+		CREATE TABLE audit_log (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			product_id INTEGER,
+			action TEXT
+		);
+	`
+
+	// Rebuild products table with AllowDropColumn: true
+	err := grizzle.Sync(ctx, db, grizzle.Options{
+		Dialect:         grizzle.DialectSQLite,
+		SchemaSQL:       schemaV2,
+		AllowDropColumn: new(true),
+		AcceptHazards:   []grizzle.HazardCode{grizzle.HazardDropColumn},
+	})
+	if err != nil {
+		t.Fatalf("Sync V2 rebuild failed: %v", err)
+	}
+
+	// 1. Verify view product_names is still valid and returns product data
+	var vID int
+	var vName string
+	err = db.QueryRowContext(ctx, "SELECT id, name FROM product_names WHERE id = 1;").Scan(&vID, &vName)
+	if err != nil {
+		t.Fatalf("querying preserved view failed: %v", err)
+	}
+	if vName != "gadget" {
+		t.Fatalf("view returned unexpected name %q, want 'gadget'", vName)
+	}
+
+	// 2. Verify trigger trg_product_audit is preserved and fires on UPDATE
+	if _, err := db.ExecContext(ctx, "UPDATE products SET name = 'gadget-v2' WHERE id = 1;"); err != nil {
+		t.Fatalf("updating product failed: %v", err)
+	}
+
+	var auditAction string
+	var auditProductID int
+	err = db.QueryRowContext(ctx, "SELECT product_id, action FROM audit_log WHERE product_id = 1;").Scan(&auditProductID, &auditAction)
+	if err != nil {
+		t.Fatalf("querying audit_log after trigger execution failed: %v", err)
+	}
+	if auditAction != "updated" {
+		t.Fatalf("expected audit action 'updated', got %q", auditAction)
+	}
+
+	// 3. Verify warm boot produces 0 diffs
+	p, err := grizzle.PlanDiff(ctx, db, grizzle.Options{
+		Dialect:   grizzle.DialectSQLite,
+		SchemaSQL: schemaV2,
+	})
+	if err != nil {
+		t.Fatalf("PlanDiff failed: %v", err)
+	}
+	if len(p.Steps) != 0 {
+		t.Fatalf("expected 0 diff steps after rebuild, got %d: %+v", len(p.Steps), p.Steps)
+	}
+}
+
+func TestSQLite_RebuildBatchKeysetCopy(t *testing.T) {
+	db := getSQLiteDB(t)
+	db.SetMaxOpenConns(1)
+	ctx := t.Context()
+
+	// Initial schema with extra column
+	schemaV1 := `
+		CREATE TABLE items (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			val INTEGER NOT NULL,
+			extra TEXT
+		);
+	`
+	if err := grizzle.Sync(ctx, db, grizzle.Options{
+		Dialect:   grizzle.DialectSQLite,
+		SchemaSQL: schemaV1,
+	}); err != nil {
+		t.Fatalf("Sync V1 failed: %v", err)
+	}
+
+	// Insert 50 rows
+	for i := 1; i <= 50; i++ {
+		_, err := db.ExecContext(ctx, "INSERT INTO items (val, extra) VALUES (?, ?);", i, "data")
+		if err != nil {
+			t.Fatalf("failed inserting item %d: %v", i, err)
+		}
+	}
+
+	// Schema V2: Drop column 'extra', requiring rebuild
+	schemaV2 := `
+		CREATE TABLE items (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			val INTEGER NOT NULL
+		);
+	`
+
+	// Sync with small threshold (10) and batch size (5) to force multiple chunked copies
+	err := grizzle.Sync(ctx, db, grizzle.Options{
+		Dialect:                grizzle.DialectSQLite,
+		SchemaSQL:              schemaV2,
+		AllowDropColumn:        new(true),
+		AcceptHazards:          []grizzle.HazardCode{grizzle.HazardDropColumn},
+		SQLiteRebuildThreshold: 10,
+		SQLiteRebuildBatchSize: 5,
+	})
+	if err != nil {
+		t.Fatalf("Sync with chunked keyset batch copy failed: %v", err)
+	}
+
+	// Verify all 50 rows exist and sum of val is 50*51/2 = 1275
+	var count, sumVal int
+	err = db.QueryRowContext(ctx, "SELECT COUNT(*), SUM(val) FROM items;").Scan(&count, &sumVal)
+	if err != nil {
+		t.Fatalf("querying items after batch rebuild failed: %v", err)
+	}
+	if count != 50 {
+		t.Fatalf("expected 50 rows after rebuild, got %d", count)
+	}
+	if sumVal != 1275 {
+		t.Fatalf("expected sum(val) 1275, got %d", sumVal)
+	}
+}
+
+func TestSQLite_RebuildSavepointFKViolationRollback(t *testing.T) {
+	db := getSQLiteDB(t)
+	db.SetMaxOpenConns(1)
+	ctx := t.Context()
+
+	schemaV1 := `
+		CREATE TABLE parents (
+			id INTEGER PRIMARY KEY
+		);
+		CREATE TABLE children (
+			id INTEGER PRIMARY KEY,
+			parent_id INTEGER NOT NULL REFERENCES parents(id),
+			extra TEXT
+		);
+	`
+	if err := grizzle.Sync(ctx, db, grizzle.Options{
+		Dialect:   grizzle.DialectSQLite,
+		SchemaSQL: schemaV1,
+	}); err != nil {
+		t.Fatalf("Sync V1 failed: %v", err)
+	}
+
+	// Insert valid parent and valid child
+	if _, err := db.ExecContext(ctx, "INSERT INTO parents (id) VALUES (1);"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "INSERT INTO children (id, parent_id, extra) VALUES (10, 1, 'ok');"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Temporarily disable FKs to insert an orphaned child that violates FK constraint
+	if _, err := db.ExecContext(ctx, "PRAGMA foreign_keys = OFF;"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "INSERT INTO children (id, parent_id, extra) VALUES (20, 999, 'orphan');"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "PRAGMA foreign_keys = ON;"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Schema V2: Drop extra from children, triggering a rebuild of children
+	schemaV2 := `
+		CREATE TABLE parents (
+			id INTEGER PRIMARY KEY
+		);
+		CREATE TABLE children (
+			id INTEGER PRIMARY KEY,
+			parent_id INTEGER NOT NULL REFERENCES parents(id)
+		);
+	`
+
+	err := grizzle.Sync(ctx, db, grizzle.Options{
+		Dialect:         grizzle.DialectSQLite,
+		SchemaSQL:       schemaV2,
+		AllowDropColumn: new(true),
+		AcceptHazards:   []grizzle.HazardCode{grizzle.HazardDropColumn},
+	})
+	if err == nil {
+		t.Fatalf("expected error due to foreign key violation, got nil")
+	}
+
+	if !errors.Is(err, grizzle.ErrExecutionFailed) {
+		t.Logf("got error: %v", err)
+	}
+
+	// Verify that table children was not modified to V2 and extra column still exists
+	var count int
+	err = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM children WHERE extra = 'orphan';").Scan(&count)
+	if err != nil {
+		t.Fatalf("table children rollback failed: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected orphaned row with extra='orphan' still present, got count %d", count)
+	}
+}
+

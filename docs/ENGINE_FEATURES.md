@@ -221,6 +221,8 @@ For local development outside automated CI pipelines, the CLI will support an in
 
 ## SQLite table rebuild engine improvements
 
+*Status: Implemented*
+
 SQLite does not support altering column types, renaming foreign keys, or dropping constraints in place. The engine executes a 12-step table recreation procedure.
 
 ### Current 12-step rebuild procedure
