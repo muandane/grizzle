@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -23,6 +24,15 @@ func main() {
 		dsn = "postgres://postgres:password@localhost:5432/myapp?sslmode=disable"
 	}
 
+	targetSchema := os.Getenv("PG_SCHEMA")
+	if targetSchema != "" {
+		if strings.Contains(dsn, "?") {
+			dsn = fmt.Sprintf("%s&search_path=%s", dsn, targetSchema)
+		} else {
+			dsn = fmt.Sprintf("%s?search_path=%s", dsn, targetSchema)
+		}
+	}
+
 	sqlDB, err := sql.Open("pgx", dsn)
 	if err != nil {
 		log.Fatalf("invalid database connection: %v", err)
@@ -35,8 +45,6 @@ func main() {
 	if err := sqlDB.PingContext(ctx); err != nil {
 		log.Fatalf("database unreachable: %v", err)
 	}
-
-	targetSchema := os.Getenv("PG_SCHEMA")
 
 	// 1. In-process declarative schema automigration with Grizzle
 	log.Println("Applying schema synchronization from shared schema.sql...")

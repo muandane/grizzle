@@ -699,15 +699,14 @@ func TestLocking_PgTerminateBackendRecovery(t *testing.T) {
 
 	// 4. Verify invalid index was left behind in pg_index
 	var isInvalid bool
-	//nolint:gosec // G201: test executes query on randomized test schema
-	checkQuery := fmt.Sprintf(`
+	const checkQuery = `
 		SELECT NOT i.indisvalid
 		FROM pg_index i
 		JOIN pg_class c ON c.oid = i.indexrelid
 		JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE n.nspname = '%s' AND c.relname = 'idx_term_email';
-	`, schema)
-	err = db.QueryRow(checkQuery).Scan(&isInvalid)
+		WHERE n.nspname = $1 AND c.relname = $2;
+	`
+	err = db.QueryRow(checkQuery, schema, "idx_term_email").Scan(&isInvalid)
 	if err != nil {
 		t.Fatalf("querying invalid index failed: %v", err)
 	}

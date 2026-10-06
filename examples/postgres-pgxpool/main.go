@@ -25,10 +25,18 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
+	targetSchema := os.Getenv("PG_SCHEMA")
+
 	// 1. Configure and initialize native pgx connection pool
 	poolConfig, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		log.Fatalf("parsing connection config failed: %v", err)
+	}
+	if targetSchema != "" {
+		if poolConfig.ConnConfig.RuntimeParams == nil {
+			poolConfig.ConnConfig.RuntimeParams = make(map[string]string)
+		}
+		poolConfig.ConnConfig.RuntimeParams["search_path"] = targetSchema
 	}
 	poolConfig.MaxConns = 15
 	poolConfig.MinConns = 2
@@ -43,8 +51,6 @@ func main() {
 	if err := pool.Ping(ctx); err != nil {
 		log.Fatalf("pinging postgres failed: %v", err)
 	}
-
-	targetSchema := os.Getenv("PG_SCHEMA")
 
 	// 2. Wrap pool with stdlib.OpenDBFromPool for in-process automigration
 	// This shares the existing connection pool without allocating new connection handles.

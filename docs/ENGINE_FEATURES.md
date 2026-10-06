@@ -246,9 +246,17 @@ SQLite does not support altering column types, renaming foreign keys, or droppin
 1. **Trigger and view preservation:** Introspects triggers and views referencing the target table before dropping it. Rebinds them to the recreated table after renaming.
 2. **Batch data copying for large tables:** Copying large datasets in a single `INSERT INTO ... SELECT` statement inflates SQLite journal memory. The engine performs chunked keyset copying (`WHERE rowid > ? ORDER BY rowid ASC LIMIT ?`) when table row count exceeds `SQLiteRebuildThreshold`.
    - **Global threshold design:** `SQLiteRebuildThreshold` (default 100,000) and `SQLiteRebuildBatchSize` (default 10,000) are configured globally in `Options` and `ApplyOpts` rather than per-table. This design keeps schema definitions clean and declarative while ensuring uniform memory and journal bounds across all tables.
-   - **Disk and NAS performance verification:** Keyset batch copy duration and WAL page growth across chunk sizes are verified through benchmark tests (`sqlite_bench_test.go`).
+   - **Disk and NAS performance verification:** Keyset batch copy duration and WAL page growth across chunk sizes are benchmarked (`sqlite_bench_test.go`). Rotational mechanical disk (HDD) and NAS network filesystems (NFS/SMB) introduce high-latency fsync pauses and checkpoint stalls that cannot be automated in CI; these must be validated manually per the checklist below.
    - **Multi-schema scope:** Multi-schema configurations (`TargetSchemas > 1`) are explicitly out of scope for SQLite and return typed error `ErrUnsupportedMultiSchema`, as SQLite operates with a single attached database per connection.
 3. **Savepoint isolation:** Wraps each table rebuild in an explicit `SAVEPOINT grizzle_rebuild`. If `PRAGMA foreign_key_check` discovers constraint violations, rolls back the savepoint and aborts migration before committing.
+
+### Manual verification checklist
+
+The following operational characteristics cannot be fully automated in continuous integration runners and require periodic manual verification:
+
+1. **Mechanical-disk & NAS storage performance:** Keyset batch copy duration, WAL page checkpoint stalls, and journal growth under rotational disks (5400/7200 RPM) or high-latency network mounts (NFS v4, SMB).
+2. **Multi-version live PostgreSQL matrix:** Concurrently executing migration suites against live, isolated PostgreSQL clusters running 14.x, 15.x, 16.x, and 17.x in production-equivalent network topologies.
+3. **Human interactive terminal emulators:** Manual validation of interactive terminal prompts (`grizzle apply` with `[y/N/details]`) across standard human terminals (macOS Terminal, iTerm2, tmux, Windows Terminal) beyond automated `pty.Open()` pseudo-terminals.
 
 ---
 

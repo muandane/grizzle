@@ -77,9 +77,12 @@ func TestScopeSafety_StrictScopeWithIncludeTablesSucceeds(t *testing.T) {
 }
 
 func TestScopeSafety_BuiltinExtensionExclusions(t *testing.T) {
-	connStr := os.Getenv("POSTGRES_DSN")
+	connStr := os.Getenv("DATABASE_URL")
 	if connStr == "" {
-		connStr = "postgres://postgres:postgres@localhost:5432/grizzle_test?sslmode=disable"
+		connStr = os.Getenv("POSTGRES_DSN")
+	}
+	if connStr == "" {
+		connStr = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable"
 	}
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {
