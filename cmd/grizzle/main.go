@@ -257,6 +257,21 @@ func runApply(ctx context.Context, dsn, planFile, schemaFile, expectedHash strin
 		expHash = expectedHash
 	}
 
+	if planFile == "" && isTerminalFunc(os.Stdin.Fd()) {
+		if len(p.Steps) == 0 {
+			fmt.Println("Planned changes:")
+			fmt.Println("  No changes. Database schema is already in sync.")
+			return 0
+		}
+		confirmed, promptErr := promptInteractiveApply(os.Stdin, os.Stdout, p)
+		if promptErr != nil || !confirmed {
+			return 1
+		}
+		for _, h := range p.Hazards() {
+			acceptedCodes = append(acceptedCodes, h.Code)
+		}
+	}
+
 	applyOpts := grizzle.ApplyOpts{
 		ExpectedHash:  expHash,
 		AcceptHazards: acceptedCodes,
