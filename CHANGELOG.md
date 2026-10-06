@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0] - 2026-10-06
 
 ### Added
+- **Multi-Schema Support (PostgreSQL)**:
+  - Declarative management across multiple PostgreSQL schemas via `Options.TargetSchemas` (with `Options.TargetSchema` maintained as a deprecated alias).
+  - Isolated per-schema shadow environments (`_grizzle_shadow_<schema>`) and SQL qualifier rewriting (`RewriteShadowSQL`) isolating DDL statements during shadow compilation.
+  - Multi-schema catalog introspection and cross-schema foreign key canonical normalization preserving foreign references while stripping local schema qualifiers.
+  - Cross-schema foreign key topological sorting (`SortSteps`): referenced tables created before referencing tables; reverse order on drop.
+  - Advisory lock hashing combining database identifier with all declared schemas (`grizzle:<sorted_schemas>`) to prevent cross-app lock collisions.
 - **Partial and Functional Indexes**:
   - Declarative support for PostgreSQL and SQLite functional indexes (indexing expressions like `lower(email)`) and partial indexes (filtered by `WHERE` predicates).
   - Catalog introspection of index predicates via `pg_get_expr(ix.indpred, ix.indrelid)`.

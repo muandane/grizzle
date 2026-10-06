@@ -57,6 +57,7 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 }
 
 // DiffWithMappings compares live and desired schemas using schemaMappings for normalization and returns pure changes.
+//nolint:revive // DiffWithMappings is distinct from Diff for multi-schema mapping context
 func DiffWithMappings(live, desired *schema.Schema, targetSchema, shadowSchema string, filters scope.Filters, schemaMappings map[string]string) ([]Change, error) {
 	var changes []Change
 
@@ -105,11 +106,23 @@ func DiffWithMappings(live, desired *schema.Schema, targetSchema, shadowSchema s
 		}
 		lTable, exists := live.Tables[tblName]
 		if !exists {
+			tblCopy := *dTable
+			if len(dTable.ForeignKeys) > 0 {
+				tblCopy.ForeignKeys = make(map[string]*schema.ForeignKey, len(dTable.ForeignKeys))
+				for k, v := range dTable.ForeignKeys {
+					fkCopy := *v
+					if mapped, ok := schemaMappings[fkCopy.RefSchema]; ok {
+						fkCopy.RefSchema = mapped
+					}
+					fkCopy.Definition = normalize(fkCopy.Definition)
+					tblCopy.ForeignKeys[k] = &fkCopy
+				}
+			}
 			createChange := Change{
 				Type:        plan.ChangeCreateTable,
 				Schema:      targetSchema,
 				Table:       tblName,
-				TableData:   dTable,
+				TableData:   &tblCopy,
 				Destructive: false,
 			}
 			if dTable.IsPartition() {
@@ -131,15 +144,12 @@ func DiffWithMappings(live, desired *schema.Schema, targetSchema, shadowSchema s
 				})
 			}
 
-			for _, dFK := range dTable.ForeignKeys {
-				normDef := normalize(dFK.Definition)
-				fkCopy := *dFK
-				fkCopy.Definition = normDef
+			for _, dFK := range tblCopy.ForeignKeys {
 				changes = append(changes, Change{
 					Type:        plan.ChangeAddFK,
 					Schema:      targetSchema,
 					Table:       tblName,
-					ForeignKey:  &fkCopy,
+					ForeignKey:  dFK,
 					Destructive: false,
 				})
 			}

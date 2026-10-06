@@ -172,11 +172,13 @@ Adding a check constraint with `CHECK (expr)` scans the entire table under `ACCE
 
 ## Multi-schema support
 
+*Status: Implemented*
+
 Large applications organize data across multiple PostgreSQL schemas, such as logical domains or tenant spaces.
 
 ### Scope and catalog changes
 
-Current engine options accept a single `TargetSchema`. Multi-schema support requires accepting a list of target schemas:
+Current engine options accept a single `TargetSchema`. Multi-schema support accepts a list of target schemas via `TargetSchemas` (with `TargetSchema` retained as a deprecated alias):
 
 ```go
 opts := grizzle.Options{
@@ -185,10 +187,10 @@ opts := grizzle.Options{
 }
 ```
 
-The engine must apply these rules:
-1. Search path configuration: Shadow schemas must mirror each declared schema namespace (`_grizzle_shadow_public`, `_grizzle_shadow_billing`).
-2. Cross-schema foreign keys: Tables in `billing` referencing primary keys in `identity` must resolve correctly during dependency sorting.
-3. Lock identifiers: The advisory lock hashing algorithm must combine the database identifier with all declared schema names to prevent lock collisions across distinct applications sharing a database.
+The engine applies these rules:
+1. **Search path configuration:** Shadow schemas mirror each declared schema namespace (`_grizzle_shadow_public`, `_grizzle_shadow_billing`). During shadow compilation, statements qualify target identifiers rewritten to their shadow counterparts without altering literals or comments.
+2. **Cross-schema foreign keys:** Tables in `billing` referencing primary keys in `identity` resolve correctly during relational dependency topological sorting (`identity.users` created before `billing.accounts`; reverse order on drop).
+3. **Lock identifiers:** The advisory lock hashing algorithm combines the database identifier with all declared schema names (`grizzle:<sorted_schemas>`) to prevent lock collisions across distinct applications sharing a database.
 
 ---
 

@@ -397,6 +397,9 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 		}
 
 		if tbl, exists := s.Tables[tableName]; exists {
+			if refSchema != "" && refSchema != schemaName {
+				fkDef = qualifyCrossSchemaFK(fkDef, refSchema, refTable)
+			}
 			tbl.ForeignKeys[fkName] = &schema.ForeignKey{
 				Name:       fkName,
 				TableName:  tableName,
@@ -653,4 +656,28 @@ func InspectSchemas(ctx context.Context, dbtx dialect.DBTX, schemaNames []string
 		schemas[name] = s
 	}
 	return schemas, nil
+}
+
+func qualifyCrossSchemaFK(fkDef, refSchema, refTable string) string {
+	if refSchema == "" {
+		return fkDef
+	}
+	if strings.Contains(fkDef, refSchema+".") || strings.Contains(fkDef, `"`+refSchema+`".`) {
+		return fkDef
+	}
+	upper := strings.ToUpper(fkDef)
+	idx := strings.Index(upper, "REFERENCES ")
+	if idx == -1 {
+		return fkDef
+	}
+	rest := fkDef[idx+len("REFERENCES "):]
+	parenIdx := strings.Index(rest, "(")
+	if parenIdx == -1 {
+		return fkDef
+	}
+	tblPart := strings.TrimSpace(rest[:parenIdx])
+	if strings.Contains(tblPart, ".") {
+		return fkDef
+	}
+	return fkDef[:idx] + "REFERENCES " + refSchema + "." + strings.TrimSpace(rest)
 }

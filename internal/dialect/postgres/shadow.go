@@ -183,7 +183,7 @@ func RewriteShadowSQL(sqlStr string, shadowMap map[string]string) string {
 		if ch == '/' && i+1 < n && sqlStr[i+1] == '*' {
 			start := i
 			i += 2
-			for i+1 < n && !(sqlStr[i] == '*' && sqlStr[i+1] == '/') {
+			for i+1 < n && (sqlStr[i] != '*' || sqlStr[i+1] != '/') {
 				i++
 			}
 			if i+1 < n {

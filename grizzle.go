@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -207,6 +208,8 @@ func prepareOptions(ctx context.Context, db *sql.DB, opts *Options) error {
 		}
 	case DialectPostgres:
 		if len(opts.TargetSchemas) > 0 {
+			slices.Sort(opts.TargetSchemas)
+			opts.TargetSchemas = slices.Compact(opts.TargetSchemas)
 			if opts.TargetSchema == "" {
 				opts.TargetSchema = opts.TargetSchemas[0]
 			}
