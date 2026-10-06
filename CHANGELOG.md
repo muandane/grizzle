@@ -10,29 +10,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **SQLite Table Rebuild Engine Improvements**:
   - **Trigger and View Preservation**: Introspects triggers (`sqlite_schema` where `type='trigger'`) and views (`sqlite_schema` where `type='view'`) referencing target tables, drops views prior to table recreation to prevent SQLite rename errors, and rebinds all views and triggers to the recreated table after renaming.
-  - **Chunked Keyset Batch Copying**: Supports keyset pagination (`ORDER BY rowid ASC LIMIT ?` / `WHERE rowid > ? ORDER BY rowid ASC LIMIT ?`) during rebuild data copying for tables exceeding configured size thresholds (`Options.SQLiteRebuildThreshold`, default 100,000; `Options.SQLiteRebuildBatchSize`, default 10,000), preventing SQLite journal memory exhaustion on large tables.
+  - **Chunked Keyset Batch Copying**: Supports keyset pagination (`ORDER BY rowid ASC LIMIT ?` / `WHERE rowid > ? ORDER BY rowid ASC LIMIT ?`) during rebuild data copying for tables exceeding configured size thresholds (`Options.SQLiteRebuildThreshold`, default 100,000; `Options.SQLiteRebuildBatchSize`, default 10,000), preventing SQLite journal memory exhaustion on large tables. Benchmarked across chunk sizes and WAL checkpoint page counts.
   - **Savepoint Isolation & FK Validation**: Encloses each table rebuild execution inside `SAVEPOINT grizzle_rebuild` and validates `PRAGMA foreign_key_check` under the savepoint. Rolls back directly to the savepoint and aborts on any constraint violations before committing the transaction.
+  - **Multi-Schema Rejection**: Explicitly rejects multi-schema configurations (`len(TargetSchemas) > 1`) on SQLite with typed `ErrUnsupportedMultiSchema`.
 - **Interactive Terminal Inspection**:
   - Interactive TTY confirmation flow for `grizzle apply` without `--plan` when connected to an interactive terminal (`os.Stdin`).
   - Terminal summary table rendering planned changes with operation badges (`+`, `~`, `!`), target tables/columns, and hazard severity markers (`[CODE: LEVEL]`).
   - Detailed critical hazard explanations listing specific data loss risks and consequences prior to confirmation.
   - Interactive prompts (`[y/N/details]`) supporting confirmation, full SQL statement inspection (`details` / `d`), and safe cancellation (`n` / `N` / default empty line) exiting with code 1.
+  - Real pseudo-terminal integration tests using `github.com/creack/pty` testing `y`, `N`, and `details` inputs against native TTY descriptors.
   - Preserves strict headless / CI behavior: interactive prompts disabled without TTY, requiring explicit `--accept-hazard <CODE>` and exiting immediately with code 2 on unaccepted critical hazards.
 - **Multi-Schema Support (PostgreSQL)**:
   - Declarative management across multiple PostgreSQL schemas via `Options.TargetSchemas` (with `Options.TargetSchema` maintained as a deprecated alias).
   - Isolated per-schema shadow environments (`_grizzle_shadow_<schema>`) and SQL qualifier rewriting (`RewriteShadowSQL`) isolating DDL statements during shadow compilation.
   - Multi-schema catalog introspection and cross-schema foreign key canonical normalization preserving foreign references while stripping local schema qualifiers.
   - Cross-schema foreign key topological sorting (`SortSteps`): referenced tables created before referencing tables; reverse order on drop.
-  - Advisory lock hashing combining database identifier with all declared schemas (`grizzle:<sorted_schemas>`) to prevent cross-app lock collisions.
+  - Dedicated per-schema 2-integer advisory locks (`pg_try_advisory_lock(hash32(LockNamespace), hash32(schema))`) acquired in sorted, deduplicated order on a single pinned connection, rolling back previously acquired locks on acquisition failure, and releasing in reverse order upon completion.
+  - Cross-app isolation configurable via `Options.LockNamespace` (default `"grizzle"`).
 - **Partial and Functional Indexes**:
   - Declarative support for PostgreSQL and SQLite functional indexes (indexing expressions like `lower(email)`) and partial indexes (filtered by `WHERE` predicates).
   - Catalog introspection of index predicates via `pg_get_expr(ix.indpred, ix.indrelid)`.
   - Shadow compilation normalization eliminating false diffs caused by PostgreSQL type casts, parentheses wrapping, and schema qualifications on functions/types.
+  - Non-immutable function error wrapping: Intercepts shadow schema pre-flight compilation failures and wraps them with index name, table name, and `"expression must be IMMUTABLE"`, asserting target database is untouched.
+  - External schema function resolution: Shadow search path includes target schema (`SET LOCAL search_path TO shadow, target, public;`) allowing custom functions in non-table schemas to resolve during shadow DDL compilation.
   - Non-transactional execution (`NonTx=true`) with `CREATE INDEX CONCURRENTLY` and `DROP INDEX CONCURRENTLY`.
   - Automatic detection and concurrent repair of broken indexes (`indisvalid = false`) resulting from aborted index builds.
 - **PostgreSQL Partitioned Tables**:
-  - Declarative support for range (`RANGE`), list (`LIST`), and hash (`HASH`) partitioned tables and attached partitions (`PARTITION OF ... FOR VALUES ...`).
-  - Catalog introspection of partitioning strategies, partition keys, and partition inheritance bounds from `pg_partitioned_table`, `pg_inherits`, and `pg_class`.
+  - Declarative support for range (`RANGE`), list (`LIST`), and hash (`HASH`) partitioned tables, attached partitions (`PARTITION OF ... FOR VALUES ...`), and multi-level sub-partition hierarchies.
+  - Catalog introspection of partitioning strategies, partition keys, and partition inheritance bounds from `pg_partitioned_table`, `pg_inherits`, and `pg_class`, filtering out internal index partitions.
+  - `DETACH PARTITION CONCURRENTLY`: Renders as standalone `NonTx` step on PostgreSQL 14+, falling back to plain `DETACH` below PG 14, when `--non-concurrent-indexes` is set, or when a default partition exists.
+  - Interrupted pending-detach handling: Introspects `pg_inherits.inhdetachpending` and plans `ALTER TABLE ... DETACH PARTITION ... FINALIZE` alongside `PARTITION_PENDING_DETACH` warning hazard.
+  - Structural validation: Pure diff checks that `PRIMARY KEY` and unique index definitions on partitioned tables include all partition key columns, rejecting violations at plan time with typed `ErrPartitionKeyNotInUnique`.
+  - Wrapped foreign key errors: Wraps runtime foreign key errors on partitioned tables with table and constraint context.
   - Invariant enforcement: strictly rejects in-place conversion between regular tables and partitioned tables (`ErrPartitionConversion`).
   - Emits `PARTITION_ATTACH_SCAN` (`WARNING`) hazard when attaching an existing standalone table to a partitioned table to flag table validation scans under `ACCESS EXCLUSIVE` lock.
   - Safe partition detachment (`DETACH_PARTITION`) to standalone managed tables.

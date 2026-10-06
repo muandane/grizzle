@@ -63,12 +63,16 @@ WHERE n.relname = $1;
 
 ### Safety hazards and invariants
 
-Converting an existing standard table into a partitioned table requires rewriting all rows. The engine must enforce these invariants:
+Converting an existing standard table into a partitioned table requires rewriting all rows. The engine enforces these invariants:
 
-1. Modifying a table from regular to partitioned cannot happen with `ALTER TABLE`. The engine must reject this transition unless an explicit staged migration strategy is defined.
-2. Detaching a partition (`ALTER TABLE parent DETACH PARTITION child`) preserves table data in the child table. The engine maps detached partitions to standalone managed tables.
-3. Attaching an existing table with data (`ALTER TABLE parent ATTACH PARTITION child FOR VALUES ...`) requires a table scan to validate that rows fit the partition bound. In PostgreSQL, this acquires an `ACCESS EXCLUSIVE` lock on both parent and child. The step must emit a `PARTITION_ATTACH_SCAN` hazard at `WARNING` level.
-4. Foreign keys referencing a partitioned table require identical unique keys containing the partition key. The engine must validate this constraint prior to emitting foreign key DDL.
+1. Modifying a table from regular to partitioned cannot happen with `ALTER TABLE`. The engine rejects this transition with `ErrPartitionConversion` unless an explicit staged migration strategy is defined.
+2. Detaching a partition preserves data in the child table.
+   - On PostgreSQL 14+ (`server_version_num >= 140000`), detaching executes via `ALTER TABLE parent DETACH PARTITION child CONCURRENTLY;` as a standalone `NonTx` step outside transaction blocks to minimize table locks.
+   - On PostgreSQL < 14, when `--non-concurrent-indexes` is specified, or when the partitioned table contains a `DEFAULT` partition, detaching automatically falls back to standard transactional `ALTER TABLE parent DETACH PARTITION child;`.
+   - Interrupted detaches (pending-detach state in `pg_inherits.inhdetachpending`) are detected during catalog introspection and planned as `ALTER TABLE parent DETACH PARTITION child FINALIZE;`, accompanied by the `PARTITION_PENDING_DETACH` warning hazard.
+3. Attaching an existing table with data (`ALTER TABLE parent ATTACH PARTITION child FOR VALUES ...`) requires a table scan to validate that rows fit the partition bound. In PostgreSQL, this acquires an `ACCESS EXCLUSIVE` lock on both parent and child. The step emits a `PARTITION_ATTACH_SCAN` hazard at `WARNING` level.
+4. Structural uniqueness rules: Pure diff validates that any `PRIMARY KEY` or unique index on a partitioned table includes all partition key columns. Violations are rejected deterministically at plan time with `ErrPartitionKeyNotInUnique` before executing any database I/O.
+5. Runtime foreign key and constraint execution errors on partitioned tables are wrapped with specific table name and constraint context.
 
 ---
 
@@ -112,7 +116,9 @@ Comparing raw user SQL with `pg_get_indexdef` creates false diffs due to:
 * Parentheses wrapping expressions (for example, `(status = 'pending'::text)`).
 * Fully qualified schema references on custom functions.
 
-The engine must compile index definitions in the shadow schema and compare the output of `pg_get_indexdef` from the live catalog against `pg_get_indexdef` from the shadow catalog. This eliminates string parsing heuristics.
+The engine compiles index definitions in the shadow schema and compares the output of `pg_get_indexdef` from the live catalog against `pg_get_indexdef` from the shadow catalog. This eliminates string parsing heuristics.
+* **Non-immutable function detection:** When an index expression references non-immutable functions (e.g. `clock_timestamp()` or a `STABLE`/`VOLATILE` function), shadow compilation fails before modifying the live database. Grizzle wraps the pre-flight failure with the index name, table name, and `"expression must be IMMUTABLE"`.
+* **Search path resolution:** Shadow compilation configures `search_path` to include both the shadow schema and the target schema (`SET LOCAL search_path TO shadow, target, public;`), allowing custom functions defined in external or target schemas to resolve correctly.
 
 ### Execution sequencing
 
@@ -235,11 +241,14 @@ SQLite does not support altering column types, renaming foreign keys, or droppin
 6. Recreate indexes and triggers.
 7. Run `PRAGMA foreign_key_check`.
 
-### Planned improvements
+### Implemented improvements
 
-1. **Trigger and view preservation:** Introspect triggers and views referencing the target table before dropping it. Rebind them to the recreated table after renaming.
-2. **Batch data copying for large tables:** Copying millions of rows in a single `INSERT INTO ... SELECT` statement inflates SQLite journal memory. The engine will support chunked keyset copying for tables exceeding configured size thresholds.
-3. **Savepoint isolation:** Wrap each table rebuild in an explicit `SAVEPOINT grizzle_rebuild`. If `PRAGMA foreign_key_check` discovers constraint violations, roll back the savepoint and abort migration before committing.
+1. **Trigger and view preservation:** Introspects triggers and views referencing the target table before dropping it. Rebinds them to the recreated table after renaming.
+2. **Batch data copying for large tables:** Copying large datasets in a single `INSERT INTO ... SELECT` statement inflates SQLite journal memory. The engine performs chunked keyset copying (`WHERE rowid > ? ORDER BY rowid ASC LIMIT ?`) when table row count exceeds `SQLiteRebuildThreshold`.
+   - **Global threshold design:** `SQLiteRebuildThreshold` (default 100,000) and `SQLiteRebuildBatchSize` (default 10,000) are configured globally in `Options` and `ApplyOpts` rather than per-table. This design keeps schema definitions clean and declarative while ensuring uniform memory and journal bounds across all tables.
+   - **Disk and NAS performance verification:** Keyset batch copy duration and WAL page growth across chunk sizes are verified through benchmark tests (`sqlite_bench_test.go`).
+   - **Multi-schema scope:** Multi-schema configurations (`TargetSchemas > 1`) are explicitly out of scope for SQLite and return typed error `ErrUnsupportedMultiSchema`, as SQLite operates with a single attached database per connection.
+3. **Savepoint isolation:** Wraps each table rebuild in an explicit `SAVEPOINT grizzle_rebuild`. If `PRAGMA foreign_key_check` discovers constraint violations, rolls back the savepoint and aborts migration before committing.
 
 ---
 
@@ -252,9 +261,13 @@ Grizzle implements a dedicated session-level advisory lock architecture that coo
 ### Architecture and connection lifecycle
 
 1. **Dedicated connection pinning:** Grizzle obtains a dedicated connection (`db.Conn(ctx)`) exclusively reserved for the migration lifecycle.
-2. **Deterministic lock identifier:** Advisory lock IDs are 64-bit integer hashes computed deterministically from the managed schema name (`grizzle.GenerateLockID("grizzle", schema)`).
-3. **Non-blocking lock acquisition loop:** Instead of blocking indefinitely on `pg_advisory_lock` (which can create server-side lock wait queues and trigger deadlocks against PostgreSQL internal catalog locks during concurrent DDL), Grizzle queries `SELECT pg_try_advisory_lock($1)` on a polling ticker.
+2. **Per-schema deadlock-free ordering:**
+   - Single-schema migrations acquire a 64-bit integer advisory lock computed from `grizzle.GenerateLockID(namespace, schema)`.
+   - Multi-schema migrations acquire two-integer advisory locks `pg_try_advisory_lock(hash32(LockNamespace), hash32(schema))` for each target schema. Schemas are sorted and deduplicated prior to acquisition to guarantee consistent acquisition order across concurrent processes, preventing cross-schema deadlocks.
+   - On mid-acquisition failure, all previously held locks are released in reverse order before returning an error.
+   - `Options.LockNamespace` (default `"grizzle"`) isolates lock spaces between distinct applications sharing the same database.
+3. **Non-blocking lock acquisition loop:** Instead of blocking indefinitely on `pg_advisory_lock` (which can create server-side lock wait queues and trigger deadlocks against PostgreSQL internal catalog locks during concurrent DDL), Grizzle queries `SELECT pg_try_advisory_lock(...)` on a polling ticker.
 4. **Context-scoped lock timeout:** Because PostgreSQL server-side `SET lock_timeout` does not govern `pg_try_advisory_lock`, timeout enforcement is bounded client-side using `context.WithTimeout(ctx, lockTimeout)`. Timeout expiration yields `plan.ErrLockTimeout`, which triggers truncated exponential backoff retry with jitter up to `Options.MaxRetries`.
-5. **Session hygiene and connection reset:** Because `*sql.Conn.Close()` returns connections to the `*sql.DB` pool rather than terminating TCP sockets, Grizzle releases the advisory lock via `SELECT pg_advisory_unlock($1)` and issues session-level resets (`RESET search_path; RESET lock_timeout; RESET statement_timeout;`) inside `defer` handlers.
+5. **Session hygiene and connection reset:** Because `*sql.Conn.Close()` returns connections to the `*sql.DB` pool rather than terminating TCP sockets, Grizzle releases advisory locks in reverse order via `SELECT pg_advisory_unlock(...)` and issues session-level resets (`RESET search_path; RESET lock_timeout; RESET statement_timeout;`) inside `defer` handlers.
 6. **Direct plan apply parity:** When executing approved plans via `grizzle.Apply` where `SchemaSQL` is not retained, statements route through `exec.ApplyPostgres` / `exec.ApplySQLite` under dedicated session locks and step grouping (`GroupSteps`), rather than naive uncoordinated transactions.
 7. **Multi-pod mutual exclusion and idempotency:** Under the advisory lock, `applyPostgresOnce` and `ApplySQLite` verify `history.IsApplied(ctx, conn, dialect, schema, planHash)`. If a competing replica has already committed the plan under the lock, subsequent replicas exit gracefully as a no-op instead of failing on duplicate relation creation.

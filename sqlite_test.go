@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log/slog"
 	"testing"
 
@@ -540,6 +541,89 @@ func TestSQLite_RebuildSavepointFKViolationRollback(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("expected orphaned row with extra='orphan' still present, got count %d", count)
+	}
+}
+
+func TestSQLite_KeysetBatchCopy_LargeVolume_Checksum(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping large volume sqlite test in short mode")
+	}
+
+	db := getSQLiteDB(t)
+	db.SetMaxOpenConns(1)
+	ctx := t.Context()
+
+	schemaV1 := `
+		CREATE TABLE logs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			val INTEGER NOT NULL,
+			payload TEXT NOT NULL,
+			temp_tag TEXT
+		);
+	`
+	if err := grizzle.Sync(ctx, db, grizzle.Options{
+		Dialect:   grizzle.DialectSQLite,
+		SchemaSQL: schemaV1,
+	}); err != nil {
+		t.Fatalf("Sync V1 failed: %v", err)
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmt, err := tx.PrepareContext(ctx, "INSERT INTO logs (val, payload, temp_tag) VALUES (?, ?, ?);")
+	if err != nil {
+		t.Fatal(err)
+	}
+	totalRows := 20000
+	for i := 1; i <= totalRows; i++ {
+		if _, err := stmt.ExecContext(ctx, i, fmt.Sprintf("payload_%d", i), "tag"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = stmt.Close()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	var preCount, preSumVal int64
+	err = db.QueryRowContext(ctx, "SELECT COUNT(*), SUM(val) FROM logs;").Scan(&preCount, &preSumVal)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Schema V2: Drop column 'temp_tag' requiring rebuild with chunked copying
+	schemaV2 := `
+		CREATE TABLE logs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			val INTEGER NOT NULL,
+			payload TEXT NOT NULL
+		);
+	`
+
+	err = grizzle.Sync(ctx, db, grizzle.Options{
+		Dialect:                grizzle.DialectSQLite,
+		SchemaSQL:              schemaV2,
+		AllowDropColumn:        new(true),
+		AcceptHazards:          []grizzle.HazardCode{grizzle.HazardDropColumn},
+		SQLiteRebuildThreshold: 5000,
+		SQLiteRebuildBatchSize: 2000,
+	})
+	if err != nil {
+		t.Fatalf("Sync V2 chunked rebuild failed: %v", err)
+	}
+
+	var postCount, postSumVal int64
+	err = db.QueryRowContext(ctx, "SELECT COUNT(*), SUM(val) FROM logs;").Scan(&postCount, &postSumVal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if postCount != preCount {
+		t.Errorf("row count mismatch after rebuild: got %d, want %d", postCount, preCount)
+	}
+	if postSumVal != preSumVal {
+		t.Errorf("sum(val) checksum mismatch after rebuild: got %d, want %d", postSumVal, preSumVal)
 	}
 }
 
