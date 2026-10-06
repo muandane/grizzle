@@ -362,23 +362,34 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 	}
 
 	// Direct execution fallback if SchemaSQL was not retained
-	if err := p.ValidatePolicy(); err != nil {
-		return err
-	}
-	if err := p.ValidateHazards(opts.AcceptHazards); err != nil {
-		return err
-	}
-	tx, err := db.BeginTx(ctx, nil)
+	dialect, err := detectDialect(ctx, db)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = tx.Rollback() }()
-	for _, s := range p.Steps {
-		if _, err := tx.ExecContext(ctx, s.SQL); err != nil {
-			return fmt.Errorf("%w: failed executing [%s]: %w", plan.ErrExecutionFailed, s.SQL, err)
-		}
+
+	switch dialect {
+	case DialectSQLite:
+		return exec.ApplySQLite(ctx, db, p, exec.SQLiteExecConfig{
+			Policy:        p.Policy,
+			AcceptHazards: opts.AcceptHazards,
+			Backfill:      toExecBackfill(opts.Backfill),
+		})
+	case DialectPostgres:
+		targetSchema := cmp.Or(p.TargetSchema, "public")
+		lockID := defaultPostgresLockID(targetSchema)
+		return exec.ApplyPostgres(ctx, db, p, exec.PostgresExecConfig{
+			TargetSchema:     targetSchema,
+			LockID:           lockID,
+			Policy:           p.Policy,
+			AcceptHazards:    opts.AcceptHazards,
+			LockTimeout:      exec.DefaultLockTimeout,
+			StatementTimeout: exec.DefaultStatementTimeout,
+			MaxRetries:       exec.DefaultMaxRetries,
+			Backfill:         toExecBackfill(opts.Backfill),
+		})
+	default:
+		return fmt.Errorf("grizzle: unsupported dialect %q", dialect)
 	}
-	return tx.Commit()
 }
 
 // Check inspects the live database and returns ErrDrift (wrapped in DriftError) if the schema
