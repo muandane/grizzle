@@ -74,6 +74,8 @@ Converting an existing standard table into a partitioned table requires rewritin
 
 ## Partial and functional indexes
 
+*Status: Implemented*
+
 Partial and functional indexes reduce index storage and speed up targeted queries by indexing expressions or filtered row sets.
 
 ### Declarative syntax

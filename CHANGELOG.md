@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0] - 2026-10-06
 
 ### Added
+- **Partial and Functional Indexes**:
+  - Declarative support for PostgreSQL and SQLite functional indexes (indexing expressions like `lower(email)`) and partial indexes (filtered by `WHERE` predicates).
+  - Catalog introspection of index predicates via `pg_get_expr(ix.indpred, ix.indrelid)`.
+  - Shadow compilation normalization eliminating false diffs caused by PostgreSQL type casts, parentheses wrapping, and schema qualifications on functions/types.
+  - Non-transactional execution (`NonTx=true`) with `CREATE INDEX CONCURRENTLY` and `DROP INDEX CONCURRENTLY`.
+  - Automatic detection and concurrent repair of broken indexes (`indisvalid = false`) resulting from aborted index builds.
 - **PostgreSQL Partitioned Tables**:
   - Declarative support for range (`RANGE`), list (`LIST`), and hash (`HASH`) partitioned tables and attached partitions (`PARTITION OF ... FOR VALUES ...`).
   - Catalog introspection of partitioning strategies, partition keys, and partition inheritance bounds from `pg_partitioned_table`, `pg_inherits`, and `pg_class`.
