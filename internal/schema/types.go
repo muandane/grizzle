@@ -112,6 +112,12 @@ type Index struct {
 	IsUnique   bool   `json:"is_unique"`
 	Definition string `json:"definition"`
 	IsValid    bool   `json:"is_valid"`
+	Predicate  string `json:"predicate,omitempty"`
+}
+
+// IsPartial reports whether the index contains a WHERE predicate filter.
+func (idx *Index) IsPartial() bool {
+	return idx != nil && idx.Predicate != ""
 }
 
 // ForeignKey represents a foreign key constraint on a table.
