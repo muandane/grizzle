@@ -1112,30 +1112,46 @@ func TestPartition_InterruptedDetach_RealPgCancelBackend(t *testing.T) {
 
 	schemaIdent := pgx.Identifier{schemaPrefix}.Sanitize()
 
+	db.SetMaxOpenConns(5)
+
+	setupConn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("failed getting setup conn: %v", err)
+	}
+	defer func() { _ = setupConn.Close() }()
+
+	if _, err := setupConn.ExecContext(context.Background(), "SELECT set_config('search_path', $1, false);", schemaIdent); err != nil {
+		t.Fatalf("set search_path failed: %v", err)
+	}
+
 	// 1. Setup table and partition
-	setupSQL := fmt.Sprintf(`
-		CREATE TABLE %s.telemetry (
+	const setupSQL = `
+		CREATE TABLE telemetry (
 			id BIGINT NOT NULL,
 			recorded_at DATE NOT NULL,
 			PRIMARY KEY (id, recorded_at)
 		) PARTITION BY RANGE (recorded_at);
 
-		CREATE TABLE %s.telemetry_2026_01 PARTITION OF %s.telemetry
+		CREATE TABLE telemetry_2026_01 PARTITION OF telemetry
 			FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
 
-		INSERT INTO %s.telemetry (id, recorded_at) VALUES (1, '2026-01-15');
-	`, schemaIdent, schemaIdent, schemaIdent, schemaIdent)
-	if _, err := db.Exec(setupSQL); err != nil {
+		INSERT INTO telemetry (id, recorded_at) VALUES (1, '2026-01-15');
+	`
+	if _, err := setupConn.ExecContext(context.Background(), setupSQL); err != nil {
 		t.Fatalf("setup failed: %v", err)
 	}
+	_ = setupConn.Close()
 
 	// 2. Open a blocker connection that keeps an open transaction reading from the partition
 	blockerConn, err := db.Conn(context.Background())
 	if err != nil {
 		t.Fatalf("failed getting blocker conn: %v", err)
 	}
-	defer blockerConn.Close()
+	defer func() { _ = blockerConn.Close() }()
 
+	if _, err := blockerConn.ExecContext(context.Background(), "SELECT set_config('search_path', $1, false);", schemaIdent); err != nil {
+		t.Fatalf("set blocker search_path failed: %v", err)
+	}
 	if _, err := blockerConn.ExecContext(context.Background(), "BEGIN;"); err != nil {
 		t.Fatalf("failed to begin blocker tx: %v", err)
 	}
@@ -1144,7 +1160,7 @@ func TestPartition_InterruptedDetach_RealPgCancelBackend(t *testing.T) {
 	}()
 
 	var count int
-	if err := blockerConn.QueryRowContext(context.Background(), fmt.Sprintf("SELECT COUNT(*) FROM %s.telemetry_2026_01;", schemaIdent)).Scan(&count); err != nil {
+	if err := blockerConn.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM telemetry_2026_01;").Scan(&count); err != nil {
 		t.Fatalf("blocker query failed: %v", err)
 	}
 
@@ -1153,10 +1169,14 @@ func TestPartition_InterruptedDetach_RealPgCancelBackend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed getting detacher conn: %v", err)
 	}
-	defer detacherConn.Close()
+	defer func() { _ = detacherConn.Close() }()
+
+	if _, err := detacherConn.ExecContext(context.Background(), "SELECT set_config('search_path', $1, false);", schemaIdent); err != nil {
+		t.Fatalf("set detacher search_path failed: %v", err)
+	}
 
 	detachErrCh := make(chan error, 1)
-	detachSQL := fmt.Sprintf("ALTER TABLE %s.telemetry DETACH PARTITION %s.telemetry_2026_01 CONCURRENTLY;", schemaIdent, schemaIdent)
+	const detachSQL = "ALTER TABLE telemetry DETACH PARTITION telemetry_2026_01 CONCURRENTLY;"
 	go func() {
 		_, dErr := detacherConn.ExecContext(context.Background(), detachSQL)
 		detachErrCh <- dErr
