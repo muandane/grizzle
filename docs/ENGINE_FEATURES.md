@@ -230,3 +230,21 @@ SQLite does not support altering column types, renaming foreign keys, or droppin
 1. **Trigger and view preservation:** Introspect triggers and views referencing the target table before dropping it. Rebind them to the recreated table after renaming.
 2. **Batch data copying for large tables:** Copying millions of rows in a single `INSERT INTO ... SELECT` statement inflates SQLite journal memory. The engine will support chunked keyset copying for tables exceeding configured size thresholds.
 3. **Savepoint isolation:** Wrap each table rebuild in an explicit `SAVEPOINT grizzle_rebuild`. If `PRAGMA foreign_key_check` discovers constraint violations, roll back the savepoint and abort migration before committing.
+
+---
+
+## Dedicated session advisory lock
+
+PostgreSQL disallows running `CREATE INDEX CONCURRENTLY` inside an explicit transaction block (`ERROR: 25001: CREATE INDEX CONCURRENTLY cannot run inside a transaction block`). Because migration plans frequently interleave non-transactional index creations with transactional table modifications, a transaction-level lock (`pg_advisory_xact_lock`) cannot span both phases.
+
+Grizzle implements a dedicated session-level advisory lock architecture that coordinates multi-pod migrations safely across all transactional and non-transactional step groups.
+
+### Architecture and connection lifecycle
+
+1. **Dedicated connection pinning:** Grizzle obtains a dedicated connection (`db.Conn(ctx)`) exclusively reserved for the migration lifecycle.
+2. **Deterministic lock identifier:** Advisory lock IDs are 64-bit integer hashes computed deterministically from the managed schema name (`grizzle.GenerateLockID("grizzle", schema)`).
+3. **Non-blocking lock acquisition loop:** Instead of blocking indefinitely on `pg_advisory_lock` (which can create server-side lock wait queues and trigger deadlocks against PostgreSQL internal catalog locks during concurrent DDL), Grizzle queries `SELECT pg_try_advisory_lock($1)` on a polling ticker.
+4. **Context-scoped lock timeout:** Because PostgreSQL server-side `SET lock_timeout` does not govern `pg_try_advisory_lock`, timeout enforcement is bounded client-side using `context.WithTimeout(ctx, lockTimeout)`. Timeout expiration yields `plan.ErrLockTimeout`, which triggers truncated exponential backoff retry with jitter up to `Options.MaxRetries`.
+5. **Session hygiene and connection reset:** Because `*sql.Conn.Close()` returns connections to the `*sql.DB` pool rather than terminating TCP sockets, Grizzle releases the advisory lock via `SELECT pg_advisory_unlock($1)` and issues session-level resets (`RESET search_path; RESET lock_timeout; RESET statement_timeout;`) inside `defer` handlers.
+6. **Direct plan apply parity:** When executing approved plans via `grizzle.Apply` where `SchemaSQL` is not retained, statements route through `exec.ApplyPostgres` / `exec.ApplySQLite` under dedicated session locks and step grouping (`GroupSteps`), rather than naive uncoordinated transactions.
+7. **Multi-pod mutual exclusion and idempotency:** Under the advisory lock, `applyPostgresOnce` and `ApplySQLite` verify `history.IsApplied(ctx, conn, dialect, schema, planHash)`. If a competing replica has already committed the plan under the lock, subsequent replicas exit gracefully as a no-op instead of failing on duplicate relation creation.
