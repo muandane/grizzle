@@ -375,7 +375,7 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 	defer func() { _ = tx.Rollback() }()
 	for _, s := range p.Steps {
 		if _, err := tx.ExecContext(ctx, s.SQL); err != nil {
-			return fmt.Errorf("%w: failed executing [%s]: %v", plan.ErrExecutionFailed, s.SQL, err)
+			return fmt.Errorf("%w: failed executing [%s]: %w", plan.ErrExecutionFailed, s.SQL, err)
 		}
 	}
 	return tx.Commit()

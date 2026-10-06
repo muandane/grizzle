@@ -27,11 +27,9 @@ func (m *mockFailingDBTX) QueryRowContext(ctx context.Context, query string, arg
 	return nil
 }
 
-// TestErrorChain_Characterization asserts the current behavior of error wrapping:
-// Sentinel errors match via errors.Is, but driver errors (*pgconn.PgError) are NOT unwrap-able
-// via errors.As because %v is currently used instead of %w.
-// In Step 3, when upgraded to %w: %w, errors.As will flip to true.
-func TestErrorChain_Characterization(t *testing.T) {
+// TestErrorChain_PreservesDriverError asserts that error wrapping with %w: %w preserves both
+// the sentinel error (for high-level categorization) and the underlying driver error (*pgconn.PgError).
+func TestErrorChain_PreservesDriverError(t *testing.T) {
 	driverErr := &pgconn.PgError{
 		Code:    "42P01",
 		Message: "relation does not exist",
@@ -47,13 +45,17 @@ func TestErrorChain_Characterization(t *testing.T) {
 		t.Fatalf("expected error from DiffPostgres, got nil")
 	}
 
-	// 1. Sentinel matches
+	// 1. Sentinel matches via errors.Is
 	if !errors.Is(err, plan.ErrInspectionFailed) {
 		t.Errorf("expected errors.Is(err, plan.ErrInspectionFailed) to be true, got false: %v", err)
 	}
 
-	// 2. Driver error does NOT unwrap under current %v wrapping (characterization of legacy behavior)
-	if _, ok := errors.AsType[*pgconn.PgError](err); ok {
-		t.Errorf("expected errors.As(err, &pgErr) to be false on current %%%%v wrapping, but was true")
+	// 2. Driver error unwraps via errors.As (*pgconn.PgError)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		t.Fatalf("expected errors.As(err, &pgErr) to be true with %%w: %%w wrapping, got false")
+	}
+	if pgErr.Code != "42P01" {
+		t.Errorf("expected pgErr.Code to be 42P01, got %s", pgErr.Code)
 	}
 }

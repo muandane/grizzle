@@ -43,12 +43,12 @@ type PostgresExecConfig struct {
 func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig) ([]plan.Step, error) {
 	live, err := postgres.Inspect(ctx, dbtx, cfg.TargetSchema)
 	if err != nil {
-		return nil, fmt.Errorf("%w: live schema: %v", plan.ErrInspectionFailed, err)
+		return nil, fmt.Errorf("%w: live schema: %w", plan.ErrInspectionFailed, err)
 	}
 
 	desired, err := postgres.Inspect(ctx, dbtx, cfg.ShadowSchema)
 	if err != nil {
-		return nil, fmt.Errorf("%w: shadow schema: %v", plan.ErrInspectionFailed, err)
+		return nil, fmt.Errorf("%w: shadow schema: %w", plan.ErrInspectionFailed, err)
 	}
 
 	changes := diff.Diff(live, desired, cfg.TargetSchema, cfg.ShadowSchema, cfg.Filters)
@@ -147,7 +147,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 		if logger != nil {
 			logger.ErrorContext(ctx, "grizzle: lock acquisition failed", "lock_id", cfg.LockID, "error", err)
 		}
-		return 0, fmt.Errorf("%w: %v", plan.ErrLockAcquisition, err)
+		return 0, fmt.Errorf("%w: %w", plan.ErrLockAcquisition, err)
 	}
 	defer func() {
 		_ = postgres.ReleaseSessionAdvisoryLock(context.Background(), conn, cfg.LockID)
@@ -175,7 +175,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 		if logger != nil {
 			logger.ErrorContext(ctx, "grizzle: shadow compilation failed", "error", err)
 		}
-		return 0, fmt.Errorf("%w: %v", plan.ErrCompilationFailed, err)
+		return 0, fmt.Errorf("%w: %w", plan.ErrCompilationFailed, err)
 	}
 	if logger != nil {
 		logger.DebugContext(ctx, "grizzle: shadow compilation succeeded", "duration", time.Since(shadowStart))
@@ -284,7 +284,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 						logger.ErrorContext(ctx, "grizzle: failed executing non-tx step", "step_index", stepIdx, "sql", s.SQL, "error", err)
 					}
 					recordFailureHistory(stepIdx, err, true)
-					return committedSteps + 1, fmt.Errorf("%w: failed executing non-tx [%s]: %v", plan.ErrExecutionFailed, s.SQL, err)
+					return committedSteps + 1, fmt.Errorf("%w: failed executing non-tx [%s]: %w", plan.ErrExecutionFailed, s.SQL, err)
 				}
 				committedSteps++
 				if logger != nil {
@@ -318,7 +318,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 						logger.ErrorContext(ctx, "grizzle: failed executing step in tx", "step_index", stepIdx, "sql", s.SQL, "error", err)
 					}
 					recordFailureHistory(stepIdx, err, false)
-					return committedSteps, fmt.Errorf("%w: failed executing [%s]: %v", plan.ErrExecutionFailed, s.SQL, err)
+					return committedSteps, fmt.Errorf("%w: failed executing [%s]: %w", plan.ErrExecutionFailed, s.SQL, err)
 				}
 				if logger != nil {
 					logger.DebugContext(ctx, "grizzle: executed step in tx", "step_index", stepIdx, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
@@ -365,7 +365,7 @@ func PlanDiffPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 	defer func() { _ = postgres.DropShadowSchema(context.Background(), tx, cfg.ShadowSchema) }()
 
 	if err := postgres.RunShadowDDL(ctx, tx, cfg.ShadowSchema, cfg.TargetSchema, cfg.SchemaSQL); err != nil {
-		return nil, fmt.Errorf("%w: %v", plan.ErrCompilationFailed, err)
+		return nil, fmt.Errorf("%w: %w", plan.ErrCompilationFailed, err)
 	}
 
 	steps, err := DiffPostgres(ctx, tx, cfg)
@@ -411,13 +411,13 @@ func SyncSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) error {
 		if logger != nil {
 			logger.ErrorContext(ctx, "sqlite: shadow compilation failed", "error", err)
 		}
-		return fmt.Errorf("%w: %v", plan.ErrCompilationFailed, err)
+		return fmt.Errorf("%w: %w", plan.ErrCompilationFailed, err)
 	}
 
 	// 2. Introspect live schema
 	live, err := sqlite.Inspect(ctx, db)
 	if err != nil {
-		return fmt.Errorf("%w: %v", plan.ErrInspectionFailed, err)
+		return fmt.Errorf("%w: %w", plan.ErrInspectionFailed, err)
 	}
 
 	// 3. Diff schemas
@@ -502,7 +502,7 @@ func SyncSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) error {
 			histCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			_ = history.RecordProgress(histCtx, db, "sqlite", "", p, "failed", i+1, err, time.Since(start))
-			return fmt.Errorf("%w: failed executing [%s]: %v", plan.ErrExecutionFailed, sqlToExec, err)
+			return fmt.Errorf("%w: failed executing [%s]: %w", plan.ErrExecutionFailed, sqlToExec, err)
 		}
 		if logger != nil {
 			logger.DebugContext(ctx, "sqlite: executed step", "step_index", i+1, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
@@ -544,12 +544,12 @@ func SyncSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) error {
 func PlanDiffSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) (*plan.Plan, error) {
 	desired, err := sqlite.CompileInShadow(ctx, cfg.SchemaSQL)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", plan.ErrCompilationFailed, err)
+		return nil, fmt.Errorf("%w: %w", plan.ErrCompilationFailed, err)
 	}
 
 	live, err := sqlite.Inspect(ctx, db)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", plan.ErrInspectionFailed, err)
+		return nil, fmt.Errorf("%w: %w", plan.ErrInspectionFailed, err)
 	}
 
 	steps := sqlite.Diff(live, desired, cfg.Filters)
