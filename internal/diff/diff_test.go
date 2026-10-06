@@ -451,3 +451,70 @@ func TestDiff_PartialAndFunctionalIndexes(t *testing.T) {
 		})
 	}
 }
+
+func TestDiff_MultiSchemaCrossSchemaFK(t *testing.T) {
+	mappings := map[string]string{
+		"_shadow_identity": "identity",
+		"_shadow_billing":  "billing",
+	}
+
+	live := &schema.Schema{
+		Name:      "billing",
+		Tables:    make(map[string]*schema.Table),
+		Enums:     make(map[string]*schema.Enum),
+		Unmanaged: make(map[string]*schema.UnmanagedObject),
+	}
+
+	desired := &schema.Schema{
+		Name:      "billing",
+		Tables:    make(map[string]*schema.Table),
+		Enums:     make(map[string]*schema.Enum),
+		Unmanaged: make(map[string]*schema.UnmanagedObject),
+	}
+
+	// Add accounts table in billing referencing identity.users
+	desired.Tables["accounts"] = &schema.Table{
+		Schema: "billing",
+		Name:   "accounts",
+		Columns: map[string]*schema.Column{
+			"id":      {Name: "id", DataType: "bigint", Position: 1},
+			"user_id": {Name: "user_id", DataType: "bigint", Position: 2},
+		},
+		Indexes: make(map[string]*schema.Index),
+		ForeignKeys: map[string]*schema.ForeignKey{
+			"fk_user": {
+				Name:       "fk_user",
+				TableName:  "accounts",
+				RefSchema:  "identity",
+				RefTable:   "users",
+				Definition: "FOREIGN KEY (user_id) REFERENCES _shadow_identity.users(id)",
+				IsValid:    true,
+			},
+		},
+	}
+
+	changes, err := diff.DiffWithMappings(live, desired, "billing", "_shadow_billing", scope.Filters{}, mappings)
+	if err != nil {
+		t.Fatalf("unexpected diff error: %v", err)
+	}
+
+	var hasCreateTable, hasAddFK bool
+	for _, c := range changes {
+		if c.Type == plan.ChangeCreateTable && c.Table == "accounts" && c.Schema == "billing" {
+			hasCreateTable = true
+		}
+		if c.Type == plan.ChangeAddFK && c.Table == "accounts" && c.Schema == "billing" {
+			hasAddFK = true
+			if c.ForeignKey.Definition != "FOREIGN KEY (user_id) REFERENCES identity.users(id)" {
+				t.Errorf("FK definition not normalized: got %q", c.ForeignKey.Definition)
+			}
+		}
+	}
+
+	if !hasCreateTable {
+		t.Errorf("expected ChangeCreateTable for billing.accounts")
+	}
+	if !hasAddFK {
+		t.Errorf("expected ChangeAddFK for billing.accounts")
+	}
+}

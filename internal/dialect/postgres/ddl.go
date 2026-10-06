@@ -244,13 +244,49 @@ func GenerateDetachPartitionSQL(targetSchema, parentTable, childTable string) st
 	return fmt.Sprintf("ALTER TABLE %q.%q DETACH PARTITION %q.%q;", targetSchema, parentTable, targetSchema, childTable)
 }
 
+func foreignKeyRefTable(fk *schema.ForeignKey, defaultSchema string) string {
+	if fk == nil {
+		return ""
+	}
+	if fk.RefTable != "" {
+		if fk.RefSchema != "" {
+			return fk.RefSchema + "." + fk.RefTable
+		}
+		if defaultSchema != "" {
+			return defaultSchema + "." + fk.RefTable
+		}
+		return fk.RefTable
+	}
+	upper := strings.ToUpper(fk.Definition)
+	idx := strings.Index(upper, "REFERENCES ")
+	if idx != -1 {
+		rest := strings.TrimSpace(fk.Definition[idx+len("REFERENCES "):])
+		parenIdx := strings.Index(rest, "(")
+		spaceIdx := strings.Index(rest, " ")
+		end := len(rest)
+		if parenIdx != -1 && (spaceIdx == -1 || parenIdx < spaceIdx) {
+			end = parenIdx
+		} else if spaceIdx != -1 {
+			end = spaceIdx
+		}
+		ref := strings.Trim(strings.TrimSpace(rest[:end]), `"'`)
+		if !strings.Contains(ref, ".") && defaultSchema != "" {
+			ref = defaultSchema + "." + ref
+		}
+		return ref
+	}
+	return ""
+}
+
 // RenderChange converts a pure diff.Change into an executable plan.Step with PostgreSQL DDL.
 func RenderChange(targetSchema string, c diff.Change, nonConcurrent ...bool) plan.Step {
 	isNonConcurrent := len(nonConcurrent) > 0 && nonConcurrent[0]
+	effectiveSchema := cmp.Or(c.Schema, targetSchema)
 
 	step := plan.Step{
 		Type:              c.Type,
 		Table:             c.Table,
+		Schema:            c.Schema,
 		Destructive:        c.Destructive,
 		ColumnNotNull:      c.ColumnNotNull,
 		ColumnHasDefault:   c.ColumnHasDefault,
@@ -268,44 +304,69 @@ func RenderChange(targetSchema string, c diff.Change, nonConcurrent ...bool) pla
 
 	switch c.Type {
 	case plan.ChangeCreateEnum:
-		step.SQL = GenerateCreateEnumSQL(targetSchema, c.Enum)
+		step.SQL = GenerateCreateEnumSQL(effectiveSchema, c.Enum)
 	case plan.ChangeAlterEnum:
-		step.SQL = GenerateAddEnumValueSQL(targetSchema, c.Table, c.EnumValue)
+		step.SQL = GenerateAddEnumValueSQL(effectiveSchema, c.Table, c.EnumValue)
 	case plan.ChangeCreateTable:
-		step.SQL = GenerateCreateTableSQL(targetSchema, c.TableData)
-		if c.TableData != nil && c.TableData.IsPartition() {
-			step.ParentTable = c.TableData.PartitionOf.Parent
-			step.PartitionBounds = c.TableData.PartitionOf.Bounds
+		step.SQL = GenerateCreateTableSQL(effectiveSchema, c.TableData)
+		if c.TableData != nil {
+			if c.TableData.IsPartition() {
+				step.ParentTable = c.TableData.PartitionOf.Parent
+				step.PartitionBounds = c.TableData.PartitionOf.Bounds
+			}
+			for _, fk := range c.TableData.ForeignKeys {
+				if ref := foreignKeyRefTable(fk, effectiveSchema); ref != "" {
+					step.DependsOn = append(step.DependsOn, ref)
+				}
+			}
+			if len(step.DependsOn) > 0 {
+				slices.Sort(step.DependsOn)
+				step.DependsOn = slices.Compact(step.DependsOn)
+			}
 		}
 	case plan.ChangeAttachPartition:
-		step.SQL = GenerateAttachPartitionSQL(targetSchema, c.ParentTable, c.Table, c.PartitionBounds)
+		step.SQL = GenerateAttachPartitionSQL(effectiveSchema, c.ParentTable, c.Table, c.PartitionBounds)
 		step.ParentTable = c.ParentTable
 		step.PartitionBounds = c.PartitionBounds
 	case plan.ChangeDetachPartition:
-		step.SQL = GenerateDetachPartitionSQL(targetSchema, c.ParentTable, c.Table)
+		step.SQL = GenerateDetachPartitionSQL(effectiveSchema, c.ParentTable, c.Table)
 		step.ParentTable = c.ParentTable
 	case plan.ChangeAddColumn:
-		step.SQL = GenerateAddColumnSQL(targetSchema, c.Table, c.Column)
+		step.SQL = GenerateAddColumnSQL(effectiveSchema, c.Table, c.Column)
 	case plan.ChangeAlterColumn:
-		step.SQL = GenerateAlterColumnSQL(targetSchema, c.Table, c.OldColumn, c.Column)
+		step.SQL = GenerateAlterColumnSQL(effectiveSchema, c.Table, c.OldColumn, c.Column)
 	case plan.ChangeRenameColumn:
-		step.SQL = fmt.Sprintf("ALTER TABLE %q.%q RENAME COLUMN %q TO %q;", targetSchema, c.Table, c.OldColumn.Name, c.Column.Name)
+		step.SQL = fmt.Sprintf("ALTER TABLE %q.%q RENAME COLUMN %q TO %q;", effectiveSchema, c.Table, c.OldColumn.Name, c.Column.Name)
 	case plan.ChangeDropColumn:
-		step.SQL = fmt.Sprintf("ALTER TABLE %q.%q DROP COLUMN %q CASCADE;", targetSchema, c.Table, c.Column.Name)
+		step.SQL = fmt.Sprintf("ALTER TABLE %q.%q DROP COLUMN %q CASCADE;", effectiveSchema, c.Table, c.Column.Name)
 	case plan.ChangeCreateIndex:
 		step.SQL = GenerateCreateIndexSQL(c.Index.Definition, !isNonConcurrent)
 		step.NonTx = !isNonConcurrent
 	case plan.ChangeDropIndex:
-		step.SQL = GenerateDropIndexSQL(targetSchema, c.Index.Name, !isNonConcurrent)
+		step.SQL = GenerateDropIndexSQL(effectiveSchema, c.Index.Name, !isNonConcurrent)
 		step.NonTx = !isNonConcurrent
 	case plan.ChangeAddFK:
-		step.SQL = GenerateAddFKSQL(targetSchema, c.Table, c.ForeignKey.Name, c.ForeignKey.Definition)
+		step.SQL = GenerateAddFKSQL(effectiveSchema, c.Table, c.ForeignKey.Name, c.ForeignKey.Definition)
+		step.RefTable = foreignKeyRefTable(c.ForeignKey, effectiveSchema)
 	case plan.ChangeValidateConstraint:
-		step.SQL = GenerateValidateFKSQL(targetSchema, c.Table, c.ForeignKey.Name)
+		step.SQL = GenerateValidateFKSQL(effectiveSchema, c.Table, c.ForeignKey.Name)
+		step.RefTable = foreignKeyRefTable(c.ForeignKey, effectiveSchema)
 	case plan.ChangeDropFK:
-		step.SQL = GenerateDropFKSQL(targetSchema, c.Table, c.ForeignKey.Name)
+		step.SQL = GenerateDropFKSQL(effectiveSchema, c.Table, c.ForeignKey.Name)
+		step.RefTable = foreignKeyRefTable(c.ForeignKey, effectiveSchema)
 	case plan.ChangeDropTable:
-		step.SQL = fmt.Sprintf("DROP TABLE %q.%q CASCADE;", targetSchema, c.Table)
+		step.SQL = fmt.Sprintf("DROP TABLE %q.%q CASCADE;", effectiveSchema, c.Table)
+		if c.TableData != nil {
+			for _, fk := range c.TableData.ForeignKeys {
+				if ref := foreignKeyRefTable(fk, effectiveSchema); ref != "" {
+					step.DependsOn = append(step.DependsOn, ref)
+				}
+			}
+			if len(step.DependsOn) > 0 {
+				slices.Sort(step.DependsOn)
+				step.DependsOn = slices.Compact(step.DependsOn)
+			}
+		}
 	}
 
 	return step
@@ -321,10 +382,13 @@ func RenderChanges(targetSchema string, changes []diff.Change, nonConcurrent ...
 		steps = append(steps, step)
 
 		if c.Type == plan.ChangeAddFK {
+			effectiveSchema := cmp.Or(c.Schema, targetSchema)
 			validateStep := plan.Step{
-				Type:  plan.ChangeValidateConstraint,
-				Table: c.Table,
-				SQL:   GenerateValidateFKSQL(targetSchema, c.Table, c.ForeignKey.Name),
+				Type:     plan.ChangeValidateConstraint,
+				Schema:   c.Schema,
+				Table:    c.Table,
+				SQL:      GenerateValidateFKSQL(effectiveSchema, c.Table, c.ForeignKey.Name),
+				RefTable: step.RefTable,
 			}
 			steps = append(steps, validateStep)
 		}

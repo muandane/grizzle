@@ -14,6 +14,7 @@ import (
 // Change represents a pure difference between live and desired database schemas.
 type Change struct {
 	Type              plan.ChangeType
+	Schema            string
 	Table             string
 	Column            *schema.Column
 	OldColumn         *schema.Column
@@ -48,7 +49,20 @@ type Change struct {
 
 // Diff compares live and desired schemas using the given scope filters and returns pure changes.
 func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filters scope.Filters) ([]Change, error) {
+	mapping := make(map[string]string)
+	if shadowSchema != "" {
+		mapping[shadowSchema] = targetSchema
+	}
+	return DiffWithMappings(live, desired, targetSchema, shadowSchema, filters, mapping)
+}
+
+// DiffWithMappings compares live and desired schemas using schemaMappings for normalization and returns pure changes.
+func DiffWithMappings(live, desired *schema.Schema, targetSchema, shadowSchema string, filters scope.Filters, schemaMappings map[string]string) ([]Change, error) {
 	var changes []Change
+
+	normalize := func(def string) string {
+		return schema.NormalizeDefinitionWithMappings(def, schemaMappings, targetSchema)
+	}
 
 	// 1. Custom ENUM Types Diff
 	dEnumNames := slices.Collect(maps.Keys(desired.Enums))
@@ -59,6 +73,7 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 		if !exists {
 			changes = append(changes, Change{
 				Type:        plan.ChangeCreateEnum,
+				Schema:      targetSchema,
 				Table:       dName,
 				Enum:        dEnum,
 				Destructive: false,
@@ -68,6 +83,7 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 				if !slices.Contains(lEnum.Values, val) {
 					changes = append(changes, Change{
 						Type:        plan.ChangeAlterEnum,
+						Schema:      targetSchema,
 						Table:       dName,
 						Enum:        dEnum,
 						OldEnum:     lEnum,
@@ -91,22 +107,24 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 		if !exists {
 			createChange := Change{
 				Type:        plan.ChangeCreateTable,
+				Schema:      targetSchema,
 				Table:       tblName,
 				TableData:   dTable,
 				Destructive: false,
 			}
 			if dTable.IsPartition() {
 				createChange.ParentTable = dTable.PartitionOf.Parent
-				createChange.PartitionBounds = schema.NormalizeDefinition(dTable.PartitionOf.Bounds, shadowSchema, targetSchema)
+				createChange.PartitionBounds = normalize(dTable.PartitionOf.Bounds)
 			}
 			changes = append(changes, createChange)
 
 			for _, dIdx := range dTable.Indexes {
-				normDef := schema.NormalizeDefinition(dIdx.Definition, shadowSchema, targetSchema)
+				normDef := normalize(dIdx.Definition)
 				idxCopy := *dIdx
 				idxCopy.Definition = normDef
 				changes = append(changes, Change{
 					Type:        plan.ChangeCreateIndex,
+					Schema:      targetSchema,
 					Table:       tblName,
 					Index:       &idxCopy,
 					Destructive: false,
@@ -114,11 +132,12 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 			}
 
 			for _, dFK := range dTable.ForeignKeys {
-				normDef := schema.NormalizeDefinition(dFK.Definition, shadowSchema, targetSchema)
+				normDef := normalize(dFK.Definition)
 				fkCopy := *dFK
 				fkCopy.Definition = normDef
 				changes = append(changes, Change{
 					Type:        plan.ChangeAddFK,
+					Schema:      targetSchema,
 					Table:       tblName,
 					ForeignKey:  &fkCopy,
 					Destructive: false,
@@ -132,8 +151,8 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 			return nil, fmt.Errorf("%w: table %q cannot be converted in-place between regular and partitioned table", plan.ErrPartitionConversion, tblName)
 		}
 		if lTable.IsPartitioned() && dTable.IsPartitioned() {
-			lKey := schema.NormalizeDefinition(lTable.PartitionKey.Def, shadowSchema, targetSchema)
-			dKey := schema.NormalizeDefinition(dTable.PartitionKey.Def, shadowSchema, targetSchema)
+			lKey := normalize(lTable.PartitionKey.Def)
+			dKey := normalize(dTable.PartitionKey.Def)
 			if lTable.PartitionKey.Strategy != dTable.PartitionKey.Strategy || lKey != dKey {
 				return nil, fmt.Errorf("%w: table %q cannot change partition strategy or key in-place", plan.ErrPartitionConversion, tblName)
 			}
@@ -141,9 +160,10 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 
 		// Partition attachment or detachment transitions
 		if dTable.IsPartition() && !lTable.IsPartition() {
-			normBounds := schema.NormalizeDefinition(dTable.PartitionOf.Bounds, shadowSchema, targetSchema)
+			normBounds := normalize(dTable.PartitionOf.Bounds)
 			changes = append(changes, Change{
 				Type:            plan.ChangeAttachPartition,
+				Schema:          targetSchema,
 				Table:           tblName,
 				ParentTable:     dTable.PartitionOf.Parent,
 				PartitionBounds: normBounds,
@@ -152,22 +172,25 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 		} else if !dTable.IsPartition() && lTable.IsPartition() {
 			changes = append(changes, Change{
 				Type:        plan.ChangeDetachPartition,
+				Schema:      targetSchema,
 				Table:       tblName,
 				ParentTable: lTable.PartitionOf.Parent,
 				Destructive: false,
 			})
 		} else if dTable.IsPartition() && lTable.IsPartition() {
-			normLiveBounds := schema.NormalizeDefinition(lTable.PartitionOf.Bounds, shadowSchema, targetSchema)
-			normDesiredBounds := schema.NormalizeDefinition(dTable.PartitionOf.Bounds, shadowSchema, targetSchema)
+			normLiveBounds := normalize(lTable.PartitionOf.Bounds)
+			normDesiredBounds := normalize(dTable.PartitionOf.Bounds)
 			if lTable.PartitionOf.Parent != dTable.PartitionOf.Parent || normLiveBounds != normDesiredBounds {
 				changes = append(changes, Change{
 					Type:        plan.ChangeDetachPartition,
+					Schema:      targetSchema,
 					Table:       tblName,
 					ParentTable: lTable.PartitionOf.Parent,
 					Destructive: false,
 				})
 				changes = append(changes, Change{
 					Type:            plan.ChangeAttachPartition,
+					Schema:          targetSchema,
 					Table:           tblName,
 					ParentTable:     dTable.PartitionOf.Parent,
 					PartitionBounds: normDesiredBounds,
@@ -207,6 +230,7 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 						}
 						changes = append(changes, Change{
 							Type:             plan.ChangeAlterColumn,
+							Schema:           targetSchema,
 							Table:            tblName,
 							Column:           dCol,
 							OldColumn:        lCol,
@@ -257,6 +281,7 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 							expandedCol.IsNullable = true
 							changes = append(changes, Change{
 								Type:             plan.ChangeAddColumn,
+								Schema:           targetSchema,
 								Table:            tblName,
 								Column:           &expandedCol,
 								Destructive:      false,
@@ -267,6 +292,7 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 							// Single-step atomic rename
 							changes = append(changes, Change{
 								Type:        plan.ChangeRenameColumn,
+								Schema:      targetSchema,
 								Table:       tblName,
 								Column:      dCol,
 								OldColumn:   lCol,
@@ -284,6 +310,7 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 				dCol := addedCols[colName]
 				changes = append(changes, Change{
 					Type:             plan.ChangeAddColumn,
+					Schema:           targetSchema,
 					Table:            tblName,
 					Column:           dCol,
 					Destructive:      false,
@@ -306,6 +333,7 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 				}
 				changes = append(changes, Change{
 					Type:              plan.ChangeDropColumn,
+					Schema:            targetSchema,
 					Table:             tblName,
 					Column:            lCol,
 					OldColumn:         lCol,
@@ -318,23 +346,25 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 
 		// Indexes Diff
 		for idxName, dIdx := range dTable.Indexes {
-			normDef := schema.NormalizeDefinition(dIdx.Definition, shadowSchema, targetSchema)
+			normDef := normalize(dIdx.Definition)
 			lIdx, inLive := lTable.Indexes[idxName]
 			if !inLive {
 				idxCopy := *dIdx
 				idxCopy.Definition = normDef
 				changes = append(changes, Change{
 					Type:        plan.ChangeCreateIndex,
+					Schema:      targetSchema,
 					Table:       tblName,
 					Index:       &idxCopy,
 					Destructive: false,
 				})
 			} else {
-				normLive := schema.NormalizeDefinition(lIdx.Definition, shadowSchema, targetSchema)
+				normLive := normalize(lIdx.Definition)
 				isInvalid := !lIdx.IsValid
 				if normDef != normLive || isInvalid {
 					changes = append(changes, Change{
 						Type:        plan.ChangeDropIndex,
+						Schema:      targetSchema,
 						Table:       tblName,
 						Index:       lIdx,
 						Destructive: !isInvalid,
@@ -343,6 +373,7 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 					idxCopy.Definition = normDef
 					changes = append(changes, Change{
 						Type:        plan.ChangeCreateIndex,
+						Schema:      targetSchema,
 						Table:       tblName,
 						Index:       &idxCopy,
 						Destructive: false,
@@ -355,6 +386,7 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 			if _, inDesired := dTable.Indexes[idxName]; !inDesired {
 				changes = append(changes, Change{
 					Type:        plan.ChangeDropIndex,
+					Schema:      targetSchema,
 					Table:       tblName,
 					Index:       lIdx,
 					Destructive: lIdx.IsValid,
@@ -364,24 +396,26 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 
 		// Foreign Keys Diff
 		for fkName, dFK := range dTable.ForeignKeys {
-			normDef := schema.NormalizeDefinition(dFK.Definition, shadowSchema, targetSchema)
+			normDef := normalize(dFK.Definition)
 			lFK, inLive := lTable.ForeignKeys[fkName]
 			if !inLive {
 				fkCopy := *dFK
 				fkCopy.Definition = normDef
 				changes = append(changes, Change{
 					Type:        plan.ChangeAddFK,
+					Schema:      targetSchema,
 					Table:       tblName,
 					ForeignKey:  &fkCopy,
 					Destructive: false,
 				})
 			} else {
-				normLive := schema.NormalizeDefinition(lFK.Definition, shadowSchema, targetSchema)
+				normLive := normalize(lFK.Definition)
 				baseLive := strings.TrimSuffix(normLive, " NOT VALID")
 				baseDef := strings.TrimSuffix(normDef, " NOT VALID")
 				if baseDef != baseLive {
 					changes = append(changes, Change{
 						Type:        plan.ChangeDropFK,
+						Schema:      targetSchema,
 						Table:       tblName,
 						ForeignKey:  lFK,
 						Destructive: true,
@@ -390,6 +424,7 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 					fkCopy.Definition = normDef
 					changes = append(changes, Change{
 						Type:        plan.ChangeAddFK,
+						Schema:      targetSchema,
 						Table:       tblName,
 						ForeignKey:  &fkCopy,
 						Destructive: false,
@@ -399,6 +434,7 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 					fkCopy.Definition = baseLive
 					changes = append(changes, Change{
 						Type:        plan.ChangeValidateConstraint,
+						Schema:      targetSchema,
 						Table:       tblName,
 						ForeignKey:  &fkCopy,
 						Destructive: false,
@@ -411,6 +447,7 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 			if _, inDesired := dTable.ForeignKeys[fkName]; !inDesired {
 				changes = append(changes, Change{
 					Type:        plan.ChangeDropFK,
+					Schema:      targetSchema,
 					Table:       tblName,
 					ForeignKey:  lFK,
 					Destructive: true,
@@ -429,6 +466,7 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 		if _, exists := desired.Tables[tblName]; !exists {
 			changes = append(changes, Change{
 				Type:          plan.ChangeDropTable,
+				Schema:        targetSchema,
 				Table:         tblName,
 				Destructive:   true,
 				UnmanagedDeps: findUnmanagedDeps(live.Unmanaged, tblName, ""),

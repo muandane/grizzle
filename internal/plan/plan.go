@@ -53,6 +53,11 @@ type Step struct {
 	// Partitioning metadata
 	ParentTable     string `json:"parent_table,omitzero"`
 	PartitionBounds string `json:"partition_bounds,omitzero"`
+
+	// Relational dependency metadata for multi-schema toposort
+	Schema    string   `json:"schema,omitzero"`
+	DependsOn []string `json:"depends_on,omitzero"`
+	RefTable  string   `json:"ref_table,omitzero"`
 }
 
 // DropPolicy defines fine-grained permissions for destructive operations.
@@ -87,6 +92,7 @@ func (p DropPolicy) IsAllowed(s Step) bool {
 // Plan contains the complete list of sequenced migration steps.
 type Plan struct {
 	TargetSchema   string            `json:"target_schema"`
+	TargetSchemas  []string          `json:"target_schemas,omitempty"`
 	Steps          []Step            `json:"steps"`
 	Policy         DropPolicy        `json:"policy"`
 	IncludeTables  []string          `json:"include_tables,omitzero"`
@@ -110,6 +116,11 @@ func (p *Plan) Hash() string {
 	}
 
 	write("schema:%s\n", p.TargetSchema)
+	if len(p.TargetSchemas) > 1 {
+		schemas := slices.Clone(p.TargetSchemas)
+		slices.Sort(schemas)
+		write("schemas:%s\n", strings.Join(schemas, ","))
+	}
 	write("includes:%s\n", strings.Join(includes, ","))
 	write("excludes:%s\n", strings.Join(excludes, ","))
 
@@ -136,10 +147,14 @@ func (p *Plan) Hash() string {
 		if s.PartitionBounds != "" {
 			partStr += "|bounds:" + s.PartitionBounds
 		}
-		write("step:%d|type:%s|table:%s|sql:%s|destructive:%t|non_tx:%t|not_null:%t|default:%t|narrowed:%t|rebuild:%t|rename_cand:%t|gen_rewrite:%t|old_col:%s%s%s\n",
+		schemaStr := ""
+		if s.Schema != "" {
+			schemaStr = "|schema:" + s.Schema
+		}
+		write("step:%d|type:%s|table:%s|sql:%s|destructive:%t|non_tx:%t|not_null:%t|default:%t|narrowed:%t|rebuild:%t|rename_cand:%t|gen_rewrite:%t|old_col:%s%s%s%s\n",
 			i, s.Type, s.Table, strings.TrimSpace(s.SQL), s.Destructive, s.NonTx,
 			s.ColumnNotNull, s.ColumnHasDefault, s.TypeNarrowed, s.IsTableRebuild,
-			s.IsRenameCandidate, s.IsGeneratedRewrite, s.OldColumn, unmStr, partStr,
+			s.IsRenameCandidate, s.IsGeneratedRewrite, s.OldColumn, unmStr, partStr, schemaStr,
 		)
 	}
 
