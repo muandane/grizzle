@@ -222,8 +222,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 	// 5. Enforce safety policy (policy check hard-blocks drops regardless of AcceptHazards)
 	if err := p.ValidatePolicy(); err != nil {
 		if logger != nil {
-			var vErr *plan.DestructiveViolationError
-			if errors.As(err, &vErr) {
+			if vErr, ok := errors.AsType[*plan.DestructiveViolationError](err); ok {
 				logger.WarnContext(ctx, "grizzle: migration blocked by safety policy", "violations_count", len(vErr.Violations))
 			} else {
 				logger.WarnContext(ctx, "grizzle: migration blocked by safety policy", "error", err)
@@ -457,8 +456,7 @@ func SyncSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) error {
 	// 4. Enforce safety policy (policy check hard-blocks drops regardless of AcceptHazards)
 	if err := p.ValidatePolicy(); err != nil {
 		if logger != nil {
-			var vErr *plan.DestructiveViolationError
-			if errors.As(err, &vErr) {
+			if vErr, ok := errors.AsType[*plan.DestructiveViolationError](err); ok {
 				logger.WarnContext(ctx, "sqlite: migration blocked by safety policy", "violations_count", len(vErr.Violations))
 			} else {
 				logger.WarnContext(ctx, "sqlite: migration blocked by safety policy", "error", err)

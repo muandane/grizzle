@@ -4,10 +4,24 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/muandane/grizzle.svg)](https://pkg.go.dev/github.com/muandane/grizzle)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-Grizzle is a declarative, in-process database automigration engine for Go applications. It synchronizes PostgreSQL and SQLite database schemas directly from standard `schema.sql` definitions on boot—eliminating manual migration sequence files, version collisions, and external runtime CLI dependencies.
+Grizzle is a declarative, in-process database automigration engine for Go applications. It synchronizes PostgreSQL and SQLite database schemas directly from standard `schema.sql` definitions on boot, eliminating manual migration sequence files, version collisions, and external runtime CLI dependencies.
 
-```
-schema.sql ──► [Shadow Sandbox] ──► [Diff Engine] ──► [Hazard Gate] ──► [Advisory Lock] ──► Live DB
+```mermaid
+flowchart LR
+    A["📄 schema.sql"] --> B["🧪 Shadow Sandbox<br/><code>_grizzle_shadow</code>"]
+    B --> C["⚖️ Diff Engine<br/><code>Pure Core</code>"]
+    C --> D{"🛡️️ Hazard Gate<br/><code>Plan.Hazards()</code>"}
+    D -->|Approved| E["🔒 Advisory Lock<br/><code>pg_advisory_lock</code>"]
+    E --> F[("🗄️ Live DB<br/>PostgreSQL / SQLite")]
+
+    classDef default fill:#0d1117,stroke:#30363d,stroke-width:1px,color:#e6edf3;
+    classDef gate fill:#161b22,stroke:#f85149,stroke-width:1.5px,color:#ff7b72;
+    classDef lock fill:#161b22,stroke:#d29922,stroke-width:1.5px,color:#e3b341;
+    classDef db fill:#161b22,stroke:#2ea043,stroke-width:1.5px,color:#56d364;
+
+    class D gate;
+    class E lock;
+    class F db;
 ```
 
 ---
@@ -278,7 +292,9 @@ grizzle export --plan plan.json --format goose --out ./migrations
 - [Safety Invariants & Competitor Analysis](docs/SAFETY.md)
 - [System Architecture](docs/ARCHITECTURE.md)
 - [Engine Specification & API Reference](docs/SPEC.md)
+- [Planned Engine Features](docs/ENGINE_FEATURES.md)
 - [Changelog](CHANGELOG.md)
+
 
 ---
 

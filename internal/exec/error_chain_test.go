@@ -53,8 +53,7 @@ func TestErrorChain_Characterization(t *testing.T) {
 	}
 
 	// 2. Driver error does NOT unwrap under current %v wrapping (characterization of legacy behavior)
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) {
+	if _, ok := errors.AsType[*pgconn.PgError](err); ok {
 		t.Errorf("expected errors.As(err, &pgErr) to be false on current %%%%v wrapping, but was true")
 	}
 }
