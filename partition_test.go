@@ -1089,3 +1089,135 @@ func TestPartition_InterruptedDetachPending_FinalizeAndHazard(t *testing.T) {
 	}
 }
 
+func TestPartition_InterruptedDetach_RealPgCancelBackend(t *testing.T) {
+	db, _ := getPostgresDB(t)
+	defer func() { _ = db.Close() }()
+
+	var serverVersion int
+	if err := db.QueryRow("SHOW server_version_num;").Scan(&serverVersion); err != nil {
+		t.Fatalf("failed reading server version: %v", err)
+	}
+	if serverVersion < 140000 {
+		t.Skip("skipping real DETACH CONCURRENTLY cancel test on PostgreSQL < 14")
+	}
+
+	schemaPrefix := fmt.Sprintf("test_detach_cancel_%d", time.Now().UnixNano())
+	_, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schemaPrefix))
+	if err != nil {
+		t.Fatalf("failed creating schema: %v", err)
+	}
+	defer func() {
+		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schemaPrefix))
+	}()
+
+	schemaIdent := pgx.Identifier{schemaPrefix}.Sanitize()
+
+	// 1. Setup table and partition
+	setupSQL := fmt.Sprintf(`
+		CREATE TABLE %s.telemetry (
+			id BIGINT NOT NULL,
+			recorded_at DATE NOT NULL,
+			PRIMARY KEY (id, recorded_at)
+		) PARTITION BY RANGE (recorded_at);
+
+		CREATE TABLE %s.telemetry_2026_01 PARTITION OF %s.telemetry
+			FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+
+		INSERT INTO %s.telemetry (id, recorded_at) VALUES (1, '2026-01-15');
+	`, schemaIdent, schemaIdent, schemaIdent, schemaIdent)
+	if _, err := db.Exec(setupSQL); err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+
+	// 2. Open a blocker connection that keeps an open transaction reading from the partition
+	blockerConn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("failed getting blocker conn: %v", err)
+	}
+	defer blockerConn.Close()
+
+	if _, err := blockerConn.ExecContext(context.Background(), "BEGIN;"); err != nil {
+		t.Fatalf("failed to begin blocker tx: %v", err)
+	}
+	defer func() {
+		_, _ = blockerConn.ExecContext(context.Background(), "ROLLBACK;")
+	}()
+
+	var count int
+	if err := blockerConn.QueryRowContext(context.Background(), fmt.Sprintf("SELECT COUNT(*) FROM %s.telemetry_2026_01;", schemaIdent)).Scan(&count); err != nil {
+		t.Fatalf("blocker query failed: %v", err)
+	}
+
+	// 3. Launch DETACH CONCURRENTLY on separate connection in background
+	detacherConn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("failed getting detacher conn: %v", err)
+	}
+	defer detacherConn.Close()
+
+	detachErrCh := make(chan error, 1)
+	detachSQL := fmt.Sprintf("ALTER TABLE %s.telemetry DETACH PARTITION %s.telemetry_2026_01 CONCURRENTLY;", schemaIdent, schemaIdent)
+	go func() {
+		_, dErr := detacherConn.ExecContext(context.Background(), detachSQL)
+		detachErrCh <- dErr
+	}()
+
+	// 4. Poll until detacher backend is active and waiting on lock/snapshot
+	var detacherPID int
+	for range 50 {
+		time.Sleep(50 * time.Millisecond)
+		err := db.QueryRow(`
+			SELECT pid FROM pg_stat_activity
+			WHERE query LIKE '%DETACH PARTITION%CONCURRENTLY%'
+			  AND pid <> pg_backend_pid()
+			  AND state = 'active'
+			LIMIT 1;
+		`).Scan(&detacherPID)
+		if err == nil && detacherPID > 0 {
+			break
+		}
+	}
+	if detacherPID == 0 {
+		t.Fatalf("failed to find active DETACH CONCURRENTLY backend in pg_stat_activity")
+	}
+
+	// 5. Cancel the backend
+	var cancelled bool
+	if err := db.QueryRow("SELECT pg_cancel_backend($1);", detacherPID).Scan(&cancelled); err != nil {
+		t.Fatalf("pg_cancel_backend failed: %v", err)
+	}
+	if !cancelled {
+		t.Fatalf("pg_cancel_backend returned false")
+	}
+
+	// Wait for detacher to return error
+	select {
+	case detachErr := <-detachErrCh:
+		if detachErr == nil {
+			t.Fatalf("expected DETACH CONCURRENTLY to fail due to cancellation, but succeeded")
+		}
+		t.Logf("detacher cancelled as expected with error: %v", detachErr)
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for detacher cancellation")
+	}
+
+	// Release blocker
+	_, _ = blockerConn.ExecContext(context.Background(), "ROLLBACK;")
+
+	// 6. Assert inhdetachpending is true on real PostgreSQL!
+	var isPending bool
+	const checkPendingSQL = `
+		SELECT i.inhdetachpending
+		FROM pg_inherits i
+		JOIN pg_class c ON c.oid = i.inhrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relname = 'telemetry_2026_01';
+	`
+	if err := db.QueryRow(checkPendingSQL, schemaPrefix).Scan(&isPending); err != nil {
+		t.Fatalf("querying inhdetachpending failed: %v", err)
+	}
+	if !isPending {
+		t.Fatalf("expected inhdetachpending=true after real pg_cancel_backend of DETACH CONCURRENTLY, got false")
+	}
+}
+

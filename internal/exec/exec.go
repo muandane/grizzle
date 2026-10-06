@@ -1176,7 +1176,7 @@ func executeSQLiteStep(ctx context.Context, tx *sql.Tx, s plan.Step, cfg SQLiteE
 		if colStart != -1 && colEnd != -1 && colEnd > colStart {
 			colList := strings.TrimSpace(copyStmt[colStart+1 : colEnd])
 			if colList != "" {
-				if err := copyDataKeysetChunks(ctx, tx, tempTable, colList, s.Table, batchSize); err != nil {
+				if err := copyDataKeysetChunks(ctx, tx, tempTable, colList, s.Table, batchSize, cfg.Logger); err != nil {
 					_, _ = tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT grizzle_rebuild;")
 					_, _ = tx.ExecContext(ctx, "RELEASE SAVEPOINT grizzle_rebuild;")
 					return err
@@ -1229,11 +1229,13 @@ func executeSQLiteStep(ctx context.Context, tx *sql.Tx, s plan.Step, cfg SQLiteE
 	return nil
 }
 
-func copyDataKeysetChunks(ctx context.Context, tx *sql.Tx, tempTable, colList, liveTable string, batchSize int) error {
+func copyDataKeysetChunks(ctx context.Context, tx *sql.Tx, tempTable, colList, liveTable string, batchSize int, logger *slog.Logger) error {
 	var lastRowID int64
 	var hasStarted bool
+	var batchNum int
 
 	for {
+		batchNum++
 		var query string
 		var args []any
 		if !hasStarted {
@@ -1251,6 +1253,9 @@ func copyDataKeysetChunks(ctx context.Context, tx *sql.Tx, tempTable, colList, l
 		affected, err := res.RowsAffected()
 		if err != nil || affected == 0 {
 			break
+		}
+		if logger != nil {
+			logger.DebugContext(ctx, "sqlite: copied keyset batch", "table", liveTable, "batch", batchNum, "rows", affected)
 		}
 
 		var maxRowID int64

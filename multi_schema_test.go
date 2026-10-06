@@ -460,6 +460,44 @@ func TestMultiSchema_CircularCrossSchemaFKs(t *testing.T) {
 	if lastFKDropIdx != -1 && firstTableDropIdx != -1 && lastFKDropIdx > firstTableDropIdx {
 		t.Errorf("expected all DROP_FK steps before DROP_TABLE steps: lastFK=%d, firstTable=%d", lastFKDropIdx, firstTableDropIdx)
 	}
+
+	// 4. Golden plan hash: verify deterministic plan hash for circular cross-schema FK drops with static schemas
+	const staticS1 = "circ_static_a"
+	const staticS2 = "circ_static_b"
+	defer func() {
+		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA IF EXISTS %s, %s CASCADE;", staticS1, staticS2))
+	}()
+	_, _ = db.Exec(fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s;", staticS1))
+	_, _ = db.Exec(fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s;", staticS2))
+
+	staticCircularSQL := fmt.Sprintf(`
+		CREATE TABLE %s.table_a (id INT PRIMARY KEY, b_id INT);
+		CREATE TABLE %s.table_b (id INT PRIMARY KEY, a_id INT, CONSTRAINT fk_b_a FOREIGN KEY (a_id) REFERENCES %s.table_a(id));
+		ALTER TABLE %s.table_a ADD CONSTRAINT fk_a_b FOREIGN KEY (b_id) REFERENCES %s.table_b(id);
+	`, staticS1, staticS2, staticS1, staticS1, staticS2)
+
+	if err := grizzle.Sync(ctx, db, grizzle.Options{
+		Dialect:       grizzle.DialectPostgres,
+		TargetSchemas: []string{staticS1, staticS2},
+		SchemaSQL:     staticCircularSQL,
+	}); err != nil {
+		t.Fatalf("Sync static circular schemas failed: %v", err)
+	}
+
+	staticDropSQL := fmt.Sprintf(`CREATE TABLE %s.empty_placeholder (id INT);`, staticS1)
+	staticDropPlan, err := grizzle.PlanDiff(ctx, db, grizzle.Options{
+		Dialect:       grizzle.DialectPostgres,
+		TargetSchemas: []string{staticS1, staticS2},
+		SchemaSQL:     staticDropSQL,
+		AllowDrop:     true,
+	})
+	if err != nil {
+		t.Fatalf("PlanDiff static drop failed: %v", err)
+	}
+	const goldenCircularDropHash = "aa491d14de51977619c96da1b0c24b556cd397636d669e19fd2d894d2e9c4cbc"
+	if staticDropPlan.Hash() != goldenCircularDropHash {
+		t.Errorf("circular FK drop plan golden hash mismatch:\ngot:  %s\nwant: %s", staticDropPlan.Hash(), goldenCircularDropHash)
+	}
 }
 
 func TestMultiSchema_SQLiteTypedError(t *testing.T) {

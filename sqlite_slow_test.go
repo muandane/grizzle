@@ -3,15 +3,32 @@
 package grizzle_test
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/muandane/grizzle"
 	_ "modernc.org/sqlite"
 )
+
+type batchCountHandler struct {
+	count *int
+}
+
+func (h *batchCountHandler) Enabled(_ context.Context, _ slog.Level) bool { return true }
+func (h *batchCountHandler) Handle(_ context.Context, r slog.Record) error {
+	if strings.Contains(r.Message, "copied keyset batch") {
+		*h.count++
+	}
+	return nil
+}
+func (h *batchCountHandler) WithAttrs(_ []slog.Attr) slog.Handler { return h }
+func (h *batchCountHandler) WithGroup(_ string) slog.Handler      { return h }
 
 func TestSQLite_KeysetBatchCopy_1M_Rows_Checksum(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -79,6 +96,9 @@ func TestSQLite_KeysetBatchCopy_1M_Rows_Checksum(t *testing.T) {
 		);
 	`
 
+	var batchCount int
+	batchLogger := slog.New(&batchCountHandler{count: &batchCount})
+
 	rebuildStart := time.Now()
 	err = grizzle.Sync(ctx, db, grizzle.Options{
 		Dialect:                grizzle.DialectSQLite,
@@ -87,12 +107,16 @@ func TestSQLite_KeysetBatchCopy_1M_Rows_Checksum(t *testing.T) {
 		AcceptHazards:          []grizzle.HazardCode{grizzle.HazardDropColumn},
 		SQLiteRebuildThreshold: 50000,
 		SQLiteRebuildBatchSize: 25000,
+		Logger:                 batchLogger,
 	})
 	rebuildElapsed := time.Since(rebuildStart)
 	if err != nil {
 		t.Fatalf("Sync V2 chunked rebuild failed: %v", err)
 	}
-	t.Logf("Rebuilt 1,000,000 row table in %v", rebuildElapsed)
+	t.Logf("Rebuilt 1,000,000 row table in %v across %d keyset batches", rebuildElapsed, batchCount)
+	if batchCount <= 1 {
+		t.Fatalf("expected keyset batch count > 1 for 1M rows, got %d", batchCount)
+	}
 
 	var postCount, postSumVal int64
 	err = db.QueryRowContext(ctx, "SELECT COUNT(*), SUM(val) FROM logs;").Scan(&postCount, &postSumVal)
@@ -105,5 +129,5 @@ func TestSQLite_KeysetBatchCopy_1M_Rows_Checksum(t *testing.T) {
 	if postSumVal != preSumVal {
 		t.Fatalf("checksum mismatch: got %d, want %d", postSumVal, preSumVal)
 	}
-	t.Logf("1M row verification passed: count=%d, checksum=%d", postCount, postSumVal)
+	t.Logf("1M row verification passed: count=%d, checksum=%d, batchCount=%d", postCount, postSumVal, batchCount)
 }
