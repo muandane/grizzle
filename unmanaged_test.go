@@ -280,7 +280,7 @@ func TestUnmanaged_PostgresIntegration(t *testing.T) {
 		Dialect:        grizzle.DialectPostgres,
 		TargetSchema:   schemaPrefix,
 		SchemaSQL:      desiredSQL,
-		AllowDropTable: boolPtr(true),
+		AllowDropTable: new(true),
 	}
 
 	// 3. PlanDiff should detect the hazard UNMANAGED_DEPENDENCY
@@ -301,7 +301,7 @@ func TestUnmanaged_PostgresIntegration(t *testing.T) {
 	}
 
 	// 4. Sync without accepting hazard must fail
-	opts.AllowDropColumn = boolPtr(true)
+	opts.AllowDropColumn = new(true)
 	err = grizzle.Sync(context.Background(), db, opts)
 	if !errors.Is(err, grizzle.ErrHazardBlocked) {
 		t.Fatalf("expected ErrHazardBlocked on Sync without AcceptHazards, got: %v", err)
@@ -324,6 +324,7 @@ func TestUnmanaged_PostgresIntegration(t *testing.T) {
 	}
 }
 
+//go:fix inline
 func boolPtr(b bool) *bool {
-	return &b
+	return new(b)
 }

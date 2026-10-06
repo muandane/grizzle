@@ -1,17 +1,32 @@
 # Grizzle
 
-Grizzle provides declarative, in-process database schema automigration for Go applications. It synchronizes PostgreSQL and SQLite schemas directly from standard `schema.sql` files at application boot, eliminating migration sequence files, version collisions, and external CLI tools.
+[![CI](https://github.com/muandane/grizzle/actions/workflows/ci.yml/badge.svg)](https://github.com/muandane/grizzle/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/muandane/grizzle.svg)](https://pkg.go.dev/github.com/muandane/grizzle)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-## Problems Grizzle solves
+Grizzle is a declarative, in-process database automigration engine for Go applications. It synchronizes PostgreSQL and SQLite database schemas directly from standard `schema.sql` definitions on boot—eliminating manual migration sequence files, version collisions, and external runtime CLI dependencies.
 
-1. **Migration sequence conflicts.** When multiple developers generate numbered migration files on different Git branches (e.g. `0005_add_users.sql` and `0005_add_teams.sql`), merging to the main branch causes file name collisions and execution ordering ambiguities. Grizzle diffs the desired state against the live catalog directly.
-2. **Schema duplication in ORMs.** Libraries such as GORM and Ent require declaring schemas using Go struct tags or Go DSLs. GORM auto-migration only adds missing columns and skips column type alterations or drop detection. Grizzle uses standard SQL DDL as the single source of truth.
-3. **External binary requirements.** Tools such as Atlas, Prisma, and Drizzle require standalone CLI binaries, Node.js runtimes, or pre-migration Docker containers. Grizzle runs entirely within the compiled Go application binary.
-4. **Multi-replica race conditions.** When multiple application instances boot concurrently, uncoordinated DDL execution leads to deadlocks and failed deployments. Grizzle coordinates instances with distributed advisory locking, lock timeouts, and exponential backoff retry.
+```
+schema.sql ──► [Shadow Sandbox] ──► [Diff Engine] ──► [Hazard Gate] ──► [Advisory Lock] ──► Live DB
+```
 
-## Quick start
+---
 
-Define your database schema in standard SQL:
+## Why Grizzle?
+
+- **Standard SQL as single source of truth**: No Go struct tags, ORM annotations, or proprietary DSLs. Write standard `CREATE TABLE` and `CREATE INDEX` statements.
+- **Zero external dependencies**: Runs entirely in-process within your compiled Go binary. Zero Node.js, Python, Docker, or external CLI requirements in production container images.
+- **Production safety by default**: Destructive drops are hard-blocked (`AllowDrop: false`). Dangerous structural alterations trigger blocking hazard gates.
+- **Distributed multi-pod mutual exclusion**: Dedicated session-level advisory locks prevent migration races across concurrent Kubernetes replicas, with automatic lock contention retry and post-lock re-diffing.
+- **Safe PostgreSQL execution**: Index creation defaults to `CREATE INDEX CONCURRENTLY` outside transactions; foreign keys are staged as `NOT VALID` and validated in a separate transaction to avoid extended table locks.
+- **Complete SQLite parity**: Supports table rebuild procedures (12-step SQLite table rebuild), column renames, and foreign key verification via pure Go (`modernc.org/sqlite`).
+- **Exportable artifacts**: Generates versioned migration files for `sql`, `goose`, and `atlas` formats with deterministic plan hashes.
+
+---
+
+## Quickstart
+
+### 1. PostgreSQL (with `pgx`)
 
 ```sql
 -- schema.sql
@@ -24,8 +39,6 @@ CREATE TABLE users (
 
 CREATE INDEX idx_users_created_at ON users (created_at);
 ```
-
-Embed the file and call `grizzle.Apply` (or `grizzle.Sync`) in `main.go`:
 
 ```go
 package main
@@ -47,18 +60,17 @@ var schemaSQL string
 func main() {
 	ctx := context.Background()
 
-	db, err := sql.Open("pgx", "postgres://postgres:password@localhost:5432/myapp?sslmode=disable")
+	db, err := sql.Open("pgx", "postgres://postgres:secret@localhost:5432/myapp?sslmode=disable")
 	if err != nil {
-		log.Fatalf("connect failed: %v", err)
+		log.Fatalf("database connect error: %v", err)
 	}
 	defer db.Close()
 
 	opts := grizzle.Options{
 		SchemaSQL:        schemaSQL,
-		AllowDrop:        false, // Prevents accidental data destruction in production
-		StrictScope:      true,  // Requires explicit IncludeTables whitelist
+		AllowDrop:        false, // Default-deny drops
+		StrictScope:      true,  // Protect unmanaged tables (asynq, postgis, etc.)
 		IncludeTables:    []string{"users"},
-		ExcludeTables:    []string{"asynq_*", "temporal_*"}, // Protects worker queue tables
 		LockTimeout:      5 * time.Second,
 		StatementTimeout: 2 * time.Minute,
 	}
@@ -66,7 +78,7 @@ func main() {
 	// 1. Inspect and compute deterministic migration plan
 	plan, err := grizzle.PlanDiff(ctx, db, opts)
 	if err != nil {
-		log.Fatalf("plan failed: %v", err)
+		log.Fatalf("planning failed: %v", err)
 	}
 
 	// 2. Apply plan with cryptographic approval hash verification
@@ -77,47 +89,199 @@ func main() {
 		log.Fatalf("migration failed: %v", err)
 	}
 
-	log.Println("Database synchronized. Starting server...")
+	log.Println("Database synchronized. Starting service...")
 }
 ```
 
-## Features
+### 2. SQLite (Embedded, Zero Cgo)
 
-* **Zero external dependencies**: Runs completely in-process within your compiled Go binary. Zero Cgo.
-* **PostgreSQL and SQLite engines**: Supports PostgreSQL 13+ and SQLite 3.35+ (via `modernc.org/sqlite`).
-* **Deterministic plan hashing & drift detection**: `Plan.Hash()` computes a SHA-256 digest of migration steps; `Apply` verifies post-lock state against `ExpectedHash`, and `Check(ctx, db, opts)` inspects drift read-only.
-* **Blocking hazard gating**: Critical hazards (`DROP_TABLE`, `DROP_COLUMN`, `TYPE_NARROW`, `RENAME_AMBIGUOUS`) fail execution unless accepted via `Options.AcceptHazards`. Evaluated structurally without SQL string matching.
-* **Distributed locking with retry**: Acquires advisory locks (`pg_advisory_xact_lock` or session-level advisory locks), recomputes plans post-lock, and automatically retries with exponential backoff and jitter on lock contention (`55P03`).
-* **Non-blocking concurrent indexes**: PostgreSQL builds new indexes using `CREATE INDEX CONCURRENTLY` by default outside transactions, minimizing table locks.
-* **Safe foreign key validation**: Foreign keys are added as `NOT VALID` and verified in a subsequent `VALIDATE CONSTRAINT` step to eliminate prolonged share-row-exclusive locks.
-* **Staged expand-and-contract column renames**: Detects ambiguous renames, supports explicit mappings via `Options.Renames`, and stages dual-column additions with `Options.ExpandContract: true` for zero-downtime migrations.
-* **Non-destructive defaults**: `AllowDrop: false` halts execution if columns or tables are missing from `schema.sql`. Granular flags (`AllowDropTable`, `AllowDropColumn`, `AllowDropIndex`, `AllowDropFK`) allow selective overrides.
-* **Audit history tracking**: Automatically records applied migration plans, hashes, timestamps, durations, and steps into `grizzle_history`.
-* **SQLite 12-step rebuild**: Executes table recreation procedures to modify column types and drop constraints safely.
-* **Terminal visualization**: Renders colored migration diffs and hazards using `Plan.Format(os.Stdout, true)`.
+```sql
+-- schema.sql
+CREATE TABLE documents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 
-## Documentation index
+CREATE INDEX idx_documents_created ON documents (created_at);
+```
 
-* [Safety analysis & production comparison](docs/SAFETY.md): Detailed comparison with Drizzle ORM, Atlas, Ent, and TypeORM, documenting safety invariants, competitor references, and production guarantees.
-* [System architecture](docs/ARCHITECTURE.md): Layered dependency architecture, component interactions, and execution sequence diagrams.
-* [Specification](docs/SPEC.md): Complete API contract, configuration options, and error taxonomy.
-* [Design notes](docs/DESIGN.md): PostgreSQL catalog inspection, SQLite rebuild engine, and type normalization algorithms.
+```go
+package main
 
-## Development environment
+import (
+	"context"
+	"database/sql"
+	_ "embed"
+	"log"
 
-Grizzle uses [devenv](https://devenv.sh/) to provide a reproducible development shell with Go 1.27, PostgreSQL 16, and test utilities.
+	"github.com/muandane/grizzle"
+	_ "modernc.org/sqlite"
+)
+
+//go:embed schema.sql
+var schemaSQL string
+
+func main() {
+	ctx := context.Background()
+
+	db, err := sql.Open("sqlite", "app.db?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
+	if err != nil {
+		log.Fatalf("database open error: %v", err)
+	}
+	defer db.Close()
+
+	// Apply schema automatically in a single call
+	err = grizzle.Sync(ctx, db, grizzle.Options{
+		SchemaSQL: schemaSQL,
+	})
+	if err != nil {
+		log.Fatalf("sqlite sync failed: %v", err)
+	}
+
+	log.Println("SQLite database initialized successfully.")
+}
+```
+
+---
+
+## Five Safety Defaults Comparison
+
+| Capability | TypeORM (`synchronize`) | Drizzle (`drizzle-kit push`) | Atlas CLI | Ent (`entgo.io`) | Grizzle |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Runtime Topology** | In-process Node.js | External Node CLI | External Go binary / Docker | In-process Go ORM | **In-process Go library** |
+| **Distributed Locking** | None (races on multi-pod boot) | None (developer CLI) | Advisory locks | Custom driver hook | **`pg_advisory_lock` + post-lock re-diffing** |
+| **Default Drop Policy** | Drops unmapped tables/cols | Prompts in TTY; drops with `--force` | Configurable flags | Drops disabled (`WithDropColumn(false)`) | **Hard-blocked (`AllowDrop: false`)** |
+| **Shadow Validation** | None (runs on live DB) | None (runs on live DB) | Dev DB container | In-memory parser | **Isolated shadow schema (`_grizzle_shadow`)** |
+| **Pre-execution Hazard Gate** | None | None | Analyzer rules (Pro/Cloud) | None | **Structural `Plan.Hazards()` blocking gate** |
+| **Plan Hash & Drift Check** | None | None | Directory checksums | None | **Cryptographic `Plan.Hash()` + `Check()`** |
+
+*For a detailed architectural breakdown and benchmark citations, see [docs/SAFETY.md](docs/SAFETY.md).*
+
+---
+
+## Supported Engines
+
+| Engine | Version | Dialect Driver | Key Capabilities |
+| :--- | :--- | :--- | :--- |
+| **PostgreSQL** | 13, 14, 15, 16, 17 | `pgx/v5`, `lib/pq`, `database/sql` | Session advisory locks, `CREATE INDEX CONCURRENTLY`, `ADD CONSTRAINT ... NOT VALID` with separate `VALIDATE CONSTRAINT`, automated invalid index repair, unmanaged object dependency tracking (`UNMANAGED_DEPENDENCY`). |
+| **SQLite** | 3.35+ | `modernc.org/sqlite` (pure Go), `mattn/go-sqlite3` | 12-step table rebuild engine, generated columns (`VIRTUAL` / `STORED`), native column renames, `PRAGMA foreign_key_check` validation. |
+
+---
+
+## Architecture
+
+Grizzle enforces a strict one-way dependency architecture:
+
+```mermaid
+graph TD
+    subgraph Facade ["Public API (Facade)"]
+        Grizzle["grizzle (root)<br/>Sync / PlanDiff / Apply / Check / Export"]
+    end
+
+    subgraph Execution ["Execution Layer (I/O, Locks, History)"]
+        Exec["internal/exec<br/>Advisory locks, Tx groups, Retries"]
+        History["internal/history<br/>grizzle_history audit table"]
+    end
+
+    subgraph Dialect ["Dialect Layer (Catalog & SQL Syntax)"]
+        Postgres["internal/dialect/postgres<br/>Catalog introspection, DDL rendering"]
+        SQLite["internal/dialect/sqlite<br/>Catalog introspection, 12-step rebuild"]
+    end
+
+    subgraph PureCore ["Pure Core (Zero I/O, Deterministic)"]
+        Schema["internal/schema<br/>Table, Column, Index models"]
+        Scope["internal/scope<br/>Table filters, unmanaged exclusions"]
+        Diff["internal/diff<br/>Pure schema diffing engine"]
+        Plan["internal/plan<br/>Steps, Hazards, SHA-256 Hash"]
+        Export["internal/export<br/>SQL, Goose, Atlas formatters"]
+    end
+
+    Grizzle --> Exec
+    Grizzle --> History
+    Grizzle --> Postgres
+    Grizzle --> SQLite
+    Grizzle --> Plan
+
+    Exec --> Dialect
+    Exec --> Plan
+    History --> Dialect
+
+    Postgres --> Schema
+    Postgres --> Plan
+    Postgres --> Scope
+    SQLite --> Schema
+    SQLite --> Plan
+    SQLite --> Scope
+
+    Diff --> Schema
+    Diff --> Scope
+    Plan --> Schema
+    Export --> Plan
+```
+
+- **Pure Core** (`schema`, `scope`, `diff`, `plan`, `export`): Free of `database/sql`, context, network, or file I/O. 100% deterministic and unit-testable.
+- **Dialect Layer** (`dialect/postgres`, `dialect/sqlite`): Encapsulates catalog introspection and dialect-specific DDL syntax.
+- **Execution Layer** (`exec`, `history`): Coordinates connection pools, advisory locks, timeouts, transaction grouping, and failure recording.
+- **Public Facade** (`grizzle`): Minimal wiring surface and public type aliases.
+
+---
+
+## When to use Grizzle vs goose vs Atlas
+
+| Scenario | Recommend | Rationale |
+| :--- | :--- | :--- |
+| **Go application boot automigration** | **Grizzle** | Runs in-process on boot, single binary, standard `schema.sql`, distributed advisory locking, zero deployment sidecars. |
+| **Imperative hand-crafted SQL migrations** | **goose** | When migrations require manual data transformations (`UPDATE users SET legacy = false`), complex ETL backfills, or strict sequential numbered scripts (`001_init.sql`). *Tip: Use `grizzle export --format goose` to bootstrap initial goose files.* |
+| **Polyglot teams & Terraform / CI/CD pipelines** | **Atlas** | When managing multiple language stacks (Node, Python, Java), deploying via Atlas Kubernetes Operator, or using Atlas Cloud team governance. *Tip: Use `grizzle export --format atlas` to generate compatible schemas.* |
+
+---
+
+## Stability Note (v0.1.0)
+
+- **Production-Ready Core**: The declarative automigration pipeline (`Sync`, `PlanDiff`, `Apply`, `Check`, `Export`), PostgreSQL and SQLite dialects, advisory locking, invalid index recovery, unmanaged object protection, and hazard gates are production-tested and covered by rigorous integration suites.
+- **Experimental APIs**: Column renames (`Options.Renames`) and staged zero-downtime expand-and-contract migrations (`Options.ExpandContract`, `Options.Backfill`) are fully functional and golden-tested, but marked `// Experimental:` as their configuration signatures may evolve prior to v1.0.
+
+---
+
+## CLI Usage
+
+Grizzle includes a lightweight CLI for CI/CD automation and artifact export:
 
 ```bash
-# 1. Enter the dev shell
-devenv shell
+# Generate deterministic migration plan JSON
+grizzle plan --dsn "$DATABASE_URL" --schema schema.sql --out plan.json
 
-# 2. Start PostgreSQL daemon
-devenv up
+# Apply pre-approved plan with strict drift verification
+grizzle apply --dsn "$DATABASE_URL" --plan plan.json --accept-hazard DROP_COLUMN
 
-# 3. Development commands
-test-all    # Run tests with race detection (-race)
-lint        # Run golangci-lint
-db-shell    # Open psql on grizzle_test
-db-reset    # Reset public schema
-clean       # Remove generated SQLite databases and test artifacts
+# Check live database for schema drift in CI (exits 0 if clean, 4 on drift)
+grizzle check --dsn "$DATABASE_URL" --schema schema.sql
+
+# Export planned migration to Goose or Atlas format
+grizzle export --plan plan.json --format goose --out ./migrations
 ```
+
+### Exit Codes
+
+- `0`: Success / clean schema / no-op
+- `1`: Execution or connection error
+- `2`: Blocked by unaccepted hazard
+- `3`: Plan hash drift during `apply` (`ErrPlanDrift`)
+- `4`: Schema drift detected during `check`
+
+---
+
+## Documentation
+
+- [Safety Invariants & Competitor Analysis](docs/SAFETY.md)
+- [System Architecture](docs/ARCHITECTURE.md)
+- [Engine Specification & API Reference](docs/SPEC.md)
+- [Changelog](CHANGELOG.md)
+
+---
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE) for details.
