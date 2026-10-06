@@ -56,9 +56,9 @@ func AcquireSessionAdvisoryLock(ctx context.Context, dbtx dialect.DBTX, lockID i
 
 // ReleaseSessionAdvisoryLock releases a PostgreSQL session-level exclusive advisory lock on a dedicated connection.
 func ReleaseSessionAdvisoryLock(ctx context.Context, dbtx dialect.DBTX, lockID int64) error {
-	var dummy int
-	err := dbtx.QueryRowContext(ctx, "SELECT 1 FROM pg_advisory_unlock($1);", lockID).Scan(&dummy)
-	if err != nil && err != sql.ErrNoRows {
+	var released bool
+	err := dbtx.QueryRowContext(ctx, "SELECT pg_advisory_unlock($1);", lockID).Scan(&released)
+	if err != nil {
 		return fmt.Errorf("failed to release pg_advisory_unlock: %w", err)
 	}
 	return nil
