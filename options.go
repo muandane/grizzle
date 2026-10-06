@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
@@ -34,7 +35,11 @@ type Options struct {
 	SchemaSQL string
 
 	// TargetSchema is the schema to manage (defaults to "public" for Postgres, "main" for SQLite).
+	// Deprecated: Use TargetSchemas for multi-schema support.
 	TargetSchema string
+
+	// TargetSchemas specifies the database schemas to manage (defaults to [TargetSchema] or ["public"] for Postgres).
+	TargetSchemas []string
 
 	// ShadowSchema is the temporary schema name used for validation (defaults to "_grizzle_shadow").
 	ShadowSchema string
@@ -125,9 +130,21 @@ func WithDialect(d Dialect) Option {
 }
 
 // WithTargetSchema sets the target schema.
+// Deprecated: Use WithTargetSchemas for multi-schema support.
 func WithTargetSchema(schema string) Option {
 	return func(o *Options) {
 		o.TargetSchema = schema
+		o.TargetSchemas = []string{schema}
+	}
+}
+
+// WithTargetSchemas sets the target schemas to manage.
+func WithTargetSchemas(schemas ...string) Option {
+	return func(o *Options) {
+		o.TargetSchemas = schemas
+		if len(schemas) > 0 {
+			o.TargetSchema = schemas[0]
+		}
 	}
 }
 
@@ -285,4 +302,16 @@ func toScopeFilters(opts Options) scope.Filters {
 func defaultPostgresLockID(targetSchema string) int64 {
 	schema := cmp.Or(targetSchema, "public")
 	return GenerateLockID("grizzle", schema)
+}
+
+func defaultPostgresLockIDFromSchemas(targetSchemas []string) int64 {
+	if len(targetSchemas) == 0 {
+		return defaultPostgresLockID("")
+	}
+	if len(targetSchemas) == 1 {
+		return defaultPostgresLockID(targetSchemas[0])
+	}
+	sorted := slices.Clone(targetSchemas)
+	slices.Sort(sorted)
+	return GenerateLockID("grizzle", strings.Join(sorted, ","))
 }

@@ -202,11 +202,23 @@ func prepareOptions(ctx context.Context, db *sql.DB, opts *Options) error {
 	switch opts.Dialect {
 	case DialectSQLite:
 		opts.TargetSchema = cmp.Or(opts.TargetSchema, "main")
+		if len(opts.TargetSchemas) == 0 {
+			opts.TargetSchemas = []string{opts.TargetSchema}
+		}
 	case DialectPostgres:
-		opts.TargetSchema = cmp.Or(opts.TargetSchema, "public")
+		if len(opts.TargetSchemas) > 0 {
+			if opts.TargetSchema == "" {
+				opts.TargetSchema = opts.TargetSchemas[0]
+			}
+		} else if opts.TargetSchema != "" {
+			opts.TargetSchemas = []string{opts.TargetSchema}
+		} else {
+			opts.TargetSchema = "public"
+			opts.TargetSchemas = []string{"public"}
+		}
 		opts.ShadowSchema = cmp.Or(opts.ShadowSchema, "_grizzle_shadow")
 		if opts.LockID == 0 {
-			opts.LockID = defaultPostgresLockID(opts.TargetSchema)
+			opts.LockID = defaultPostgresLockIDFromSchemas(opts.TargetSchemas)
 		}
 		if opts.LockTimeout <= 0 {
 			opts.LockTimeout = exec.DefaultLockTimeout
@@ -248,6 +260,7 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error {
 
 	return exec.SyncPostgres(ctx, db, exec.PostgresExecConfig{
 		TargetSchema:         opts.TargetSchema,
+		TargetSchemas:        opts.TargetSchemas,
 		ShadowSchema:         opts.ShadowSchema,
 		SchemaSQL:            opts.SchemaSQL,
 		LockID:               opts.LockID,
@@ -286,6 +299,7 @@ func PlanDiff(ctx context.Context, db *sql.DB, opts Options) (*Plan, error) {
 
 	return exec.PlanDiffPostgres(ctx, db, exec.PostgresExecConfig{
 		TargetSchema:         opts.TargetSchema,
+		TargetSchemas:        opts.TargetSchemas,
 		ShadowSchema:         opts.ShadowSchema,
 		SchemaSQL:            opts.SchemaSQL,
 		LockID:               opts.LockID,
@@ -332,6 +346,7 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 		syncOpts := Options{
 			SchemaSQL:       p.SchemaSQL,
 			TargetSchema:    p.TargetSchema,
+			TargetSchemas:   p.TargetSchemas,
 			IncludeTables:   p.IncludeTables,
 			ExcludeTables:   p.ExcludeTables,
 			Renames:         p.Renames,
@@ -364,6 +379,7 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 
 		return exec.SyncPostgres(ctx, db, exec.PostgresExecConfig{
 			TargetSchema:         syncOpts.TargetSchema,
+			TargetSchemas:        syncOpts.TargetSchemas,
 			ShadowSchema:         syncOpts.ShadowSchema,
 			SchemaSQL:            syncOpts.SchemaSQL,
 			LockID:               syncOpts.LockID,
@@ -397,10 +413,15 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 			Backfill:      toExecBackfill(opts.Backfill),
 		})
 	case DialectPostgres:
-		targetSchema := cmp.Or(p.TargetSchema, "public")
-		lockID := defaultPostgresLockID(targetSchema)
+		targetSchemas := p.TargetSchemas
+		if len(targetSchemas) == 0 {
+			targetSchemas = []string{cmp.Or(p.TargetSchema, "public")}
+		}
+		targetSchema := targetSchemas[0]
+		lockID := defaultPostgresLockIDFromSchemas(targetSchemas)
 		return exec.ApplyPostgres(ctx, db, p, exec.PostgresExecConfig{
 			TargetSchema:     targetSchema,
+			TargetSchemas:    targetSchemas,
 			LockID:           lockID,
 			Policy:           p.Policy,
 			AcceptHazards:    opts.AcceptHazards,
