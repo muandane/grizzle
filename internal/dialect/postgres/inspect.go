@@ -68,9 +68,9 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 		JOIN pg_namespace n ON n.oid = c.relnamespace
 		LEFT JOIN pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum
 		WHERE n.nspname = $1
-		  AND c.relkind = 'r'       -- Base tables only
-		  AND a.attnum > 0          -- Filter out system columns (tableoid, ctid, etc.)
-		  AND NOT a.attisdropped    -- Filter out dropped columns
+		  AND c.relkind IN ('r', 'p') -- Base tables and partitioned tables
+		  AND a.attnum > 0            -- Filter out system columns (tableoid, ctid, etc.)
+		  AND NOT a.attisdropped      -- Filter out dropped columns
 		ORDER BY c.relname, a.attnum;
 	`
 
@@ -148,6 +148,113 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 		return nil, err
 	}
 	_ = rows.Close()
+
+	// 2b. Inspect Partitioned Tables
+	partQuery := `
+		SELECT
+			c.relname AS table_name,
+			p.partstrat AS strategy,
+			pg_get_partkeydef(c.oid) AS partition_key
+		FROM pg_partitioned_table p
+		JOIN pg_class c ON c.oid = p.partrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1
+		ORDER BY c.relname;
+	`
+	partRows, err := dbtx.QueryContext(ctx, partQuery, schemaName)
+	if err != nil {
+		return nil, fmt.Errorf("inspecting partitioned tables in schema %q: %w", schemaName, err)
+	}
+	defer func() { _ = partRows.Close() }()
+
+	for partRows.Next() {
+		var (
+			tableName string
+			strat     string
+			partKey   string
+		)
+		if err := partRows.Scan(&tableName, &strat, &partKey); err != nil {
+			return nil, fmt.Errorf("scanning partitioned table data in schema %q: %w", schemaName, err)
+		}
+		tbl, exists := s.Tables[tableName]
+		if !exists {
+			tbl = &schema.Table{
+				Name:        tableName,
+				Columns:     make(map[string]*schema.Column),
+				Indexes:     make(map[string]*schema.Index),
+				ForeignKeys: make(map[string]*schema.ForeignKey),
+			}
+			s.Tables[tableName] = tbl
+		}
+		var pStrat schema.PartitionStrategy
+		switch strat {
+		case "r":
+			pStrat = schema.PartitionStrategyRange
+		case "l":
+			pStrat = schema.PartitionStrategyList
+		case "h":
+			pStrat = schema.PartitionStrategyHash
+		default:
+			pStrat = schema.PartitionStrategy(strings.ToUpper(strat))
+		}
+		tbl.PartitionKey = &schema.PartitionKey{
+			Strategy: pStrat,
+			Def:      partKey,
+		}
+	}
+	if err := partRows.Err(); err != nil {
+		return nil, err
+	}
+	_ = partRows.Close()
+
+	// 2c. Inspect Attached Partitions
+	inhQuery := `
+		SELECT
+			c.relname AS child_table,
+			p.relname AS parent_table,
+			COALESCE(pg_get_expr(c.relpartbound, c.oid), '') AS partition_bounds
+		FROM pg_inherits i
+		JOIN pg_class c ON c.oid = i.inhrelid
+		JOIN pg_class p ON p.oid = i.inhparent
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1
+		  AND c.relispartition
+		ORDER BY c.relname;
+	`
+	inhRows, err := dbtx.QueryContext(ctx, inhQuery, schemaName)
+	if err != nil {
+		return nil, fmt.Errorf("inspecting partition inheritance in schema %q: %w", schemaName, err)
+	}
+	defer func() { _ = inhRows.Close() }()
+
+	for inhRows.Next() {
+		var (
+			childTable  string
+			parentTable string
+			bounds      string
+		)
+		if err := inhRows.Scan(&childTable, &parentTable, &bounds); err != nil {
+			return nil, fmt.Errorf("scanning partition bounds in schema %q: %w", schemaName, err)
+		}
+		tbl, exists := s.Tables[childTable]
+		if !exists {
+			tbl = &schema.Table{
+				Name:        childTable,
+				Columns:     make(map[string]*schema.Column),
+				Indexes:     make(map[string]*schema.Index),
+				ForeignKeys: make(map[string]*schema.ForeignKey),
+			}
+			s.Tables[childTable] = tbl
+		}
+		tbl.PartitionOf = &schema.PartitionOf{
+			Parent: parentTable,
+			Bounds: bounds,
+		}
+	}
+	if err := inhRows.Err(); err != nil {
+		return nil, err
+	}
+	_ = inhRows.Close()
 
 	// 3. Inspect Primary Keys
 	pkQuery := `
