@@ -214,3 +214,55 @@ func TestApply_EdgeCases(t *testing.T) {
 	}
 }
 
+type mockSpan struct {
+	name  string
+	attrs map[string]any
+	ended bool
+	err   error
+}
+
+func (s *mockSpan) End()                         { s.ended = true }
+func (s *mockSpan) RecordError(err error)        { s.err = err }
+func (s *mockSpan) SetAttribute(key string, val any) {
+	if s.attrs == nil {
+		s.attrs = make(map[string]any)
+	}
+	s.attrs[key] = val
+}
+
+type mockTracer struct {
+	spans []*mockSpan
+}
+
+func (m *mockTracer) Start(ctx context.Context, spanName string) (context.Context, grizzle.Span) {
+	span := &mockSpan{name: spanName}
+	m.spans = append(m.spans, span)
+	return ctx, span
+}
+
+func TestOptions_Tracer(t *testing.T) {
+	tracer := &mockTracer{}
+	opts := grizzle.Options{}
+	grizzle.WithTracer(tracer)(&opts)
+	if opts.Tracer != tracer {
+		t.Fatalf("expected Tracer to be set")
+	}
+
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("opening sqlite: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	schema := "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);"
+	err = grizzle.Sync(context.Background(), db, grizzle.Options{
+		Dialect:   grizzle.DialectSQLite,
+		SchemaSQL: schema,
+		Tracer:    tracer,
+	})
+	if err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+}
+
+

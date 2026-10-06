@@ -166,6 +166,9 @@ func TestDiffSchemas_Enums(t *testing.T) {
 	if steps[1].Type != ChangeAlterEnum || steps[1].Table != "status" {
 		t.Errorf("expected ChangeAlterEnum for status, got %s on %s", steps[1].Type, steps[1].Table)
 	}
+	if !steps[1].NonTx {
+		t.Errorf("expected NonTx=true for ChangeAlterEnum (ALTER TYPE ... ADD VALUE)")
+	}
 }
 
 func TestDiffSchemas_IndexesAndForeignKeys(t *testing.T) {

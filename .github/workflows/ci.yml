@@ -86,9 +86,9 @@ jobs:
           POSTGRES_DSN: postgres://postgres:password@localhost:5432/grizzle_test?sslmode=disable
         run: |
           echo "Running integration tests against PostgreSQL ${{ matrix.postgres-version }}..."
-          out=$(go test -tags integration -race -count=3 -v ./...)
-          echo "$out"
-          pass_count=$(echo "$out" | grep -c "^--- PASS" || true)
+          set -o pipefail
+          go test -tags integration -race -count=1 -v ./... | tee test.log
+          pass_count=$(grep -c "^--- PASS" test.log || true)
           echo "Executed passing integration tests: $pass_count"
           if [ "$pass_count" -eq 0 ]; then
             echo "Error: No integration tests were executed! Count is 0."

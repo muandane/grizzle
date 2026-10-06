@@ -338,6 +338,7 @@ func RenderChangeWithOpts(targetSchema string, c diff.Change, opts RenderOpts) p
 		step.SQL = GenerateCreateEnumSQL(effectiveSchema, c.Enum)
 	case plan.ChangeAlterEnum:
 		step.SQL = GenerateAddEnumValueSQL(effectiveSchema, c.Table, c.EnumValue)
+		step.NonTx = true
 	case plan.ChangeCreateTable:
 		step.SQL = GenerateCreateTableSQL(effectiveSchema, c.TableData)
 		if c.TableData != nil {

@@ -19,6 +19,18 @@ import (
 	"github.com/muandane/grizzle/internal/scope"
 )
 
+// Tracer defines the interface for tracing Grizzle lifecycle events.
+type Tracer interface {
+	Start(ctx context.Context, spanName string) (context.Context, Span)
+}
+
+// Span represents an active trace span recorded by a Tracer.
+type Span interface {
+	End()
+	RecordError(err error)
+	SetAttribute(key string, value any)
+}
+
 // PostgresExecConfig specifies the execution options for PostgreSQL synchronization.
 type PostgresExecConfig struct {
 	TargetSchema         string
@@ -38,6 +50,7 @@ type PostgresExecConfig struct {
 	MaxRetries           int
 	RandFloat            func() float64
 	Logger               *slog.Logger
+	Tracer               Tracer
 	DryRun               bool
 	Backfill             BackfillFunc
 }
@@ -80,6 +93,11 @@ func localSearchPathSQL(schemas []string) string {
 
 // DiffPostgres computes the diff and renders the sequenced migration steps for PostgreSQL.
 func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig) ([]plan.Step, error) {
+	if cfg.Tracer != nil {
+		var diffSpan Span
+		ctx, diffSpan = cfg.Tracer.Start(ctx, "grizzle.diff_plan")
+		defer diffSpan.End()
+	}
 	var serverVersion int
 	if row := dbtx.QueryRowContext(ctx, "SELECT current_setting('server_version_num')::integer;"); row != nil {
 		_ = row.Scan(&serverVersion)
@@ -249,6 +267,10 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 		lockTimeout = DefaultLockTimeout
 	}
 	lockCtx, cancelLock := context.WithTimeout(ctx, lockTimeout)
+	var lockSpan Span
+	if cfg.Tracer != nil {
+		_, lockSpan = cfg.Tracer.Start(ctx, "grizzle.acquire_lock")
+	}
 	var acquiredSchemas []string
 	if cfg.LockID != 0 {
 		err = postgres.AcquireSessionAdvisoryLock(lockCtx, conn, cfg.LockID)
@@ -257,6 +279,12 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 		acquiredSchemas, err = postgres.AcquireSchemaLocks(lockCtx, conn, lockNs, targetSchemas)
 	}
 	cancelLock()
+	if lockSpan != nil {
+		if err != nil {
+			lockSpan.RecordError(err)
+		}
+		lockSpan.End()
+	}
 	if err != nil {
 		if logger != nil {
 			logger.ErrorContext(ctx, "grizzle: lock acquisition failed", "schemas", targetSchemas, "lock_id", cfg.LockID, "error", err)
@@ -429,12 +457,26 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 			for _, s := range group.Steps {
 				stepIdx++
 				stepStart := time.Now()
+				var stepSpan Span
+				if cfg.Tracer != nil {
+					_, stepSpan = cfg.Tracer.Start(ctx, "grizzle.exec_step")
+					stepSpan.SetAttribute("step.type", string(s.Type))
+					stepSpan.SetAttribute("step.table", s.Table)
+					stepSpan.SetAttribute("step.non_tx", true)
+				}
 				if _, err := conn.ExecContext(ctx, s.SQL); err != nil {
+					if stepSpan != nil {
+						stepSpan.RecordError(err)
+						stepSpan.End()
+					}
 					if logger != nil {
 						logger.ErrorContext(ctx, "grizzle: failed executing non-tx step", "step_index", stepIdx, "sql", s.SQL, "error", err)
 					}
 					recordFailureHistory(stepIdx, err, true)
 					return committedSteps + 1, wrapStepExecError(s, err, true)
+				}
+				if stepSpan != nil {
+					stepSpan.End()
 				}
 				committedSteps++
 				if logger != nil {
@@ -460,13 +502,27 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 			for _, s := range group.Steps {
 				stepIdx++
 				stepStart := time.Now()
+				var stepSpan Span
+				if cfg.Tracer != nil {
+					_, stepSpan = cfg.Tracer.Start(ctx, "grizzle.exec_step")
+					stepSpan.SetAttribute("step.type", string(s.Type))
+					stepSpan.SetAttribute("step.table", s.Table)
+					stepSpan.SetAttribute("step.non_tx", false)
+				}
 				if _, err := tx.ExecContext(ctx, s.SQL); err != nil {
+					if stepSpan != nil {
+						stepSpan.RecordError(err)
+						stepSpan.End()
+					}
 					_ = tx.Rollback()
 					if logger != nil {
 						logger.ErrorContext(ctx, "grizzle: failed executing step in tx", "step_index", stepIdx, "sql", s.SQL, "error", err)
 					}
 					recordFailureHistory(stepIdx, err, false)
 					return committedSteps, wrapStepExecError(s, err, false)
+				}
+				if stepSpan != nil {
+					stepSpan.End()
 				}
 				if logger != nil {
 					logger.DebugContext(ctx, "grizzle: executed step in tx", "step_index", stepIdx, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
@@ -569,6 +625,7 @@ type SQLiteExecConfig struct {
 	AcceptHazards []plan.HazardCode
 	ExpectedHash  string
 	Logger        *slog.Logger
+	Tracer        Tracer
 	DryRun        bool
 	Backfill      BackfillFunc
 
@@ -865,6 +922,10 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 		lockTimeout = DefaultLockTimeout
 	}
 	lockCtx, cancelLock := context.WithTimeout(ctx, lockTimeout)
+	var lockSpan Span
+	if cfg.Tracer != nil {
+		_, lockSpan = cfg.Tracer.Start(ctx, "grizzle.acquire_lock")
+	}
 	var acquiredSchemas []string
 	if cfg.LockID != 0 {
 		err = postgres.AcquireSessionAdvisoryLock(lockCtx, conn, cfg.LockID)
@@ -873,6 +934,12 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 		acquiredSchemas, err = postgres.AcquireSchemaLocks(lockCtx, conn, lockNs, targetSchemas)
 	}
 	cancelLock()
+	if lockSpan != nil {
+		if err != nil {
+			lockSpan.RecordError(err)
+		}
+		lockSpan.End()
+	}
 	if err != nil {
 		if logger != nil {
 			logger.ErrorContext(ctx, "grizzle: lock acquisition failed", "schemas", targetSchemas, "lock_id", cfg.LockID, "error", err)
@@ -930,12 +997,26 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 			for _, s := range group.Steps {
 				stepIdx++
 				stepStart := time.Now()
+				var stepSpan Span
+				if cfg.Tracer != nil {
+					_, stepSpan = cfg.Tracer.Start(ctx, "grizzle.exec_step")
+					stepSpan.SetAttribute("step.type", string(s.Type))
+					stepSpan.SetAttribute("step.table", s.Table)
+					stepSpan.SetAttribute("step.non_tx", true)
+				}
 				if _, err := conn.ExecContext(ctx, s.SQL); err != nil {
+					if stepSpan != nil {
+						stepSpan.RecordError(err)
+						stepSpan.End()
+					}
 					if logger != nil {
 						logger.ErrorContext(ctx, "grizzle: failed executing non-tx step", "step_index", stepIdx, "sql", s.SQL, "error", err)
 					}
 					recordFailureHistory(stepIdx, err, true)
 					return committedSteps + 1, wrapStepExecError(s, err, true)
+				}
+				if stepSpan != nil {
+					stepSpan.End()
 				}
 				committedSteps++
 				if logger != nil {
@@ -960,13 +1041,27 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 			for _, s := range group.Steps {
 				stepIdx++
 				stepStart := time.Now()
+				var stepSpan Span
+				if cfg.Tracer != nil {
+					_, stepSpan = cfg.Tracer.Start(ctx, "grizzle.exec_step")
+					stepSpan.SetAttribute("step.type", string(s.Type))
+					stepSpan.SetAttribute("step.table", s.Table)
+					stepSpan.SetAttribute("step.non_tx", false)
+				}
 				if _, err := tx.ExecContext(ctx, s.SQL); err != nil {
+					if stepSpan != nil {
+						stepSpan.RecordError(err)
+						stepSpan.End()
+					}
 					_ = tx.Rollback()
 					if logger != nil {
 						logger.ErrorContext(ctx, "grizzle: failed executing step in tx", "step_index", stepIdx, "sql", s.SQL, "error", err)
 					}
 					recordFailureHistory(stepIdx, err, false)
 					return committedSteps, wrapStepExecError(s, err, false)
+				}
+				if stepSpan != nil {
+					stepSpan.End()
 				}
 				if logger != nil {
 					logger.DebugContext(ctx, "grizzle: executed step in tx", "step_index", stepIdx, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))

@@ -115,6 +115,16 @@ func TestGroupSteps_TableDriven(t *testing.T) {
 			expectedLens:  []int{1, 1, 1},
 			expectedNonTx: []bool{false, false, false},
 		},
+		{
+			name: "alter enum non-tx step executed outside transaction",
+			steps: []plan.Step{
+				{Type: plan.ChangeCreateEnum, SQL: "CREATE TYPE status AS ENUM ('active');", NonTx: false},
+				{Type: plan.ChangeAlterEnum, SQL: "ALTER TYPE status ADD VALUE 'inactive';", NonTx: true},
+				{Type: plan.ChangeCreateTable, SQL: "CREATE TABLE users (id int, s status);", NonTx: false},
+			},
+			expectedLens:  []int{1, 1, 1},
+			expectedNonTx: []bool{false, true, false},
+		},
 	}
 
 	for _, tc := range tests {

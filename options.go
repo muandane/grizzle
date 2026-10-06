@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/muandane/grizzle/internal/exec"
 	"github.com/muandane/grizzle/internal/plan"
 	"github.com/muandane/grizzle/internal/scope"
 )
@@ -92,16 +93,16 @@ type Options struct {
 	// RandFloat provides an optional random source func returning in [0.0, 1.0) for deterministic jitter in tests.
 	RandFloat func() float64
 
-	// Experimental: Renames maps old column names to new column names (e.g. "users.old_col": "new_col" or "old_col": "new_col")
+	// Renames maps old column names to new column names (e.g. "users.old_col": "new_col" or "old_col": "new_col")
 	// to explicitly disambiguate column renames instead of treating them as DROP + ADD.
 	Renames map[string]string
 
-	// Experimental: ExpandContract enables staged expand-and-contract zero-downtime migrations.
+	// ExpandContract enables staged expand-and-contract zero-downtime migrations (ZDM).
 	// In expand mode, renamed or modified columns are added alongside existing columns,
 	// delaying destructive drops to a later, separately approved plan.
 	ExpandContract bool
 
-	// Experimental: Backfill hook function run outside the DDL lock window in batches during staged expand migration.
+	// Backfill hook function run outside the DDL lock window in batches during staged expand migration.
 	Backfill BackfillFunc
 
 	// DryRun returns the planned SQL statements without executing them on the live database.
@@ -118,7 +119,16 @@ type Options struct {
 
 	// Logger accepts a structured logger (*slog.Logger) for migration events.
 	Logger *slog.Logger
+
+	// Tracer specifies an optional tracer (OpenTelemetry or custom) for observing migrations.
+	Tracer Tracer
 }
+
+// Tracer defines the interface for tracing Grizzle lifecycle events.
+type Tracer = exec.Tracer
+
+// Span represents an active trace span recorded by a Tracer.
+type Span = exec.Span
 
 // BackfillFunc defines the hook function signature for batch backfilling columns outside the DDL lock window.
 type BackfillFunc func(ctx context.Context, tx *sql.Tx, table, oldCol, newCol string) error
@@ -130,6 +140,13 @@ type Option func(*Options)
 func WithLogger(l *slog.Logger) Option {
 	return func(o *Options) {
 		o.Logger = l
+	}
+}
+
+// WithTracer sets the tracer.
+func WithTracer(t Tracer) Option {
+	return func(o *Options) {
+		o.Tracer = t
 	}
 }
 
@@ -292,7 +309,6 @@ func resolveDropPolicy(opts Options) plan.DropPolicy {
 }
 
 // WithRenames sets the explicit column rename mapping.
-// Experimental: Column remapping APIs may change before 1.0.
 func WithRenames(renames map[string]string) Option {
 	return func(o *Options) {
 		o.Renames = renames
@@ -300,7 +316,6 @@ func WithRenames(renames map[string]string) Option {
 }
 
 // WithExpandContract enables or disables staged expand-and-contract zero-downtime migrations.
-// Experimental: Staged migrations API may change before 1.0.
 func WithExpandContract(expand bool) Option {
 	return func(o *Options) {
 		o.ExpandContract = expand
@@ -308,7 +323,6 @@ func WithExpandContract(expand bool) Option {
 }
 
 // WithBackfill configures the batch backfill hook function for staged expand migrations.
-// Experimental: Staged backfill hook signature may change before 1.0.
 func WithBackfill(fn BackfillFunc) Option {
 	return func(o *Options) {
 		o.Backfill = fn

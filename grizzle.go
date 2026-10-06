@@ -264,6 +264,7 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error {
 			Policy:           policy,
 			AcceptHazards:    opts.AcceptHazards,
 			Logger:           opts.Logger,
+			Tracer:           opts.Tracer,
 			DryRun:           opts.DryRun,
 			Backfill:         toExecBackfill(opts.Backfill),
 			RebuildThreshold: opts.SQLiteRebuildThreshold,
@@ -287,6 +288,7 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error {
 		MaxRetries:           opts.MaxRetries,
 		RandFloat:            opts.RandFloat,
 		Logger:               opts.Logger,
+		Tracer:               opts.Tracer,
 		DryRun:               opts.DryRun,
 		Backfill:             toExecBackfill(opts.Backfill),
 	})
@@ -307,6 +309,7 @@ func PlanDiff(ctx context.Context, db *sql.DB, opts Options) (*Plan, error) {
 			Filters:   filters,
 			Policy:    policy,
 			Logger:    opts.Logger,
+			Tracer:    opts.Tracer,
 			DryRun:    opts.DryRun,
 		})
 	}
@@ -326,6 +329,7 @@ func PlanDiff(ctx context.Context, db *sql.DB, opts Options) (*Plan, error) {
 		MaxRetries:           opts.MaxRetries,
 		RandFloat:            opts.RandFloat,
 		Logger:               opts.Logger,
+		Tracer:               opts.Tracer,
 		DryRun:               opts.DryRun,
 	})
 }
@@ -353,6 +357,9 @@ type ApplyOpts struct {
 
 	// LockNamespace specifies the application namespace string used for PostgreSQL advisory locking (defaults to "grizzle").
 	LockNamespace string
+
+	// Tracer specifies an optional tracer for observing plan application.
+	Tracer Tracer
 }
 
 // Apply applies an approved migration plan to the database.
@@ -386,6 +393,7 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 			SQLiteRebuildThreshold: opts.SQLiteRebuildThreshold,
 			SQLiteRebuildBatchSize: opts.SQLiteRebuildBatchSize,
 			LockNamespace:          opts.LockNamespace,
+			Tracer:                 opts.Tracer,
 		}
 		if err := prepareOptions(ctx, db, &syncOpts); err != nil {
 			return err
@@ -401,6 +409,7 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 				AcceptHazards:    opts.AcceptHazards,
 				ExpectedHash:     opts.ExpectedHash,
 				Logger:           syncOpts.Logger,
+				Tracer:           syncOpts.Tracer,
 				DryRun:           syncOpts.DryRun,
 				Backfill:         toExecBackfill(opts.Backfill),
 				RebuildThreshold: syncOpts.SQLiteRebuildThreshold,
@@ -425,6 +434,7 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 			MaxRetries:           syncOpts.MaxRetries,
 			RandFloat:            syncOpts.RandFloat,
 			Logger:               syncOpts.Logger,
+			Tracer:               syncOpts.Tracer,
 			DryRun:               syncOpts.DryRun,
 			Backfill:             toExecBackfill(opts.Backfill),
 		})
@@ -442,6 +452,7 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 			Policy:           p.Policy,
 			AcceptHazards:    opts.AcceptHazards,
 			ExpectedHash:     opts.ExpectedHash,
+			Tracer:           opts.Tracer,
 			Backfill:         toExecBackfill(opts.Backfill),
 			RebuildThreshold: opts.SQLiteRebuildThreshold,
 			RebuildBatchSize: opts.SQLiteRebuildBatchSize,
@@ -460,6 +471,7 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 			Policy:           p.Policy,
 			AcceptHazards:    opts.AcceptHazards,
 			ExpectedHash:     opts.ExpectedHash,
+			Tracer:           opts.Tracer,
 			LockTimeout:      exec.DefaultLockTimeout,
 			StatementTimeout: exec.DefaultStatementTimeout,
 			MaxRetries:       exec.DefaultMaxRetries,

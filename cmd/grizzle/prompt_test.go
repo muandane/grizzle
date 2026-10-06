@@ -320,3 +320,42 @@ func TestRunApply_InteractiveTerminalSimulated(t *testing.T) {
 		t.Fatalf("expected exit code 0 when already in sync, got %d", codeInSync)
 	}
 }
+
+func TestPromptInteractiveInit(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		expected    string
+		expectError bool
+	}{
+		{name: "default empty enters sqlc", input: "\n", expected: "sqlc"},
+		{name: "choice 1 enters sqlc", input: "1\n", expected: "sqlc"},
+		{name: "name sqlc", input: "sqlc\n", expected: "sqlc"},
+		{name: "choice 2 enters stdlib", input: "2\n", expected: "stdlib"},
+		{name: "name stdlib", input: "stdlib\n", expected: "stdlib"},
+		{name: "choice 3 enters sqlite", input: "3\n", expected: "sqlite"},
+		{name: "name sqlite", input: "sqlite\n", expected: "sqlite"},
+		{name: "invalid choice", input: "4\n", expectError: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			in := strings.NewReader(tc.input)
+			var out bytes.Buffer
+			template, err := promptInteractiveInit(in, &out)
+			if tc.expectError {
+				if err == nil {
+					t.Fatalf("expected error on input %q, got nil", tc.input)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error on input %q: %v", tc.input, err)
+			}
+			if template != tc.expected {
+				t.Errorf("expected template %q, got %q", tc.expected, template)
+			}
+		})
+	}
+}
+

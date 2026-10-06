@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -79,3 +80,94 @@ func TestCLI_RunDirect(t *testing.T) {
 		}
 	}
 }
+
+func TestCLI_PlanGitHubFormat(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbFile := filepath.Join(tmpDir, "github_format.db")
+	dsn := "sqlite:" + dbFile
+	schemaFile := filepath.Join(tmpDir, "schema.sql")
+	if err := os.WriteFile(schemaFile, []byte("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);"), 0600); err != nil {
+		t.Fatalf("writing schema file: %v", err)
+	}
+
+	// Capture stdout
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stdout = w
+
+	code := run([]string{"plan", "--dsn", dsn, "--schema", schemaFile, "--format", "github"})
+	_ = w.Close()
+	os.Stdout = oldStdout
+
+	if code != 0 {
+		t.Fatalf("expected exit 0 on plan --format github, got %d", code)
+	}
+
+	buf := make([]byte, 2048)
+	n, _ := r.Read(buf)
+	_ = r.Close()
+	output := string(buf[:n])
+
+	if !strings.Contains(output, "::notice title=Grizzle Migration Plan::") {
+		t.Errorf("expected output to contain ::notice title=Grizzle Migration Plan::, got %q", output)
+	}
+}
+
+func TestCLI_Init(t *testing.T) {
+	origIsTerminal := isTerminalFunc
+	defer func() { isTerminalFunc = origIsTerminal }()
+
+	// Non-TTY environment
+	isTerminalFunc = func(fd uintptr) bool { return false }
+
+	tmpDir := t.TempDir()
+
+	// 1. Missing --template in non-TTY -> exit 1
+	if code := run([]string{"init", "--dir", tmpDir}); code != 1 {
+		t.Fatalf("expected exit 1 on init without template in non-TTY, got %d", code)
+	}
+
+	// 2. Unknown template -> exit 1
+	if code := run([]string{"init", "--dir", tmpDir, "--template", "invalid"}); code != 1 {
+		t.Fatalf("expected exit 1 on invalid template, got %d", code)
+	}
+
+	// 3. Valid template: sqlc -> creates files
+	initDir := filepath.Join(tmpDir, "sqlc_proj")
+	if code := run([]string{"init", "--dir", initDir, "--template", "sqlc"}); code != 0 {
+		t.Fatalf("expected exit 0 on init sqlc, got %d", code)
+	}
+
+	expectedFiles := []string{"schema.sql", "queries.sql", "sqlc.yaml", "main.go"}
+	for _, f := range expectedFiles {
+		if _, err := os.Stat(filepath.Join(initDir, f)); err != nil {
+			t.Errorf("expected file %s to exist: %v", f, err)
+		}
+	}
+
+	// 4. Running again without force -> exit 1
+	if code := run([]string{"init", "--dir", initDir, "--template", "sqlc"}); code != 1 {
+		t.Fatalf("expected exit 1 when files exist without --force, got %d", code)
+	}
+
+	// 5. Running with force -> exit 0
+	if code := run([]string{"init", "--dir", initDir, "--template", "sqlc", "--force"}); code != 0 {
+		t.Fatalf("expected exit 0 when using --force, got %d", code)
+	}
+
+	// 6. Valid template: sqlite -> creates schema.sql and main.go
+	sqliteDir := filepath.Join(tmpDir, "sqlite_proj")
+	if code := run([]string{"init", "--dir", sqliteDir, "--template", "sqlite"}); code != 0 {
+		t.Fatalf("expected exit 0 on init sqlite, got %d", code)
+	}
+	if _, err := os.Stat(filepath.Join(sqliteDir, "schema.sql")); err != nil {
+		t.Errorf("expected schema.sql in sqlite_proj: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(sqliteDir, "main.go")); err != nil {
+		t.Errorf("expected main.go in sqlite_proj: %v", err)
+	}
+}
+

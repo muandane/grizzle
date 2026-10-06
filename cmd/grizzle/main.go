@@ -92,7 +92,7 @@ var (
 
 func run(args []string) int {
 	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "Usage: grizzle <plan|apply|check|export|version> [flags]")
+		fmt.Fprintln(os.Stderr, "Usage: grizzle <plan|apply|check|export|init|version> [flags]")
 		return 1
 	}
 
@@ -109,12 +109,16 @@ func run(args []string) int {
 		schemaFile   = fs.String("schema", "schema.sql", "Path to schema SQL file")
 		planFile     = fs.String("plan", "", "Path to plan JSON file")
 		outFile      = fs.String("out", "", "Destination file or directory")
-		formatFlag   = fs.String("format", "sql", "Export format: sql, goose, or atlas")
+		formatFlag   = fs.String("format", "sql", "Output/export format: sql, goose, atlas, or github")
 		allowDrop    = fs.Bool("allow-drop", false, "Permit destructive operations")
 		jsonOutput   = fs.Bool("json", false, "Output in JSON format")
+		githubOutput = fs.Bool("github", false, "Emit GitHub Actions workflow annotations")
 		jsonLog      = fs.Bool("json-log", false, "Emit logs in structured JSON format")
 		expectedHash = fs.String("expected-hash", "", "Expected plan approval hash")
 		versionFlag  = fs.String("version", version, "Version string for export headers")
+		templateFlag = fs.String("template", "", "Project template: sqlc, stdlib, or sqlite")
+		dirFlag      = fs.String("dir", ".", "Destination directory for init")
+		forceFlag    = fs.Bool("force", false, "Overwrite existing files during init")
 	)
 
 	var hazards hazardFlags
@@ -130,8 +134,11 @@ func run(args []string) int {
 	dsn := getDSN(*dsnFlag)
 
 	switch command {
+	case "init":
+		return runInit(*templateFlag, *dirFlag, *forceFlag)
 	case "plan":
-		return runPlan(ctx, dsn, *schemaFile, *outFile, *allowDrop, *jsonOutput)
+		isGitHub := *githubOutput || *formatFlag == "github"
+		return runPlan(ctx, dsn, *schemaFile, *outFile, *allowDrop, *jsonOutput, isGitHub)
 	case "apply":
 		return runApply(ctx, dsn, *planFile, *schemaFile, *expectedHash, *allowDrop, hazards)
 	case "check":
@@ -140,7 +147,7 @@ func run(args []string) int {
 		return runExport(ctx, dsn, *planFile, *schemaFile, *formatFlag, *versionFlag, *outFile, *allowDrop)
 	default:
 		slog.Error("unknown command", "command", command)
-		fmt.Fprintf(os.Stderr, "Unknown command: %q. Expected plan, apply, check, or export.\n", command)
+		fmt.Fprintf(os.Stderr, "Unknown command: %q. Expected plan, apply, check, export, or init.\n", command)
 		return 1
 	}
 }
@@ -191,7 +198,7 @@ func loadOrComputePlan(ctx context.Context, db *sql.DB, planFile, schemaFile str
 	return computedPlan, computedPlan.Hash(), nil
 }
 
-func runPlan(ctx context.Context, dsn, schemaFile, outFile string, allowDrop, jsonOutput bool) int {
+func runPlan(ctx context.Context, dsn, schemaFile, outFile string, allowDrop, jsonOutput, githubOutput bool) int {
 	db, err := initDB(dsn)
 	if err != nil {
 		return 1
@@ -228,6 +235,8 @@ func runPlan(ctx context.Context, dsn, schemaFile, outFile string, allowDrop, js
 		slog.Info("plan written successfully", "out", outFile, "hash", p.Hash(), "steps", len(p.Steps))
 	} else if jsonOutput {
 		fmt.Println(string(data))
+	} else if githubOutput {
+		outputGitHubActions(os.Stdout, p, schemaFile)
 	} else {
 		_ = p.Format(os.Stdout, true)
 		fmt.Fprintf(os.Stderr, "Plan Hash: %s\n", p.Hash())
