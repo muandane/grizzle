@@ -457,7 +457,13 @@ func TestMultiSchema_CircularCrossSchemaFKs(t *testing.T) {
 		}
 	}
 
-	if lastFKDropIdx != -1 && firstTableDropIdx != -1 && lastFKDropIdx > firstTableDropIdx {
+	if lastFKDropIdx == -1 {
+		t.Fatalf("expected at least one DROP_FK step in drop plan, found none: %+v", dropPlan.Steps)
+	}
+	if firstTableDropIdx == -1 {
+		t.Fatalf("expected at least one DROP_TABLE step in drop plan, found none: %+v", dropPlan.Steps)
+	}
+	if lastFKDropIdx > firstTableDropIdx {
 		t.Errorf("expected all DROP_FK steps before DROP_TABLE steps: lastFK=%d, firstTable=%d", lastFKDropIdx, firstTableDropIdx)
 	}
 
@@ -494,7 +500,7 @@ func TestMultiSchema_CircularCrossSchemaFKs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PlanDiff static drop failed: %v", err)
 	}
-	const goldenCircularDropHash = "aa491d14de51977619c96da1b0c24b556cd397636d669e19fd2d894d2e9c4cbc"
+	const goldenCircularDropHash = "297c08ffded2b2a01104c0679da2e071a699f189ba1d2896f77aec1fda2d2032"
 	if staticDropPlan.Hash() != goldenCircularDropHash {
 		t.Errorf("circular FK drop plan golden hash mismatch:\ngot:  %s\nwant: %s", staticDropPlan.Hash(), goldenCircularDropHash)
 	}

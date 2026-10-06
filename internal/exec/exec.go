@@ -1251,7 +1251,10 @@ func copyDataKeysetChunks(ctx context.Context, tx *sql.Tx, tempTable, colList, l
 			return fmt.Errorf("sqlite: chunked keyset copy failed: %w", err)
 		}
 		affected, err := res.RowsAffected()
-		if err != nil || affected == 0 {
+		if err != nil {
+			return fmt.Errorf("sqlite: failed checking rows affected in keyset copy: %w", err)
+		}
+		if affected == 0 {
 			break
 		}
 		if logger != nil {
@@ -1270,7 +1273,10 @@ func copyDataKeysetChunks(ctx context.Context, tx *sql.Tx, tempTable, colList, l
 		}
 
 		if err := tx.QueryRowContext(ctx, maxQuery, maxArgs...).Scan(&maxRowID); err != nil {
-			break
+			if errors.Is(err, sql.ErrNoRows) {
+				break
+			}
+			return fmt.Errorf("sqlite: failed querying max rowid in keyset copy: %w", err)
 		}
 		lastRowID = maxRowID
 		hasStarted = true

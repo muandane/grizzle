@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/muandane/grizzle"
@@ -464,6 +465,97 @@ func TestSQLite_RebuildBatchKeysetCopy(t *testing.T) {
 	}
 	if sumVal != 1275 {
 		t.Fatalf("expected sum(val) 1275, got %d", sumVal)
+	}
+}
+
+func TestSQLite_KeysetBatchCopy_MidChunkFailureRollback(t *testing.T) {
+	db := getSQLiteDB(t)
+	db.SetMaxOpenConns(1)
+	ctx := t.Context()
+
+	// Initial schema: nullable column
+	schemaV1 := `
+		CREATE TABLE items (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			val INTEGER,
+			extra TEXT
+		);
+	`
+	if err := grizzle.Sync(ctx, db, grizzle.Options{
+		Dialect:   grizzle.DialectSQLite,
+		SchemaSQL: schemaV1,
+	}); err != nil {
+		t.Fatalf("Sync V1 failed: %v", err)
+	}
+
+	// Insert 30 rows. Rows 1..10 have non-null val.
+	// Row 15 has NULL val!
+	// Rows 16..30 have non-null val.
+	for i := 1; i <= 30; i++ {
+		var val any = i
+		if i == 15 {
+			val = nil
+		}
+		_, err := db.ExecContext(ctx, "INSERT INTO items (val, extra) VALUES (?, ?);", val, "data")
+		if err != nil {
+			t.Fatalf("failed inserting item %d: %v", i, err)
+		}
+	}
+
+	// Schema V2: Drop column 'extra', and make 'val' NOT NULL.
+	// This triggers a table rebuild where chunk 1 (1..5) succeeds, chunk 2 (6..10) succeeds,
+	// but chunk 3 (11..15) encounters row 15 with NULL in NOT NULL column and fails!
+	schemaV2 := `
+		CREATE TABLE items (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			val INTEGER NOT NULL
+		);
+	`
+
+	err := grizzle.Sync(ctx, db, grizzle.Options{
+		Dialect:                grizzle.DialectSQLite,
+		SchemaSQL:              schemaV2,
+		AllowDropColumn:        new(true),
+		AcceptHazards:          []grizzle.HazardCode{grizzle.HazardDropColumn, grizzle.HazardNotNullNoDefault},
+		SQLiteRebuildThreshold: 10,
+		SQLiteRebuildBatchSize: 5,
+	})
+	if err == nil {
+		t.Fatalf("expected Sync to fail due to NOT NULL violation during chunked copy, but got nil")
+	}
+	if !strings.Contains(err.Error(), "NOT NULL constraint failed") && !strings.Contains(err.Error(), "chunked keyset copy failed") {
+		t.Fatalf("expected error to mention chunked keyset copy failure or constraint violation, got: %v", err)
+	}
+
+	// Assert original table is completely intact!
+	var count int
+	err = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM items;").Scan(&count)
+	if err != nil {
+		t.Fatalf("querying original items table failed: %v", err)
+	}
+	if count != 30 {
+		t.Fatalf("expected all 30 original rows intact, got %d", count)
+	}
+
+	// Assert original column 'extra' still exists and row 15 still has NULL
+	var row15Extra string
+	var row15Val sql.NullInt64
+	err = db.QueryRowContext(ctx, "SELECT val, extra FROM items WHERE id = 15;").Scan(&row15Val, &row15Extra)
+	if err != nil {
+		t.Fatalf("failed querying row 15 from original table: %v", err)
+	}
+	if row15Val.Valid {
+		t.Fatalf("expected row 15 val to remain NULL, got %d", row15Val.Int64)
+	}
+	if row15Extra != "data" {
+		t.Fatalf("expected row 15 extra column to be intact, got %s", row15Extra)
+	}
+
+	// Verify temp table _grizzle_new_items was rolled back and does not exist
+	var tempExists int
+	_ = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='_grizzle_new_items';").Scan(&tempExists)
+	if tempExists != 0 {
+		t.Fatalf("expected temporary table _grizzle_new_items to be cleaned up after rollback")
 	}
 }
 

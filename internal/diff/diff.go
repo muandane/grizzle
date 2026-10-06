@@ -498,10 +498,35 @@ func DiffWithMappings(live, desired *schema.Schema, targetSchema, shadowSchema s
 			continue
 		}
 		if _, exists := desired.Tables[tblName]; !exists {
+			lTable := live.Tables[tblName]
+			tableSchema := targetSchema
+			if lTable != nil && lTable.Schema != "" {
+				tableSchema = lTable.Schema
+			}
+			tableName := tblName
+			if lTable != nil && lTable.Name != "" {
+				tableName = lTable.Name
+			}
+
+			if lTable != nil && len(lTable.ForeignKeys) > 0 {
+				fkNames := slices.Collect(maps.Keys(lTable.ForeignKeys))
+				slices.Sort(fkNames)
+				for _, fkName := range fkNames {
+					lFK := lTable.ForeignKeys[fkName]
+					changes = append(changes, Change{
+						Type:        plan.ChangeDropFK,
+						Schema:      tableSchema,
+						Table:       tableName,
+						ForeignKey:  lFK,
+						Destructive: true,
+					})
+				}
+			}
+
 			changes = append(changes, Change{
 				Type:          plan.ChangeDropTable,
-				Schema:        targetSchema,
-				Table:         tblName,
+				Schema:        tableSchema,
+				Table:         tableName,
 				Destructive:   true,
 				UnmanagedDeps: findUnmanagedDeps(live.Unmanaged, tblName, ""),
 			})

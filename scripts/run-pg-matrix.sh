@@ -4,7 +4,7 @@ set -euo pipefail
 if [ -n "${PG_IMAGE:-}" ]; then
   IMAGES=("$PG_IMAGE")
 else
-  IMAGES=("postgres:14" "postgres:16" "postgres:17")
+  IMAGES=("postgres:14" "postgres:15" "postgres:16" "postgres:17")
 fi
 
 PORT="${PG_PORT:-5433}"
