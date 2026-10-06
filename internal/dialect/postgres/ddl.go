@@ -46,6 +46,14 @@ func GenerateAddEnumValueSQL(targetSchema, enumName, val string) string {
 
 // GenerateCreateTableSQL constructs a CREATE TABLE statement including columns and primary key.
 func GenerateCreateTableSQL(targetSchema string, tbl *schema.Table) string {
+	if tbl.IsPartition() {
+		bounds := strings.TrimSpace(tbl.PartitionOf.Bounds)
+		if !strings.HasPrefix(strings.ToUpper(bounds), "FOR VALUES") && strings.ToUpper(bounds) != "DEFAULT" {
+			bounds = "FOR VALUES " + bounds
+		}
+		return fmt.Sprintf("CREATE TABLE %q.%q PARTITION OF %q.%q %s;", targetSchema, tbl.Name, targetSchema, tbl.PartitionOf.Parent, bounds)
+	}
+
 	cols := slices.Collect(maps.Values(tbl.Columns))
 	slices.SortFunc(cols, func(a, b *schema.Column) int {
 		return cmp.Compare(a.Position, b.Position)
@@ -85,7 +93,17 @@ func GenerateCreateTableSQL(targetSchema string, tbl *schema.Table) string {
 		lines = append(lines, pkLine)
 	}
 
-	return fmt.Sprintf("CREATE TABLE %q.%q (\n%s\n);", targetSchema, tbl.Name, strings.Join(lines, ",\n"))
+	partitionClause := ""
+	if tbl.IsPartitioned() {
+		partDef := strings.TrimSpace(tbl.PartitionKey.Def)
+		strat := string(tbl.PartitionKey.Strategy)
+		if !strings.HasPrefix(strings.ToUpper(partDef), strat) {
+			partDef = strat + " " + partDef
+		}
+		partitionClause = " PARTITION BY " + partDef
+	}
+
+	return fmt.Sprintf("CREATE TABLE %q.%q (\n%s\n)%s;", targetSchema, tbl.Name, strings.Join(lines, ",\n"), partitionClause)
 }
 
 // GenerateAddColumnSQL constructs an ALTER TABLE ... ADD COLUMN statement.
@@ -212,6 +230,20 @@ func GenerateDropFKSQL(targetSchema, tableName, fkName string) string {
 	return fmt.Sprintf("ALTER TABLE %q.%q DROP CONSTRAINT IF EXISTS %q;", targetSchema, tableName, fkName)
 }
 
+// GenerateAttachPartitionSQL constructs an ALTER TABLE ... ATTACH PARTITION statement.
+func GenerateAttachPartitionSQL(targetSchema, parentTable, childTable, bounds string) string {
+	b := strings.TrimSpace(bounds)
+	if !strings.HasPrefix(strings.ToUpper(b), "FOR VALUES") && strings.ToUpper(b) != "DEFAULT" {
+		b = "FOR VALUES " + b
+	}
+	return fmt.Sprintf("ALTER TABLE %q.%q ATTACH PARTITION %q.%q %s;", targetSchema, parentTable, targetSchema, childTable, b)
+}
+
+// GenerateDetachPartitionSQL constructs an ALTER TABLE ... DETACH PARTITION statement.
+func GenerateDetachPartitionSQL(targetSchema, parentTable, childTable string) string {
+	return fmt.Sprintf("ALTER TABLE %q.%q DETACH PARTITION %q.%q;", targetSchema, parentTable, targetSchema, childTable)
+}
+
 // RenderChange converts a pure diff.Change into an executable plan.Step with PostgreSQL DDL.
 func RenderChange(targetSchema string, c diff.Change, nonConcurrent ...bool) plan.Step {
 	isNonConcurrent := len(nonConcurrent) > 0 && nonConcurrent[0]
@@ -241,6 +273,17 @@ func RenderChange(targetSchema string, c diff.Change, nonConcurrent ...bool) pla
 		step.SQL = GenerateAddEnumValueSQL(targetSchema, c.Table, c.EnumValue)
 	case plan.ChangeCreateTable:
 		step.SQL = GenerateCreateTableSQL(targetSchema, c.TableData)
+		if c.TableData != nil && c.TableData.IsPartition() {
+			step.ParentTable = c.TableData.PartitionOf.Parent
+			step.PartitionBounds = c.TableData.PartitionOf.Bounds
+		}
+	case plan.ChangeAttachPartition:
+		step.SQL = GenerateAttachPartitionSQL(targetSchema, c.ParentTable, c.Table, c.PartitionBounds)
+		step.ParentTable = c.ParentTable
+		step.PartitionBounds = c.PartitionBounds
+	case plan.ChangeDetachPartition:
+		step.SQL = GenerateDetachPartitionSQL(targetSchema, c.ParentTable, c.Table)
+		step.ParentTable = c.ParentTable
 	case plan.ChangeAddColumn:
 		step.SQL = GenerateAddColumnSQL(targetSchema, c.Table, c.Column)
 	case plan.ChangeAlterColumn:
