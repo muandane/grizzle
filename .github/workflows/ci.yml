@@ -82,8 +82,8 @@ jobs:
       fail-fast: false
       matrix:
         # On PRs, test against PostgreSQL 16 to save runner minutes.
-        # On pushes to main, test the full matrix [14, 15, 16, 17].
-        postgres-version: ${{ github.event_name == 'pull_request' && fromJSON('["16"]') || fromJSON('["14", "15", "16", "17"]') }}
+        # On pushes to main, test the full matrix [14, 15, 16, 17, 18].
+        postgres-version: ${{ github.event_name == 'pull_request' && fromJSON('["16"]') || fromJSON('["14", "15", "16", "17", "18"]') }}
     services:
       postgres:
         image: postgres:${{ matrix.postgres-version }}
