@@ -58,6 +58,12 @@ type PostgresExecConfig struct {
 	AfterSync            SyncHook
 	BeforeStep           StepHook
 	AfterStep            StepHook
+	// DryRunLockTimeout bounds lock waits for dry-run verification
+	// (defaults to DefaultDryRunLockTimeout of 2s).
+	DryRunLockTimeout time.Duration
+	// ExecuteHooksInDryRun allows BeforeStep/AfterStep hooks to run inside the
+	// dry-run sandbox. Defaults to false to avoid external side effects.
+	ExecuteHooksInDryRun bool
 }
 
 func (cfg PostgresExecConfig) targetSchemas() []string {
@@ -666,19 +672,21 @@ func PlanDiffPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 
 // SQLiteExecConfig specifies the execution options for SQLite synchronization.
 type SQLiteExecConfig struct {
-	SchemaSQL     string
-	Filters       scope.Filters
-	Policy        plan.DropPolicy
-	AcceptHazards []plan.HazardCode
-	ExpectedHash  string
-	Logger        *slog.Logger
-	Tracer        Tracer
-	DryRun        bool
-	Backfill      BackfillFunc
-	BeforeSync    SyncHook
-	AfterSync     SyncHook
-	BeforeStep    StepHook
-	AfterStep     StepHook
+	SchemaSQL            string
+	Filters              scope.Filters
+	Policy               plan.DropPolicy
+	AcceptHazards        []plan.HazardCode
+	ExpectedHash         string
+	Logger               *slog.Logger
+	Tracer               Tracer
+	DryRun               bool
+	Backfill             BackfillFunc
+	BeforeSync           SyncHook
+	AfterSync            SyncHook
+	BeforeStep           StepHook
+	AfterStep            StepHook
+	DryRunLockTimeout    time.Duration
+	ExecuteHooksInDryRun bool
 
 	RebuildThreshold int
 	RebuildBatchSize int

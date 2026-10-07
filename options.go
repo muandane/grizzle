@@ -130,6 +130,15 @@ type Options struct {
 	// DryRun returns the planned SQL statements without executing them on the live database.
 	DryRun bool
 
+	// DryRunLockTimeout bounds how long live dry-run verification waits on
+	// table locks before failing fast (defaults to 2s).
+	DryRunLockTimeout time.Duration
+
+	// ExecuteHooksInDryRun allows BeforeStep/AfterStep hooks to run during
+	// live dry-run verification. Defaults to false to avoid accidental
+	// external side effects (webhooks, message publishing, etc.).
+	ExecuteHooksInDryRun bool
+
 	// SQLiteRebuildThreshold defines the row count threshold above which SQLite table rebuilds
 	// chunk data copying by keyset to prevent journal memory exhaustion.
 	// Defaults to 100000. Set to 0 to disable batching.
@@ -393,6 +402,29 @@ func WithBeforeStep(fn StepHook) Option {
 func WithAfterStep(fn StepHook) Option {
 	return func(o *Options) {
 		o.AfterStep = fn
+	}
+}
+
+// WithDryRun enables dry-run mode: the planned SQL is validated against the
+// live database without executing it.
+func WithDryRun() Option {
+	return func(o *Options) {
+		o.DryRun = true
+	}
+}
+
+// WithDryRunLockTimeout sets the lock wait bound for live dry-run verification.
+func WithDryRunLockTimeout(d time.Duration) Option {
+	return func(o *Options) {
+		o.DryRunLockTimeout = d
+	}
+}
+
+// WithExecuteHooksInDryRun allows BeforeStep/AfterStep hooks to run during
+// live dry-run verification.
+func WithExecuteHooksInDryRun() Option {
+	return func(o *Options) {
+		o.ExecuteHooksInDryRun = true
 	}
 }
 

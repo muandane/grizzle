@@ -645,6 +645,63 @@ func LintHasErrors(diags []LintDiagnostic) bool {
 	return lint.HasErrors(diags)
 }
 
+// DryRunResult reports the outcome of a live dry-run verification.
+type DryRunResult = exec.DryRunResult
+
+// DryRunVerify executes a live dry-run rollback against the target database:
+// the planned DDL runs against real data inside transactions that are
+// unconditionally rolled back, so constraints, casts, and check expressions
+// are verified without persisting any change. Non-transactional steps
+// (CREATE INDEX CONCURRENTLY, ALTER TYPE ... ADD VALUE, DETACH PARTITION
+// CONCURRENTLY) are skipped and reported in DryRunResult.UnverifiedNonTx.
+// No records are written to grizzle_history, and hooks do not run unless
+// opts.ExecuteHooksInDryRun is set.
+func DryRunVerify(ctx context.Context, db *sql.DB, opts Options) (*DryRunResult, error) {
+	if err := prepareOptions(ctx, db, &opts); err != nil {
+		return nil, err
+	}
+
+	policy := resolveDropPolicy(opts)
+	filters := toScopeFilters(opts)
+
+	if opts.Dialect == DialectSQLite {
+		return exec.DryRunVerifySQLite(ctx, db, exec.SQLiteExecConfig{
+			SchemaSQL:            opts.SchemaSQL,
+			Filters:              filters,
+			Policy:               policy,
+			AcceptHazards:        opts.AcceptHazards,
+			Logger:               opts.Logger,
+			Tracer:               opts.Tracer,
+			BeforeStep:           opts.BeforeStep,
+			AfterStep:            opts.AfterStep,
+			ExecuteHooksInDryRun: opts.ExecuteHooksInDryRun,
+		})
+	}
+
+	return exec.DryRunVerifyPostgres(ctx, db, exec.PostgresExecConfig{
+		TargetSchema:         opts.TargetSchema,
+		TargetSchemas:        opts.TargetSchemas,
+		ShadowSchema:         opts.ShadowSchema,
+		SchemaSQL:            opts.SchemaSQL,
+		LockNamespace:        opts.LockNamespace,
+		LockID:               opts.LockID,
+		Filters:              filters,
+		Policy:               policy,
+		AcceptHazards:        opts.AcceptHazards,
+		NonConcurrentIndexes: opts.NonConcurrentIndexes,
+		LockTimeout:          opts.LockTimeout,
+		StatementTimeout:     opts.StatementTimeout,
+		MaxRetries:           opts.MaxRetries,
+		RandFloat:            opts.RandFloat,
+		Logger:               opts.Logger,
+		Tracer:               opts.Tracer,
+		BeforeStep:           opts.BeforeStep,
+		AfterStep:            opts.AfterStep,
+		DryRunLockTimeout:    opts.DryRunLockTimeout,
+		ExecuteHooksInDryRun: opts.ExecuteHooksInDryRun,
+	})
+}
+
 // LintFormatText renders diagnostics as human-readable text.
 func LintFormatText(w io.Writer, diags []LintDiagnostic) error {
 	return lint.FormatText(w, diags)

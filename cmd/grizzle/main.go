@@ -120,6 +120,7 @@ func run(args []string) int {
 		dirFlag      = fs.String("dir", ".", "Destination directory for init")
 		forceFlag    = fs.Bool("force", false, "Overwrite existing files during init")
 		failOnWarn   = fs.Bool("fail-on-warning", false, "Fail lint when warnings are reported")
+		dryRunFlag   = fs.Bool("dry-run", false, "Verify planned DDL against live data without persisting changes (apply)")
 	)
 
 	var hazards hazardFlags
@@ -142,7 +143,7 @@ func run(args []string) int {
 		isJSON := *jsonOutput || *formatFlag == "json"
 		return runPlan(ctx, dsn, *schemaFile, *outFile, *allowDrop, isJSON, isGitHub)
 	case "apply":
-		return runApply(ctx, dsn, *planFile, *schemaFile, *expectedHash, *allowDrop, hazards)
+		return runApply(ctx, dsn, *planFile, *schemaFile, *expectedHash, *allowDrop, hazards, *dryRunFlag)
 	case "check":
 		return runCheck(ctx, dsn, *schemaFile, *allowDrop)
 	case "lint":
@@ -252,7 +253,7 @@ func runPlan(ctx context.Context, dsn, schemaFile, outFile string, allowDrop, js
 	return 0
 }
 
-func runApply(ctx context.Context, dsn, planFile, schemaFile, expectedHash string, allowDrop bool, hazards []string) int {
+func runApply(ctx context.Context, dsn, planFile, schemaFile, expectedHash string, allowDrop bool, hazards []string, dryRun bool) int {
 	db, err := initDB(dsn)
 	if err != nil {
 		return 1
@@ -262,6 +263,10 @@ func runApply(ctx context.Context, dsn, planFile, schemaFile, expectedHash strin
 	var acceptedCodes []grizzle.HazardCode
 	for _, h := range hazards {
 		acceptedCodes = append(acceptedCodes, grizzle.HazardCode(h))
+	}
+
+	if dryRun {
+		return runDryRunApply(ctx, db, planFile, schemaFile, allowDrop, acceptedCodes)
 	}
 
 	p, planHash, err := loadOrComputePlan(ctx, db, planFile, schemaFile, allowDrop, acceptedCodes)
