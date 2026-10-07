@@ -334,7 +334,16 @@ grizzle check --dsn "$DATABASE_URL" --schema schema.sql
 
 # Export planned migration to Goose or Atlas format
 grizzle export --plan plan.json --format goose --out ./migrations
+
+# Experimental: zero-downtime expand/contract planning with explicit renames
+# (expand: new columns added alongside existing; contract: separate drop plan)
+grizzle plan --dsn "$DATABASE_URL" --schema schema.sql --out expand.json \
+  --rename users.full_name=display_name --expand-contract
+grizzle plan --dsn "$DATABASE_URL" --schema schema.sql --out contract.json \
+  --rename users.full_name=display_name --allow-drop
 ```
+
+`--rename old=new` (optionally table-qualified `table.old=new`) can be repeated and is accepted by `plan`, `apply`, and `check`. `--expand-contract` stages new columns alongside existing ones and defers drops to a separate contract plan. Backfilling renamed columns is library-only (`Options.Backfill`); see [examples/expand-contract](examples/expand-contract).
 
 ### Exit codes
 
@@ -355,6 +364,7 @@ grizzle export --plan plan.json --format goose --out ./migrations
 - [sqlc Workflow](examples/sqlc-workflow): Shared `schema.sql` with sqlc query generation.
 - [Native pgxpool](examples/postgres-pgxpool): `*pgxpool.Pool` for queries via `stdlib.OpenDBFromPool`.
 - [Kubernetes Blueprint](examples/kubernetes-blueprint): Multi-replica rolling update coordination.
+- [Expand/Contract](examples/expand-contract): Zero-downtime column rename with staged expand, library-only backfill, and a separate contract plan (experimental).
 
 ---
 
