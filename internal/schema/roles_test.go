@@ -100,6 +100,17 @@ func TestValidateRolesSQL_RejectsUnsupportedRoleForms(t *testing.T) {
 		{`CREATE ROLE app_read PASSWORD 'secret';`, "passworded roles are not supported yet"},
 		{`DROP ROLE app_read;`, "DROP ROLE/USER is not supported"},
 		{`REVOKE GRANT OPTION FOR SELECT ON docs FROM app_read;`, "per-privilege grant-option revocation"},
+		{`GRANT app_read TO app_writer WITH ADMIN OPTION;`, "unsupported GRANT form"},
+		{`GRANT SELECT ON VIEW docs TO app_read;`, "object list contains malformed"},
+		{`GRANT SELECT, ON docs TO app_read;`, "privilege list is malformed"},
+		{`GRANT SELECT ON docs, TO app_read;`, "object list is malformed"},
+		{`GRANT SELECT ON docs TO app_read,;`, "grantee list is malformed"},
+		{`GRANT  ON docs TO app_read;`, "unsupported GRANT form"},
+		{`GRANT SELECT ON FUNCTION fn(integer,) TO app_read;`, "object list contains malformed"},
+		{`GRANT SELECT ON FUNCTION ""() TO app_read;`, "object list contains malformed"},
+		{`CREATE ROLE "";`, "role identifier must not be empty"},
+		{`GRANT SELECT ON docs TO "";`, "grantee list contains malformed"},
+		{`GRANT SELECT ON docs TO app_read -- trailing comment`, "SQL comment"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.message, func(t *testing.T) {
@@ -108,6 +119,42 @@ func TestValidateRolesSQL_RejectsUnsupportedRoleForms(t *testing.T) {
 				t.Fatalf("ValidateRolesSQL(%q) = %v, want error containing %q", tt.sql, err, tt.message)
 			}
 		})
+	}
+}
+
+func TestCanonicalGrantObject_FunctionIdentity(t *testing.T) {
+	tests := []struct {
+		name, object, want string
+	}{
+		{"unqualified", `touch_ts()`, `public.touch_ts()`},
+		{"qualified quoted", `"Public"."Touch_TS"(integer, text)`, `"Public"."Touch_TS"(integer, text)`},
+		{"overload", `touch_ts(integer, text)`, `public.touch_ts(integer, text)`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := CanonicalGrantObject("FUNCTION", tt.object, "public"); got != tt.want {
+				t.Fatalf("CanonicalGrantObject(%q) = %q, want %q", tt.object, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseRolesSQL_PreservesQuotedRoleIdentity(t *testing.T) {
+	spec := ParseRolesSQL(`
+		CREATE ROLE app;
+		CREATE ROLE "App";
+		GRANT SELECT ON docs TO app;
+		GRANT SELECT ON docs TO "App";
+	`)
+	if len(spec.Roles) != 2 || len(spec.Grants) != 2 {
+		t.Fatalf("quoted and unquoted role identities must remain distinct: roles=%v grants=%v", spec.Roles, spec.Grants)
+	}
+	if spec.Roles["app"] == nil || spec.Roles["App"] == nil {
+		t.Fatalf("unexpected role identities: %v", spec.Roles)
+	}
+	if GrantKey("TABLE", "docs", spec.Grants[0].Grantee) ==
+		GrantKey("TABLE", "docs", spec.Grants[1].Grantee) {
+		t.Fatalf("quoted and unquoted grantees must not share an ACL key: %+v", spec.Grants)
 	}
 }
 

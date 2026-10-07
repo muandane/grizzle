@@ -101,11 +101,14 @@ func TestCatalogDiff_EventTriggerDrift(t *testing.T) {
 			},
 		}
 		changes := CatalogDiff(desired, live, "public")
-		if len(changes) != 1 || changes[0].Type != plan.ChangeAlterEventTrigger {
-			t.Fatalf("want single ALTER_EVENT_TRIGGER, got %+v", changes)
+		if len(changes) != 2 ||
+			changes[0].Type != plan.ChangeDropEventTrigger ||
+			changes[1].Type != plan.ChangeCreateEventTrigger ||
+			!changes[0].Destructive {
+			t.Fatalf("definition drift must be a destructive DROP+CREATE, got %+v", changes)
 		}
-		if changes[0].EventTrigger == nil || changes[0].OldEventTrigger == nil {
-			t.Fatal("ALTER_EVENT_TRIGGER must carry desired and old trigger IR")
+		if changes[1].EventTrigger == nil || changes[1].EventTrigger.Function != "log_ddl_v2" {
+			t.Fatalf("replacement must carry desired trigger IR: %+v", changes[1])
 		}
 	})
 
@@ -138,10 +141,59 @@ func TestCatalogDiff_EventTriggerDrift(t *testing.T) {
 			},
 		}
 		changes := CatalogDiff(desired, live, "public")
-		if len(changes) != 1 || changes[0].Type != plan.ChangeAlterEventTrigger {
-			t.Fatalf("want single ALTER_EVENT_TRIGGER, got %+v", changes)
+		if len(changes) != 2 ||
+			changes[0].Type != plan.ChangeDropEventTrigger ||
+			changes[1].Type != plan.ChangeCreateEventTrigger ||
+			!changes[0].Destructive {
+			t.Fatalf("tag drift must be a destructive DROP+CREATE, got %+v", changes)
 		}
 	})
+}
+
+func TestCatalogDiff_PublicationAllTablesToEmptyIsGatedReplacement(t *testing.T) {
+	desired := &schema.CatalogSpec{
+		Publications: []*schema.Publication{{
+			Name:          "docs_pub",
+			PublishInsert: true, PublishUpdate: true,
+			PublishDelete: true, PublishTruncate: true,
+		}},
+	}
+	live := &CatalogLiveState{
+		Publications: map[string]*PublicationState{
+			"docs_pub": {
+				Name: "docs_pub", Managed: true, AllTables: true,
+				PublishInsert: true, PublishUpdate: true,
+				PublishDelete: true, PublishTruncate: true,
+			},
+		},
+		EventTriggers: map[string]*EventTriggerState{},
+	}
+	changes := CatalogDiff(desired, live, "public")
+	if len(changes) != 2 ||
+		changes[0].Type != plan.ChangeDropPublication ||
+		changes[1].Type != plan.ChangeCreatePublication ||
+		!changes[0].Destructive {
+		t.Fatalf("ALL TABLES to empty must be a gated replacement: %+v", changes)
+	}
+}
+
+func TestCatalogDiff_PreservesQuotedCatalogIdentity(t *testing.T) {
+	desired := &schema.CatalogSpec{
+		Publications: []*schema.Publication{
+			{Name: "pub", PublishInsert: true, PublishUpdate: true, PublishDelete: true, PublishTruncate: true},
+			{Name: "Pub", PublishInsert: true, PublishUpdate: true, PublishDelete: true, PublishTruncate: true},
+		},
+	}
+	live := &CatalogLiveState{
+		Publications: map[string]*PublicationState{
+			"pub": {Name: "pub", Managed: true, PublishInsert: true, PublishUpdate: true, PublishDelete: true, PublishTruncate: true},
+			"Pub": {Name: "Pub", Managed: true, PublishInsert: true, PublishUpdate: true, PublishDelete: true, PublishTruncate: true},
+		},
+		EventTriggers: map[string]*EventTriggerState{},
+	}
+	if changes := CatalogDiff(desired, live, "public"); len(changes) != 0 {
+		t.Fatalf("quoted and unquoted catalog names must remain distinct identities: %+v", changes)
+	}
 }
 
 func TestCatalogDiff_NarrowDrops(t *testing.T) {

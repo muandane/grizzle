@@ -213,7 +213,7 @@ func CatalogDiff(desired *schema.CatalogSpec, live *CatalogLiveState, targetSche
 	}
 
 	for _, p := range desired.Publications {
-		key := strings.ToLower(p.Name)
+		key := schema.CanonicalIdentifierKey(p.Name)
 		liveP, exists := live.Publications[key]
 		liveOnlyPubs[key] = false
 		want := canonicalizePublication(p, targetSchema)
@@ -223,6 +223,22 @@ func CatalogDiff(desired *schema.CatalogSpec, live *CatalogLiveState, targetSche
 				Table:       want.Name,
 				Publication: want,
 			})
+			continue
+		}
+		if publicationNeedsRecreate(want, liveP) {
+			changes = append(changes,
+				Change{
+					Type:        plan.ChangeDropPublication,
+					Table:       liveP.Name,
+					Destructive: true,
+					Publication: &schema.Publication{Name: liveP.Name},
+				},
+				Change{
+					Type:        plan.ChangeCreatePublication,
+					Table:       want.Name,
+					Publication: want,
+				},
+			)
 			continue
 		}
 		if publicationHasDrift(want, liveP) {
@@ -282,7 +298,7 @@ func CatalogDiff(desired *schema.CatalogSpec, live *CatalogLiveState, targetSche
 	}
 
 	for _, e := range desired.EventTriggers {
-		key := strings.ToLower(e.Name)
+		key := schema.CanonicalIdentifierKey(e.Name)
 		liveE, exists := live.EventTriggers[key]
 		liveOnlyETs[key] = false
 		if !exists {
@@ -294,12 +310,19 @@ func CatalogDiff(desired *schema.CatalogSpec, live *CatalogLiveState, targetSche
 			continue
 		}
 		if eventTriggerNeedsRecreate(e, liveE) {
-			changes = append(changes, Change{
-				Type:            plan.ChangeAlterEventTrigger,
-				Table:           e.Name,
-				EventTrigger:    e,
-				OldEventTrigger: &schema.EventTrigger{Name: liveE.Name, Event: liveE.Event, Tags: liveE.Tags, Function: liveE.Function, Enabled: liveE.Enabled},
-			})
+			changes = append(changes,
+				Change{
+					Type:         plan.ChangeDropEventTrigger,
+					Table:        liveE.Name,
+					Destructive:  true,
+					EventTrigger: &schema.EventTrigger{Name: liveE.Name},
+				},
+				Change{
+					Type:         plan.ChangeCreateEventTrigger,
+					Table:        e.Name,
+					EventTrigger: e,
+				},
+			)
 		} else if e.Enabled != liveE.Enabled {
 			changes = append(changes, Change{
 				Type:            plan.ChangeAlterEventTrigger,
@@ -357,6 +380,11 @@ func publicationHasDrift(want *schema.Publication, live *PublicationState) bool 
 		return true
 	}
 	return !sameStringSet(want.Schemas, live.Schemas)
+}
+
+func publicationNeedsRecreate(want *schema.Publication, live *PublicationState) bool {
+	return live.AllTables && !want.AllTables &&
+		len(want.Tables) == 0 && len(want.Schemas) == 0
 }
 
 // eventTriggerNeedsRecreate reports whether the desired event-trigger

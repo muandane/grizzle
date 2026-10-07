@@ -108,14 +108,69 @@ func TestUnifiedSchemaSQL_Lifecycle(t *testing.T) {
 		t.Fatal("disabled event trigger must remain disabled after CREATE and overlay ALTER")
 	}
 
-	plan, err := exec.PlanDiffPostgres(ctx, db, cfg)
+	unifiedPlan, err := exec.PlanDiffPostgres(ctx, db, cfg)
 	if err != nil {
 		t.Fatalf("second unified plan failed: %v", err)
 	}
-	if len(plan.Steps) != 0 {
-		t.Fatalf("second unified plan must be a no-op, got %+v", plan.Steps)
+	if len(unifiedPlan.Steps) != 0 {
+		t.Fatalf("second unified plan must be a no-op, got %+v", unifiedPlan.Steps)
 	}
-	if err := exec.SyncPostgres(ctx, db, cfg); err != nil {
-		t.Fatalf("second unified sync failed: %v", err)
+
+	// Definition replacement is a destructive DROP+CREATE and must preserve
+	// the disabled desired state and managed marker.
+	replacementFunction := functionName + "_v2"
+	replacementCfg := cfg
+	replacementCfg.SchemaSQL = schemaSQL + fmt.Sprintf(`
+		CREATE FUNCTION %s() RETURNS event_trigger
+		LANGUAGE plpgsql AS $$
+		BEGIN
+			RAISE NOTICE 'replacement';
+		END;
+		$$;
+	`, replacementFunction)
+	replacementCfg.CatalogSQL = fmt.Sprintf(`
+		CREATE PUBLICATION %s FOR TABLE docs;
+		ALTER PUBLICATION %s SET (publish = 'insert');
+		CREATE EVENT TRIGGER %s ON ddl_command_end EXECUTE FUNCTION %s();
+		ALTER EVENT TRIGGER %s DISABLE;
+	`, publicationName, publicationName, eventTriggerName, replacementFunction, eventTriggerName)
+	replacementPlan, err := exec.PlanDiffPostgres(ctx, db, replacementCfg)
+	if err != nil {
+		t.Fatalf("definition replacement plan failed: %v", err)
+	}
+	var replacementDrop, replacementCreate bool
+	for _, step := range replacementPlan.Steps {
+		switch step.Type {
+		case plan.ChangeDropEventTrigger:
+			replacementDrop = true
+			if !step.Destructive {
+				t.Fatalf("event-trigger definition replacement drop must be destructive: %+v", step)
+			}
+		case plan.ChangeCreateEventTrigger:
+			replacementCreate = true
+		}
+	}
+	if !replacementDrop || !replacementCreate {
+		t.Fatalf("event-trigger definition drift must plan DROP+CREATE: %+v", replacementPlan.Steps)
+	}
+	replacementCfg.Policy = plan.DropPolicy{AllowDropEventTrigger: true}
+	replacementCfg.AcceptHazards = []plan.HazardCode{plan.HazardDropEventTrigger}
+	if err := exec.SyncPostgres(ctx, db, replacementCfg); err != nil {
+		t.Fatalf("definition replacement sync failed: %v", err)
+	}
+	var replacementEnabled bool
+	var replacementMarker string
+	if err := db.QueryRow(`SELECT e.evtenabled <> 'D', COALESCE(obj_description(e.oid, 'pg_event_trigger'), '') FROM pg_event_trigger e JOIN pg_proc p ON p.oid = e.evtfoid WHERE e.evtname = $1 AND p.proname = $2;`, eventTriggerName, replacementFunction).Scan(&replacementEnabled, &replacementMarker); err != nil {
+		t.Fatalf("query replaced event trigger: %v", err)
+	}
+	if replacementEnabled || replacementMarker != "grizzle-managed" {
+		t.Fatalf("replaced event trigger must be disabled and marker-stamped: enabled=%v marker=%q", replacementEnabled, replacementMarker)
+	}
+	replacementPlan, err = exec.PlanDiffPostgres(ctx, db, replacementCfg)
+	if err != nil {
+		t.Fatalf("second replacement plan failed: %v", err)
+	}
+	if len(replacementPlan.Steps) != 0 {
+		t.Fatalf("second replacement sync must be a no-op, got %+v", replacementPlan.Steps)
 	}
 }

@@ -34,14 +34,17 @@ func TestRoles_Lifecycle(t *testing.T) {
 		return fmt.Sprintf(`
 			CREATE ROLE app_read;
 			GRANT SELECT ON docs TO app_read;
+			GRANT EXECUTE ON FUNCTION touch_ts() TO app_read;
 			%s
 		`, grantExtra)
 	}
 
 	newCfg := func(rolesSQL string) exec.PostgresExecConfig {
 		return exec.PostgresExecConfig{
-			TargetSchema:     schema,
-			SchemaSQL:        "CREATE TABLE docs (id bigint PRIMARY KEY, body text NOT NULL);",
+			TargetSchema: schema,
+			SchemaSQL: `CREATE TABLE docs (id bigint PRIMARY KEY, body text NOT NULL);
+			CREATE FUNCTION touch_ts() RETURNS bigint
+			LANGUAGE sql IMMUTABLE AS 'SELECT 1';`,
 			RolesSQL:         rolesSQL,
 			Filters:          scope.Filters{},
 			Policy:           plan.DropPolicy{},
@@ -84,6 +87,21 @@ func TestRoles_Lifecycle(t *testing.T) {
 	if grants != 1 {
 		t.Fatalf("expected SELECT grant on docs for app_read, count = %d", grants)
 	}
+	if err := db.QueryRow(fmt.Sprintf(`
+		SELECT count(*)
+		FROM pg_proc p
+		JOIN pg_namespace n ON n.oid = p.pronamespace
+		JOIN aclexplode(p.proacl) a ON true
+		WHERE n.nspname = '%s'
+		  AND p.proname = 'touch_ts'
+		  AND a.grantee = (SELECT oid FROM pg_roles WHERE rolname = 'app_read')
+		  AND a.privilege_type = 'EXECUTE';
+	`, schema)).Scan(&grants); err != nil {
+		t.Fatalf("query function grant: %v", err)
+	}
+	if grants != 1 {
+		t.Fatalf("expected EXECUTE grant on touch_ts for app_read, count = %d", grants)
+	}
 
 	// 2. Second sync: no-op.
 	p, err := exec.PlanDiffPostgres(ctx, db, newCfg(rolesSpec("")))
@@ -99,8 +117,13 @@ func TestRoles_Lifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("revoke plan: %v", err)
 	}
-	if len(p2.Steps) != 1 || p2.Steps[0].Type != plan.ChangeRevoke || !p2.Steps[0].Destructive {
-		t.Fatalf("expected single destructive REVOKE, got %+v", p2.Steps)
+	if len(p2.Steps) != 2 {
+		t.Fatalf("expected table and function destructive REVOKEs, got %+v", p2.Steps)
+	}
+	for _, step := range p2.Steps {
+		if step.Type != plan.ChangeRevoke || !step.Destructive {
+			t.Fatalf("expected only destructive REVOKEs, got %+v", p2.Steps)
+		}
 	}
 	if err := exec.SyncPostgres(ctx, db, newCfg(`CREATE ROLE app_read;`)); err == nil {
 		t.Fatalf("revoke must fail with default policy (AllowRevoke=false)")

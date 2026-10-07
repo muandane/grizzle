@@ -70,12 +70,12 @@ func SortSteps(steps []Step) {
 		ChangeGrant:                121, // 15. Grants after all schema objects and roles exist
 		ChangeRevoke:               122, // 16. Revokes after grants (replacement flows)
 		ChangeDropRole:             123, // 17. Drop roles last, after their grants are gone
-		ChangeCreatePublication:    130, // 18. Publications after schema objects exist
-		ChangeAlterPublication:     131, // 19. Publication drift after creation
-		ChangeDropPublication:      132, // 20. Publication drops after drift reconciliation
-		ChangeCreateEventTrigger:   133, // 21. Event triggers last: they fire on subsequent DDL
-		ChangeAlterEventTrigger:    134, // 22. Event-trigger drift after creation
-		ChangeDropEventTrigger:     135, // 23. Event-trigger drops last
+		ChangeDropPublication:      129, // 18. Publication replacement/removal before creates
+		ChangeCreatePublication:    130, // 19. Publications after schema objects exist
+		ChangeAlterPublication:     131, // 20. Publication drift after creation
+		ChangeDropEventTrigger:     132, // 21. Event-trigger replacement/removal before creates
+		ChangeCreateEventTrigger:   133, // 22. Event triggers last: they fire on subsequent DDL
+		ChangeAlterEventTrigger:    134, // 23. Event-trigger enabled-state drift
 	}
 
 	// Build relational dependency graph: referencingTable -> referencedTable

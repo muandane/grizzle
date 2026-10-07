@@ -48,7 +48,9 @@ var (
 	// revokeRe matches the desired-state counterpart of grantRe. Captures:
 	// (1) optional "GRANT OPTION FOR", (2) privileges, (3) optional object
 	// kind, (4) object list, (5) grantee list.
-	revokeRe = regexp.MustCompile(`(?is)^REVOKE\s+(GRANT\s+OPTION\s+FOR\s+)?(.+?)\s+ON\s+(?:(TABLE|SEQUENCE|DATABASE|SCHEMA|FUNCTION)\s+)?(.+?)\s+FROM\s+(.+?)(?:\s+(?:CASCADE|RESTRICT))?\s*$`)
+	revokeRe         = regexp.MustCompile(`(?is)^REVOKE\s+(GRANT\s+OPTION\s+FOR\s+)?(.+?)\s+ON\s+(?:(TABLE|SEQUENCE|DATABASE|SCHEMA|FUNCTION)\s+)?(.+?)\s+FROM\s+(.+?)(?:\s+(?:CASCADE|RESTRICT))?\s*$`)
+	adminOptionRe    = regexp.MustCompile(`(?is)\s+WITH\s+ADMIN\s+OPTION\s*$`)
+	functionObjectRe = regexp.MustCompile(`(?is)^` + catalogIdentifierPartPattern + `(?:\s*\.\s*` + catalogIdentifierPartPattern + `)?\s*\([^()]*\)$`)
 )
 
 // Privilege sets used to expand ALL per object kind. They mirror the
@@ -71,7 +73,163 @@ var (
 // GrantKey returns the map key identifying a grant: object kind, object
 // name, and grantee. Privilege lists are compared separately.
 func GrantKey(kind, object, grantee string) string {
-	return strings.ToUpper(kind) + ":" + object + ":" + strings.ToUpper(grantee)
+	return strings.ToUpper(strings.TrimSpace(kind)) + ":" +
+		CanonicalGrantObject(kind, object, "") + ":" +
+		canonicalRoleKey(grantee)
+}
+
+func canonicalRoleKey(identifier string) string {
+	identifier = strings.TrimSpace(identifier)
+	if len(identifier) >= 2 && identifier[0] == '"' && identifier[len(identifier)-1] == '"' {
+		return "quoted:" + decodeIdentifier(identifier)
+	}
+	return "unquoted:" + strings.ToLower(identifier)
+}
+
+func canonicalRoleName(identifier string) string {
+	identifier = strings.TrimSpace(identifier)
+	if len(identifier) >= 2 && identifier[0] == '"' && identifier[len(identifier)-1] == '"' {
+		return decodeIdentifier(identifier)
+	}
+	return strings.ToLower(identifier)
+}
+
+// CanonicalRoleName returns the PostgreSQL role identity represented by a
+// quoted or unquoted role token.
+func CanonicalRoleName(identifier string) string {
+	return canonicalRoleName(identifier)
+}
+
+// IsPublicRoleIdentifier reports whether a raw SQL role token is the PUBLIC
+// keyword. A quoted "PUBLIC" is a distinct role name.
+func IsPublicRoleIdentifier(identifier string) bool {
+	identifier = strings.TrimSpace(identifier)
+	if len(identifier) >= 2 && identifier[0] == '"' && identifier[len(identifier)-1] == '"' {
+		return false
+	}
+	return strings.EqualFold(identifier, "PUBLIC")
+}
+
+// RenderRoleIdentifier renders a role token without changing quoted-role
+// identity. PUBLIC is a keyword and must not be double-quoted.
+func RenderRoleIdentifier(identifier string) string {
+	name := canonicalRoleName(identifier)
+	if IsPublicRoleIdentifier(identifier) {
+		return "PUBLIC"
+	}
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
+// CanonicalGrantObject returns the identity key used for ACL comparison.
+// Unquoted identifiers are normalized to PostgreSQL's lower-case form while
+// quoted identifiers retain their decoded case. Function signatures are
+// normalized independently from the function name so ACL inspection and
+// RolesSQL use the same identity.
+func CanonicalGrantObject(kind, object, targetSchema string) string {
+	kind = strings.ToUpper(strings.TrimSpace(kind))
+	if kind == "FUNCTION" {
+		return canonicalFunctionObject(object, targetSchema)
+	}
+	parts := splitQualifiedIdentifier(object)
+	if len(parts) == 0 {
+		return ""
+	}
+	if (kind == "TABLE" || kind == "SEQUENCE") && len(parts) == 1 && targetSchema != "" {
+		parts = append([]string{targetSchema}, parts...)
+	}
+	for i, part := range parts {
+		parts[i] = canonicalGrantIdentifierPart(part)
+	}
+	return strings.Join(parts, ".")
+}
+
+func canonicalFunctionObject(object, targetSchema string) string {
+	object = strings.TrimSpace(object)
+	open := -1
+	inQuote := false
+	for i := 0; i < len(object); i++ {
+		switch object[i] {
+		case '"':
+			if inQuote && i+1 < len(object) && object[i+1] == '"' {
+				i++
+				continue
+			}
+			inQuote = !inQuote
+		case '(':
+			if !inQuote {
+				open = i
+				i = len(object)
+			}
+		}
+	}
+	name := object
+	args := ""
+	if open >= 0 {
+		name = strings.TrimSpace(object[:open])
+		args = strings.TrimSpace(object[open+1:])
+		if strings.HasSuffix(args, ")") {
+			args = strings.TrimSpace(args[:len(args)-1])
+		}
+	}
+	nameParts := splitQualifiedIdentifier(name)
+	if len(nameParts) == 1 && targetSchema != "" {
+		nameParts = append([]string{targetSchema}, nameParts...)
+	}
+	for i, part := range nameParts {
+		nameParts[i] = canonicalGrantIdentifierPart(part)
+	}
+	return strings.Join(nameParts, ".") + "(" + canonicalFunctionArguments(args) + ")"
+}
+
+func canonicalFunctionArguments(args string) string {
+	if strings.TrimSpace(args) == "" {
+		return ""
+	}
+	parts, ok := splitSQLList(args)
+	if !ok {
+		return strings.ToLower(strings.Join(strings.Fields(args), " "))
+	}
+	for i, part := range parts {
+		parts[i] = canonicalGrantType(part)
+	}
+	return strings.Join(parts, ", ")
+}
+
+func canonicalGrantType(value string) string {
+	var out strings.Builder
+	inQuote := false
+	for i := 0; i < len(value); i++ {
+		switch value[i] {
+		case '"':
+			if inQuote && i+1 < len(value) && value[i+1] == '"' {
+				out.WriteString(`""`)
+				i++
+				continue
+			}
+			inQuote = !inQuote
+			out.WriteByte(value[i])
+		default:
+			if inQuote {
+				out.WriteByte(value[i])
+			} else {
+				out.WriteString(strings.ToLower(string(value[i])))
+			}
+		}
+	}
+	return strings.Join(strings.Fields(out.String()), " ")
+}
+
+func canonicalGrantIdentifierPart(part string) string {
+	part = strings.TrimSpace(part)
+	if len(part) >= 2 && part[0] == '"' && part[len(part)-1] == '"' {
+		decoded := strings.ReplaceAll(part[1:len(part)-1], `""`, `"`)
+		if decoded != "" && decoded == strings.ToLower(decoded) &&
+			catalogIdentifierPartRe.MatchString(decoded) {
+			return decoded
+		}
+		return `"` + strings.ReplaceAll(decoded, `"`, `""`) + `"`
+	}
+	return strings.ToLower(part)
 }
 
 // ParseRolesSQL extracts managed roles and privilege grants from a RolesSQL
@@ -94,7 +252,7 @@ func ParseRolesSQL(sql string) *RolesSpec {
 			if m := createRoleRe.FindStringSubmatch(trimmed); m != nil {
 				name := statementIdentifier(m)
 				if name != "" {
-					spec.Roles[strings.ToLower(name)] = &Role{Name: name}
+					spec.Roles[CanonicalIdentifierKey(name)] = &Role{Name: name}
 				}
 			}
 		case strings.HasPrefix(upper, "GRANT"):
@@ -219,12 +377,12 @@ func parseGrantStatement(stmt string) []*Grant {
 	var out []*Grant
 	for _, object := range objectList {
 		for _, grantee := range granteeList {
-			grantee = strings.Trim(grantee, `"`)
-			if grantee == "" {
+			grantee = strings.TrimSpace(grantee)
+			if !validCatalogIdentifierPart(grantee) {
 				continue
 			}
 			out = append(out, &Grant{
-				Grantee:     strings.ToUpper(grantee),
+				Grantee:     grantee,
 				ObjectKind:  kind,
 				ObjectName:  object,
 				Privileges:  slicesCloneStrings(privileges),
@@ -260,12 +418,12 @@ func parseRevokeStatement(stmt string) []*Grant {
 	var out []*Grant
 	for _, object := range objectList {
 		for _, grantee := range granteeList {
-			grantee = strings.Trim(grantee, `"`)
-			if grantee == "" {
+			grantee = strings.TrimSpace(grantee)
+			if !validCatalogIdentifierPart(grantee) {
 				continue
 			}
 			out = append(out, &Grant{
-				Grantee:     strings.ToUpper(grantee),
+				Grantee:     grantee,
 				ObjectKind:  kind,
 				ObjectName:  object,
 				Privileges:  slicesCloneStrings(privileges),
@@ -302,11 +460,12 @@ func applyRevokes(spec *RolesSpec, revokes []*Grant) {
 				continue
 			}
 			if revoke.GrantOption {
-				for _, privilege := range revoke.Privileges {
-					if containsFold(grant.Privileges, privilege) {
-						grant.GrantOption = false
-						break
-					}
+				// PR1 rejects this syntax in ValidateRolesSQL because Grant
+				// only carries one option bit for the whole privilege set.
+				// Keep parsing defensive: never clear the option for an
+				// unrelated subset that the IR cannot represent precisely.
+				if samePrivilegeSet(grant.Privileges, revoke.Privileges) {
+					grant.GrantOption = false
 				}
 				kept = append(kept, grant)
 				continue
@@ -326,10 +485,23 @@ func applyRevokes(spec *RolesSpec, revokes []*Grant) {
 	}
 }
 
+func samePrivilegeSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for _, privilege := range a {
+		if !containsFold(b, privilege) {
+			return false
+		}
+	}
+	return true
+}
+
 func sameGrantTarget(a, b *Grant) bool {
 	return strings.EqualFold(a.ObjectKind, b.ObjectKind) &&
-		strings.EqualFold(a.ObjectName, b.ObjectName) &&
-		strings.EqualFold(a.Grantee, b.Grantee)
+		CanonicalGrantObject(a.ObjectKind, a.ObjectName, "") ==
+			CanonicalGrantObject(b.ObjectKind, b.ObjectName, "") &&
+		canonicalRoleName(a.Grantee) == canonicalRoleName(b.Grantee)
 }
 
 func containsFold(values []string, want string) bool {
@@ -347,36 +519,177 @@ func stripLeadingComments(s string) string {
 	return stripLeadingSQLComments(s)
 }
 
-// splitList splits a comma-separated SQL identifier list, respecting quotes.
+// splitList splits a comma-separated SQL list, respecting quoted strings and
+// function argument parentheses. Invalid lists return nil.
 func splitList(s string) []string {
+	parts, ok := splitSQLList(s)
+	if !ok {
+		return nil
+	}
+	return parts
+}
+
+func splitSQLList(s string) ([]string, bool) {
 	var parts []string
 	var cur strings.Builder
-	inQuote := false
+	inDoubleQuote := false
+	inSingleQuote := false
+	parentheses := 0
 	for i := 0; i < len(s); i++ {
 		switch s[i] {
 		case '"':
 			cur.WriteByte(s[i])
-			if inQuote && i+1 < len(s) && s[i+1] == '"' {
+			if inDoubleQuote && i+1 < len(s) && s[i+1] == '"' {
 				cur.WriteByte(s[i+1])
 				i++
 				continue
 			}
-			inQuote = !inQuote
+			if !inSingleQuote {
+				inDoubleQuote = !inDoubleQuote
+			}
+		case '\'':
+			cur.WriteByte(s[i])
+			if inSingleQuote && i+1 < len(s) && s[i+1] == '\'' {
+				cur.WriteByte(s[i+1])
+				i++
+				continue
+			}
+			if !inDoubleQuote {
+				inSingleQuote = !inSingleQuote
+			}
+		case '(':
+			cur.WriteByte(s[i])
+			if !inDoubleQuote && !inSingleQuote {
+				parentheses++
+			}
+		case ')':
+			cur.WriteByte(s[i])
+			if !inDoubleQuote && !inSingleQuote {
+				if parentheses == 0 {
+					return nil, false
+				}
+				parentheses--
+			}
 		case ',':
-			if inQuote {
+			if inDoubleQuote || inSingleQuote || parentheses > 0 {
 				cur.WriteByte(s[i])
 				continue
 			}
-			parts = append(parts, strings.TrimSpace(cur.String()))
+			item := strings.TrimSpace(cur.String())
+			if item == "" {
+				return nil, false
+			}
+			parts = append(parts, item)
 			cur.Reset()
 		default:
 			cur.WriteByte(s[i])
 		}
 	}
-	if tail := strings.TrimSpace(cur.String()); tail != "" {
-		parts = append(parts, tail)
+	if inDoubleQuote || inSingleQuote || parentheses != 0 {
+		return nil, false
 	}
-	return parts
+	tail := strings.TrimSpace(cur.String())
+	if tail == "" {
+		return nil, false
+	}
+	return append(parts, tail), true
+}
+
+func validateGrantLists(matches []string, revoke bool) error {
+	offset := 0
+	if revoke {
+		offset = 1
+	}
+	privileges := strings.TrimSpace(matches[1+offset])
+	objects := strings.TrimSpace(matches[3+offset])
+	grantees := strings.TrimSpace(matches[4+offset])
+	if privileges == "" {
+		return fmt.Errorf("privilege list is empty")
+	}
+	if adminOptionRe.MatchString(grantees) {
+		return fmt.Errorf("WITH ADMIN OPTION is not supported")
+	}
+	privilegeList, ok := splitSQLList(privileges)
+	if !ok {
+		return fmt.Errorf("privilege list is malformed")
+	}
+	for _, privilege := range privilegeList {
+		upper := strings.ToUpper(strings.TrimSpace(privilege))
+		if upper == "" {
+			return fmt.Errorf("privilege list contains an empty item")
+		}
+		if upper != "ALL" && upper != "ALL PRIVILEGES" &&
+			!validCatalogIdentifierPart(upper) {
+			return fmt.Errorf("privilege %q is malformed", privilege)
+		}
+	}
+	objectList, ok := splitSQLList(objects)
+	if !ok {
+		return fmt.Errorf("object list is malformed")
+	}
+	kind := strings.ToUpper(strings.TrimSpace(matches[2+offset]))
+	if kind == "" {
+		kind = "TABLE"
+	}
+	for _, object := range objectList {
+		valid := false
+		if kind == "FUNCTION" {
+			valid = validFunctionObject(strings.TrimSpace(object))
+		} else {
+			valid = validRoleObject(strings.TrimSpace(object), kind == "TABLE" || kind == "SEQUENCE")
+		}
+		if !valid {
+			return fmt.Errorf("object list contains malformed item %q", object)
+		}
+	}
+	granteeList, ok := splitSQLList(grantees)
+	if !ok {
+		return fmt.Errorf("grantee list is malformed")
+	}
+	for _, grantee := range granteeList {
+		if !validCatalogIdentifierPart(grantee) {
+			return fmt.Errorf("grantee list contains malformed item %q", grantee)
+		}
+	}
+	return nil
+}
+
+func validFunctionObject(object string) bool {
+	if !functionObjectRe.MatchString(object) {
+		return false
+	}
+	open := strings.IndexByte(object, '(')
+	if open < 0 {
+		return false
+	}
+	for _, part := range splitQualifiedIdentifier(strings.TrimSpace(object[:open])) {
+		if !validCatalogIdentifierPart(part) {
+			return false
+		}
+	}
+	args := strings.TrimSpace(object[open+1 : len(object)-1])
+	if args == "" {
+		return true
+	}
+	_, ok := splitSQLList(args)
+	return ok
+}
+
+func validRoleObject(object string, qualified bool) bool {
+	parts := splitQualifiedIdentifier(object)
+	maxParts := 1
+	if qualified {
+		maxParts = 2
+	}
+	if len(parts) == 0 || len(parts) > maxParts {
+		return false
+	}
+	for _, part := range parts {
+		if !validCatalogIdentifierPart(part) {
+			return false
+		}
+	}
+	return true
 }
 
 func dedupeStrings(in []string) []string {
@@ -427,10 +740,16 @@ func ValidateRolesSQL(sql string) error {
 				return fmt.Errorf("passworded roles are not supported yet in PR1: %q", trimmed)
 			case createRoleStatementRe.FindStringSubmatch(trimmed) == nil:
 				return fmt.Errorf("unsupported role declaration in RolesSQL (only CREATE ROLE/USER [NOLOGIN] is supported): %q", trimmed)
+			case statementIdentifier(createRoleStatementRe.FindStringSubmatch(trimmed)) == "":
+				return fmt.Errorf("role identifier must not be empty: %q", trimmed)
 			}
 		case strings.HasPrefix(upper, "GRANT"):
-			if grantRe.FindStringSubmatch(trimmed) == nil {
+			matches := grantRe.FindStringSubmatch(trimmed)
+			if matches == nil {
 				return fmt.Errorf("unsupported GRANT form in RolesSQL (expected GRANT <privileges> ON [KIND] <object> TO <grantee>): %q", trimmed)
+			}
+			if err := validateGrantLists(matches, false); err != nil {
+				return fmt.Errorf("unsupported GRANT form in RolesSQL: %w: %q", err, trimmed)
 			}
 		case strings.HasPrefix(upper, "REVOKE"):
 			matches := revokeRe.FindStringSubmatch(trimmed)
@@ -439,6 +758,9 @@ func ValidateRolesSQL(sql string) error {
 			}
 			if strings.TrimSpace(matches[1]) != "" {
 				return fmt.Errorf("per-privilege grant-option revocation is not supported in PR1: %q", trimmed)
+			}
+			if err := validateGrantLists(matches, true); err != nil {
+				return fmt.Errorf("unsupported REVOKE form in RolesSQL: %w: %q", err, trimmed)
 			}
 		default:
 			return fmt.Errorf("unsupported statement in RolesSQL (only CREATE ROLE/USER [NOLOGIN] and GRANT/REVOKE are managed): %q", trimmed)

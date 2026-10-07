@@ -2,7 +2,6 @@ package diff
 
 import (
 	"slices"
-	"strings"
 
 	"github.com/muandane/grizzle/internal/plan"
 	"github.com/muandane/grizzle/internal/schema"
@@ -135,8 +134,8 @@ func RolesDiff(desired *schema.RolesSpec, live *RoleState, targetSchema string) 
 			continue
 		}
 		lg := liveGrants[key]
-		grantee := strings.ToLower(lg.Grantee)
-		if grantee == "public" {
+		grantee := schema.CanonicalRoleName(lg.Grantee)
+		if schema.IsPublicRoleIdentifier(lg.Grantee) {
 			// PUBLIC grants outside the desired spec are operator state:
 			// revoking them would break ambient access.
 			continue
@@ -174,13 +173,13 @@ func grantChange(typ plan.ChangeType, g *schema.Grant) Change {
 func desiredRoleNames(spec *schema.RolesSpec) map[string]bool {
 	names := make(map[string]bool)
 	for _, r := range spec.Roles {
-		names[strings.ToLower(r.Name)] = true
+		names[schema.CanonicalIdentifierKey(r.Name)] = true
 	}
 	for _, g := range spec.Grants {
-		if strings.EqualFold(g.Grantee, "PUBLIC") {
+		if schema.IsPublicRoleIdentifier(g.Grantee) {
 			continue
 		}
-		names[strings.ToLower(g.Grantee)] = true
+		names[schema.CanonicalRoleName(g.Grantee)] = true
 	}
 	return names
 }
@@ -224,18 +223,10 @@ func indexDesiredGrants(spec *schema.RolesSpec, targetSchema string) map[string]
 	return out
 }
 
-// canonicalObjectName lowercases the object name and qualifies unqualified
-// TABLE/SEQUENCE names with the target schema (matching the
-// schema.object form emitted by ACL introspection).
+// canonicalObjectName normalizes PostgreSQL identifier identity and qualifies
+// unqualified ACL objects against the target schema.
 func canonicalObjectName(g *schema.Grant, targetSchema string) string {
-	name := strings.ToLower(g.ObjectName)
-	switch strings.ToUpper(g.ObjectKind) {
-	case "TABLE", "SEQUENCE":
-		if !strings.Contains(name, ".") && targetSchema != "" {
-			return strings.ToLower(targetSchema) + "." + name
-		}
-	}
-	return name
+	return schema.CanonicalGrantObject(g.ObjectKind, g.ObjectName, targetSchema)
 }
 
 // indexLiveGrants keys live ACL entries by (kind, object, grantee).

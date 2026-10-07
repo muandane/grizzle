@@ -15,9 +15,9 @@ import (
 // LiveCatalog captures the publication/event-trigger state relevant to a
 // CatalogSQL diff.
 type LiveCatalog struct {
-	// Publications maps lowercased publication name -> live state.
+	// Publications maps canonical publication identity -> live state.
 	Publications map[string]*diff.PublicationState
-	// EventTriggers maps lowercased event-trigger name -> live state.
+	// EventTriggers maps canonical event-trigger identity -> live state.
 	EventTriggers map[string]*diff.EventTriggerState
 }
 
@@ -53,7 +53,7 @@ func InspectLiveCatalog(ctx context.Context, dbtx dialect.DBTX) (*LiveCatalog, e
 		if err := scan(&name, &allTables, &ins, &upd, &del, &trunc, &comment); err != nil {
 			return err
 		}
-		live.Publications[strings.ToLower(name)] = &diff.PublicationState{
+		live.Publications[schema.CanonicalIdentifierKey(name)] = &diff.PublicationState{
 			Name:            name,
 			Managed:         comment == schema.PublicationManagedComment,
 			AllTables:       allTables,
@@ -86,12 +86,12 @@ func InspectLiveCatalog(ctx context.Context, dbtx dialect.DBTX) (*LiveCatalog, e
 		}
 		defer func() { _ = tableRows.Close() }()
 		err = scanRows(tableRows, func(scan func(...any) error) error {
-			var pub, schema, table string
-			if err := scan(&pub, &schema, &table); err != nil {
+			var pub, schemaName, table string
+			if err := scan(&pub, &schemaName, &table); err != nil {
 				return err
 			}
-			if ps, ok := live.Publications[strings.ToLower(pub)]; ok {
-				ps.Tables = append(ps.Tables, canonicalLiveIdentifier(schema)+"."+canonicalLiveIdentifier(table))
+			if ps, ok := live.Publications[schema.CanonicalIdentifierKey(pub)]; ok {
+				ps.Tables = append(ps.Tables, canonicalLiveIdentifier(schemaName)+"."+canonicalLiveIdentifier(table))
 			}
 			return nil
 		})
@@ -120,12 +120,12 @@ func InspectLiveCatalog(ctx context.Context, dbtx dialect.DBTX) (*LiveCatalog, e
 			}
 			defer func() { _ = schemaRows.Close() }()
 			err = scanRows(schemaRows, func(scan func(...any) error) error {
-				var pub, schema string
-				if err := scan(&pub, &schema); err != nil {
+				var pub, schemaName string
+				if err := scan(&pub, &schemaName); err != nil {
 					return err
 				}
-				if ps, ok := live.Publications[strings.ToLower(pub)]; ok {
-					ps.Schemas = append(ps.Schemas, canonicalLiveIdentifier(schema))
+				if ps, ok := live.Publications[schema.CanonicalIdentifierKey(pub)]; ok {
+					ps.Schemas = append(ps.Schemas, canonicalLiveIdentifier(schemaName))
 				}
 				return nil
 			})
@@ -161,15 +161,16 @@ func InspectLiveCatalog(ctx context.Context, dbtx dialect.DBTX) (*LiveCatalog, e
 		if err := scan(&name, &event, &tags, &function, &enabled, &comment); err != nil {
 			return err
 		}
-		live.EventTriggers[strings.ToLower(name)] = &diff.EventTriggerState{
+		live.EventTriggers[schema.CanonicalIdentifierKey(name)] = &diff.EventTriggerState{
 			Name:     name,
 			Managed:  comment == schema.EventTriggerManagedComment,
 			Event:    strings.ToUpper(event),
 			Tags:     tags,
 			Function: function,
-			// evtenabled: 'O' = enabled (origin), anything else (D/K/A
-			// disabled states) reports false.
-			Enabled: enabled == "O",
+			// evtenabled: O = origin, A = always, R = replica, D =
+			// disabled. Replica/always are enabled states even though they
+			// only fire for their corresponding replication mode.
+			Enabled: eventTriggerEnabled(enabled),
 		}
 		return nil
 	})
@@ -177,6 +178,15 @@ func InspectLiveCatalog(ctx context.Context, dbtx dialect.DBTX) (*LiveCatalog, e
 		return nil, fmt.Errorf("scanning event triggers: %w", err)
 	}
 	return live, nil
+}
+
+func eventTriggerEnabled(status string) bool {
+	switch strings.ToUpper(status) {
+	case "O", "A", "R":
+		return true
+	default:
+		return false
+	}
 }
 
 // CatalogState adapts the inspected live state to the dialect-independent
@@ -246,9 +256,10 @@ func GenerateAlterPublicationSQL(want, old *schema.Publication) string {
 			out = append(out, fmt.Sprintf("ALTER PUBLICATION %s SET ALL TABLES;", quoteIdentifier(want.Name)))
 		} else {
 			// PostgreSQL has no valid empty SET TABLE form. Recreate the
-			// publication when ALL TABLES must become an empty explicit set.
+			// publication through CatalogDiff, which emits a gated
+			// DROP_PUBLICATION plus a replacement CREATE_PUBLICATION.
 			if len(want.Tables) == 0 && len(want.Schemas) == 0 {
-				return recreatePublicationSQL(want)
+				return ""
 			}
 			// Leaving FOR ALL TABLES resets explicit membership. Set one
 			// base membership form, then add the other membership kind if
@@ -285,14 +296,6 @@ func GenerateAlterPublicationSQL(want, old *schema.Publication) string {
 		out = append(out, fmt.Sprintf("ALTER PUBLICATION %s SET (publish = '%s');", quoteIdentifier(want.Name), publishFlagString(want)))
 	}
 	return strings.Join(out, "\n")
-}
-
-func recreatePublicationSQL(publication *schema.Publication) string {
-	return strings.Join([]string{
-		GenerateDropPublicationSQL(publication.Name),
-		GenerateCreatePublicationSQL(publication),
-		GeneratePublicationCommentSQL(publication.Name),
-	}, "\n")
 }
 
 // GenerateDropPublicationSQL renders DROP PUBLICATION.

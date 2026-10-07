@@ -248,6 +248,30 @@ func TestMergeCatalogSpecs_OverlaysThenAppliesOperations(t *testing.T) {
 		t.Fatalf("side-channel ALTER should apply after SchemaSQL base: %+v", merged.Publications)
 	}
 
+	schemaAlter := ParseCatalogSQL(`ALTER PUBLICATION docs_pub SET TABLE audit;`)
+	sideCreate := ParseCatalogSQL(`CREATE PUBLICATION docs_pub FOR TABLE docs;`)
+	if err := ValidateCatalogSpecMerge(schemaAlter, sideCreate); err != nil {
+		t.Fatalf("SchemaSQL ALTER should be satisfied by CatalogSQL CREATE: %v", err)
+	}
+	merged = MergeCatalogSpecs(schemaAlter, sideCreate)
+	if len(merged.Publications) != 1 || len(merged.Publications[0].Tables) != 1 ||
+		merged.Publications[0].Tables[0] != "audit" {
+		t.Fatalf("SchemaSQL ALTER should apply after side-channel CREATE: %+v", merged.Publications)
+	}
+
+	schemaAlter = ParseCatalogSQL(`ALTER PUBLICATION docs_pub ADD TABLE schema_audit;`)
+	sideCreate = ParseCatalogSQL(`
+		CREATE PUBLICATION docs_pub FOR TABLE audit;
+		ALTER PUBLICATION docs_pub ADD TABLE side_audit;
+	`)
+	if err := ValidateCatalogSpecMerge(schemaAlter, sideCreate); err != nil {
+		t.Fatalf("cross-file ALTER operations should validate: %v", err)
+	}
+	merged = MergeCatalogSpecs(schemaAlter, sideCreate)
+	if len(merged.Publications) != 1 || len(merged.Publications[0].Tables) != 3 {
+		t.Fatalf("both cross-file ALTER operations should apply to the side-channel base: %+v", merged.Publications)
+	}
+
 	if err := ValidateCatalogSpecMerge(nil, ParseCatalogSQL(`ALTER PUBLICATION missing ADD TABLE docs;`)); err == nil {
 		t.Fatal("ALTER without a declaration must fail validation")
 	}
@@ -298,9 +322,13 @@ func TestValidateCatalogSQL(t *testing.T) {
 		"CREATE PUBLICATION p FOR TABLE ONLY docs;",
 		"CREATE PUBLICATION p FOR TABLE docs.*;",
 		"CREATE PUBLICATION p FOR TABLES IN SCHEMA public.docs;",
+		`CREATE PUBLICATION "" FOR ALL TABLES;`,
+		`CREATE PUBLICATION p FOR TABLE "";`,
 		"ALTER PUBLICATION p;",
 		"ALTER PUBLICATION p RENAME TO renamed;",
 		"ALTER PUBLICATION p ADD TABLE docs,;",
+		"ALTER PUBLICATION p ADD TABLE docs -- trailing comment\n;",
+		"ALTER PUBLICATION p ADD TABLES IN SCHEMA public,;",
 		"ALTER EVENT TRIGGER t ENABLE ALWAYS;",
 		"CREATE EVENT TRIGGER t ON ddl_command_end WHEN TAG IN ('x') trailing EXECUTE FUNCTION f();",
 		"CREATE EVENT TRIGGER t ON unsupported_event EXECUTE FUNCTION f();",
@@ -308,11 +336,42 @@ func TestValidateCatalogSQL(t *testing.T) {
 		"CREATE PUBLICATION p FOR TABLE docs -- trailing comment\n;",
 		"DROP PUBLICATION;",
 		"DROP EVENT TRIGGER;",
+		`CREATE EVENT TRIGGER "" ON ddl_command_end EXECUTE FUNCTION f();`,
+		`CREATE EVENT TRIGGER t ON ddl_command_end EXECUTE FUNCTION ""();`,
 	}
 	for _, sql := range invalid {
 		if err := ValidateCatalogSQL(sql); err == nil {
 			t.Errorf("ValidateCatalogSQL(%q) = nil, want error", sql)
 		}
+	}
+}
+
+func TestValidateCatalogSQL_RejectsAllTablesMembershipMutations(t *testing.T) {
+	schemaSpec := ParseCatalogSQL(`CREATE PUBLICATION p FOR ALL TABLES;`)
+	for _, sql := range []string{
+		`ALTER PUBLICATION p ADD TABLE docs;`,
+		`ALTER PUBLICATION p DROP TABLE docs;`,
+		`ALTER PUBLICATION p ADD TABLES IN SCHEMA analytics;`,
+		`ALTER PUBLICATION p DROP TABLES IN SCHEMA analytics;`,
+	} {
+		t.Run(sql, func(t *testing.T) {
+			if err := ValidateCatalogSpecMerge(schemaSpec, ParseCatalogSQL(sql)); err == nil {
+				t.Fatalf("membership mutation after FOR ALL TABLES should fail: %q", sql)
+			}
+		})
+	}
+}
+
+func TestCatalogIdentifierIdentityKeepsQuotedCase(t *testing.T) {
+	spec := ParseCatalogSQL(`
+		CREATE PUBLICATION pub;
+		CREATE PUBLICATION "Pub";
+	`)
+	if len(spec.Publications) != 2 {
+		t.Fatalf("quoted and unquoted names must remain distinct: %+v", spec.Publications)
+	}
+	if spec.Publications[0].Name != "pub" || spec.Publications[1].Name != "Pub" {
+		t.Fatalf("unexpected publication names: %+v", spec.Publications)
 	}
 }
 

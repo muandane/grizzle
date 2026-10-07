@@ -226,6 +226,14 @@ func statementIdentifier(matches []string) string {
 	return decodeIdentifier(matches[1])
 }
 
+// CanonicalIdentifierKey returns the exact catalog identity of an already
+// decoded PostgreSQL identifier. Unquoted SQL identifiers must be normalized
+// before this helper is called; quoted identifiers and live catalog names are
+// case-sensitive and must remain unchanged.
+func CanonicalIdentifierKey(identifier string) string {
+	return strings.TrimSpace(identifier)
+}
+
 func decodeIdentifier(identifier string) string {
 	identifier = strings.TrimSpace(identifier)
 	if len(identifier) >= 2 && identifier[0] == '"' && identifier[len(identifier)-1] == '"' {
@@ -235,9 +243,9 @@ func decodeIdentifier(identifier string) string {
 }
 
 func upsertPublication(spec *CatalogSpec, publication *Publication) {
-	key := strings.ToLower(publication.Name)
+	key := CanonicalIdentifierKey(publication.Name)
 	for i, existing := range spec.Publications {
-		if strings.ToLower(existing.Name) == key {
+		if CanonicalIdentifierKey(existing.Name) == key {
 			spec.Publications[i] = publication
 			return
 		}
@@ -248,7 +256,7 @@ func upsertPublication(spec *CatalogSpec, publication *Publication) {
 func removePublication(spec *CatalogSpec, name string) {
 	filtered := spec.Publications[:0]
 	for _, publication := range spec.Publications {
-		if !strings.EqualFold(publication.Name, name) {
+		if CanonicalIdentifierKey(publication.Name) != CanonicalIdentifierKey(name) {
 			filtered = append(filtered, publication)
 		}
 	}
@@ -257,7 +265,7 @@ func removePublication(spec *CatalogSpec, name string) {
 
 func findPublication(spec *CatalogSpec, name string) *Publication {
 	for _, publication := range spec.Publications {
-		if strings.EqualFold(publication.Name, name) {
+		if CanonicalIdentifierKey(publication.Name) == CanonicalIdentifierKey(name) {
 			return publication
 		}
 	}
@@ -265,9 +273,9 @@ func findPublication(spec *CatalogSpec, name string) *Publication {
 }
 
 func upsertEventTrigger(spec *CatalogSpec, trigger *EventTrigger) {
-	key := strings.ToLower(trigger.Name)
+	key := CanonicalIdentifierKey(trigger.Name)
 	for i, existing := range spec.EventTriggers {
-		if strings.ToLower(existing.Name) == key {
+		if CanonicalIdentifierKey(existing.Name) == key {
 			spec.EventTriggers[i] = trigger
 			return
 		}
@@ -278,7 +286,7 @@ func upsertEventTrigger(spec *CatalogSpec, trigger *EventTrigger) {
 func removeEventTrigger(spec *CatalogSpec, name string) {
 	filtered := spec.EventTriggers[:0]
 	for _, trigger := range spec.EventTriggers {
-		if !strings.EqualFold(trigger.Name, name) {
+		if CanonicalIdentifierKey(trigger.Name) != CanonicalIdentifierKey(name) {
 			filtered = append(filtered, trigger)
 		}
 	}
@@ -287,7 +295,7 @@ func removeEventTrigger(spec *CatalogSpec, name string) {
 
 func findEventTrigger(spec *CatalogSpec, name string) *EventTrigger {
 	for _, trigger := range spec.EventTriggers {
-		if strings.EqualFold(trigger.Name, name) {
+		if CanonicalIdentifierKey(trigger.Name) == CanonicalIdentifierKey(name) {
 			return trigger
 		}
 	}
@@ -312,7 +320,7 @@ func applyCatalogOperations(base *CatalogSpec, operations []catalogOperation, st
 			switch operation.action {
 			case catalogCreateOperation:
 				upsertPublication(out, clonePublication(operation.publication))
-				delete(out.droppedPublications, strings.ToLower(operation.name))
+				delete(out.droppedPublications, CanonicalIdentifierKey(operation.name))
 			case catalogAlterOperation:
 				publication := findPublication(out, operation.name)
 				if publication == nil {
@@ -329,13 +337,13 @@ func applyCatalogOperations(base *CatalogSpec, operations []catalogOperation, st
 				if out.droppedPublications == nil {
 					out.droppedPublications = make(map[string]bool)
 				}
-				out.droppedPublications[strings.ToLower(operation.name)] = true
+				out.droppedPublications[CanonicalIdentifierKey(operation.name)] = true
 			}
 		case catalogEventTriggerOperation:
 			switch operation.action {
 			case catalogCreateOperation:
 				upsertEventTrigger(out, cloneEventTrigger(operation.eventTrigger))
-				delete(out.droppedEventTriggers, strings.ToLower(operation.name))
+				delete(out.droppedEventTriggers, CanonicalIdentifierKey(operation.name))
 			case catalogAlterOperation:
 				trigger := findEventTrigger(out, operation.name)
 				if trigger == nil {
@@ -352,7 +360,7 @@ func applyCatalogOperations(base *CatalogSpec, operations []catalogOperation, st
 				if out.droppedEventTriggers == nil {
 					out.droppedEventTriggers = make(map[string]bool)
 				}
-				out.droppedEventTriggers[strings.ToLower(operation.name)] = true
+				out.droppedEventTriggers[CanonicalIdentifierKey(operation.name)] = true
 			}
 		}
 	}
@@ -391,18 +399,30 @@ func applyPublicationAlterClause(publication *Publication, clause string) bool {
 		return true
 	}
 	if matches := publicationAddSchemasRe.FindStringSubmatch(clause); matches != nil {
+		if publication.AllTables {
+			return false
+		}
 		publication.Schemas = appendUniqueFold(publication.Schemas, splitList(matches[1])...)
 		return true
 	}
 	if matches := publicationDropSchemasRe.FindStringSubmatch(clause); matches != nil {
+		if publication.AllTables {
+			return false
+		}
 		publication.Schemas = removeFold(publication.Schemas, splitList(matches[1])...)
 		return true
 	}
 	if matches := publicationAddTablesRe.FindStringSubmatch(clause); matches != nil {
+		if publication.AllTables {
+			return false
+		}
 		publication.Tables = appendUniqueFold(publication.Tables, splitList(matches[1])...)
 		return true
 	}
 	if matches := publicationDropTablesRe.FindStringSubmatch(clause); matches != nil {
+		if publication.AllTables {
+			return false
+		}
 		publication.Tables = removeFold(publication.Tables, splitList(matches[1])...)
 		return true
 	}
@@ -448,7 +468,7 @@ func appendUniqueFold(values []string, additions ...string) []string {
 	for _, addition := range additions {
 		found := false
 		for _, value := range values {
-			if strings.EqualFold(value, addition) {
+			if canonicalCatalogMemberKey(value) == canonicalCatalogMemberKey(addition) {
 				found = true
 				break
 			}
@@ -465,7 +485,7 @@ func removeFold(values []string, removals ...string) []string {
 	for _, value := range values {
 		remove := false
 		for _, candidate := range removals {
-			if strings.EqualFold(value, candidate) {
+			if canonicalCatalogMemberKey(value) == canonicalCatalogMemberKey(candidate) {
 				remove = true
 				break
 			}
@@ -475,6 +495,19 @@ func removeFold(values []string, removals ...string) []string {
 		}
 	}
 	return filtered
+}
+
+func canonicalCatalogMemberKey(name string) string {
+	parts := splitQualifiedIdentifier(name)
+	for i, part := range parts {
+		part = strings.TrimSpace(part)
+		if len(part) >= 2 && part[0] == '"' && part[len(part)-1] == '"' {
+			parts[i] = strings.ReplaceAll(part[1:len(part)-1], `""`, `"`)
+		} else {
+			parts[i] = strings.ToLower(part)
+		}
+	}
+	return strings.Join(parts, ".")
 }
 
 // MergeCatalogSpecs combines catalog desired state from SchemaSQL with the
@@ -493,6 +526,9 @@ func ValidateCatalogSpecMerge(schemaSpec, sideSpec *CatalogSpec) error {
 }
 
 func mergeCatalogSpecs(schemaSpec, sideSpec *CatalogSpec, strict bool) (*CatalogSpec, error) {
+	if hasOperations(schemaSpec) || hasOperations(sideSpec) {
+		return mergeCatalogOperationSpecs(schemaSpec, sideSpec, strict)
+	}
 	out, err := materializeCatalogSpec(schemaSpec, strict)
 	if err != nil {
 		return nil, err
@@ -514,12 +550,85 @@ func mergeCatalogSpecs(schemaSpec, sideSpec *CatalogSpec, strict bool) (*Catalog
 		(len(out.droppedPublications) > 0 || len(out.droppedEventTriggers) > 0)
 	out.suppressImplicitDrops = suppressImplicitDrops(schemaSpec) || suppressImplicitDrops(sideSpec)
 	slices.SortFunc(out.Publications, func(a, b *Publication) int {
-		return strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name))
+		return strings.Compare(CanonicalIdentifierKey(a.Name), CanonicalIdentifierKey(b.Name))
 	})
 	slices.SortFunc(out.EventTriggers, func(a, b *EventTrigger) int {
-		return strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name))
+		return strings.Compare(CanonicalIdentifierKey(a.Name), CanonicalIdentifierKey(b.Name))
 	})
 	return out, nil
+}
+
+func hasOperations(spec *CatalogSpec) bool {
+	return spec != nil && len(spec.operations) > 0
+}
+
+// mergeCatalogOperationSpecs materializes both sources as one declarative
+// document. Declarations and drops are replayed in source order first, with
+// side-channel declarations applied last so they remain authoritative on
+// duplicate names. ALTER operations are replayed afterward, allowing an
+// ALTER in either source to target a CREATE supplied by the other source.
+func mergeCatalogOperationSpecs(schemaSpec, sideSpec *CatalogSpec, strict bool) (*CatalogSpec, error) {
+	out := &CatalogSpec{}
+
+	applyPhase := func(spec *CatalogSpec, include func(catalogOperation) bool) error {
+		if spec == nil {
+			return nil
+		}
+		var operations []catalogOperation
+		for _, operation := range spec.operations {
+			if include(operation) {
+				operations = append(operations, operation)
+			}
+		}
+		var err error
+		out, err = applyCatalogOperations(out, operations, strict)
+		return err
+	}
+
+	// Preserve CREATE/DROP order within each source, then overlay the
+	// side-channel's declarations and explicit drops.
+	nonAlter := func(operation catalogOperation) bool {
+		return operation.action != catalogAlterOperation
+	}
+	if err := applyPhase(schemaSpec, nonAlter); err != nil {
+		return nil, err
+	}
+	if err := applyPhase(sideSpec, nonAlter); err != nil {
+		return nil, err
+	}
+	if err := applyPhase(schemaSpec, func(operation catalogOperation) bool {
+		return operation.action == catalogAlterOperation
+	}); err != nil {
+		return nil, err
+	}
+	if err := applyPhase(sideSpec, func(operation catalogOperation) bool {
+		return operation.action == catalogAlterOperation
+	}); err != nil {
+		return nil, err
+	}
+
+	out.operations = append(append([]catalogOperation(nil),
+		operationsOf(schemaSpec)...), operationsOf(sideSpec)...)
+	out.hasCatalogStatements = hasCatalogStatements(schemaSpec) || hasCatalogStatements(sideSpec)
+	out.hasCreateStatements = hasCreateStatements(schemaSpec) || hasCreateStatements(sideSpec)
+	out.explicitDropsOnly = out.hasCatalogStatements &&
+		len(out.Publications) == 0 && len(out.EventTriggers) == 0 &&
+		(len(out.droppedPublications) > 0 || len(out.droppedEventTriggers) > 0)
+	out.suppressImplicitDrops = suppressImplicitDrops(schemaSpec) || suppressImplicitDrops(sideSpec)
+	slices.SortFunc(out.Publications, func(a, b *Publication) int {
+		return strings.Compare(CanonicalIdentifierKey(a.Name), CanonicalIdentifierKey(b.Name))
+	})
+	slices.SortFunc(out.EventTriggers, func(a, b *EventTrigger) int {
+		return strings.Compare(CanonicalIdentifierKey(a.Name), CanonicalIdentifierKey(b.Name))
+	})
+	return out, nil
+}
+
+func operationsOf(spec *CatalogSpec) []catalogOperation {
+	if spec == nil {
+		return nil
+	}
+	return spec.operations
 }
 
 func materializeCatalogSpec(spec *CatalogSpec, strict bool) (*CatalogSpec, error) {
@@ -546,11 +655,11 @@ func overlayCatalogDeclarations(out, overlay *CatalogSpec) {
 	}
 	for _, publication := range overlay.Publications {
 		upsertPublication(out, clonePublication(publication))
-		delete(out.droppedPublications, strings.ToLower(publication.Name))
+		delete(out.droppedPublications, CanonicalIdentifierKey(publication.Name))
 	}
 	for _, trigger := range overlay.EventTriggers {
 		upsertEventTrigger(out, cloneEventTrigger(trigger))
-		delete(out.droppedEventTriggers, strings.ToLower(trigger.Name))
+		delete(out.droppedEventTriggers, CanonicalIdentifierKey(trigger.Name))
 	}
 }
 
@@ -559,7 +668,7 @@ func deletePublication(spec *CatalogSpec, name string) {
 	if spec.droppedPublications == nil {
 		spec.droppedPublications = make(map[string]bool)
 	}
-	spec.droppedPublications[strings.ToLower(name)] = true
+	spec.droppedPublications[CanonicalIdentifierKey(name)] = true
 }
 
 func deleteEventTrigger(spec *CatalogSpec, name string) {
@@ -567,7 +676,7 @@ func deleteEventTrigger(spec *CatalogSpec, name string) {
 	if spec.droppedEventTriggers == nil {
 		spec.droppedEventTriggers = make(map[string]bool)
 	}
-	spec.droppedEventTriggers[strings.ToLower(name)] = true
+	spec.droppedEventTriggers[CanonicalIdentifierKey(name)] = true
 }
 
 func cloneCatalogSpec(spec *CatalogSpec) *CatalogSpec {
@@ -626,8 +735,12 @@ func parsePublicationStatement(stmt string) *Publication {
 	if m == nil {
 		return nil
 	}
+	name := statementIdentifier(m)
+	if name == "" {
+		return nil
+	}
 	p := &Publication{
-		Name:            statementIdentifier(m),
+		Name:            name,
 		PublishInsert:   true,
 		PublishUpdate:   true,
 		PublishDelete:   true,
@@ -674,8 +787,12 @@ func parseEventTriggerStatement(stmt string) *EventTrigger {
 	if m == nil {
 		return nil
 	}
+	name := statementIdentifier(m)
+	if name == "" {
+		return nil
+	}
 	e := &EventTrigger{
-		Name:     statementIdentifier(m),
+		Name:     name,
 		Event:    strings.ToUpper(m[3]),
 		Function: decodeIdentifier(m[5]),
 		Enabled:  true,
@@ -702,13 +819,13 @@ const EventTriggerManagedComment = "grizzle-managed"
 // PublicationExplicitlyDropped reports whether the desired catalog input
 // contains a DROP PUBLICATION for name.
 func (s *CatalogSpec) PublicationExplicitlyDropped(name string) bool {
-	return s != nil && s.droppedPublications[strings.ToLower(name)]
+	return s != nil && s.droppedPublications[CanonicalIdentifierKey(name)]
 }
 
 // EventTriggerExplicitlyDropped reports whether the desired catalog input
 // contains a DROP EVENT TRIGGER for name.
 func (s *CatalogSpec) EventTriggerExplicitlyDropped(name string) bool {
-	return s != nil && s.droppedEventTriggers[strings.ToLower(name)]
+	return s != nil && s.droppedEventTriggers[CanonicalIdentifierKey(name)]
 }
 
 // ExplicitDropsOnly reports whether the input contains only explicit drops
@@ -738,21 +855,23 @@ func ValidateCatalogSQL(sql string) error {
 		switch {
 		case strings.HasPrefix(upper, "CREATE PUBLICATION"):
 			matches := createPublicationRe.FindStringSubmatch(trimmed)
-			if matches == nil || !validatePublicationCreate(matches) {
+			if matches == nil || statementIdentifier(matches) == "" || !validatePublicationCreate(matches) {
 				return fmt.Errorf("unsupported CREATE PUBLICATION form in CatalogSQL (expected CREATE PUBLICATION <name> [FOR ALL TABLES | FOR TABLE <tables> | FOR TABLES IN SCHEMA <schemas>] [WITH (publish = '...')]): %q", trimmed)
 			}
 		case strings.HasPrefix(upper, "ALTER PUBLICATION"):
 			matches := alterPublicationRe.FindStringSubmatch(trimmed)
-			if matches == nil || !isSupportedPublicationAlter(matches[3]) {
+			if matches == nil || statementIdentifier(matches) == "" || !isSupportedPublicationAlter(matches[3]) {
 				return fmt.Errorf("unsupported ALTER PUBLICATION form in CatalogSQL: %q", trimmed)
 			}
 		case strings.HasPrefix(upper, "DROP PUBLICATION"):
-			if dropPublicationRe.FindStringSubmatch(trimmed) == nil {
+			matches := dropPublicationRe.FindStringSubmatch(trimmed)
+			if matches == nil || statementIdentifier(matches) == "" {
 				return fmt.Errorf("unsupported DROP PUBLICATION form in CatalogSQL: %q", trimmed)
 			}
 		case strings.HasPrefix(upper, "CREATE EVENT TRIGGER"):
 			matches := createEventTriggerRe.FindStringSubmatch(trimmed)
-			if matches == nil {
+			if matches == nil || statementIdentifier(matches) == "" ||
+				!validCatalogIdentifierPart(matches[5]) {
 				return fmt.Errorf("unsupported CREATE EVENT TRIGGER form in CatalogSQL (expected CREATE EVENT TRIGGER <name> ON <event> [WHEN TAG IN ('...')] EXECUTE FUNCTION <fn>()): %q", trimmed)
 			}
 			if !supportedEventTriggerEvents[strings.ToUpper(matches[3])] {
@@ -763,11 +882,12 @@ func ValidateCatalogSQL(sql string) error {
 			}
 		case strings.HasPrefix(upper, "ALTER EVENT TRIGGER"):
 			matches := alterEventTriggerRe.FindStringSubmatch(trimmed)
-			if matches == nil || !isSupportedEventTriggerAlter(matches[3]) {
+			if matches == nil || statementIdentifier(matches) == "" || !isSupportedEventTriggerAlter(matches[3]) {
 				return fmt.Errorf("unsupported ALTER EVENT TRIGGER form in CatalogSQL: %q", trimmed)
 			}
 		case strings.HasPrefix(upper, "DROP EVENT TRIGGER"):
-			if dropEventTriggerRe.FindStringSubmatch(trimmed) == nil {
+			matches := dropEventTriggerRe.FindStringSubmatch(trimmed)
+			if matches == nil || statementIdentifier(matches) == "" {
 				return fmt.Errorf("unsupported DROP EVENT TRIGGER form in CatalogSQL: %q", trimmed)
 			}
 		default:
@@ -818,21 +938,32 @@ func validatePublicationCreate(matches []string) bool {
 }
 
 func containsSQLCommentOutsideQuotes(s string) bool {
-	inQuote := false
+	inDoubleQuote := false
+	inSingleQuote := false
 	for i := 0; i < len(s); i++ {
 		switch s[i] {
 		case '"':
-			if inQuote && i+1 < len(s) && s[i+1] == '"' {
+			if inDoubleQuote && i+1 < len(s) && s[i+1] == '"' {
 				i++
 				continue
 			}
-			inQuote = !inQuote
+			if !inSingleQuote {
+				inDoubleQuote = !inDoubleQuote
+			}
+		case '\'':
+			if inSingleQuote && i+1 < len(s) && s[i+1] == '\'' {
+				i++
+				continue
+			}
+			if !inDoubleQuote {
+				inSingleQuote = !inSingleQuote
+			}
 		case '-':
-			if !inQuote && i+1 < len(s) && s[i+1] == '-' {
+			if !inDoubleQuote && !inSingleQuote && i+1 < len(s) && s[i+1] == '-' {
 				return true
 			}
 		case '/':
-			if !inQuote && i+1 < len(s) && s[i+1] == '*' {
+			if !inDoubleQuote && !inSingleQuote && i+1 < len(s) && s[i+1] == '*' {
 				return true
 			}
 		}
@@ -903,12 +1034,20 @@ func nonEmptyIdentifierList(list string, qualified bool) bool {
 			return false
 		}
 		for _, part := range parts {
-			if !catalogIdentifierPartRe.MatchString(strings.TrimSpace(part)) {
+			if !validCatalogIdentifierPart(part) {
 				return false
 			}
 		}
 	}
 	return true
+}
+
+func validCatalogIdentifierPart(part string) bool {
+	part = strings.TrimSpace(part)
+	if !catalogIdentifierPartRe.MatchString(part) {
+		return false
+	}
+	return decodeIdentifier(part) != ""
 }
 
 func splitIdentifierList(list string) ([]string, bool) {

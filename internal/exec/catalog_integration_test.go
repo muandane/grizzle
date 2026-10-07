@@ -99,6 +99,22 @@ func TestCatalog_Lifecycle(t *testing.T) {
 		t.Fatalf("parsed event trigger must be created enabled")
 	}
 
+	// PostgreSQL uses O (origin), A (always), and R (replica) for enabled
+	// event-trigger modes. All three must satisfy desired Enabled=true.
+	enabledCfg := newCfg(catalogSpec(""))
+	for _, mode := range []string{"ALWAYS", "REPLICA"} {
+		if _, err := db.Exec(fmt.Sprintf(`ALTER EVENT TRIGGER "audit_ddl" ENABLE %s;`, mode)); err != nil {
+			t.Fatalf("enable event trigger %s: %v", mode, err)
+		}
+		pEnabled, err := exec.PlanDiffPostgres(ctx, db, enabledCfg)
+		if err != nil {
+			t.Fatalf("plan after ENABLE %s: %v", mode, err)
+		}
+		if len(pEnabled.Steps) != 0 {
+			t.Fatalf("ENABLE %s should satisfy desired enabled trigger, got %+v", mode, pEnabled.Steps)
+		}
+	}
+
 	// 2. Second sync: no-op.
 	p, err := exec.PlanDiffPostgres(ctx, db, newCfg(catalogSpec("")))
 	if err != nil {
@@ -214,6 +230,7 @@ func TestCatalog_Lifecycle(t *testing.T) {
 	// WARNING.
 	_, _ = db.Exec(`DROP PUBLICATION IF EXISTS all_pub;`) //nolint:errcheck // idempotent re-runs
 	allCfg := newCfg("CREATE PUBLICATION all_pub FOR ALL TABLES;")
+	allCfg.SchemaSQL = fullSchema
 	p4, err := exec.PlanDiffPostgres(ctx, db, allCfg)
 	if err != nil {
 		t.Fatalf("all-tables plan: %v", err)
@@ -228,7 +245,49 @@ func TestCatalog_Lifecycle(t *testing.T) {
 		t.Fatalf("expected PUBLICATION_ALL_TABLES NOTICE hazard, got %+v", p4.Hazards())
 	}
 	defer func() { _, _ = db.Exec(`DROP PUBLICATION IF EXISTS all_pub;`) }()
-	_ = exec.SyncPostgres(ctx, db, allCfg) //nolint:errcheck // applied best-effort; teardown below
+	if err := exec.SyncPostgres(ctx, db, allCfg); err != nil {
+		t.Fatalf("all-tables sync: %v", err)
+	}
+
+	emptyAllCfg := allCfg
+	emptyAllCfg.CatalogSQL = "CREATE PUBLICATION all_pub;"
+	p6, err := exec.PlanDiffPostgres(ctx, db, emptyAllCfg)
+	if err != nil {
+		t.Fatalf("ALL TABLES -> empty publication plan: %v", err)
+	}
+	var replacementDrop, replacementCreate bool
+	for _, step := range p6.Steps {
+		switch step.Type {
+		case plan.ChangeDropPublication:
+			replacementDrop = true
+			if !step.Destructive || strings.Contains(strings.ToUpper(step.SQL), "DROP PUBLICATION") == false {
+				t.Fatalf("replacement drop must be explicit and destructive: %+v", step)
+			}
+		case plan.ChangeCreatePublication:
+			replacementCreate = true
+		case plan.ChangeAlterPublication:
+			if strings.Contains(strings.ToUpper(step.SQL), "DROP PUBLICATION") {
+				t.Fatalf("non-destructive publication ALTER must not contain DROP PUBLICATION: %+v", step)
+			}
+		}
+	}
+	if !replacementDrop || !replacementCreate {
+		t.Fatalf("ALL TABLES -> empty publication must be a drop/create replacement: %+v", p6.Steps)
+	}
+	allowEmptyAllCfg := emptyAllCfg
+	allowEmptyAllCfg.Policy = plan.DropPolicy{AllowDropPublication: true}
+	allowEmptyAllCfg.AcceptHazards = []plan.HazardCode{plan.HazardDropPublication}
+	if err := exec.SyncPostgres(ctx, db, allowEmptyAllCfg); err != nil {
+		t.Fatalf("ALL TABLES -> empty publication sync: %v", err)
+	}
+	var allTables bool
+	if err := db.QueryRow(`SELECT puballtables FROM pg_publication WHERE pubname = 'all_pub';`).Scan(&allTables); err != nil {
+		t.Fatalf("query replacement publication: %v", err)
+	}
+	if allTables {
+		t.Fatal("replacement publication must not retain FOR ALL TABLES")
+	}
+
 	var superWarn bool
 	p5, err := exec.PlanDiffPostgres(ctx, db, newCfg("-- empty desired catalog state\n"))
 	if err == nil {

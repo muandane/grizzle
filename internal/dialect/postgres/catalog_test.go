@@ -102,10 +102,8 @@ func TestGenerateAlterPublicationSQL_AllTablesTransitions(t *testing.T) {
 		PublishTruncate: true,
 	}
 	sql = GenerateAlterPublicationSQL(empty, old)
-	if !strings.Contains(sql, `DROP PUBLICATION "docs_pub";`) ||
-		!strings.Contains(sql, `CREATE PUBLICATION "docs_pub"`) ||
-		strings.Contains(sql, "SET TABLE ;") {
-		t.Fatalf("ALL TABLES -> empty explicit membership must use valid recreation: %s", sql)
+	if sql != "" || strings.Contains(sql, "DROP PUBLICATION") || strings.Contains(sql, "CREATE PUBLICATION") {
+		t.Fatalf("ALL TABLES -> empty explicit membership must be represented by gated diff replacement: %s", sql)
 	}
 
 	oldExplicit := &schema.Publication{
@@ -119,5 +117,23 @@ func TestGenerateAlterPublicationSQL_AllTablesTransitions(t *testing.T) {
 	sql = GenerateAlterPublicationSQL(empty, oldExplicit)
 	if !strings.Contains(sql, `ALTER PUBLICATION "docs_pub" DROP TABLE "public"."docs";`) {
 		t.Fatalf("explicit membership -> empty must drop existing table membership: %s", sql)
+	}
+}
+
+func TestEventTriggerEnabledStatus(t *testing.T) {
+	for _, test := range []struct {
+		status  string
+		enabled bool
+	}{
+		{status: "O", enabled: true},
+		{status: "A", enabled: true},
+		{status: "R", enabled: true},
+		{status: "D", enabled: false},
+	} {
+		t.Run(test.status, func(t *testing.T) {
+			if got := eventTriggerEnabled(test.status); got != test.enabled {
+				t.Fatalf("eventTriggerEnabled(%q) = %v, want %v", test.status, got, test.enabled)
+			}
+		})
 	}
 }
