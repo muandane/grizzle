@@ -91,12 +91,22 @@ jobs:
     needs: goreleaser
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
       - name: Setup Go
         uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
 
       - name: Index on pkg.go.dev
+        # proxy.golang.org can only fetch PUBLIC modules; while the repository
+        # is private this ping 404s by design. continue-on-error keeps the
+        # release green and the ping turns into a working notification once
+        # the repository goes public.
+        continue-on-error: true
         run: |
           VERSION="${{ github.ref_name }}"
           echo "Pinging proxy.golang.org for github.com/muandane/grizzle@${VERSION}..."
