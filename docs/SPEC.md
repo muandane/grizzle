@@ -106,12 +106,15 @@ type Options struct {
 
     // Renames maps old column names to new column names (e.g. "users.old_col": "new_col")
     // to disambiguate renames instead of treating them as DROP + ADD.
+    // Experimental: mapping format may change before 1.0.
     Renames map[string]string
 
     // ExpandContract enables staged expand-and-contract zero-downtime migrations.
+    // Experimental: staged plan shape may change before 1.0.
     ExpandContract bool
 
     // Backfill hook is executed during staged expand migration outside the DDL lock window in batches.
+    // Experimental: library-only; no CLI equivalent.
     Backfill BackfillFunc
 
     // DryRun outputs planned statements without executing them.
@@ -281,7 +284,13 @@ Critical hazards (`DROP_TABLE`, `DROP_COLUMN`, `TYPE_NARROW`, `RENAME_AMBIGUOUS`
 `StrictScope` ensures `IncludeTables` is provided, preventing accidental mutations in shared databases.
 
 ### Invariant 7: Expand and contract
-Ambiguous column renames are blocked. Explicit mappings can execute as atomic renames or staged dual-column expansions for zero downtime.
+Ambiguous column renames are blocked with `RENAME_AMBIGUOUS`; map them explicitly via `Options.Renames` (CLI: repeatable `--rename old=new`, optionally table-qualified `table.old=new`). Explicit renames execute either as atomic renames or, with `Options.ExpandContract` enabled (CLI: `--expand-contract`), as staged zero-downtime migrations:
+
+1. **Expand plan**: renamed/modified columns are added alongside existing columns as nullable; nothing is dropped or rewritten.
+2. **Backfill**: values are copied in batches outside the DDL lock window via the library-only `Options.Backfill` hook. There is no CLI backfill runner.
+3. **Contract plan**: a second, separately-approved plan (own deterministic hash) drops the legacy columns once the application no longer reads them; destructive, so it requires `AllowDropColumn` and explicit `AcceptHazards`.
+
+The `RENAME_AMBIGUOUS` hazard description and the interactive summary remediation point to `--rename`. See `examples/expand-contract` for a runnable end-to-end flow.
 
 ### Invariant 8: History and drift detection
 Applied plans are audited in `grizzle_history`. `Check()` provides read-only schema drift verification.

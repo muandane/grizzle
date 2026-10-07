@@ -139,7 +139,7 @@ Supported hazard codes:
 | `DROP_TABLE` | `CRITICAL` | Table dropped from schema (permanent data loss) |
 | `DROP_COLUMN` | `CRITICAL` | Column dropped from table (permanent data loss) |
 | `TYPE_NARROW` | `CRITICAL` | Column type narrowed (e.g. `bigint` to `integer`, risk of numeric overflow) |
-| `RENAME_AMBIGUOUS` | `CRITICAL` | Unmapped column dropped and added with identical type in same table |
+| `RENAME_AMBIGUOUS` | `CRITICAL` | Unmapped column dropped and added with identical type in same table; remediation: map the rename via `Options.Renames` (CLI `--rename old=new`) |
 | `UNMANAGED_DEPENDENCY` | `CRITICAL` | Operation on column or table that an unmanaged object (view, trigger, function) depends on |
 | `NOT_NULL_NO_DEFAULT` | `CRITICAL` | Adding non-null column without default to non-empty table |
 | `GENERATED_REWRITE` | `WARNING` | Generated column expression modified; requires table rewrite on PostgreSQL |

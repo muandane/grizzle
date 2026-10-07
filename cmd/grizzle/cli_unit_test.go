@@ -170,3 +170,35 @@ func TestCLI_Init(t *testing.T) {
 		t.Errorf("expected main.go in sqlite_proj: %v", err)
 	}
 }
+
+func TestRenameFlags_Parse(t *testing.T) {
+	r := renameFlags{}
+	cases := []string{"old_col=new_col", "users.old_col=new_name", "  spaced  =  trimmed  "}
+	for _, c := range cases {
+		if err := r.Set(c); err != nil {
+			t.Fatalf("Set(%q) failed: %v", c, err)
+		}
+	}
+	want := map[string]string{
+		"old_col":       "new_col",
+		"users.old_col": "new_name",
+		"spaced":        "trimmed",
+	}
+	if len(r) != len(want) {
+		t.Fatalf("expected %d entries, got %d: %v", len(want), len(r), r)
+	}
+	for k, v := range want {
+		if r[k] != v {
+			t.Errorf("rename[%q] = %q, want %q", k, r[k], v)
+		}
+	}
+}
+
+func TestRenameFlags_RejectsInvalid(t *testing.T) {
+	for _, c := range []string{"", "noequals", "=new_col", "old_col="} {
+		r := renameFlags{}
+		if err := r.Set(c); err == nil {
+			t.Errorf("Set(%q) should fail", c)
+		}
+	}
+}

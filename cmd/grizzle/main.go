@@ -34,6 +34,33 @@ func (h *hazardFlags) Set(val string) error {
 	return nil
 }
 
+type renameFlags map[string]string
+
+func (r renameFlags) String() string {
+	pairs := make([]string, 0, len(r))
+	for k, v := range r {
+		pairs = append(pairs, k+"="+v)
+	}
+	return strings.Join(pairs, ",")
+}
+
+// Set parses a single --rename old=new mapping. The key may be a bare column
+// name ("old_col") or table-qualified ("table.old_col"); the value is the new
+// column name.
+func (r renameFlags) Set(val string) error {
+	old, new, ok := strings.Cut(val, "=")
+	old = strings.TrimSpace(old)
+	new = strings.TrimSpace(new)
+	if !ok || old == "" || new == "" {
+		return fmt.Errorf("invalid --rename mapping %q: expected --rename old=new", val)
+	}
+	if r == nil {
+		return fmt.Errorf("rename map not initialized")
+	}
+	r[old] = new
+	return nil
+}
+
 func main() {
 	os.Exit(run(os.Args[1:]))
 }
@@ -127,6 +154,10 @@ func run(args []string) int {
 	var hazards hazardFlags
 	fs.Var(&hazards, "accept-hazard", "Hazard code to accept (can be repeated or comma-separated)")
 
+	renames := renameFlags{}
+	fs.Var(&renames, "rename", "Explicit column rename mapping old=new, optionally table-qualified table.old=new (experimental; can be repeated)")
+	expandContract := fs.Bool("expand-contract", false, "Emit staged expand-and-contract (ZDM) plans; new columns are added alongside existing ones and drops are deferred to a separate contract plan (experimental)")
+
 	if err := fs.Parse(args[1:]); err != nil {
 		return 1
 	}
@@ -142,11 +173,11 @@ func run(args []string) int {
 	case "plan":
 		isGitHub := *githubOutput || *formatFlag == "github"
 		isJSON := *jsonOutput || *formatFlag == "json"
-		return runPlan(ctx, dsn, *schemaFile, *outFile, *allowDrop, isJSON, isGitHub)
+		return runPlan(ctx, dsn, *schemaFile, *outFile, *allowDrop, isJSON, isGitHub, renames, *expandContract)
 	case "apply":
-		return runApply(ctx, dsn, *planFile, *schemaFile, *expectedHash, *allowDrop, hazards, *dryRunFlag)
+		return runApply(ctx, dsn, *planFile, *schemaFile, *expectedHash, *allowDrop, hazards, *dryRunFlag, renames, *expandContract)
 	case "check":
-		return runCheck(ctx, dsn, *schemaFile, *allowDrop)
+		return runCheck(ctx, dsn, *schemaFile, *allowDrop, renames, *expandContract)
 	case "lint":
 		lintFormat := *formatFlag
 		if lintFormat == "sql" {
@@ -177,7 +208,7 @@ func initDB(dsn string) (*sql.DB, error) {
 	return db, nil
 }
 
-func loadOrComputePlan(ctx context.Context, db *sql.DB, planFile, schemaFile string, allowDrop bool, acceptedCodes []grizzle.HazardCode) (*grizzle.Plan, string, error) {
+func loadOrComputePlan(ctx context.Context, db *sql.DB, planFile, schemaFile string, allowDrop bool, acceptedCodes []grizzle.HazardCode, renames map[string]string, expandContract bool) (*grizzle.Plan, string, error) {
 	if planFile != "" {
 		planData, err := os.ReadFile(filepath.Clean(planFile)) //nolint:gosec // G304: CLI accepts user-provided plan file path
 		if err != nil {
@@ -198,9 +229,11 @@ func loadOrComputePlan(ctx context.Context, db *sql.DB, planFile, schemaFile str
 		return nil, "", err
 	}
 	opts := grizzle.Options{
-		SchemaSQL:     string(content),
-		AllowDrop:     allowDrop,
-		AcceptHazards: acceptedCodes,
+		SchemaSQL:      string(content),
+		AllowDrop:      allowDrop,
+		AcceptHazards:  acceptedCodes,
+		Renames:        renames,
+		ExpandContract: expandContract,
 	}
 	computedPlan, err := grizzle.PlanDiff(ctx, db, opts)
 	if err != nil {
@@ -210,7 +243,7 @@ func loadOrComputePlan(ctx context.Context, db *sql.DB, planFile, schemaFile str
 	return computedPlan, computedPlan.Hash(), nil
 }
 
-func runPlan(ctx context.Context, dsn, schemaFile, outFile string, allowDrop, jsonOutput, githubOutput bool) int {
+func runPlan(ctx context.Context, dsn, schemaFile, outFile string, allowDrop, jsonOutput, githubOutput bool, renames map[string]string, expandContract bool) int {
 	db, err := initDB(dsn)
 	if err != nil {
 		return 1
@@ -224,8 +257,10 @@ func runPlan(ctx context.Context, dsn, schemaFile, outFile string, allowDrop, js
 	}
 
 	opts := grizzle.Options{
-		SchemaSQL: string(content),
-		AllowDrop: allowDrop,
+		SchemaSQL:      string(content),
+		AllowDrop:      allowDrop,
+		Renames:        renames,
+		ExpandContract: expandContract,
 	}
 	p, err := grizzle.PlanDiff(ctx, db, opts)
 	if err != nil {
@@ -256,7 +291,7 @@ func runPlan(ctx context.Context, dsn, schemaFile, outFile string, allowDrop, js
 	return 0
 }
 
-func runApply(ctx context.Context, dsn, planFile, schemaFile, expectedHash string, allowDrop bool, hazards []string, dryRun bool) int {
+func runApply(ctx context.Context, dsn, planFile, schemaFile, expectedHash string, allowDrop bool, hazards []string, dryRun bool, renames map[string]string, expandContract bool) int {
 	db, err := initDB(dsn)
 	if err != nil {
 		return 1
@@ -269,10 +304,10 @@ func runApply(ctx context.Context, dsn, planFile, schemaFile, expectedHash strin
 	}
 
 	if dryRun {
-		return runDryRunApply(ctx, db, planFile, schemaFile, allowDrop, acceptedCodes)
+		return runDryRunApply(ctx, db, planFile, schemaFile, allowDrop, acceptedCodes, renames, expandContract)
 	}
 
-	p, planHash, err := loadOrComputePlan(ctx, db, planFile, schemaFile, allowDrop, acceptedCodes)
+	p, planHash, err := loadOrComputePlan(ctx, db, planFile, schemaFile, allowDrop, acceptedCodes, renames, expandContract)
 	if err != nil {
 		return 1
 	}
@@ -320,7 +355,7 @@ func runApply(ctx context.Context, dsn, planFile, schemaFile, expectedHash strin
 	return 0
 }
 
-func runCheck(ctx context.Context, dsn, schemaFile string, allowDrop bool) int {
+func runCheck(ctx context.Context, dsn, schemaFile string, allowDrop bool, renames map[string]string, expandContract bool) int {
 	db, err := initDB(dsn)
 	if err != nil {
 		return 1
@@ -334,8 +369,10 @@ func runCheck(ctx context.Context, dsn, schemaFile string, allowDrop bool) int {
 	}
 
 	opts := grizzle.Options{
-		SchemaSQL: string(content),
-		AllowDrop: allowDrop,
+		SchemaSQL:      string(content),
+		AllowDrop:      allowDrop,
+		Renames:        renames,
+		ExpandContract: expandContract,
 	}
 	p, err := grizzle.PlanDiff(ctx, db, opts)
 	if err != nil {

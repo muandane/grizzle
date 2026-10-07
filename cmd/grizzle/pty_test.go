@@ -34,7 +34,7 @@ func TestInteractiveTTY_RealPTY(t *testing.T) {
 		t.Fatalf("writing schemaV1: %v", err)
 	}
 
-	codeInit := runApply(context.Background(), dsn, "", schemaV1, "", false, nil, false)
+	codeInit := runApply(context.Background(), dsn, "", schemaV1, "", false, nil, false, nil, false)
 	if codeInit != 0 {
 		t.Fatalf("initial setup failed with code %d", codeInit)
 	}
@@ -62,7 +62,7 @@ func TestInteractiveTTY_RealPTY(t *testing.T) {
 		os.Stdin = rPipe
 		defer func() { os.Stdin = origStdin }()
 
-		code := runApply(context.Background(), dsn, "", schemaV2, "", true, nil, false)
+		code := runApply(context.Background(), dsn, "", schemaV2, "", true, nil, false, nil, false)
 		if code != 2 {
 			t.Fatalf("expected exit code 2 for non-TTY without accepted hazard, got %d", code)
 		}
@@ -95,7 +95,7 @@ func TestInteractiveTTY_RealPTY(t *testing.T) {
 			_, _ = ptmx.WriteString("y\n")
 		}()
 
-		code := runApply(context.Background(), dsn, "", schemaV2, "", true, nil, false)
+		code := runApply(context.Background(), dsn, "", schemaV2, "", true, nil, false, nil, false)
 		if code != 0 {
 			t.Fatalf("expected exit code 0 when user confirms 'y' in real PTY, got %d", code)
 		}
@@ -105,7 +105,7 @@ func TestInteractiveTTY_RealPTY(t *testing.T) {
 	if err := os.WriteFile(schemaV1, []byte("CREATE TABLE users (id INTEGER PRIMARY KEY, legacy_role TEXT);"), 0600); err != nil {
 		t.Fatalf("writing schemaV1: %v", err)
 	}
-	_ = runApply(context.Background(), dsn, "", schemaV1, "", false, nil, false)
+	_ = runApply(context.Background(), dsn, "", schemaV1, "", false, nil, false, nil, false)
 
 	t.Run("RealPTY_AnswerNo_AbortsAndExitsCode1", func(t *testing.T) {
 		ptmx, pts, err := pty.Open()
@@ -129,7 +129,7 @@ func TestInteractiveTTY_RealPTY(t *testing.T) {
 			_, _ = ptmx.WriteString("N\n")
 		}()
 
-		code := runApply(context.Background(), dsn, "", schemaV2, "", true, nil, false)
+		code := runApply(context.Background(), dsn, "", schemaV2, "", true, nil, false, nil, false)
 		if code != 1 {
 			t.Fatalf("expected exit code 1 when user aborts with 'N' in real PTY, got %d", code)
 		}
@@ -179,7 +179,7 @@ func TestInteractiveTTY_RealPTY(t *testing.T) {
 			}
 		}()
 
-		code := runApply(context.Background(), dsn, "", schemaV2, "", true, nil, false)
+		code := runApply(context.Background(), dsn, "", schemaV2, "", true, nil, false, nil, false)
 		if code != 0 {
 			t.Fatalf("expected exit code 0 when confirming after details, got %d", code)
 		}
@@ -195,7 +195,7 @@ func TestInteractiveTTY_RealPTY(t *testing.T) {
 	})
 
 	// Re-create the column for details->no test
-	_ = runApply(context.Background(), dsn, "", schemaV1, "", false, nil, false)
+	_ = runApply(context.Background(), dsn, "", schemaV1, "", false, nil, false, nil, false)
 
 	t.Run("RealPTY_AnswerDetailsThenNo_ShowsSQLAndAborts", func(t *testing.T) {
 		ptmx, pts, err := pty.Open()
@@ -240,7 +240,7 @@ func TestInteractiveTTY_RealPTY(t *testing.T) {
 			}
 		}()
 
-		code := runApply(context.Background(), dsn, "", schemaV2, "", true, nil, false)
+		code := runApply(context.Background(), dsn, "", schemaV2, "", true, nil, false, nil, false)
 		if code != 1 {
 			t.Fatalf("expected exit code 1 when aborting after details, got %d", code)
 		}

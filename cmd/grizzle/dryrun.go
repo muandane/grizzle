@@ -13,8 +13,10 @@ import (
 
 // runDryRunApply verifies the planned DDL against live data without
 // persisting any change (live dry-run rollback verification).
-func runDryRunApply(ctx context.Context, db *sql.DB, planFile, schemaFile string, allowDrop bool, acceptedCodes []grizzle.HazardCode) int {
+func runDryRunApply(ctx context.Context, db *sql.DB, planFile, schemaFile string, allowDrop bool, acceptedCodes []grizzle.HazardCode, renames map[string]string, expandContract bool) int {
 	var schemaSQL string
+	var planRenames map[string]string
+	var planExpandContract bool
 	if planFile != "" {
 		planData, err := os.ReadFile(filepath.Clean(planFile)) //nolint:gosec // G304: CLI accepts user-provided plan file path
 		if err != nil {
@@ -31,6 +33,9 @@ func runDryRunApply(ctx context.Context, db *sql.DB, planFile, schemaFile string
 			return 2
 		}
 		schemaSQL = p.SchemaSQL
+		// The approved plan is authoritative: honor its embedded ZDM options
+		// and only fall back to CLI flags when absent.
+		planRenames, planExpandContract = p.Renames, p.ExpandContract
 	} else {
 		content, err := os.ReadFile(filepath.Clean(schemaFile)) //nolint:gosec // G304: CLI accepts user-provided schema file path
 		if err != nil {
@@ -40,10 +45,18 @@ func runDryRunApply(ctx context.Context, db *sql.DB, planFile, schemaFile string
 		schemaSQL = string(content)
 	}
 
+	effectiveRenames := renames
+	if planRenames != nil {
+		effectiveRenames = planRenames
+	}
+	effectiveExpand := expandContract || planExpandContract
+
 	opts := grizzle.Options{
-		SchemaSQL:     schemaSQL,
-		AllowDrop:     allowDrop,
-		AcceptHazards: acceptedCodes,
+		SchemaSQL:      schemaSQL,
+		AllowDrop:      allowDrop,
+		AcceptHazards:  acceptedCodes,
+		Renames:        effectiveRenames,
+		ExpandContract: effectiveExpand,
 	}
 	res, err := grizzle.DryRunVerify(ctx, db, opts)
 	if err != nil {
