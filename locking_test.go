@@ -11,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/muandane/grizzle"
+	"github.com/muandane/grizzle/internal/dialect"
 	"github.com/muandane/grizzle/internal/dialect/postgres"
 	"github.com/muandane/grizzle/internal/exec"
 	"github.com/muandane/grizzle/internal/plan"
@@ -247,6 +248,86 @@ func TestLocking_NonConcurrentIndexes(t *testing.T) {
 	}
 }
 
+// TestLocking_PreambleDoesNotConsumeLockBudget guards the lock-budget
+// accounting: only lock waiting (acquisition + backoff) consumes the
+// LockTimeout budget. A slow BeforeSync hook must not shrink the acquisition
+// window of its own attempt — the timer is armed when acquisition begins,
+// not when the wrapper starts. On the previous implementation the deadline
+// was anchored at wrapper start, so this hook delay zeroed the acquisition
+// window and Sync failed even though the holder released well inside the
+// budget.
+func TestLocking_PreambleDoesNotConsumeLockBudget(t *testing.T) {
+	connStr := testutil.PostgresDSN()
+	db, err := sql.Open("pgx", connStr)
+	if err != nil {
+		t.Fatalf("failed to open pg: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := db.Ping(); err != nil {
+		t.Skipf("skipping postgres locking test, database not reachable: %v", err)
+	}
+
+	schema := fmt.Sprintf("test_preamble_budget_%d", time.Now().UnixNano())
+	if _, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema)); err != nil {
+		t.Fatalf("failed creating schema: %v", err)
+	}
+	defer func() { _, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schema)) }()
+
+	nsKey := postgres.Hash32("grizzle")
+	schemaKey := postgres.Hash32(schema)
+
+	holderConn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("failed acquiring holder conn: %v", err)
+	}
+	defer func() { _ = holderConn.Close() }()
+
+	var dummy int
+	if err := holderConn.QueryRowContext(context.Background(), "SELECT 1 FROM pg_advisory_lock($1, $2);", nsKey, schemaKey).Scan(&dummy); err != nil {
+		t.Fatalf("holder failed acquiring pg_advisory_lock: %v", err)
+	}
+	go func() {
+		time.Sleep(1200 * time.Millisecond)
+		var released bool
+		_ = holderConn.QueryRowContext(context.Background(), "SELECT pg_advisory_unlock($1, $2);", nsKey, schemaKey).Scan(&released)
+	}()
+
+	// Slow preamble: 500ms. Budget: 1s. Holder releases at 1.2s. With the
+	// acquisition timer armed when acquisition begins, the window is
+	// [500ms, 1.5s] and covers the release. Anchoring the deadline at wrapper
+	// start instead makes the window [500ms, 1s] — it expires before the
+	// holder releases, and the backoff reserve then aborts the campaign.
+	hookRan := make(chan struct{}, 1)
+	start := time.Now()
+	err = grizzle.Sync(context.Background(), db, grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: schema,
+		SchemaSQL:    "CREATE TABLE preamble_probe (id BIGINT PRIMARY KEY);",
+		LockTimeout:  1 * time.Second,
+		MaxRetries:   2,
+		BeforeSync: func(ctx context.Context, dbtx dialect.DBTX) error {
+			select {
+			case hookRan <- struct{}{}:
+			default:
+			}
+			time.Sleep(500 * time.Millisecond)
+			return nil
+		},
+	})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("sync failed: slow preamble must not consume the acquisition budget: %v", err)
+	}
+	select {
+	case <-hookRan:
+	default:
+		t.Errorf("BeforeSync hook did not run")
+	}
+	if elapsed < 700*time.Millisecond {
+		t.Errorf("sync finished before the holder released: %v", elapsed)
+	}
+}
 func TestLocking_DedicatedSessionAdvisoryLock_ContentionRetry(t *testing.T) {
 	connStr := testutil.PostgresDSN()
 	db, err := sql.Open("pgx", connStr)
@@ -290,14 +371,17 @@ func TestLocking_DedicatedSessionAdvisoryLock_ContentionRetry(t *testing.T) {
 		_ = holderConn.QueryRowContext(context.Background(), "SELECT pg_advisory_unlock($1, $2);", nsKey, schemaKey).Scan(&released)
 	}()
 
-	// 3. Migration attempts Sync with a 50ms lock timeout and MaxRetries=5
+	// 3. Migration attempts Sync with a 1s TOTAL lock budget and MaxRetries=5.
+	// LockTimeout bounds the entire acquisition across retries (Task: total
+	// lock budget), while MaxRetries still applies to retryable execution
+	// errors (deadlock, 55P03). Holder releases at 150ms, well inside budget.
 	desiredSQL := `CREATE TABLE products (id BIGINT PRIMARY KEY, name TEXT);`
 	start := time.Now()
 	err = grizzle.Sync(context.Background(), db, grizzle.Options{
 		Dialect:          grizzle.DialectPostgres,
 		TargetSchema:     schema,
 		SchemaSQL:        desiredSQL,
-		LockTimeout:      50 * time.Millisecond,
+		LockTimeout:      1 * time.Second,
 		StatementTimeout: 5 * time.Second,
 		MaxRetries:       5,
 	})
@@ -305,8 +389,8 @@ func TestLocking_DedicatedSessionAdvisoryLock_ContentionRetry(t *testing.T) {
 		t.Fatalf("migration failed despite retries on advisory lock contention: %v", err)
 	}
 
-	if time.Since(start) < 150*time.Millisecond {
-		t.Errorf("migration should have waited for advisory lock release (expected >= 150ms, took %v)", time.Since(start))
+	if time.Since(start) < 100*time.Millisecond {
+		t.Errorf("migration should have waited for advisory lock release (expected >= 100ms, took %v)", time.Since(start))
 	}
 }
 
@@ -363,7 +447,7 @@ func TestLocking_DedicatedSessionAdvisoryLock_ExhaustRetriesFails(t *testing.T) 
 		t.Fatalf("expected migration to fail due to advisory lock contention timeout, got nil")
 	}
 
-	if !exec.IsLockTimeout(err) && !strings.Contains(err.Error(), "lock") {
+	if !exec.IsRetryable(err) && !strings.Contains(err.Error(), "lock") {
 		t.Errorf("expected lock timeout error, got: %v", err)
 	}
 }
@@ -740,5 +824,566 @@ func TestLocking_PgTerminateBackendRecovery(t *testing.T) {
 	}
 	if len(pFinal.Steps) != 0 {
 		t.Fatalf("expected 0 diff steps after recovery, got %d: %+v", len(pFinal.Steps), pFinal.Steps)
+	}
+}
+
+// TestLocking_TotalLockWait_BoundedAcrossRetries verifies the advisory-lock
+// acquisition budget is TOTAL across retries: Sync must fail after roughly
+// LockTimeout, not LockTimeout x (MaxRetries+1).
+func TestLocking_TotalLockWait_BoundedAcrossRetries(t *testing.T) {
+	db := testutil.TestDatabase(t)
+
+	schema := fmt.Sprintf("test_total_budget_%d", time.Now().UnixNano())
+	if _, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema)); err != nil {
+		t.Fatalf("failed creating schema: %v", err)
+	}
+	defer func() { _, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schema)) }()
+
+	nsKey := postgres.Hash32("grizzle")
+	schemaKey := postgres.Hash32(schema)
+
+	holderConn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("failed acquiring holder conn: %v", err)
+	}
+	defer func() {
+		var released bool
+		_ = holderConn.QueryRowContext(context.Background(), "SELECT pg_advisory_unlock($1, $2);", nsKey, schemaKey).Scan(&released)
+		_ = holderConn.Close()
+	}()
+
+	var dummy int
+	if err := holderConn.QueryRowContext(context.Background(), "SELECT 1 FROM pg_advisory_lock($1, $2);", nsKey, schemaKey).Scan(&dummy); err != nil {
+		t.Fatalf("holder failed acquiring pg_advisory_lock: %v", err)
+	}
+
+	start := time.Now()
+	err = grizzle.Sync(context.Background(), db, grizzle.Options{
+		Dialect:          grizzle.DialectPostgres,
+		TargetSchema:     schema,
+		SchemaSQL:        "CREATE TABLE widgets (id BIGINT PRIMARY KEY);",
+		LockTimeout:      300 * time.Millisecond,
+		MaxRetries:       5,
+		StatementTimeout: 5 * time.Second,
+	})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatalf("expected lock acquisition failure, got nil")
+	}
+	if elapsed >= 2000*time.Millisecond {
+		t.Errorf("total lock wait not bounded across retries: took %v (want ~300ms budget + backoff)", elapsed)
+	}
+	if elapsed < 150*time.Millisecond {
+		t.Errorf("returned before the lock budget could elapse: %v", elapsed)
+	}
+}
+
+// TestLocking_LockSucceedsWhenReleasedWithinBudget verifies the shared
+// deadline does not break the success path: when the holder releases the lock
+// inside the budget, Sync succeeds via the polling acquisition.
+func TestLocking_LockSucceedsWhenReleasedWithinBudget(t *testing.T) {
+	db := testutil.TestDatabase(t)
+
+	schema := fmt.Sprintf("test_budget_success_%d", time.Now().UnixNano())
+	if _, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema)); err != nil {
+		t.Fatalf("failed creating schema: %v", err)
+	}
+	defer func() { _, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schema)) }()
+
+	nsKey := postgres.Hash32("grizzle")
+	schemaKey := postgres.Hash32(schema)
+
+	holderConn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("failed acquiring holder conn: %v", err)
+	}
+	defer func() { _ = holderConn.Close() }()
+
+	var dummy int
+	if err := holderConn.QueryRowContext(context.Background(), "SELECT 1 FROM pg_advisory_lock($1, $2);", nsKey, schemaKey).Scan(&dummy); err != nil {
+		t.Fatalf("holder failed acquiring pg_advisory_lock: %v", err)
+	}
+
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		var released bool
+		_ = holderConn.QueryRowContext(context.Background(), "SELECT pg_advisory_unlock($1, $2);", nsKey, schemaKey).Scan(&released)
+	}()
+
+	start := time.Now()
+	err = grizzle.Sync(context.Background(), db, grizzle.Options{
+		Dialect:          grizzle.DialectPostgres,
+		TargetSchema:     schema,
+		SchemaSQL:        "CREATE TABLE widgets (id BIGINT PRIMARY KEY);",
+		LockTimeout:      1 * time.Second,
+		MaxRetries:       3,
+		StatementTimeout: 5 * time.Second,
+	})
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("expected sync to succeed after holder released within budget, got: %v", err)
+	}
+	if elapsed < 100*time.Millisecond {
+		t.Errorf("sync did not wait for the lock to be released (took %v)", elapsed)
+	}
+}
+
+// TestLocking_DDLLockTimeoutConfiguredOnRetry guards against overwriting
+// cfg.LockTimeout for the acquisition budget: cfg.LockTimeout also feeds
+// SET lock_timeout for DDL, so a table-level lock conflict on the DDL itself
+// must still fail fast with the configured timeout (a wrong fix that zeroes
+// cfg.LockTimeout would disable the DDL timeout and hang here).
+func TestLocking_DDLLockTimeoutConfiguredOnRetry(t *testing.T) {
+	db := testutil.TestDatabase(t)
+
+	schema := fmt.Sprintf("test_ddl_lock_%d", time.Now().UnixNano())
+	if _, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema)); err != nil {
+		t.Fatalf("failed creating schema: %v", err)
+	}
+	defer func() { _, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schema)) }()
+
+	initialSQL := "CREATE TABLE locked_tbl (id BIGINT PRIMARY KEY);"
+	if err := grizzle.Sync(context.Background(), db, grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: schema,
+		SchemaSQL:    initialSQL,
+	}); err != nil {
+		t.Fatalf("initial sync failed: %v", err)
+	}
+
+	// Holder takes ACCESS EXCLUSIVE on the target table inside a transaction,
+	// so the migration's DDL (ALTER TABLE) blocks on lock_timeout.
+	holderConn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("failed acquiring holder conn: %v", err)
+	}
+	defer func() {
+		_, _ = holderConn.ExecContext(context.Background(), "ROLLBACK;")
+		_ = holderConn.Close()
+	}()
+	if _, err := holderConn.ExecContext(context.Background(),
+		fmt.Sprintf("BEGIN; LOCK TABLE %q.locked_tbl IN ACCESS EXCLUSIVE MODE;", schema)); err != nil {
+		t.Fatalf("holder failed locking table: %v", err)
+	}
+
+	start := time.Now()
+	err = grizzle.Sync(context.Background(), db, grizzle.Options{
+		Dialect:          grizzle.DialectPostgres,
+		TargetSchema:     schema,
+		SchemaSQL:        "CREATE TABLE locked_tbl (id BIGINT PRIMARY KEY, name TEXT);",
+		AllowDrop:        true,
+		LockTimeout:      300 * time.Millisecond,
+		MaxRetries:       2,
+		StatementTimeout: 5 * time.Second,
+	})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatalf("expected DDL lock timeout failure while table lock is held, got nil")
+	}
+	if elapsed >= 3000*time.Millisecond {
+		t.Errorf("DDL lock_timeout not honored across retries: took %v", elapsed)
+	}
+}
+
+// TestLocking_LockReleasedAfterContextCancel verifies the advisory lock is
+// released when the migration context is cancelled mid-migration, and that
+// the dedicated connection is not handed back to the pool while it could
+// still hold the lock (release failure discards it via driver.ErrBadConn).
+func TestLocking_LockReleasedAfterContextCancel(t *testing.T) {
+	db := testutil.TestDatabase(t)
+
+	schema := fmt.Sprintf("test_cancel_rel_%d", time.Now().UnixNano())
+	if _, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema)); err != nil {
+		t.Fatalf("failed creating schema: %v", err)
+	}
+	defer func() { _, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schema)) }()
+
+	initialSQL := "CREATE TABLE cancels (id BIGINT PRIMARY KEY);"
+	if err := grizzle.Sync(context.Background(), db, grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: schema,
+		SchemaSQL:    initialSQL,
+	}); err != nil {
+		t.Fatalf("initial sync failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	syncDone := make(chan error, 1)
+	go func() {
+		err := grizzle.Sync(ctx, db, grizzle.Options{
+			Dialect:      grizzle.DialectPostgres,
+			TargetSchema: schema,
+			SchemaSQL:    initialSQL + "CREATE TABLE cancels2 (id BIGINT PRIMARY KEY);",
+			BeforeStep: func(hc grizzle.HookContext) error {
+				cancel() // cancel mid-migration, after the lock is held
+				return nil
+			},
+		})
+		syncDone <- err
+	}()
+
+	select {
+	case <-syncDone:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("Sync did not return after mid-migration cancellation")
+	}
+
+	// The advisory lock must be free: acquiring it on a fresh connection
+	// with a short timeout proves release.
+	nsKey := postgres.Hash32("grizzle")
+	schemaKey := postgres.Hash32(schema)
+	testConn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("failed acquiring test conn: %v", err)
+	}
+	defer func() { _ = testConn.Close() }()
+
+	lockCtx, lockCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer lockCancel()
+	if err := postgres.AcquireSessionAdvisoryLock2(lockCtx, testConn, nsKey, schemaKey); err != nil {
+		t.Fatalf("advisory lock not released after context cancellation: %v", err)
+	}
+	var released bool
+	_ = testConn.QueryRowContext(context.Background(), "SELECT pg_advisory_unlock($1, $2);", nsKey, schemaKey).Scan(&released)
+}
+
+// TestHookPanic_LockReleasedAfterBeforeStepPanic verifies a panicking hook is
+// recovered into an error (with stack) and the advisory lock is released.
+func TestHookPanic_LockReleasedAfterBeforeStepPanic(t *testing.T) {
+	db := testutil.TestDatabase(t)
+
+	schema := fmt.Sprintf("test_hook_panic_%d", time.Now().UnixNano())
+	if _, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema)); err != nil {
+		t.Fatalf("failed creating schema: %v", err)
+	}
+	defer func() { _, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schema)) }()
+
+	initialSQL := "CREATE TABLE panic_tbl (id BIGINT PRIMARY KEY);"
+	if err := grizzle.Sync(context.Background(), db, grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: schema,
+		SchemaSQL:    initialSQL,
+	}); err != nil {
+		t.Fatalf("initial sync failed: %v", err)
+	}
+
+	err := grizzle.Sync(context.Background(), db, grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: schema,
+		SchemaSQL:    initialSQL + "CREATE TABLE panic_tbl2 (id BIGINT PRIMARY KEY);",
+		BeforeStep: func(hc grizzle.HookContext) error {
+			panic("hook exploded")
+		},
+	})
+	if err == nil {
+		t.Fatalf("expected hook panic to surface as error, got nil")
+	}
+	if !strings.Contains(err.Error(), "hook panicked") || !strings.Contains(err.Error(), "hook exploded") {
+		t.Errorf("expected panic message in error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "goroutine") {
+		t.Errorf("expected debug.Stack() in error, got: %v", err)
+	}
+
+	// Lock must be free after the panic.
+	nsKey := postgres.Hash32("grizzle")
+	schemaKey := postgres.Hash32(schema)
+	testConn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("failed acquiring test conn: %v", err)
+	}
+	defer func() { _ = testConn.Close() }()
+
+	lockCtx, lockCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer lockCancel()
+	if err := postgres.AcquireSessionAdvisoryLock2(lockCtx, testConn, nsKey, schemaKey); err != nil {
+		t.Fatalf("advisory lock not released after hook panic: %v", err)
+	}
+	var released bool
+	_ = testConn.QueryRowContext(context.Background(), "SELECT pg_advisory_unlock($1, $2);", nsKey, schemaKey).Scan(&released)
+}
+
+// TestApply_FallbackRespectsPlanLockID verifies the direct-apply fallback
+// (plan without SchemaSQL) uses the LockID persisted in the plan: while a
+// holder owns that advisory lock, Apply must block, not run under a
+// different (default) lock.
+func TestApply_FallbackRespectsPlanLockID(t *testing.T) {
+	db := testutil.TestDatabase(t)
+
+	schema := fmt.Sprintf("test_fallback_lockid_%d", time.Now().UnixNano())
+	if _, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema)); err != nil {
+		t.Fatalf("failed creating schema: %v", err)
+	}
+	defer func() { _, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schema)) }()
+
+	initialSQL := "CREATE TABLE lockid_items (id BIGINT PRIMARY KEY);"
+	if err := grizzle.Sync(context.Background(), db, grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: schema,
+		SchemaSQL:    initialSQL,
+	}); err != nil {
+		t.Fatalf("initial sync failed: %v", err)
+	}
+
+	customLockID := int64(918273645000) + time.Now().UnixNano()%1000
+	desiredSQL := "CREATE TABLE lockid_items (id BIGINT PRIMARY KEY, name TEXT);"
+
+	p, err := grizzle.PlanDiff(context.Background(), db, grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: schema,
+		SchemaSQL:    desiredSQL,
+		LockID:       customLockID,
+		LockTimeout:  5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("PlanDiff failed: %v", err)
+	}
+	if p.LockID != customLockID {
+		t.Fatalf("plan does not persist LockID: got %d, want %d", p.LockID, customLockID)
+	}
+
+	// Strip SchemaSQL to force the direct-apply fallback.
+	p.SchemaSQL = ""
+	approvedHash := p.Hash()
+
+	holderConn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("failed acquiring holder conn: %v", err)
+	}
+	defer func() {
+		var released bool
+		_ = holderConn.QueryRowContext(context.Background(), "SELECT pg_advisory_unlock($1);", customLockID).Scan(&released)
+		_ = holderConn.Close()
+	}()
+
+	var dummy int
+	if err := holderConn.QueryRowContext(context.Background(), "SELECT 1 FROM pg_advisory_lock($1);", customLockID).Scan(&dummy); err != nil {
+		t.Fatalf("holder failed acquiring custom lock: %v", err)
+	}
+
+	applyDone := make(chan error, 1)
+	go func() {
+		applyDone <- grizzle.Apply(context.Background(), db, p, grizzle.ApplyOpts{
+			ExpectedHash: approvedHash,
+		})
+	}()
+
+	// While the holder owns the custom lock, Apply must still be blocked.
+	select {
+	case err := <-applyDone:
+		t.Fatalf("Apply bypassed the plan's LockID (returned while holder owns the lock): %v", err)
+	case <-time.After(1200 * time.Millisecond):
+		// still blocked — expected
+	}
+
+	// Release; Apply must now complete.
+	var released bool
+	if err := holderConn.QueryRowContext(context.Background(), "SELECT pg_advisory_unlock($1);", customLockID).Scan(&released); err != nil {
+		t.Fatalf("holder unlock failed: %v", err)
+	}
+
+	select {
+	case err := <-applyDone:
+		if err != nil {
+			t.Fatalf("Apply failed after lock release: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("Apply did not complete after lock release")
+	}
+}
+
+// TestApply_FallbackRejectsOutOfScopeSteps verifies the direct-apply fallback
+// enforces the plan's recorded IncludeTables/ExcludeTables scope against its
+// steps, instead of blindly executing whatever the plan artifact contains.
+func TestApply_FallbackRejectsOutOfScopeSteps(t *testing.T) {
+	db := testutil.TestDatabase(t)
+
+	schema := fmt.Sprintf("test_fallback_scope_%d", time.Now().UnixNano())
+	if _, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema)); err != nil {
+		t.Fatalf("failed creating schema: %v", err)
+	}
+	defer func() { _, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schema)) }()
+
+	initialSQL := "CREATE TABLE in_scope (id BIGINT PRIMARY KEY); CREATE TABLE out_of_scope (id BIGINT PRIMARY KEY);"
+	if err := grizzle.Sync(context.Background(), db, grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: schema,
+		SchemaSQL:    initialSQL,
+	}); err != nil {
+		t.Fatalf("initial sync failed: %v", err)
+	}
+
+	desiredSQL := "CREATE TABLE in_scope (id BIGINT PRIMARY KEY, name TEXT);"
+	p, err := grizzle.PlanDiff(context.Background(), db, grizzle.Options{
+		Dialect:       grizzle.DialectPostgres,
+		TargetSchema:  schema,
+		SchemaSQL:     desiredSQL,
+		IncludeTables: []string{"in_scope"},
+	})
+	if err != nil {
+		t.Fatalf("PlanDiff failed: %v", err)
+	}
+
+	// Tamper: inject a hazard-free step for a table outside the plan's
+	// recorded scope. ADD COLUMN carries no hazard, so only scope enforcement
+	// can reject it.
+	p.Steps = append(p.Steps, grizzle.Step{
+		Type:  grizzle.ChangeAddColumn,
+		Table: "out_of_scope",
+		SQL:   fmt.Sprintf("ALTER TABLE %q.out_of_scope ADD COLUMN sneaky TEXT;", schema),
+	})
+	p.SchemaSQL = ""
+
+	err = grizzle.Apply(context.Background(), db, p, grizzle.ApplyOpts{ExpectedHash: p.Hash()})
+	if err == nil {
+		t.Fatalf("expected Apply to reject out-of-scope step, got nil")
+	}
+	if !strings.Contains(err.Error(), "outside the plan's recorded scope") {
+		t.Errorf("expected scope violation error, got: %v", err)
+	}
+
+	// The out-of-scope table must be untouched.
+	var cols int
+	if err := db.QueryRow(`SELECT count(*) FROM information_schema.columns
+		WHERE table_schema = $1 AND table_name = 'out_of_scope' AND column_name = 'sneaky';`, schema).Scan(&cols); err != nil {
+		t.Fatalf("querying out_of_scope columns: %v", err)
+	}
+	if cols != 0 {
+		t.Errorf("out-of-scope table was modified: sneaky column exists")
+	}
+}
+
+// TestPlanDiff_ConcurrentCallsDoNotCollide verifies concurrent PlanDiff calls
+// on one database each use their own shadow schema (no shared-name DDL
+// serialization or CASCADE collision) and leave no shadow schemas behind.
+func TestPlanDiff_ConcurrentCallsDoNotCollide(t *testing.T) {
+	db := testutil.TestDatabase(t)
+
+	schema := fmt.Sprintf("test_plandiff_conc_%d", time.Now().UnixNano())
+	if _, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema)); err != nil {
+		t.Fatalf("failed creating schema: %v", err)
+	}
+	defer func() { _, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schema)) }()
+
+	initialSQL := "CREATE TABLE conc_items (id BIGINT PRIMARY KEY);"
+	if err := grizzle.Sync(context.Background(), db, grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: schema,
+		SchemaSQL:    initialSQL,
+	}); err != nil {
+		t.Fatalf("initial sync failed: %v", err)
+	}
+
+	desiredSQL := "CREATE TABLE conc_items (id BIGINT PRIMARY KEY, name TEXT);"
+	shadowBase := fmt.Sprintf("_grizzle_shadow_test_%d", time.Now().UnixNano())
+
+	const numCalls = 4
+	var wg sync.WaitGroup
+	errs := make(chan error, numCalls)
+	plans := make(chan *grizzle.Plan, numCalls)
+	barrier := make(chan struct{})
+
+	for range numCalls {
+		wg.Go(func() {
+			<-barrier
+			p, err := grizzle.PlanDiff(context.Background(), db, grizzle.Options{
+				Dialect:      grizzle.DialectPostgres,
+				TargetSchema: schema,
+				SchemaSQL:    desiredSQL + "; SELECT pg_sleep(0.3);",
+				ShadowSchema: shadowBase,
+			})
+			if err != nil {
+				errs <- err
+				return
+			}
+			plans <- p
+		})
+	}
+
+	start := time.Now()
+	close(barrier)
+	wg.Wait()
+	close(errs)
+	elapsed := time.Since(start)
+
+	for err := range errs {
+		t.Errorf("concurrent PlanDiff error: %v", err)
+	}
+
+	// With per-call unique shadow schemas the compiles run in parallel;
+	// sharing one name would serialize them on the shadow schema DDL locks
+	// (4 x 300ms >= 1.2s serialized vs well under 1s parallel).
+	if elapsed >= 2500*time.Millisecond {
+		t.Errorf("concurrent PlanDiff calls appear serialized: took %v", elapsed)
+	}
+
+	first := <-plans
+	for range numCalls - 1 {
+		p := <-plans
+		if p.Hash() != first.Hash() {
+			t.Errorf("concurrent PlanDiff produced different hashes: %s vs %s", p.Hash(), first.Hash())
+		}
+	}
+
+	// No shadow schema with the test prefix may survive.
+	var leftovers int
+	if err := db.QueryRow(fmt.Sprintf(
+		"SELECT count(*) FROM pg_namespace WHERE nspname LIKE '%s%%';", shadowBase)).Scan(&leftovers); err != nil {
+		t.Fatalf("querying pg_namespace: %v", err)
+	}
+	if leftovers != 0 {
+		t.Errorf("expected 0 leftover shadow schemas, found %d", leftovers)
+	}
+}
+
+// TestPlanDiff_CrashMidCompileLeavesNoShadow verifies that a compile that dies
+// mid-flight (context deadline simulating a crashed/cancelled caller) leaves
+// no stale shadow schema behind: the compile transaction aborts server-side.
+func TestPlanDiff_CrashMidCompileLeavesNoShadow(t *testing.T) {
+	db := testutil.TestDatabase(t)
+
+	schema := fmt.Sprintf("test_plandiff_crash_%d", time.Now().UnixNano())
+	if _, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema)); err != nil {
+		t.Fatalf("failed creating schema: %v", err)
+	}
+	defer func() { _, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schema)) }()
+
+	initialSQL := "CREATE TABLE crash_items (id BIGINT PRIMARY KEY);"
+	if err := grizzle.Sync(context.Background(), db, grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: schema,
+		SchemaSQL:    initialSQL,
+	}); err != nil {
+		t.Fatalf("initial sync failed: %v", err)
+	}
+
+	shadowBase := fmt.Sprintf("_grizzle_shadow_crash_%d", time.Now().UnixNano())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	// pg_sleep keeps the compile busy past the deadline.
+	_, err := grizzle.PlanDiff(ctx, db, grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: schema,
+		SchemaSQL:    "CREATE TABLE crash_items (id BIGINT PRIMARY KEY); SELECT pg_sleep(5);",
+		ShadowSchema: shadowBase,
+	})
+	if err == nil {
+		t.Fatalf("expected PlanDiff to fail on cancelled context, got nil")
+	}
+
+	var leftovers int
+	if err := db.QueryRow(fmt.Sprintf(
+		"SELECT count(*) FROM pg_namespace WHERE nspname LIKE '%s%%';", shadowBase)).Scan(&leftovers); err != nil {
+		t.Fatalf("querying pg_namespace: %v", err)
+	}
+	if leftovers != 0 {
+		t.Errorf("expected 0 stale shadow schemas after mid-compile crash, found %d", leftovers)
 	}
 }

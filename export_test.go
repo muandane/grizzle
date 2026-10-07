@@ -62,3 +62,11 @@ func diffSQLiteSchemas(live, desired *schema.Schema, filters ...any) []plan.Step
 	}
 	return sqlite.Diff(live, desired, f)
 }
+
+// DetectDialectFromDriver bridges the internal driver-type matcher for
+// white-box dialect detection tests.
+var DetectDialectFromDriver = detectDialectFromDriver
+
+// DetectDialectForTest bridges the full detection path (driver match +
+// probe fallback) for white-box tests.
+var DetectDialectForTest = detectDialect

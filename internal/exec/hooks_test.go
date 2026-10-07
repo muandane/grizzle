@@ -202,3 +202,147 @@ func assertSQLiteHistory(t *testing.T, db *sql.DB, errSubstring string, wantFail
 		t.Errorf("history error = %q, want substring %q", histErr, errSubstring)
 	}
 }
+
+func TestSyncSQLite_HookPanic_BeforeSync(t *testing.T) {
+	db := openSQLite(t)
+	ctx := context.Background()
+	if _, err := db.Exec(`CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);`); err != nil {
+		t.Fatalf("seeding users table: %v", err)
+	}
+
+	cfg := exec.SQLiteExecConfig{
+		SchemaSQL: `
+			CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+			CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users (id));
+		`,
+		BeforeSync: func(ctx context.Context, dbtx dialect.DBTX) error {
+			panic("before_sync kaboom")
+		},
+	}
+
+	err := exec.SyncSQLite(ctx, db, cfg)
+	if err == nil {
+		t.Fatalf("expected panic converted to error, got nil")
+	}
+	if !strings.Contains(err.Error(), "hook panicked") || !strings.Contains(err.Error(), "before_sync kaboom") || !strings.Contains(err.Error(), "goroutine") {
+		t.Errorf("expected panic error with stack trace, got: %v", err)
+	}
+
+	// Tx must be rolled back: posts absent.
+	var count int
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='posts';`).Scan(&count); err != nil {
+		t.Fatalf("querying posts existence: %v", err)
+	}
+	if count != 0 {
+		t.Error("posts table should not exist after before_sync hook panic")
+	}
+
+	// No history assertion: BeforeSync runs before the history table exists.
+}
+
+func TestSyncSQLite_HookPanic_BeforeStep(t *testing.T) {
+	db := openSQLite(t)
+	ctx := context.Background()
+	if _, err := db.Exec(`CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);`); err != nil {
+		t.Fatalf("seeding users table: %v", err)
+	}
+
+	cfg := exec.SQLiteExecConfig{
+		SchemaSQL: `
+			CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+			CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users (id));
+		`,
+		BeforeStep: func(hc exec.HookContext) error {
+			panic(hc.Index)
+		},
+	}
+
+	err := exec.SyncSQLite(ctx, db, cfg)
+	if err == nil {
+		t.Fatalf("expected panic converted to error, got nil")
+	}
+	if !strings.Contains(err.Error(), "hook panicked") || !strings.Contains(err.Error(), "goroutine") {
+		t.Errorf("expected panic error with stack trace, got: %v", err)
+	}
+
+	var count int
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='posts';`).Scan(&count); err != nil {
+		t.Fatalf("querying posts existence: %v", err)
+	}
+	if count != 0 {
+		t.Error("posts table should not exist after before_step hook panic")
+	}
+
+	assertSQLiteHistory(t, db, "hook panicked", 1)
+}
+
+func TestSyncSQLite_HookPanic_AfterStep(t *testing.T) {
+	db := openSQLite(t)
+	ctx := context.Background()
+	if _, err := db.Exec(`CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);`); err != nil {
+		t.Fatalf("seeding users table: %v", err)
+	}
+
+	cfg := exec.SQLiteExecConfig{
+		SchemaSQL: `
+			CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+			CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users (id));
+		`,
+		AfterStep: func(hc exec.HookContext) error {
+			panic("after_step kaboom")
+		},
+	}
+
+	err := exec.SyncSQLite(ctx, db, cfg)
+	if err == nil {
+		t.Fatalf("expected panic converted to error, got nil")
+	}
+	if !strings.Contains(err.Error(), "hook panicked") || !strings.Contains(err.Error(), "after_step kaboom") || !strings.Contains(err.Error(), "goroutine") {
+		t.Errorf("expected panic error with stack trace, got: %v", err)
+	}
+
+	var count int
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='posts';`).Scan(&count); err != nil {
+		t.Fatalf("querying posts existence: %v", err)
+	}
+	if count != 0 {
+		t.Error("posts table should be rolled back after after_step hook panic")
+	}
+
+	assertSQLiteHistory(t, db, "hook panicked", 1)
+}
+
+func TestSyncSQLite_HookPanic_AfterSync(t *testing.T) {
+	db := openSQLite(t)
+	ctx := context.Background()
+	if _, err := db.Exec(`CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);`); err != nil {
+		t.Fatalf("seeding users table: %v", err)
+	}
+
+	cfg := exec.SQLiteExecConfig{
+		SchemaSQL: `
+			CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+			CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users (id));
+		`,
+		AfterSync: func(ctx context.Context, dbtx dialect.DBTX) error {
+			panic("after_sync kaboom")
+		},
+	}
+
+	err := exec.SyncSQLite(ctx, db, cfg)
+	if err == nil {
+		t.Fatalf("expected panic converted to error, got nil")
+	}
+	if !strings.Contains(err.Error(), "hook panicked") || !strings.Contains(err.Error(), "after_sync kaboom") || !strings.Contains(err.Error(), "goroutine") {
+		t.Errorf("expected panic error with stack trace, got: %v", err)
+	}
+
+	// Tx already committed: posts must remain.
+	var count int
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='posts';`).Scan(&count); err != nil {
+		t.Fatalf("querying posts existence: %v", err)
+	}
+	if count != 1 {
+		t.Error("posts table must remain committed after after_sync hook panic")
+	}
+}

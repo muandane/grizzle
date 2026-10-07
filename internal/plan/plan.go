@@ -7,6 +7,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"time"
 )
 
 // ChangeType describes the category of a schema mutation.
@@ -111,6 +112,17 @@ type Plan struct {
 	Renames        map[string]string `json:"renames,omitzero"`
 	ExpandContract bool              `json:"expand_contract,omitzero"`
 	SchemaSQL      string            `json:"schema_sql,omitzero"`
+
+	// Execution knobs persisted with the plan so direct apply (when
+	// SchemaSQL is empty and the recorded steps run as-is) reproduces the
+	// locking and timeout posture used to generate it. These fields do NOT
+	// participate in Hash(): they are operational settings, not schema intent.
+	LockID               int64         `json:"lock_id,omitempty"`
+	LockNamespace        string        `json:"lock_namespace,omitempty"`
+	LockTimeout          time.Duration `json:"lock_timeout_ns,omitempty"`
+	StatementTimeout     time.Duration `json:"statement_timeout_ns,omitempty"`
+	NonConcurrentIndexes bool          `json:"non_concurrent_indexes,omitempty"`
+	ShadowSchema         string        `json:"shadow_schema,omitempty"`
 }
 
 // Hash computes a deterministic SHA-256 hex digest of the canonical step list and scope.

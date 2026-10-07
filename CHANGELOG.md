@@ -5,6 +5,31 @@ All notable changes to Grizzle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Plan Operational Fields & Document Round-Trip**:
+  - `Plan` carries persisted execution knobs (`LockID`, `LockNamespace`, `LockTimeout`, `StatementTimeout`, `NonConcurrentIndexes`, `ShadowSchema`) so direct `Apply` reproduces the locking and timeout posture used to generate the plan. They are serialized in the plan document envelope (durations as nanoseconds) and excluded from `Plan.Hash()` approval digests.
+  - `Plan.ValidateExecutionFields()` validates operational fields on load and apply: `ShadowSchema` must use the reserved `_grizzle_shadow` prefix when set, be ≤ 63 bytes (PostgreSQL `NAMEDATALEN`), be a valid SQL identifier, and never name a target or included schema; `LockNamespace` must be a valid identifier; timeouts must be within `[0, 24h]`. Violations wrap `ErrInvalidOptions`. `ParsePlanJSON` rejects tampered artifacts (e.g. `shadow_schema` rewritten to `"public"`), and `Apply` re-validates before touching the database.
+  - `grizzle.ErrHistoryRecord`: typed non-fatal error surfaced when the migration succeeds but the success-path `grizzle_history` record could not be written (detect with `errors.Is`; the schema changes remain applied). Failure-path history write failures are logged and never swallowed or misreported as success.
+  - Hook panic recovery: a panicking lifecycle hook is converted into an error carrying the full stack trace (returned to the caller and logged at ERROR); only the first line of the panic message is persisted to `grizzle_history`.
+- **Retry Classification (`exec.IsRetryable`)**:
+  - Lock-contention retries are classified by PostgreSQL SQLSTATE (`55P03` lock_timeout, `40P01` deadlock) instead of error-string matching, working through wrapped errors and PgBouncer/transaction-pooling proxies.
+
+### Changed
+- **`LockTimeout` is a total budget across retries**: the advisory-lock acquisition wait is bounded once and shared across all retry attempts (including backoff waits). Only lock waiting consumes the budget: preamble work (hooks, schema setup, session timeouts) and DDL execution are excluded — each attempt's acquisition timer is armed when acquisition begins, so slow hooks or retryable DDL failures cannot starve the acquisition window. `cfg.LockTimeout` still feeds the per-statement DDL `lock_timeout` via session timeouts. Retryable attempts exit early once waiting the backoff would exhaust the remaining budget.
+- **Unique per-call shadow schemas for `PlanDiff`**: each read-only drift check compiles in a unique `_grizzle_shadow_<hash>` schema (≤ 63 bytes), so concurrent `PlanDiff` calls never serialize on shadow DDL locks and cannot collide with a concurrently running `Sync`. Custom `Options.ShadowSchema` values without the reserved prefix are accepted but not persisted into plan artifacts (Apply re-derives the default).
+- **SQLite foreign-key pinning**: `PRAGMA foreign_keys` is toggled per-connection on a pinned `*sql.Conn` (with read-back verification) instead of on `*sql.DB`, and `PRAGMA foreign_key_check` runs inside the migration transaction on the pinned connection before commit — safe under transaction-pooling proxies.
+
+### Fixed
+- **SQLite foreign keys during migration**: `PRAGMA foreign_keys = OFF` on `*sql.DB` does not affect other pooled connections (and is a no-op inside a transaction); migrations now disable and restore foreign keys on a single pinned connection for the whole transaction.
+- **Advisory-lock release hygiene (PostgreSQL)**: lock release and session-state `RESET` run on a detached, bounded context after cancellation, and a failed release discards the connection (`driver.ErrBadConn`) so a session that may still hold advisory locks is never returned to the pool.
+- **Dialect detection via driver package path** for registered-but-unmatched driver types (e.g. wrappers around `pgx` or `sqlite`).
+- **Timeout semantics in tests**: integration timing assertions loosened to remove CI scheduling flakes; `TestTimeouts_ConflictingHolder_RetrySucceeds` updated to total-budget `LockTimeout` semantics.
+
+### Security
+- **Plan artifact validation on load**: untrusted `plan.json` documents are validated (`ValidateExecutionFields`) before use, rejecting shadow schemas that would collide with target schemas (the shadow is dropped with `CASCADE` before compilation).
+
 ## [0.1.0] - 2026-10-06
 
 ### Added

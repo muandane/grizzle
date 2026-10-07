@@ -234,6 +234,17 @@ Details and citations: [docs/SAFETY.md](docs/SAFETY.md).
 
 ---
 
+## Connection pooling (PgBouncer)
+
+Grizzle's distributed locking uses **session-level** advisory locks (`pg_advisory_lock`), which are bound to a backend session and released when that session ends.
+
+- **Session pooling** (PgBouncer `pool_mode = session`) or a **direct connection** to PostgreSQL: supported.
+- **Transaction pooling** (`pool_mode = transaction`): **not supported.** Sessions can migrate between backends between statements, silently breaking both the advisory lock and per-session `SET lock_timeout` / `SET statement_timeout`. A migration could run without holding the lock.
+
+If you deploy behind PgBouncer, route migration traffic through the **direct connection port** (typically `:5432` with PgBouncer on `:6432`) or a session-pooled database user.
+
+---
+
 ## Schema linting
 
 `grizzle.Lint` statically checks the desired schema IR (pure, database-free, deterministic) before anything reaches a migration. Diagnostics carry a rule ID, severity (`ERROR` / `WARNING` / `INFO`), and target; render them as text, JSON, or GitHub Actions annotations (`LintFormatText` / `LintFormatJSON` / `LintFormatGitHub`).

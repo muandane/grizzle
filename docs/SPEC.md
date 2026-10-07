@@ -56,6 +56,8 @@ type Options struct {
     TargetSchemas []string
 
     // ShadowSchema is the temporary schema name used for validation (defaults to "_grizzle_shadow").
+    // Must use the reserved "_grizzle_shadow" prefix, be a valid identifier of at most 63 bytes,
+    // and must not name a target or included schema; violations fail with ErrInvalidOptions.
     ShadowSchema string
 
     // AllowDrop permits all destructive operations when set to true.
@@ -93,7 +95,9 @@ type Options struct {
     // If 0, Grizzle derives 2-int per-schema advisory locks using (hash32(LockNamespace), hash32(schema)).
     LockID int64
 
-    // LockTimeout sets the maximum duration to wait for acquiring the advisory lock (defaults to 5s).
+    // LockTimeout sets the maximum TOTAL duration to wait for acquiring the advisory
+    // lock across all retry attempts, including backoff (defaults to 5s). The value is
+    // never reset per attempt; it also feeds the per-statement DDL lock_timeout.
     LockTimeout time.Duration
 
     // StatementTimeout sets the maximum duration for any individual DDL statement (defaults to 5m).
@@ -191,9 +195,20 @@ type Plan struct {
     Renames        map[string]string
     ExpandContract bool
     SchemaSQL      string
+
+    // Operational knobs persisted so direct Apply reproduces the locking and
+    // timeout posture used to generate the plan. Serialized in the document
+    // envelope (durations as nanoseconds); excluded from Hash().
+    LockID               int64
+    LockNamespace        string
+    LockTimeout          time.Duration
+    StatementTimeout     time.Duration
+    NonConcurrentIndexes bool
+    ShadowSchema         string
 }
 
 func (p *Plan) Hash() string
+func (p *Plan) ValidateExecutionFields() error
 func (p *Plan) Hazards() []Hazard
 func (p *Plan) Additions() int
 func (p *Plan) Modifications() int
@@ -210,6 +225,22 @@ const (
     HazardLevelWarning  HazardLevel = "WARNING"  // Execution risk (NOT NULL without DEFAULT, GENERATED_REWRITE, PARTITION_ATTACH_SCAN, PARTITION_PENDING_DETACH)
     HazardLevelNotice   HazardLevel = "NOTICE"   // Locking or performance impact (INDEX creation/drop, FK drop)
 )
+
+// Operational field validation. Invoked by ParsePlanJSON on load and by
+// Apply before execution; rejects untrusted artifacts with ErrInvalidOptions:
+//
+//   - ShadowSchema, when set, must use the reserved "_grizzle_shadow" prefix,
+//     be <= 63 bytes (PostgreSQL NAMEDATALEN), be a valid SQL identifier, and
+//     must not name a target or included schema (the shadow is dropped with
+//     CASCADE before compilation);
+//   - LockNamespace must be a valid SQL identifier;
+//   - LockTimeout and StatementTimeout must be in [0, 24h].
+//
+// The document envelope serializes the operational fields (lock_id,
+// lock_namespace, lock_timeout_ns, statement_timeout_ns,
+// non_concurrent_indexes, shadow_schema; durations as nanoseconds) and
+// ParsePlanJSON maps them back in both envelope and legacy formats, so the
+// CLI plan -> apply round trip preserves locking and timeout posture.
 
 type HazardCode string
 
@@ -306,7 +337,7 @@ Critical hazards (`DROP_TABLE`, `DROP_COLUMN`, `TYPE_NARROW`, `RENAME_AMBIGUOUS`
 `Plan.Hash()` provides a deterministic digest. `Apply` verifies the post-lock hash against `ExpectedHash`, aborting with `ErrPlanDrift` on mismatch.
 
 ### Invariant 5: Timeouts and retry
-`LockTimeout` and `StatementTimeout` protect production availability. PostgreSQL `lock_timeout` conflicts are retried with exponential backoff and randomized jitter.
+`LockTimeout` and `StatementTimeout` protect production availability. `LockTimeout` bounds the **total** advisory-lock acquisition wait across all retry attempts (including backoff); preamble work (hooks, schema setup, session timeout statements) and DDL execution do not consume the budget — each attempt's acquisition timer is armed when acquisition begins. PostgreSQL lock-contention and deadlock failures (SQLSTATE `55P03`, `40P01`) are classified via `exec.IsRetryable` and retried with exponential backoff and randomized jitter; retries halt immediately once any DDL step commits.
 
 ### Invariant 6: Strict scope protection
 `StrictScope` ensures `IncludeTables` is provided, preventing accidental mutations in shared databases.
@@ -321,7 +352,7 @@ Ambiguous column renames are blocked with `RENAME_AMBIGUOUS`; map them explicitl
 The `RENAME_AMBIGUOUS` hazard description and the interactive summary remediation point to `--rename`. See `examples/expand-contract` for a runnable end-to-end flow.
 
 ### Invariant 8: History and drift detection
-Applied plans are audited in `grizzle_history`. `Check()` provides read-only schema drift verification.
+Applied plans are audited in `grizzle_history`. `Check()` provides read-only schema drift verification. A failed success-path history write does not fail the applied migration: it is logged at ERROR and surfaced as a typed non-fatal error (`errors.Is(err, grizzle.ErrHistoryRecord)`); failure-path history write failures are logged and never swallowed.
 
 ## 5. Error taxonomy
 
@@ -343,6 +374,7 @@ var (
     ErrPartitionConversion     = errors.New("grizzle: in-place conversion between regular and partitioned table is unsupported")
     ErrUnsupportedMultiSchema  = errors.New("grizzle: multi-schema configuration is unsupported on SQLite")
     ErrPartitionKeyNotInUnique = errors.New("grizzle: primary key or unique constraint must include all partition key columns")
+    ErrHistoryRecord           = errors.New("grizzle: migration succeeded but history record was not written") // non-fatal
 )
 
 type HazardError struct {

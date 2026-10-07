@@ -4,8 +4,12 @@ import (
 	"cmp"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"io"
+	"log/slog"
+	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -16,7 +20,12 @@ import (
 	"github.com/muandane/grizzle/internal/lint"
 	"github.com/muandane/grizzle/internal/plan"
 	"github.com/muandane/grizzle/internal/schema"
+	"github.com/muandane/grizzle/internal/scope"
 )
+
+// shadowIdentRegex constrains user-supplied shadow schema names to safely
+// quotable SQL identifiers.
+var shadowIdentRegex = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
 // Plan is the complete migration plan containing sequenced steps, policy, and hashes.
 type Plan = plan.Plan
@@ -168,21 +177,48 @@ func GenerateLockID(dbName, schemaName string) int64 {
 	return postgres.GenerateLockID(dbName + ":" + schemaName)
 }
 
+// detectDialectFromDriver maps a database/sql driver's concrete type to a
+// Grizzle dialect by matching the driver's package path (via reflection), not
+// the %T type string, which omits package paths and misclassifies wrapper
+// drivers. Pointer indirection is stripped. Returns DialectAuto when the
+// driver type is unknown (wrappers such as otelsql/sqlx), letting the caller
+// fall back to probe queries.
+func detectDialectFromDriver(drv driver.Driver) Dialect {
+	if drv == nil {
+		return DialectAuto
+	}
+	t := reflect.TypeOf(drv)
+	for t != nil && t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t == nil || t.Name() == "" {
+		return DialectAuto
+	}
+	name := strings.ToLower(t.PkgPath() + "." + t.Name())
+	switch {
+	case strings.Contains(name, "github.com/jackc/pgx"),
+		strings.Contains(name, "github.com/lib/pq"):
+		return DialectPostgres
+	case strings.Contains(name, "modernc.org/sqlite"),
+		strings.Contains(name, "github.com/mattn/go-sqlite3"):
+		return DialectSQLite
+	default:
+		return DialectAuto
+	}
+}
+
 func detectDialect(ctx context.Context, db *sql.DB) (Dialect, error) {
 	if db == nil {
 		return "", fmt.Errorf("grizzle: database connection is nil")
 	}
 
-	if drv := db.Driver(); drv != nil {
-		drvName := strings.ToLower(fmt.Sprintf("%T", drv))
-		switch {
-		case strings.Contains(drvName, "sqlite"):
-			return DialectSQLite, nil
-		case strings.Contains(drvName, "pgx"), strings.Contains(drvName, "pq"), strings.Contains(drvName, "postgres"):
-			return DialectPostgres, nil
-		}
+	if d := detectDialectFromDriver(db.Driver()); d != DialectAuto {
+		return d, nil
 	}
 
+	// Wrapper drivers (otel/sqlx etc.) hide the underlying driver type; probe
+	// the engine with a single query each. These are expected to fail on the
+	// wrong engine and produce no log noise.
 	var sqliteVer string
 	if err := db.QueryRowContext(ctx, "SELECT sqlite_version()").Scan(&sqliteVer); err == nil {
 		return DialectSQLite, nil
@@ -193,7 +229,7 @@ func detectDialect(ctx context.Context, db *sql.DB) (Dialect, error) {
 		return DialectPostgres, nil
 	}
 
-	return "", fmt.Errorf("grizzle: unable to detect database dialect, please set Options.Dialect explicitly")
+	return "", fmt.Errorf("grizzle: unable to detect database dialect from driver %T, please set Options.Dialect explicitly", db.Driver())
 }
 
 func prepareOptions(ctx context.Context, db *sql.DB, opts *Options) error {
@@ -240,6 +276,17 @@ func prepareOptions(ctx context.Context, db *sql.DB, opts *Options) error {
 			opts.TargetSchemas = []string{"public"}
 		}
 		opts.ShadowSchema = cmp.Or(opts.ShadowSchema, "_grizzle_shadow")
+		if opts.ShadowSchema != "_grizzle_shadow" {
+			// Custom shadow schema names are validated, never truncated: a
+			// name PostgreSQL would silently truncate to 63 bytes makes
+			// setup, introspection, and teardown disagree on the schema.
+			if len(opts.ShadowSchema) > 63 {
+				return fmt.Errorf("%w: shadow schema %q exceeds 63 bytes (PostgreSQL identifier limit)", ErrInvalidOptions, opts.ShadowSchema)
+			}
+			if !shadowIdentRegex.MatchString(opts.ShadowSchema) {
+				return fmt.Errorf("%w: shadow schema %q is not a valid SQL identifier", ErrInvalidOptions, opts.ShadowSchema)
+			}
+		}
 		if opts.LockTimeout <= 0 {
 			opts.LockTimeout = exec.DefaultLockTimeout
 		}
@@ -449,6 +496,10 @@ type ApplyOpts struct {
 	// LockNamespace specifies the application namespace string used for PostgreSQL advisory locking (defaults to "grizzle").
 	LockNamespace string
 
+	// Logger receives structured migration logs during Apply (defaults to no logging).
+	// The plan artifact cannot carry a logger, so it is supplied here.
+	Logger *slog.Logger
+
 	// Tracer specifies an optional tracer for observing plan application.
 	Tracer Tracer
 }
@@ -466,11 +517,19 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 		return fmt.Errorf("%w: plan hash %q does not match expected hash %q", ErrPlanDrift, p.Hash(), opts.ExpectedHash)
 	}
 
+	// Operational fields come from an untrusted artifact (plan.json): reject
+	// values that could destroy user data or corrupt execution before any
+	// connection is touched.
+	if err := p.ValidateExecutionFields(); err != nil {
+		return err
+	}
+
 	if p.SchemaSQL != "" {
 		syncOpts := Options{
 			SchemaSQL:              p.SchemaSQL,
 			TargetSchema:           p.TargetSchema,
 			TargetSchemas:          p.TargetSchemas,
+			ShadowSchema:           p.ShadowSchema,
 			IncludeTables:          p.IncludeTables,
 			ExcludeTables:          p.ExcludeTables,
 			Renames:                p.Renames,
@@ -488,7 +547,12 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 			AfterStep:              opts.AfterStep,
 			SQLiteRebuildThreshold: opts.SQLiteRebuildThreshold,
 			SQLiteRebuildBatchSize: opts.SQLiteRebuildBatchSize,
-			LockNamespace:          opts.LockNamespace,
+			LockNamespace:          cmp.Or(p.LockNamespace, opts.LockNamespace, "grizzle"),
+			LockID:                 p.LockID,
+			LockTimeout:            p.LockTimeout,
+			StatementTimeout:       p.StatementTimeout,
+			NonConcurrentIndexes:   p.NonConcurrentIndexes,
+			Logger:                 opts.Logger,
 			Tracer:                 opts.Tracer,
 		}
 		if err := prepareOptions(ctx, db, &syncOpts); err != nil {
@@ -540,7 +604,21 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 		})
 	}
 
-	// Direct execution fallback if SchemaSQL was not retained
+	// Direct execution fallback if SchemaSQL was not retained: the recorded
+	// steps run as-is. Enforce the plan's recorded scope (IncludeTables /
+	// ExcludeTables) against every table-scoped step first — enum steps carry
+	// the enum name in Table, not a table name, so they are skipped.
+	planFilters := scope.Filters{Includes: p.IncludeTables, Excludes: p.ExcludeTables}
+	for _, s := range p.Steps {
+		if s.Type == plan.ChangeCreateEnum || s.Type == plan.ChangeAlterEnum {
+			continue
+		}
+		if !scope.IsTableManaged(s.Table, planFilters) {
+			return fmt.Errorf("%w: plan step [%s on %q] is outside the plan's recorded scope (include_tables=%v, exclude_tables=%v)",
+				ErrInvalidOptions, s.Type, s.Table, p.IncludeTables, p.ExcludeTables)
+		}
+	}
+
 	dialect, err := detectDialect(ctx, db)
 	if err != nil {
 		return err
@@ -553,6 +631,7 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 			AcceptHazards:    opts.AcceptHazards,
 			ExpectedHash:     opts.ExpectedHash,
 			Tracer:           opts.Tracer,
+			Logger:           opts.Logger,
 			Backfill:         toExecBackfill(opts.Backfill),
 			BeforeSync:       opts.BeforeSync,
 			AfterSync:        opts.AfterSync,
@@ -567,23 +646,25 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 			targetSchemas = []string{cmp.Or(p.TargetSchema, "public")}
 		}
 		targetSchema := targetSchemas[0]
-		lockNs := cmp.Or(opts.LockNamespace, "grizzle")
 		return exec.ApplyPostgres(ctx, db, p, exec.PostgresExecConfig{
-			TargetSchema:     targetSchema,
-			TargetSchemas:    targetSchemas,
-			LockNamespace:    lockNs,
-			Policy:           p.Policy,
-			AcceptHazards:    opts.AcceptHazards,
-			ExpectedHash:     opts.ExpectedHash,
-			Tracer:           opts.Tracer,
-			LockTimeout:      exec.DefaultLockTimeout,
-			StatementTimeout: exec.DefaultStatementTimeout,
-			MaxRetries:       exec.DefaultMaxRetries,
-			Backfill:         toExecBackfill(opts.Backfill),
-			BeforeSync:       opts.BeforeSync,
-			AfterSync:        opts.AfterSync,
-			BeforeStep:       opts.BeforeStep,
-			AfterStep:        opts.AfterStep,
+			TargetSchema:         targetSchema,
+			TargetSchemas:        targetSchemas,
+			LockNamespace:        cmp.Or(p.LockNamespace, opts.LockNamespace, "grizzle"),
+			LockID:               p.LockID,
+			Policy:               p.Policy,
+			AcceptHazards:        opts.AcceptHazards,
+			ExpectedHash:         opts.ExpectedHash,
+			Tracer:               opts.Tracer,
+			Logger:               opts.Logger,
+			NonConcurrentIndexes: p.NonConcurrentIndexes,
+			LockTimeout:          cmp.Or(p.LockTimeout, exec.DefaultLockTimeout),
+			StatementTimeout:     cmp.Or(p.StatementTimeout, exec.DefaultStatementTimeout),
+			MaxRetries:           exec.DefaultMaxRetries,
+			Backfill:             toExecBackfill(opts.Backfill),
+			BeforeSync:           opts.BeforeSync,
+			AfterSync:            opts.AfterSync,
+			BeforeStep:           opts.BeforeStep,
+			AfterStep:            opts.AfterStep,
 		})
 	default:
 		return fmt.Errorf("grizzle: unsupported dialect %q", dialect)

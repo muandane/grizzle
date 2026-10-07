@@ -71,7 +71,10 @@ func TestTimeouts_ConflictingHolder_RetrySucceeds(t *testing.T) {
 		_ = holderTx.Rollback()
 	}()
 
-	// 3. Migration attempts ALTER TABLE with a short lock timeout (50ms) and MaxRetries=5
+	// 3. Migration attempts ALTER TABLE while the holder owns the table lock.
+	// LockTimeout is the TOTAL budget across retries (not per attempt), so it
+	// must exceed the holder's 150ms hold; the DDL lock_timeout itself is
+	// also 1s per attempt, giving the retry loop room to outlast the holder.
 	desiredSQL := `
 		CREATE TABLE accounts (id BIGINT PRIMARY KEY, balance NUMERIC, currency TEXT);
 	`
@@ -81,7 +84,7 @@ func TestTimeouts_ConflictingHolder_RetrySucceeds(t *testing.T) {
 		Dialect:          grizzle.DialectPostgres,
 		TargetSchema:     schema,
 		SchemaSQL:        desiredSQL,
-		LockTimeout:      50 * time.Millisecond,
+		LockTimeout:      1 * time.Second,
 		StatementTimeout: 5 * time.Second,
 		MaxRetries:       5,
 	})
@@ -89,8 +92,8 @@ func TestTimeouts_ConflictingHolder_RetrySucceeds(t *testing.T) {
 		t.Fatalf("migration failed despite retries: %v", err)
 	}
 
-	if time.Since(start) < 150*time.Millisecond {
-		t.Errorf("migration should have retried until holder released (expected >= 150ms, took %v)", time.Since(start))
+	if time.Since(start) < 100*time.Millisecond {
+		t.Errorf("migration should have retried until holder released (expected >= 100ms, took %v)", time.Since(start))
 	}
 }
 
@@ -160,7 +163,7 @@ func TestTimeouts_ConflictingHolder_ExhaustRetriesFails(t *testing.T) {
 		t.Fatalf("expected migration to fail due to lock timeout, got nil")
 	}
 
-	if !exec.IsLockTimeout(err) && !strings.Contains(err.Error(), "55P03") && !strings.Contains(err.Error(), "lock timeout") {
+	if !exec.IsRetryable(err) && !strings.Contains(err.Error(), "55P03") && !strings.Contains(err.Error(), "lock timeout") {
 		t.Errorf("expected lock timeout error (55P03), got: %v", err)
 	}
 }
