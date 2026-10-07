@@ -4,3 +4,7 @@
 ::warning title=L003::Posts.UserId: column name UserId is not lowercase snake_case
 ::warning title=L003::UserRole.UserRole: enum name UserRole is not lowercase snake_case
 ::warning title=L004::Posts.id: column uses a legacy SERIAL/nextval default; prefer GENERATED ALWAYS AS IDENTITY
+::warning title=L005::users.UsersEmailLen: check constraint name UsersEmailLen is not lowercase snake_case
+::warning title=L006::users.users_email_nonempty: duplicate check constraint: same expression as users_email_format_check
+::warning title=L006::users.users_email_required: duplicate check constraint: same expression as users_email_format_check
+::notice title=L007::users.users_check: check constraint uses an auto-generated name; prefer an explicit CONSTRAINT name

@@ -70,9 +70,11 @@ func runLint(ctx context.Context, dsn, schemaFile, format string, failOnWarning 
 		fmt.Fprintf(os.Stderr, "Lint failed with %d error(s)\n", countLintSeverity(diags, grizzle.LintSeverityError))
 		return 1
 	}
-	if failOnWarning && len(diags) > 0 {
-		fmt.Fprintf(os.Stderr, "Lint failed with %d warning(s) (--fail-on-warning)\n", len(diags))
-		return 1
+	if failOnWarning {
+		if n := countLintSeverity(diags, grizzle.LintSeverityWarning); n > 0 {
+			fmt.Fprintf(os.Stderr, "Lint failed with %d warning(s) (--fail-on-warning)\n", n)
+			return 1
+		}
 	}
 	if len(diags) == 0 {
 		fmt.Println("Lint passed: no diagnostics.")

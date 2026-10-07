@@ -24,6 +24,8 @@ const (
 	SeverityError Severity = "ERROR"
 	// SeverityWarning marks a recommendation that may be ignored deliberately.
 	SeverityWarning Severity = "WARNING"
+	// SeverityInfo marks a stylistic suggestion with no correctness impact.
+	SeverityInfo Severity = "INFO"
 )
 
 // Diagnostic is a single lint finding against a schema element.
@@ -57,13 +59,16 @@ func Lint(s *schema.Schema, rules ...Rule) []Diagnostic {
 	return diags
 }
 
-// DefaultRules returns the built-in rule set (L001..L004).
+// DefaultRules returns the built-in rule set (L001..L007).
 func DefaultRules() []Rule {
 	return []Rule{
 		MissingPrimaryKey{},
 		UnindexedForeignKey{},
 		NamingConvention{},
 		PreferIdentityOverSerial{},
+		CheckNamingConvention{},
+		DuplicateCheckConstraint{},
+		PreferNamedChecks{},
 	}
 }
 
@@ -111,6 +116,9 @@ func FormatText(w io.Writer, diags []Diagnostic) error {
 	if n := countSeverity(diags, SeverityWarning); n > 0 {
 		summary += fmt.Sprintf(", %d warning(s)", n)
 	}
+	if n := countSeverity(diags, SeverityInfo); n > 0 {
+		summary += fmt.Sprintf(", %d info(s)", n)
+	}
 	_, err := fmt.Fprintln(w, summary)
 	return err
 }
@@ -129,14 +137,20 @@ func FormatJSON(w io.Writer, diags []Diagnostic) error {
 }
 
 // FormatGitHub renders diagnostics as GitHub Actions workflow annotations.
+// INFO findings map to the "notice" annotation level; ERROR and WARNING map
+// to the "error" and "warning" levels respectively.
 func FormatGitHub(w io.Writer, diags []Diagnostic) error {
 	for _, d := range diags {
 		target := d.Table
 		if d.Column != "" {
 			target = fmt.Sprintf("%s.%s", d.Table, d.Column)
 		}
+		level := strings.ToLower(string(d.Severity))
+		if d.Severity == SeverityInfo {
+			level = "notice"
+		}
 		if _, err := fmt.Fprintf(w, "::%s title=%s::%s: %s\n",
-			strings.ToLower(string(d.Severity)), d.RuleID, target, d.Message); err != nil {
+			level, d.RuleID, target, d.Message); err != nil {
 			return err
 		}
 	}

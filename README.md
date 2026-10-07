@@ -234,6 +234,32 @@ Details and citations: [docs/SAFETY.md](docs/SAFETY.md).
 
 ---
 
+## Schema linting
+
+`grizzle.Lint` statically checks the desired schema IR (pure, database-free, deterministic) before anything reaches a migration. Diagnostics carry a rule ID, severity (`ERROR` / `WARNING` / `INFO`), and target; render them as text, JSON, or GitHub Actions annotations (`LintFormatText` / `LintFormatJSON` / `LintFormatGitHub`).
+
+| Rule | Severity | Check |
+| :--- | :--- | :--- |
+| `L001` | `ERROR` | Table has no primary key (breaks logical replication; partitions skipped) |
+| `L002` | `WARNING` | Foreign key columns not covered by any index (parent changes sequential-scan the table) |
+| `L003` | `WARNING` | Table / column / index / enum names not lowercase snake_case |
+| `L004` | `WARNING` | Legacy `SERIAL` / `nextval` default instead of `GENERATED ALWAYS AS IDENTITY` |
+| `L005` | `WARNING` | CHECK constraint name not lowercase snake_case |
+| `L006` | `WARNING` | Duplicate CHECK constraint expression on the same table |
+| `L007` | `INFO` | CHECK constraint relies on PostgreSQL's auto-generated name; prefer an explicit `CONSTRAINT name CHECK` |
+
+```go
+// LintSchema with no rules uses DefaultLintRules() (L001..L007).
+diags := grizzle.LintSchema(schemaIR)
+if grizzle.LintHasErrors(diags) {
+    log.Fatalf("schema lint failed:\n%s", mustFormatLint(diags))
+}
+```
+
+Details: [docs/SPEC.md](docs/SPEC.md#6-schema-linting).
+
+---
+
 ## Architecture
 
 Dependency direction is one-way:

@@ -39,5 +39,33 @@
     "table": "Posts",
     "column": "id",
     "message": "column uses a legacy SERIAL/nextval default; prefer GENERATED ALWAYS AS IDENTITY"
+  },
+  {
+    "rule_id": "L005",
+    "severity": "WARNING",
+    "table": "users",
+    "column": "UsersEmailLen",
+    "message": "check constraint name UsersEmailLen is not lowercase snake_case"
+  },
+  {
+    "rule_id": "L006",
+    "severity": "WARNING",
+    "table": "users",
+    "column": "users_email_nonempty",
+    "message": "duplicate check constraint: same expression as users_email_format_check"
+  },
+  {
+    "rule_id": "L006",
+    "severity": "WARNING",
+    "table": "users",
+    "column": "users_email_required",
+    "message": "duplicate check constraint: same expression as users_email_format_check"
+  },
+  {
+    "rule_id": "L007",
+    "severity": "INFO",
+    "table": "users",
+    "column": "users_check",
+    "message": "check constraint uses an auto-generated name; prefer an explicit CONSTRAINT name"
   }
 ]

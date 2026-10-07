@@ -320,3 +320,49 @@ type DestructiveViolationError struct {
     Violations []Step
 }
 ```
+
+## 6. Schema linting
+
+`LintSchema` statically checks the desired schema IR. The lint layer is pure: it imports only `internal/schema`, performs no I/O, and produces identical diagnostics for identical input DDL. `DefaultLintRules()` returns the built-in rule set:
+
+| Rule | Severity | Check |
+| :--- | :--- | :--- |
+| `L001` | `ERROR` | Table has no primary key (partitions are skipped; the parent's key covers them) |
+| `L002` | `WARNING` | Foreign key columns are not a prefix of any index (including the primary key) |
+| `L003` | `WARNING` | Table, column, index, or enum name is not lowercase snake_case |
+| `L004` | `WARNING` | Column uses a legacy `SERIAL` / `nextval` default instead of `GENERATED ALWAYS AS IDENTITY` |
+| `L005` | `WARNING` | CHECK constraint name is not lowercase snake_case |
+| `L006` | `WARNING` | Table declares multiple CHECK constraints with the same normalized expression |
+| `L007` | `INFO` | CHECK constraint uses PostgreSQL's auto-generated name (`table[_column]_check[n]`); prefer an explicit `CONSTRAINT name CHECK` |
+
+Severity semantics:
+
+- `ERROR`: structural anti-pattern; `LintHasErrors` reports it and release gates should fail.
+- `WARNING`: recommendation that may be ignored deliberately.
+- `INFO`: stylistic suggestion with no correctness impact.
+
+Custom rules implement the `LintRule` interface (`ID`, `Description`, `Check(*SchemaIR) []LintDiagnostic`) and may be mixed with `DefaultLintRules()`. Formatters: `LintFormatText` (human-readable with severity counts), `LintFormatJSON` (stable JSON array), `LintFormatGitHub` (workflow commands: `ERROR` → `::error`, `WARNING` → `::warning`, `INFO` → `::notice`).
+
+```go
+type LintDiagnostic struct {
+    RuleID   string       `json:"rule_id"`
+    Severity LintSeverity `json:"severity"`
+    Table    string       `json:"table"`
+    Column   string       `json:"column,omitempty"`
+    Message  string       `json:"message"`
+    Line     int          `json:"line,omitempty"`
+}
+
+type LintRule interface {
+    ID() string
+    Description() string
+    Check(s *SchemaIR) []LintDiagnostic
+}
+
+func LintSchema(s *SchemaIR, rules ...LintRule) []LintDiagnostic
+func DefaultLintRules() []LintRule
+func LintHasErrors(diags []LintDiagnostic) bool
+func LintFormatText(w io.Writer, diags []LintDiagnostic) error
+func LintFormatJSON(w io.Writer, diags []LintDiagnostic) error
+func LintFormatGitHub(w io.Writer, diags []LintDiagnostic) error
+```
