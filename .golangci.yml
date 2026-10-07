@@ -40,6 +40,7 @@ linters:
             - '**/internal/plan/**'
             - '**/internal/diff/**'
             - '**/internal/export/**'
+            - '**/internal/lint/**'
           deny:
             - pkg: database/sql
               desc: pure layers must not import database/sql

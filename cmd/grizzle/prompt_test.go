@@ -255,7 +255,7 @@ func TestRunApply_InteractiveTerminalSimulated(t *testing.T) {
 	}
 
 	// Apply v1 non-interactively
-	if code := runApply(context.Background(), dsn, "", schemaV1, "", false, nil); code != 0 {
+	if code := runApply(context.Background(), dsn, "", schemaV1, "", false, nil, false); code != 0 {
 		t.Fatalf("expected initial apply exit 0, got %d", code)
 	}
 
@@ -270,7 +270,7 @@ func TestRunApply_InteractiveTerminalSimulated(t *testing.T) {
 	defer func() { isTerminalFunc = origIsTerminal }()
 	isTerminalFunc = func(fd uintptr) bool { return false }
 
-	codeBlocked := runApply(context.Background(), dsn, "", schemaV2, "", true, nil)
+	codeBlocked := runApply(context.Background(), dsn, "", schemaV2, "", true, nil, false)
 	if codeBlocked != 2 {
 		t.Fatalf("expected exit code 2 in headless mode without accepted hazard, got %d", codeBlocked)
 	}
@@ -285,7 +285,7 @@ func TestRunApply_InteractiveTerminalSimulated(t *testing.T) {
 	_, _ = wNo.WriteString("n\n")
 	_ = wNo.Close()
 
-	codeAborted := runApply(context.Background(), dsn, "", schemaV2, "", true, nil)
+	codeAborted := runApply(context.Background(), dsn, "", schemaV2, "", true, nil, false)
 	_ = rNo.Close()
 	os.Stdin = origStdin
 
@@ -299,7 +299,7 @@ func TestRunApply_InteractiveTerminalSimulated(t *testing.T) {
 	_, _ = wYes.WriteString("y\n")
 	_ = wYes.Close()
 
-	codeSuccess := runApply(context.Background(), dsn, "", schemaV2, "", true, nil)
+	codeSuccess := runApply(context.Background(), dsn, "", schemaV2, "", true, nil, false)
 	_ = rYes.Close()
 	os.Stdin = origStdin
 
@@ -312,7 +312,7 @@ func TestRunApply_InteractiveTerminalSimulated(t *testing.T) {
 	os.Stdin = rSync
 	_ = wSync.Close()
 
-	codeInSync := runApply(context.Background(), dsn, "", schemaV2, "", true, nil)
+	codeInSync := runApply(context.Background(), dsn, "", schemaV2, "", true, nil, false)
 	_ = rSync.Close()
 	os.Stdin = origStdin
 
@@ -358,4 +358,3 @@ func TestPromptInteractiveInit(t *testing.T) {
 		})
 	}
 }
-

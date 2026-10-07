@@ -221,8 +221,8 @@ type mockSpan struct {
 	err   error
 }
 
-func (s *mockSpan) End()                         { s.ended = true }
-func (s *mockSpan) RecordError(err error)        { s.err = err }
+func (s *mockSpan) End()                  { s.ended = true }
+func (s *mockSpan) RecordError(err error) { s.err = err }
 func (s *mockSpan) SetAttribute(key string, val any) {
 	if s.attrs == nil {
 		s.attrs = make(map[string]any)
@@ -264,5 +264,3 @@ func TestOptions_Tracer(t *testing.T) {
 		t.Fatalf("sync failed: %v", err)
 	}
 }
-
-

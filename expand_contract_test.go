@@ -565,5 +565,3 @@ func TestExpandContract_PostgresStagedPlansAndBackfill(t *testing.T) {
 		t.Fatalf("expected 2 members with email, got %d", count)
 	}
 }
-
-

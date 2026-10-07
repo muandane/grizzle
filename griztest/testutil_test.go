@@ -60,3 +60,38 @@ CREATE TABLE users (
 		t.Fatalf("inserting into updated schema: %v", err)
 	}
 }
+
+func TestGriztest_MustSyncWithSeed(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("opening sqlite: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	schemaSQL := `
+CREATE TABLE cities (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	name TEXT NOT NULL
+);`
+	seedSQL := `INSERT INTO cities (name) VALUES ('berlin'), ('tokyo');`
+
+	griztest.MustSyncWithSeed(t, db, schemaSQL, seedSQL, grizzle.WithDialect(grizzle.DialectSQLite))
+
+	var count int
+	if err := db.QueryRow("SELECT count(*) FROM cities;").Scan(&count); err != nil {
+		t.Fatalf("querying cities: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("rows after first seed = %d, want 2", count)
+	}
+
+	// Re-running the same seed is skipped (idempotent by content hash).
+	griztest.MustSyncWithSeed(t, db, schemaSQL, seedSQL, grizzle.WithDialect(grizzle.DialectSQLite))
+
+	if err := db.QueryRow("SELECT count(*) FROM cities;").Scan(&count); err != nil {
+		t.Fatalf("querying cities after reseed: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("rows after skipped reseed = %d, want 2", count)
+	}
+}

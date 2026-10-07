@@ -291,4 +291,3 @@ func TestHistory_PartialOnKilledNonTxStep(t *testing.T) {
 		t.Errorf("expected non-empty error in history record")
 	}
 }
-

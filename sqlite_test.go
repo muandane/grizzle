@@ -718,4 +718,3 @@ func TestSQLite_KeysetBatchCopy_LargeVolume_Checksum(t *testing.T) {
 		t.Errorf("sum(val) checksum mismatch after rebuild: got %d, want %d", postSumVal, preSumVal)
 	}
 }
-

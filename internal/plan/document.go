@@ -40,8 +40,8 @@ func (p *Plan) Document() Document {
 	optDigest := hex.EncodeToString(h.Sum(nil))
 
 	return Document{
-		Hash:           p.Hash(),
-		TargetSchema:   p.TargetSchema,
+		Hash:         p.Hash(),
+		TargetSchema: p.TargetSchema,
 		Scope: ScopeDocument{
 			Includes: includes,
 			Excludes: excludes,

@@ -73,12 +73,12 @@ func TestPlan_FormatInteractiveSummary_OperationsAndHazards(t *testing.T) {
 				SQL:    `ALTER TABLE "users" ADD COLUMN "email" text;`,
 			},
 			{
-				Type:        plan.ChangeAlterColumn,
-				Table:       "users",
-				Column:      "bio",
-				SQL:         `ALTER TABLE "users" ALTER COLUMN "bio" TYPE varchar(50);`,
+				Type:         plan.ChangeAlterColumn,
+				Table:        "users",
+				Column:       "bio",
+				SQL:          `ALTER TABLE "users" ALTER COLUMN "bio" TYPE varchar(50);`,
 				TypeNarrowed: true,
-				Destructive: true,
+				Destructive:  true,
 			},
 			{
 				Type:  plan.ChangeCreateIndex,

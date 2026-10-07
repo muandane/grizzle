@@ -105,8 +105,49 @@ type Options struct {
 	// Backfill hook function run outside the DDL lock window in batches during staged expand migration.
 	Backfill BackfillFunc
 
+	// BeforeSync runs once before any migration steps or locks are executed.
+	// If it returns an error, the migration aborts before any DDL runs and no
+	// history record is written.
+	BeforeSync SyncHook
+
+	// AfterSync runs once after all migration steps and history recording succeed.
+	// If it returns an error, the DDL has already committed; the error is
+	// wrapped with ErrAfterSyncFailed.
+	AfterSync SyncHook
+
+	// BeforeStep executes immediately prior to executing each plan step.
+	// If it returns an error, the pending step is not executed; in a
+	// transactional group the transaction is rolled back and history records
+	// the failure with error "before_step hook: ...".
+	BeforeStep StepHook
+
+	// AfterStep executes immediately following the successful execution of each
+	// plan step. If it returns an error in a transactional group, the
+	// transaction is rolled back (reverting the step); in a non-transactional
+	// group the step has already committed and history records "partial".
+	AfterStep StepHook
+
 	// DryRun returns the planned SQL statements without executing them on the live database.
 	DryRun bool
+
+	// DryRunLockTimeout bounds how long live dry-run verification waits on
+	// table locks before failing fast (defaults to 2s).
+	DryRunLockTimeout time.Duration
+
+	// ExecuteHooksInDryRun allows BeforeStep/AfterStep hooks to run during
+	// live dry-run verification. Defaults to false to avoid accidental
+	// external side effects (webhooks, message publishing, etc.).
+	ExecuteHooksInDryRun bool
+
+	// SeedSQL contains idempotent data-seed SQL executed after a successful
+	// sync (Sync DDL → AfterSync → Seed). The seed runs in a single
+	// transaction and is skipped when the same seed (by content hash) was
+	// already applied, unless SeedForce is set.
+	SeedSQL string
+
+	// SeedForce re-runs the seed even when the same seed hash was already
+	// applied.
+	SeedForce bool
 
 	// SQLiteRebuildThreshold defines the row count threshold above which SQLite table rebuilds
 	// chunk data copying by keyset to prevent journal memory exhaustion.
@@ -132,6 +173,21 @@ type Span = exec.Span
 
 // BackfillFunc defines the hook function signature for batch backfilling columns outside the DDL lock window.
 type BackfillFunc func(ctx context.Context, tx *sql.Tx, table, oldCol, newCol string) error
+
+// HookContext provides invocation context and database access for a step hook.
+// DBTX is bound to the executor of the pending step: a *sql.Tx for
+// transactional groups or a *sql.Conn for non-transactional steps.
+type HookContext = exec.HookContext
+
+// StepHook executes custom imperative code immediately before or after each
+// plan step. Hooks must be idempotent: if a later step fails and the migration
+// is retried or resumed after partial execution, hooks may be invoked again.
+type StepHook = exec.StepHook
+
+// SyncHook executes custom imperative code once before or after the entire
+// synchronization. It receives a dedicated connection (not a transaction)
+// because the execution may contain non-transactional statements.
+type SyncHook = exec.SyncHook
 
 // Option represents a functional option for configuring Options.
 type Option func(*Options)
@@ -203,7 +259,6 @@ func WithAcceptHazards(hazards ...plan.HazardCode) Option {
 		o.AcceptHazards = append(o.AcceptHazards, hazards...)
 	}
 }
-
 
 // WithNonConcurrentIndexes controls whether PostgreSQL index creation should run inside the transaction.
 func WithNonConcurrentIndexes(disabled bool) Option {
@@ -326,6 +381,75 @@ func WithExpandContract(expand bool) Option {
 func WithBackfill(fn BackfillFunc) Option {
 	return func(o *Options) {
 		o.Backfill = fn
+	}
+}
+
+// WithBeforeSync registers a hook that runs once before any migration steps or
+// locks are executed.
+func WithBeforeSync(fn SyncHook) Option {
+	return func(o *Options) {
+		o.BeforeSync = fn
+	}
+}
+
+// WithAfterSync registers a hook that runs once after all migration steps and
+// history recording succeed.
+func WithAfterSync(fn SyncHook) Option {
+	return func(o *Options) {
+		o.AfterSync = fn
+	}
+}
+
+// WithBeforeStep registers a hook that runs immediately prior to each plan step.
+func WithBeforeStep(fn StepHook) Option {
+	return func(o *Options) {
+		o.BeforeStep = fn
+	}
+}
+
+// WithAfterStep registers a hook that runs immediately after each successful
+// plan step.
+func WithAfterStep(fn StepHook) Option {
+	return func(o *Options) {
+		o.AfterStep = fn
+	}
+}
+
+// WithDryRun enables dry-run mode: the planned SQL is validated against the
+// live database without executing it.
+func WithDryRun() Option {
+	return func(o *Options) {
+		o.DryRun = true
+	}
+}
+
+// WithDryRunLockTimeout sets the lock wait bound for live dry-run verification.
+func WithDryRunLockTimeout(d time.Duration) Option {
+	return func(o *Options) {
+		o.DryRunLockTimeout = d
+	}
+}
+
+// WithExecuteHooksInDryRun allows BeforeStep/AfterStep hooks to run during
+// live dry-run verification.
+func WithExecuteHooksInDryRun() Option {
+	return func(o *Options) {
+		o.ExecuteHooksInDryRun = true
+	}
+}
+
+// WithSeedSQL attaches idempotent seed SQL executed after a successful sync.
+func WithSeedSQL(seedSQL string) Option {
+	return func(o *Options) {
+		o.SeedSQL = seedSQL
+	}
+}
+
+// WithSeedForce re-runs the seed even when the same seed hash was already
+// applied.
+func WithSeedForce(force bool) Option {
+	return func(o *Options) {
+		o.SeedForce = force
 	}
 }
 

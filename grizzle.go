@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"slices"
 	"strings"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/muandane/grizzle/internal/dialect/postgres"
 	"github.com/muandane/grizzle/internal/exec"
 	"github.com/muandane/grizzle/internal/export"
+	"github.com/muandane/grizzle/internal/lint"
 	"github.com/muandane/grizzle/internal/plan"
 	"github.com/muandane/grizzle/internal/schema"
 )
@@ -107,16 +109,16 @@ const (
 
 // HazardCode constants
 const (
-	HazardDropTable           = plan.HazardDropTable
-	HazardDropColumn          = plan.HazardDropColumn
-	HazardTypeNarrow          = plan.HazardTypeNarrow
-	HazardNotNullNoDefault    = plan.HazardNotNullNoDefault
-	HazardIndexBuild          = plan.HazardIndexBuild
-	HazardDropIndex           = plan.HazardDropIndex
-	HazardDropFK              = plan.HazardDropFK
-	HazardRenameAmbiguous     = plan.HazardRenameAmbiguous
-	HazardUnmanagedDependency = plan.HazardUnmanagedDependency
-	HazardGeneratedRewrite    = plan.HazardGeneratedRewrite
+	HazardDropTable              = plan.HazardDropTable
+	HazardDropColumn             = plan.HazardDropColumn
+	HazardTypeNarrow             = plan.HazardTypeNarrow
+	HazardNotNullNoDefault       = plan.HazardNotNullNoDefault
+	HazardIndexBuild             = plan.HazardIndexBuild
+	HazardDropIndex              = plan.HazardDropIndex
+	HazardDropFK                 = plan.HazardDropFK
+	HazardRenameAmbiguous        = plan.HazardRenameAmbiguous
+	HazardUnmanagedDependency    = plan.HazardUnmanagedDependency
+	HazardGeneratedRewrite       = plan.HazardGeneratedRewrite
 	HazardPartitionAttachScan    = plan.HazardPartitionAttachScan
 	HazardPartitionPendingDetach = plan.HazardPartitionPendingDetach
 )
@@ -257,8 +259,9 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error {
 	policy := resolveDropPolicy(opts)
 	filters := toScopeFilters(opts)
 
+	var syncErr error
 	if opts.Dialect == DialectSQLite {
-		return exec.SyncSQLite(ctx, db, exec.SQLiteExecConfig{
+		syncErr = exec.SyncSQLite(ctx, db, exec.SQLiteExecConfig{
 			SchemaSQL:        opts.SchemaSQL,
 			Filters:          filters,
 			Policy:           policy,
@@ -267,31 +270,100 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error {
 			Tracer:           opts.Tracer,
 			DryRun:           opts.DryRun,
 			Backfill:         toExecBackfill(opts.Backfill),
+			BeforeSync:       opts.BeforeSync,
+			AfterSync:        opts.AfterSync,
+			BeforeStep:       opts.BeforeStep,
+			AfterStep:        opts.AfterStep,
 			RebuildThreshold: opts.SQLiteRebuildThreshold,
 			RebuildBatchSize: opts.SQLiteRebuildBatchSize,
 		})
+	} else {
+		syncErr = exec.SyncPostgres(ctx, db, exec.PostgresExecConfig{
+			TargetSchema:         opts.TargetSchema,
+			TargetSchemas:        opts.TargetSchemas,
+			ShadowSchema:         opts.ShadowSchema,
+			SchemaSQL:            opts.SchemaSQL,
+			LockNamespace:        opts.LockNamespace,
+			LockID:               opts.LockID,
+			Filters:              filters,
+			Policy:               policy,
+			AcceptHazards:        opts.AcceptHazards,
+			NonConcurrentIndexes: opts.NonConcurrentIndexes,
+			LockTimeout:          opts.LockTimeout,
+			StatementTimeout:     opts.StatementTimeout,
+			MaxRetries:           opts.MaxRetries,
+			RandFloat:            opts.RandFloat,
+			Logger:               opts.Logger,
+			Tracer:               opts.Tracer,
+			DryRun:               opts.DryRun,
+			Backfill:             toExecBackfill(opts.Backfill),
+			BeforeSync:           opts.BeforeSync,
+			AfterSync:            opts.AfterSync,
+			BeforeStep:           opts.BeforeStep,
+			AfterStep:            opts.AfterStep,
+		})
+	}
+	if syncErr != nil {
+		return syncErr
 	}
 
-	return exec.SyncPostgres(ctx, db, exec.PostgresExecConfig{
-		TargetSchema:         opts.TargetSchema,
-		TargetSchemas:        opts.TargetSchemas,
-		ShadowSchema:         opts.ShadowSchema,
-		SchemaSQL:            opts.SchemaSQL,
-		LockNamespace:        opts.LockNamespace,
-		LockID:               opts.LockID,
-		Filters:              filters,
-		Policy:               policy,
-		AcceptHazards:        opts.AcceptHazards,
-		NonConcurrentIndexes: opts.NonConcurrentIndexes,
-		LockTimeout:          opts.LockTimeout,
-		StatementTimeout:     opts.StatementTimeout,
-		MaxRetries:           opts.MaxRetries,
-		RandFloat:            opts.RandFloat,
-		Logger:               opts.Logger,
-		Tracer:               opts.Tracer,
-		DryRun:               opts.DryRun,
-		Backfill:             toExecBackfill(opts.Backfill),
-	})
+	// Sync DDL → AfterSync (inside exec) → Seed. Skipped in dry-run mode.
+	if strings.TrimSpace(opts.SeedSQL) != "" && !opts.DryRun {
+		return seedWithOptions(ctx, db, &opts)
+	}
+	return nil
+}
+
+// Seed executes idempotent seed SQL against the database. The seed runs in a
+// single transaction: either the whole script commits with an 'applied'
+// grizzle_history record keyed by the seed's content hash, or nothing
+// persists. If the same seed hash was already applied and force is false,
+// the seed is skipped. Forced re-runs execute the script again, so seed
+// scripts should tolerate re-execution (IF NOT EXISTS, ON CONFLICT...).
+//
+// Dialect and target schema are taken from opts (auto-detected when unset).
+func Seed(ctx context.Context, db *sql.DB, seedSQL string, opts ...Option) error {
+	if strings.TrimSpace(seedSQL) == "" {
+		return fmt.Errorf("grizzle: seed SQL is empty")
+	}
+	o := Options{SeedSQL: seedSQL}
+	for _, opt := range opts {
+		opt(&o)
+	}
+	return seedWithOptions(ctx, db, &o)
+}
+
+// SeedHash returns the deterministic sha256 identity of a seed script.
+// Leading and trailing whitespace is ignored so reformatted-but-identical
+// seeds do not re-run.
+func SeedHash(seedSQL string) string {
+	return exec.SeedHash(seedSQL)
+}
+
+// seedWithOptions dispatches seed execution based on the resolved dialect.
+func seedWithOptions(ctx context.Context, db *sql.DB, opts *Options) error {
+	if opts.Dialect == DialectAuto {
+		d, err := detectDialect(ctx, db)
+		if err != nil {
+			return err
+		}
+		opts.Dialect = d
+	}
+	if opts.Dialect == DialectSQLite {
+		return exec.SeedSQLite(ctx, db, exec.SeedExecConfig{
+			Force:  opts.SeedForce,
+			Logger: opts.Logger,
+		}, opts.SeedSQL)
+	}
+	return exec.SeedPostgres(ctx, db, exec.SeedExecConfig{
+		TargetSchemas:    opts.TargetSchemas,
+		LockID:           opts.LockID,
+		LockNamespace:    opts.LockNamespace,
+		LockTimeout:      opts.LockTimeout,
+		StatementTimeout: opts.StatementTimeout,
+		Force:            opts.SeedForce,
+		Logger:           opts.Logger,
+	}, opts.SeedSQL)
 }
 
 // PlanDiff inspects the live database and computes the planned migration steps without applying them.
@@ -347,6 +419,18 @@ type ApplyOpts struct {
 	// Backfill hook function run outside the DDL lock window in batches during staged expand migration.
 	Backfill BackfillFunc
 
+	// BeforeSync runs once before any migration steps or locks are executed.
+	BeforeSync SyncHook
+
+	// AfterSync runs once after all migration steps and history recording succeed.
+	AfterSync SyncHook
+
+	// BeforeStep executes immediately prior to executing each plan step.
+	BeforeStep StepHook
+
+	// AfterStep executes immediately following the successful execution of each plan step.
+	AfterStep StepHook
+
 	// SQLiteRebuildThreshold defines the row count threshold above which SQLite table rebuilds
 	// chunk data copying by keyset. Defaults to 100000.
 	SQLiteRebuildThreshold int
@@ -377,19 +461,23 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 
 	if p.SchemaSQL != "" {
 		syncOpts := Options{
-			SchemaSQL:       p.SchemaSQL,
-			TargetSchema:    p.TargetSchema,
-			TargetSchemas:   p.TargetSchemas,
-			IncludeTables:   p.IncludeTables,
-			ExcludeTables:   p.ExcludeTables,
-			Renames:         p.Renames,
-			ExpandContract:  p.ExpandContract,
-			AllowDropTable:  &p.Policy.AllowTable,
-			AllowDropColumn: &p.Policy.AllowColumn,
-			AllowDropIndex:  &p.Policy.AllowIndex,
-			AllowDropFK:     &p.Policy.AllowFK,
+			SchemaSQL:              p.SchemaSQL,
+			TargetSchema:           p.TargetSchema,
+			TargetSchemas:          p.TargetSchemas,
+			IncludeTables:          p.IncludeTables,
+			ExcludeTables:          p.ExcludeTables,
+			Renames:                p.Renames,
+			ExpandContract:         p.ExpandContract,
+			AllowDropTable:         &p.Policy.AllowTable,
+			AllowDropColumn:        &p.Policy.AllowColumn,
+			AllowDropIndex:         &p.Policy.AllowIndex,
+			AllowDropFK:            &p.Policy.AllowFK,
 			AcceptHazards:          opts.AcceptHazards,
 			Backfill:               opts.Backfill,
+			BeforeSync:             opts.BeforeSync,
+			AfterSync:              opts.AfterSync,
+			BeforeStep:             opts.BeforeStep,
+			AfterStep:              opts.AfterStep,
 			SQLiteRebuildThreshold: opts.SQLiteRebuildThreshold,
 			SQLiteRebuildBatchSize: opts.SQLiteRebuildBatchSize,
 			LockNamespace:          opts.LockNamespace,
@@ -412,6 +500,10 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 				Tracer:           syncOpts.Tracer,
 				DryRun:           syncOpts.DryRun,
 				Backfill:         toExecBackfill(opts.Backfill),
+				BeforeSync:       opts.BeforeSync,
+				AfterSync:        opts.AfterSync,
+				BeforeStep:       opts.BeforeStep,
+				AfterStep:        opts.AfterStep,
 				RebuildThreshold: syncOpts.SQLiteRebuildThreshold,
 				RebuildBatchSize: syncOpts.SQLiteRebuildBatchSize,
 			})
@@ -454,6 +546,10 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 			ExpectedHash:     opts.ExpectedHash,
 			Tracer:           opts.Tracer,
 			Backfill:         toExecBackfill(opts.Backfill),
+			BeforeSync:       opts.BeforeSync,
+			AfterSync:        opts.AfterSync,
+			BeforeStep:       opts.BeforeStep,
+			AfterStep:        opts.AfterStep,
 			RebuildThreshold: opts.SQLiteRebuildThreshold,
 			RebuildBatchSize: opts.SQLiteRebuildBatchSize,
 		})
@@ -476,6 +572,10 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 			StatementTimeout: exec.DefaultStatementTimeout,
 			MaxRetries:       exec.DefaultMaxRetries,
 			Backfill:         toExecBackfill(opts.Backfill),
+			BeforeSync:       opts.BeforeSync,
+			AfterSync:        opts.AfterSync,
+			BeforeStep:       opts.BeforeStep,
+			AfterStep:        opts.AfterStep,
 		})
 	default:
 		return fmt.Errorf("grizzle: unsupported dialect %q", dialect)
@@ -532,4 +632,149 @@ func Export(p *Plan, format ExportFormat, version string, timestamp ...time.Time
 // ParsePlanJSON parses a serialized plan JSON string or bytes into a *Plan, returning the recorded plan hash.
 func ParsePlanJSON(data []byte) (*Plan, string, error) {
 	return plan.ParsePlanJSON(data)
+}
+
+// LintDiagnostic is a single static lint finding against a schema element.
+type LintDiagnostic = lint.Diagnostic
+
+// LintSeverity indicates how strongly a lint diagnostic should block a release.
+type LintSeverity = lint.Severity
+
+// LintRule is a pure check executed against the desired schema IR.
+type LintRule = lint.Rule
+
+const (
+	// LintSeverityError marks a structural anti-pattern that must be fixed.
+	LintSeverityError = lint.SeverityError
+	// LintSeverityWarning marks a recommendation that may be ignored deliberately.
+	LintSeverityWarning = lint.SeverityWarning
+)
+
+// CompileSchema compiles opts.SchemaSQL into the desired SchemaIR without
+// diffing or executing anything. For PostgreSQL the compilation happens in the
+// shadow schema inside an always-rolled-back transaction (requires a
+// connection to the target database); for SQLite it happens in an in-memory
+// database, making it fully offline.
+func CompileSchema(ctx context.Context, db *sql.DB, opts Options) (*SchemaIR, error) {
+	if strings.TrimSpace(opts.SchemaSQL) == "" {
+		return nil, ErrEmptySchema
+	}
+	if db == nil {
+		return nil, fmt.Errorf("grizzle: database connection is nil")
+	}
+	if opts.Dialect == DialectAuto {
+		d, err := detectDialect(ctx, db)
+		if err != nil {
+			return nil, err
+		}
+		opts.Dialect = d
+	}
+	switch opts.Dialect {
+	case DialectSQLite:
+		return exec.CompileSchemaSQLite(ctx, opts.SchemaSQL)
+	case DialectPostgres:
+		if len(opts.TargetSchemas) > 1 {
+			return nil, ErrUnsupportedMultiSchema
+		}
+		targetSchema := cmp.Or(opts.TargetSchema, "public")
+		shadowSchema := cmp.Or(opts.ShadowSchema, "_grizzle_shadow")
+		return exec.CompileSchemaPostgres(ctx, db, exec.PostgresExecConfig{
+			TargetSchema: targetSchema,
+			ShadowSchema: shadowSchema,
+			SchemaSQL:    opts.SchemaSQL,
+		})
+	default:
+		return nil, fmt.Errorf("grizzle: unsupported dialect %q", opts.Dialect)
+	}
+}
+
+// LintSchema runs rules (defaulting to DefaultLintRules) against the compiled
+// schema IR and returns deterministically sorted diagnostics.
+func LintSchema(s *SchemaIR, rules ...LintRule) []LintDiagnostic {
+	if len(rules) == 0 {
+		rules = DefaultLintRules()
+	}
+	return lint.Lint(s, rules...)
+}
+
+// DefaultLintRules returns the built-in lint rule set (L001..L004).
+func DefaultLintRules() []LintRule {
+	return lint.DefaultRules()
+}
+
+// LintHasErrors reports whether any diagnostic has severity ERROR.
+func LintHasErrors(diags []LintDiagnostic) bool {
+	return lint.HasErrors(diags)
+}
+
+// DryRunResult reports the outcome of a live dry-run verification.
+type DryRunResult = exec.DryRunResult
+
+// DryRunVerify executes a live dry-run rollback against the target database:
+// the planned DDL runs against real data inside transactions that are
+// unconditionally rolled back, so constraints, casts, and check expressions
+// are verified without persisting any change. Non-transactional steps
+// (CREATE INDEX CONCURRENTLY, ALTER TYPE ... ADD VALUE, DETACH PARTITION
+// CONCURRENTLY) are skipped and reported in DryRunResult.UnverifiedNonTx.
+// No records are written to grizzle_history, and hooks do not run unless
+// opts.ExecuteHooksInDryRun is set.
+func DryRunVerify(ctx context.Context, db *sql.DB, opts Options) (*DryRunResult, error) {
+	if err := prepareOptions(ctx, db, &opts); err != nil {
+		return nil, err
+	}
+
+	policy := resolveDropPolicy(opts)
+	filters := toScopeFilters(opts)
+
+	if opts.Dialect == DialectSQLite {
+		return exec.DryRunVerifySQLite(ctx, db, exec.SQLiteExecConfig{
+			SchemaSQL:            opts.SchemaSQL,
+			Filters:              filters,
+			Policy:               policy,
+			AcceptHazards:        opts.AcceptHazards,
+			Logger:               opts.Logger,
+			Tracer:               opts.Tracer,
+			BeforeStep:           opts.BeforeStep,
+			AfterStep:            opts.AfterStep,
+			ExecuteHooksInDryRun: opts.ExecuteHooksInDryRun,
+		})
+	}
+
+	return exec.DryRunVerifyPostgres(ctx, db, exec.PostgresExecConfig{
+		TargetSchema:         opts.TargetSchema,
+		TargetSchemas:        opts.TargetSchemas,
+		ShadowSchema:         opts.ShadowSchema,
+		SchemaSQL:            opts.SchemaSQL,
+		LockNamespace:        opts.LockNamespace,
+		LockID:               opts.LockID,
+		Filters:              filters,
+		Policy:               policy,
+		AcceptHazards:        opts.AcceptHazards,
+		NonConcurrentIndexes: opts.NonConcurrentIndexes,
+		LockTimeout:          opts.LockTimeout,
+		StatementTimeout:     opts.StatementTimeout,
+		MaxRetries:           opts.MaxRetries,
+		RandFloat:            opts.RandFloat,
+		Logger:               opts.Logger,
+		Tracer:               opts.Tracer,
+		BeforeStep:           opts.BeforeStep,
+		AfterStep:            opts.AfterStep,
+		DryRunLockTimeout:    opts.DryRunLockTimeout,
+		ExecuteHooksInDryRun: opts.ExecuteHooksInDryRun,
+	})
+}
+
+// LintFormatText renders diagnostics as human-readable text.
+func LintFormatText(w io.Writer, diags []LintDiagnostic) error {
+	return lint.FormatText(w, diags)
+}
+
+// LintFormatJSON renders diagnostics as a JSON array.
+func LintFormatJSON(w io.Writer, diags []LintDiagnostic) error {
+	return lint.FormatJSON(w, diags)
+}
+
+// LintFormatGitHub renders diagnostics as GitHub Actions annotations.
+func LintFormatGitHub(w io.Writer, diags []LintDiagnostic) error {
+	return lint.FormatGitHub(w, diags)
 }

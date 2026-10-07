@@ -30,4 +30,3 @@ func (s *SQLite) Introspect(ctx context.Context, dbtx dialect.DBTX, targetSchema
 func (s *SQLite) Render(step plan.Step) ([]dialect.Stmt, error) {
 	return Render(step)
 }
-

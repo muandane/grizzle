@@ -51,6 +51,13 @@ var (
 
 	// ErrPartitionKeyNotInUnique is returned when a primary key or unique constraint on a partitioned table does not include all partition key columns.
 	ErrPartitionKeyNotInUnique = plan.ErrPartitionKeyNotInUnique
+
+	// ErrAfterSyncFailed is returned when the AfterSync hook fails after the migration steps have already committed.
+	ErrAfterSyncFailed = plan.ErrAfterSyncFailed
+
+	// ErrSeedFailed is returned when seed SQL execution fails; the seed
+	// transaction is rolled back and the schema is left intact.
+	ErrSeedFailed = plan.ErrSeedFailed
 )
 
 // HazardError reports all critical hazards that were not explicitly accepted.
@@ -61,4 +68,3 @@ type DestructiveViolationError = plan.DestructiveViolationError
 
 // DriftError reports unapplied differences between the live schema and the desired schema.
 type DriftError = plan.DriftError
-

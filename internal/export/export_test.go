@@ -64,9 +64,9 @@ func TestExport_Goose_Reversible(t *testing.T) {
 		TargetSchema: "public",
 		Steps: []plan.Step{
 			{
-				Type:   plan.ChangeCreateTable,
-				Table:  "accounts",
-				SQL:    "CREATE TABLE accounts (id integer PRIMARY KEY);",
+				Type:  plan.ChangeCreateTable,
+				Table: "accounts",
+				SQL:   "CREATE TABLE accounts (id integer PRIMARY KEY);",
 			},
 			{
 				Type:   plan.ChangeAddColumn,

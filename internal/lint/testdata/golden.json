@@ -1,0 +1,43 @@
+[
+  {
+    "rule_id": "L001",
+    "severity": "ERROR",
+    "table": "audit_log",
+    "message": "table has no primary key"
+  },
+  {
+    "rule_id": "L002",
+    "severity": "WARNING",
+    "table": "Posts",
+    "column": "UserId",
+    "message": "foreign key columns are not covered by any index; parent-table changes will sequential-scan this table"
+  },
+  {
+    "rule_id": "L003",
+    "severity": "WARNING",
+    "table": "Posts",
+    "column": "Posts",
+    "message": "table name Posts is not lowercase snake_case"
+  },
+  {
+    "rule_id": "L003",
+    "severity": "WARNING",
+    "table": "Posts",
+    "column": "UserId",
+    "message": "column name UserId is not lowercase snake_case"
+  },
+  {
+    "rule_id": "L003",
+    "severity": "WARNING",
+    "table": "UserRole",
+    "column": "UserRole",
+    "message": "enum name UserRole is not lowercase snake_case"
+  },
+  {
+    "rule_id": "L004",
+    "severity": "WARNING",
+    "table": "Posts",
+    "column": "id",
+    "message": "column uses a legacy SERIAL/nextval default; prefer GENERATED ALWAYS AS IDENTITY"
+  }
+]

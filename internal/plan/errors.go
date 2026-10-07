@@ -54,6 +54,14 @@ var (
 
 	// ErrPartitionKeyNotInUnique is returned when a primary key or unique constraint on a partitioned table does not include all partition key columns.
 	ErrPartitionKeyNotInUnique = errors.New("grizzle: primary key or unique constraint on partitioned table must include all partition key columns")
+
+	// ErrAfterSyncFailed is returned when the AfterSync hook fails after the
+	// migration steps have already committed.
+	ErrAfterSyncFailed = errors.New("grizzle: after_sync hook failed (migration already committed)")
+
+	// ErrSeedFailed is returned when seed SQL execution fails; the seed
+	// transaction is rolled back and the schema is left intact.
+	ErrSeedFailed = errors.New("grizzle: seed execution failed")
 )
 
 // HazardError reports all critical hazards that were not explicitly accepted.
@@ -119,4 +127,3 @@ func (e *DriftError) Is(target error) bool {
 func (e *DriftError) Unwrap() error {
 	return ErrDrift
 }
-

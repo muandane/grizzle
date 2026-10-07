@@ -39,13 +39,14 @@ func TestArchitecture_DependencyRules(t *testing.T) {
 		planPkg      = modulePrefix + "/internal/plan"
 		diffPkg      = modulePrefix + "/internal/diff"
 		exportPkg    = modulePrefix + "/internal/export"
+		lintPkg      = modulePrefix + "/internal/lint"
 		dialectPkg   = modulePrefix + "/internal/dialect"
 		execPkg      = modulePrefix + "/internal/exec"
 		rootPkg      = modulePrefix
 	)
 
-	// 1. Pure layer rules: schema, scope, plan, diff, export must NEVER import database/sql or context
-	purePackages := []string{schemaPkg, scopePkg, planPkg, diffPkg, exportPkg}
+	// 1. Pure layer rules: schema, scope, plan, diff, export, lint must NEVER import database/sql or context
+	purePackages := []string{schemaPkg, scopePkg, planPkg, diffPkg, exportPkg, lintPkg}
 	for _, pPath := range purePackages {
 		p, exists := pkgs[pPath]
 		if !exists {
@@ -70,6 +71,13 @@ func TestArchitecture_DependencyRules(t *testing.T) {
 	for _, imp := range pkgs[scopePkg].Imports {
 		if strings.HasPrefix(imp, modulePrefix+"/internal/") && imp != schemaPkg {
 			t.Errorf("internal/scope illegally imports: %s", imp)
+		}
+	}
+
+	// 3b. lint layer: can only import schema from internal
+	for _, imp := range pkgs[lintPkg].Imports {
+		if strings.HasPrefix(imp, modulePrefix+"/internal/") && imp != schemaPkg {
+			t.Errorf("internal/lint illegally imports: %s", imp)
 		}
 	}
 

@@ -59,6 +59,7 @@ func Diff(live, desired *schema.Schema, targetSchema, shadowSchema string, filte
 }
 
 // DiffWithMappings compares live and desired schemas using schemaMappings for normalization and returns pure changes.
+//
 //nolint:revive // DiffWithMappings is distinct from Diff for multi-schema mapping context
 func DiffWithMappings(live, desired *schema.Schema, targetSchema, shadowSchema string, filters scope.Filters, schemaMappings map[string]string) ([]Change, error) {
 	var changes []Change

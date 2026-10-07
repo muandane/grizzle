@@ -43,9 +43,9 @@ func TestGeneratedColumn_PureUnit_AddAndDrop(t *testing.T) {
 					"id":    {Name: "id", DataType: "integer", Position: 1},
 					"price": {Name: "price", DataType: "numeric", Position: 2},
 					"tax": {
-						Name:       "tax",
-						DataType:   "numeric",
-						Position:   3,
+						Name:     "tax",
+						DataType: "numeric",
+						Position: 3,
 						Generated: &schema.GeneratedColumn{
 							Expr:   "price * 0.2",
 							Stored: true,
@@ -192,7 +192,7 @@ func TestGeneratedColumn_PureUnit_NoopRoundTrip(t *testing.T) {
 			"orders": {
 				Name: "orders",
 				Columns: map[string]*schema.Column{
-					"id":    {Name: "id", DataType: "integer", Position: 1},
+					"id": {Name: "id", DataType: "integer", Position: 1},
 					"total": {
 						Name:     "total",
 						DataType: "integer",
@@ -217,7 +217,7 @@ func TestGeneratedColumn_PureUnit_NoopRoundTrip(t *testing.T) {
 			"orders": {
 				Name: "orders",
 				Columns: map[string]*schema.Column{
-					"id":    {Name: "id", DataType: "integer", Position: 1},
+					"id": {Name: "id", DataType: "integer", Position: 1},
 					"total": {
 						Name:     "total",
 						DataType: "integer",

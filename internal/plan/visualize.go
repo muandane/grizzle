@@ -403,4 +403,3 @@ func (p *Plan) FormatGitHubActions(w io.Writer, schemaFile string) error {
 	}
 	return nil
 }
-
