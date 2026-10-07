@@ -6,7 +6,7 @@ This document defines the technical specification, API contract, and safety mode
 
 * **Language**: Go 1.27+
 * **Engines supported**:
-  * PostgreSQL 13, 14, 15, 16, 17+
+  * PostgreSQL 13, 14, 15, 16, 17, 18
   * SQLite 3.35+ (via pure-Go `modernc.org/sqlite`, zero Cgo)
 * **Database drivers supported**:
   * PostgreSQL: `github.com/jackc/pgx/v5/stdlib`, `github.com/lib/pq`

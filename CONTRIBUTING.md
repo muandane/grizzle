@@ -1,115 +1,113 @@
 # Contributing to Grizzle
 
-Thank you for your interest in contributing to Grizzle! We welcome pull requests, bug reports, and feedback.
+Pull requests, bug reports, and feedback are welcome. Start with the short setup below, then the layering rules and PR checklist.
 
-## Architectural Principles & Layering Rule
+For a README-facing overview of the same workflow, see [Contributing](README.md#contributing).
 
-Grizzle follows a strict functional core / imperative shell architecture enforced by static analysis (`architecture_test.go` and `depguard`):
+---
+
+## Local setup (devenv)
+
+Grizzle uses [devenv](https://devenv.sh) (Nix) as the single source of truth for pinned Go, golangci-lint, PostgreSQL 16, git hooks, and quality-gate scripts. There is no Makefile; do not add one.
+
+### Prerequisites
+
+| Step | Action |
+| :--- | :--- |
+| 1 | Install [devenv](https://devenv.sh/getting-started/) (`2.x`) and [direnv](https://direnv.net/) |
+| 2 | From the repo root: `direnv allow` (or `devenv shell`) — provisions tools and installs git hooks |
+| 3 | `devenv up` — starts background PostgreSQL (required for integration tests) |
+
+Default connection strings (set by devenv):
+
+```text
+DATABASE_URL=postgres://127.0.0.1:5432/grizzle_test?sslmode=disable
+POSTGRES_DSN=postgres://127.0.0.1:5432/grizzle_test?sslmode=disable
+```
+
+### Commands
+
+Available in the devenv shell (same gates as GitHub Actions):
+
+```bash
+fmt                 # Format both Go modules
+vet                 # go vet on both modules
+lint                # golangci-lint on both modules
+test                # Unit tests with race detector (both modules)
+test-integration    # Integration tests (requires devenv up)
+ci                  # lint + vet + unit + integration
+golden-update       # Regenerate golden plan/export fixtures
+db-shell            # psql into the local test database
+db-reset            # Wipe and recreate the public schema
+clean               # Remove generated SQLite files and test artifacts
+```
+
+### Git hooks
+
+Entering the devenv shell installs hooks so checks run locally before they hit CI:
+
+| Hook | Gates |
+| :--- | :--- |
+| `pre-commit` | `gofmt`, `go vet`, `golangci-lint` (both modules) |
+| `pre-push` | `go test -race -count=1 ./...` (both modules — mirrors the CI `unit` job) |
+
+Integration tests are not hooked (they need `devenv up`). Run `ci` before a PR that touches `internal/exec`, `internal/history`, or the public API.
+
+---
+
+## Architectural layering
+
+Enforced by `architecture_test.go` and `depguard`:
 
 ```
 schema  <──  scope, diff, plan, export, lint  <──  dialect  <──  exec, history  <──  grizzle (root)
 ```
 
-1. **Pure Core (`internal/schema`, `internal/scope`, `internal/diff`, `internal/plan`, `internal/export`, `internal/lint`)**:
-   - Must be 100% deterministic and free of I/O.
-   - **Never** import `database/sql`, `context`, `net`, `os`, `slog`, or any execution packages.
-   - Sort all maps and slices before output to ensure deterministic hashes and stable golden files.
-2. **Dialect Layer (`internal/dialect/postgres`, `internal/dialect/sqlite`)**:
-   - The only packages that know SQL syntax, database catalogs, and DDL formatting.
-   - Implements catalog introspection and DDL rendering.
-3. **Execution Layer (`internal/exec`, `internal/history`)**:
-   - The only package that executes queries, manages transactions, acquires advisory locks, and handles retries.
-4. **Root Facade (`grizzle`)**:
-   - Public API facade (`Sync`, `PlanDiff`, `Apply`, `Check`, `Export`).
-   - Re-exports types via aliases (`type Plan = plan.Plan`). Minimal wiring logic only.
-5. **CLI Shell (`cmd/grizzle`)**:
-   - A thin CLI wrapper around the public Go library. No custom business logic in the CLI.
+1. **Pure core** (`internal/schema`, `scope`, `diff`, `plan`, `export`, `lint`)
+   - Deterministic; no I/O.
+   - Never import `database/sql`, `context`, `net`, `os`, `slog`, or execution packages.
+   - Sort maps and slices before output so hashes and golden files stay stable.
+2. **Dialect** (`internal/dialect/postgres`, `internal/dialect/sqlite`)
+   - Only packages that know SQL syntax, catalogs, and DDL formatting.
+3. **Execution** (`internal/exec`, `internal/history`)
+   - Only packages that run queries, manage transactions, acquire advisory locks, and retry.
+4. **Root facade** (`grizzle`)
+   - Public API (`Sync`, `PlanDiff`, `Apply`, `Check`, `Export`) and type aliases. Minimal wiring.
+5. **CLI** (`cmd/grizzle`)
+   - Thin wrapper around the public library. No business logic in the CLI.
 
 ---
 
-## Local Development Workflow (devenv)
+## Testing
 
-Grizzle uses [devenv](https://devenv.sh) (Nix-based) as the single source of truth for the local development environment: pinned Go, golangci-lint, PostgreSQL 16, git hooks, and quality-gate scripts. **There is no Makefile** — do not add one.
-
-### Prerequisites
-
-- [devenv](https://devenv.sh/getting-started/) (`devenv 2.x`) and [direnv](https://direnv.net/)
-- First run: `direnv allow` (or enter `devenv shell`) — this provisions Go/golangci-lint/PostgreSQL and installs the local git hooks
-- `devenv up` — start the background PostgreSQL service (needed for integration tests)
-
-### Commands
-
-All commands are available directly in the devenv shell (mirroring the GitHub Actions CI):
-
-```bash
-# Format both Go modules
-fmt
-
-# Static analysis (go vet) on both modules
-vet
-
-# golangci-lint on both modules
-lint
-
-# Pure unit tests with race detector (both modules)
-test
-
-# Integration tests against PostgreSQL (requires `devenv up`)
-DATABASE_URL="postgres://postgres:secret@localhost:5432/postgres?sslmode=disable" test-integration
-
-# Entire local CI suite (lint + vet + unit tests + integration tests)
-ci
-
-# Update golden plan and export fixtures after intentional changes
-golden-update
-
-# Utilities
-db-shell         # psql into the local test database
-db-reset         # wipe and recreate the public schema
-clean            # remove generated SQLite files and test artifacts
-```
-
-### Local Git Hooks (pre-push CI parity)
-
-Entering the devenv shell installs git hooks so contributions are validated **locally before they ever touch the remote** (keeping GitHub Actions usage low):
-
-| Hook stage | Gates |
-|------------|-------|
-| `pre-commit` | `gofmt` check, `go vet` (both modules), `golangci-lint` (both modules) |
-| `pre-push` | `go test -race -count=1 ./...` (both modules — mirrors the CI `unit` job) |
-
-Integration tests are intentionally **not** hooked (they require `devenv up`); run `ci` for full local parity before submitting a PR that touches `internal/exec`, `internal/history`, or the public API.
+- Write a failing unit or integration test first for bug fixes and new features.
+- All tests must pass with `-race` (`go test -race`).
+- Integration tests must be deterministic and clean up via unique schemas or rollbacks.
+- Integration tests use `//go:build integration` and fail loudly if the database is unreachable (never silent skip).
 
 ---
 
-## Testing Guidelines
+## Commits
 
-- **TDD First**: For bug fixes and new features, author a failing unit or integration test first, then implement the fix.
-- **Race Detection**: All tests must pass with `-race` enabled (`go test -race`).
-- **No Flakes**: Integration tests must be deterministic and cleanup schemas using unique test schemas or transaction rollbacks.
-- **Strict Integration Tag**: Integration tests are marked with `//go:build integration` and fail loudly (never silent skip) if the database is unreachable.
+Follow [Conventional Commits](https://www.conventionalcommits.org/):
 
----
+| Prefix | Use for |
+| :--- | :--- |
+| `feat:` | New capability |
+| `fix:` | Bug fix |
+| `refactor:` | Change with no feature or fix |
+| `test:` | Tests only |
+| `docs:` | Documentation |
+| `chore:` | Maintenance, deps, build |
 
-## Commit Guidelines
-
-All commits must follow the [Conventional Commits](https://www.conventionalcommits.org/) specification:
-
-- `feat:` New features or capabilities (e.g. `feat(schema): support generated columns`)
-- `fix:` Bug fixes (e.g. `fix(retry): halt retry after partial step progress`)
-- `refactor:` Code changes that neither fix a bug nor add a feature (e.g. `refactor(exec): isolate lock connection`)
-- `test:` Adding or improving tests (e.g. `test(dialect): add sqlite rebuild tests`)
-- `docs:` Documentation changes (e.g. `docs(safety): update competitor citations`)
-- `chore:` Maintenance tasks, dependencies, build files (e.g. `chore(ci): update github actions`)
+Examples: `feat(schema): support generated columns`, `fix(retry): halt retry after partial step progress`.
 
 ---
 
-## Pull Request Checklist
+## Pull request checklist
 
-Before submitting a pull request, please ensure:
-
-1. `lint` reports 0 issues (or accept the pre-commit hook gate).
-2. `ci` passes completely green with `-race`.
-3. Architecture import rules are strictly respected.
-4. No secrets or connection strings are logged or exposed.
-5. Any public API changes are documented in `docs/SPEC.md` and `CHANGELOG.md`.
+1. `lint` reports zero issues (or the pre-commit hook passes).
+2. `ci` is green with `-race`.
+3. Layering / import rules are respected.
+4. No secrets or connection strings are logged or committed.
+5. Public API changes are reflected in `docs/SPEC.md` and `CHANGELOG.md`.
