@@ -115,7 +115,7 @@ This document outlines the step-by-step execution plan to build, test, and ship 
 Ordered by expected impact; nothing here blocks the first release.
 
 - [x] **Declarative management surface expansion** — shipped (see "Managed surface expansion" below): extensions, RLS + policies, functions, triggers, and views/matviews are now first-class managed constructs.
-- [ ] **SQLite declarative CHECK constraints** — SQLite CHECK DDL is neither introspected nor preserved through rebuilds (documented gap in SPEC §3).
+- [x] **SQLite declarative CHECK constraints** — named and inline CHECK constraints are parsed from `sqlite_schema.sql`, emitted on create/rebuild, and diffed (check drift triggers a rebuild; removals gated by `AllowDropCheck` + `DROP_CHECK`).
 - [ ] **Domain CHECK management** — domain constraints (`pg_constraint.conrelid = 0`) are inventory-only.
 - [ ] **CLI backfill runner** — batched backfill is library-only (`Options.Backfill`); a CLI runner would need a durable batching contract.
 - [ ] **Multi-schema SQLite** — rejected today (`ErrUnsupportedMultiSchema`).

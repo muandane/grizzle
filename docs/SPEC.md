@@ -316,7 +316,7 @@ type Hazard struct {
 | `CREATE INDEX` | Yes | Direct `CREATE INDEX` and `CREATE UNIQUE INDEX` |
 | `DROP INDEX` | Yes | Guarded by `AllowDropIndex` |
 | `FOREIGN KEY` | Yes | Validated with `PRAGMA foreign_key_check` |
-| `CHECK Constraint` | No | SQLite CHECK constraints are not introspected or diffed; a table rebuild rewrites the table from the managed IR and does not preserve inline CHECK DDL — declare CHECK-managed tables as Postgres-only or avoid rebuild-triggering changes |
+| `CHECK Constraint` | Yes | Named and inline CHECK constraints are parsed from `sqlite_schema.sql`, emitted as table-level `CONSTRAINT` lines on create/rebuild, and diffed: check drift triggers a 12-step table rebuild; removals are destructive and gated by `AllowDropCheck` + `DROP_CHECK` (no `NOT VALID`/`VALIDATE` path on SQLite) |
 | `Generated Columns` | Yes | `STORED` and `VIRTUAL` supported; rebuild preserves generated definitions |
 
 ### Unmanaged database objects (Detected, Protected, Not Managed)
