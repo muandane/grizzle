@@ -59,6 +59,7 @@ type Options struct {
 	AllowDropPolicy    *bool
 	AllowDropTrigger   *bool
 	AllowDropView      *bool
+	AllowDropDomain    *bool
 
 	// ExcludeTables defines table names or glob patterns (e.g. "spatial_ref_sys", "asynq_*")
 	// that Grizzle will never manage, alter, or drop.
@@ -465,6 +466,11 @@ func resolveDropPolicy(opts Options) plan.DropPolicy {
 		allowView = *opts.AllowDropView
 	}
 
+	allowDomain := opts.AllowDrop
+	if opts.AllowDropDomain != nil {
+		allowDomain = *opts.AllowDropDomain
+	}
+
 	return plan.DropPolicy{
 		AllowTable:     allowTable,
 		AllowColumn:    allowColumn,
@@ -476,6 +482,7 @@ func resolveDropPolicy(opts Options) plan.DropPolicy {
 		AllowPolicy:    allowPolicy,
 		AllowTrigger:   allowTrigger,
 		AllowView:      allowView,
+		AllowDomain:    allowDomain,
 	}
 }
 

@@ -75,6 +75,7 @@ type Options struct {
     AllowDropPolicy    *bool
     AllowDropTrigger   *bool
     AllowDropView      *bool
+    AllowDropDomain    *bool
 
     // ExcludeTables defines table names or glob patterns (e.g. "spatial_ref_sys", "asynq_*")
     // that Grizzle will never alter, diff, or drop.
@@ -227,7 +228,7 @@ func (p *Plan) String() string
 type HazardLevel string
 
 const (
-    HazardLevelCritical HazardLevel = "CRITICAL" // Data destruction (DROP TABLE/COLUMN, DROP_EXTENSION, DROP_POLICY, DROP_FUNCTION, DROP_TRIGGER, DROP_VIEW, TYPE_NARROW, RENAME_AMBIGUOUS, UNMANAGED_DEPENDENCY, GENERATED_REWRITE)
+    HazardLevelCritical HazardLevel = "CRITICAL" // Data destruction (DROP TABLE/COLUMN, DROP_EXTENSION, DROP_POLICY, DROP_FUNCTION, DROP_TRIGGER, DROP_VIEW, DROP_DOMAIN, TYPE_NARROW, RENAME_AMBIGUOUS, UNMANAGED_DEPENDENCY, GENERATED_REWRITE)
     HazardLevelWarning  HazardLevel = "WARNING"  // Execution or lockout risk (EXTENSION_PRIVILEGE, RLS_ENABLE, SECURITY_DEFINER, PARTITION_ATTACH_SCAN, PARTITION_PENDING_DETACH)
     HazardLevelNotice   HazardLevel = "NOTICE"   // Locking or performance impact (INDEX creation/drop, FK drop)
 )
@@ -260,6 +261,7 @@ const (
     HazardSecurityDefiner        HazardCode = "SECURITY_DEFINER"
     HazardDropTrigger            HazardCode = "DROP_TRIGGER"
     HazardDropView               HazardCode = "DROP_VIEW"
+    HazardDropDomain             HazardCode = "DROP_DOMAIN"
 )
 
 type Hazard struct {
@@ -300,6 +302,7 @@ type Hazard struct {
 | `Functions` | Yes | Managed routines diffed on canonical `pg_get_functiondef` output; body drift → `CREATE OR REPLACE FUNCTION`, signature drift → DROP+CREATE; drops gated by `AllowDropFunction` + `DROP_FUNCTION` (CRITICAL); `SECURITY_DEFINER` (WARNING) without explicit `search_path` |
 | `Procedures` | Yes | Managed like functions (`pg_get_functiondef` is canonical for both); body drift → `CREATE OR REPLACE PROCEDURE`; signature drift → DROP+CREATE; drops share the `AllowDropFunction` gate |
 | `Aggregates` | Yes | Reconstructed canonical `CREATE AGGREGATE` from `pg_aggregate` (`SFUNC`/`STYPE`/`FINALFUNC`/`INITCOND`/`PARALLEL`); any drift is DROP+CREATE (no `CREATE OR REPLACE`); ordered-set/hypothetical aggregates (non-default `aggkind`) remain protected |
+| `Domains` | Yes | Managed types diffed from `pg_type` (`typtype='d'`) + `pg_constraint` (`conrelid = 0`); base type/nullability/default drift is DROP+CREATE (no in-place retype); CHECK drift → `ALTER DOMAIN ADD/DROP CONSTRAINT`; drops gated by `AllowDropDomain` + `DROP_DOMAIN` (CRITICAL); no implicit `CASCADE` — dependent columns fail at apply |
 | `Triggers` | Yes | `pg_trigger` + canonical `pg_get_triggerdef`; drift → DROP+CREATE; drops gated by `AllowDropTrigger` + `DROP_TRIGGER` (CRITICAL); surviving managed triggers block dependent column drops via `UNMANAGED_DEPENDENCY` |
 | `Views` & `Materialized Views` | Yes | Canonical `pg_get_viewdef`; append-only column changes replace in place (`CREATE OR REPLACE VIEW`), otherwise DROP+CREATE; matviews always DROP+CREATE plus `REFRESH MATERIALIZED VIEW`; drops gated by `AllowDropView` + `DROP_VIEW` (CRITICAL) |
 
@@ -324,7 +327,6 @@ type Hazard struct {
 | Construct | Supported | Policy |
 | :--- | :---: | :--- |
 | `Sequences` (unowned) | Protected | Never dropped or managed |
-| `Domains` | Protected | Introspected and protected |
 | `Window functions` (prokind `w`) | Protected | Never managed; dependency-graphed so drops referencing them stay blocked |
 | Ordered-set / hypothetical aggregates (non-default `aggkind`) | Protected | Outside the reconstructed `CREATE AGGREGATE` surface; never managed |
 

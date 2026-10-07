@@ -161,7 +161,6 @@ Production databases frequently contain database objects that Grizzle does not m
 * Table triggers and event triggers (`CREATE TRIGGER`)
 * Functions and stored procedures (`CREATE FUNCTION`, `CREATE PROCEDURE`)
 * Standalone sequences not owned by managed tables
-* Custom user domains (`CREATE DOMAIN`)
 
 **Grizzle's invariant for unmanaged objects is: Detected, Protected, Not Managed.**
 

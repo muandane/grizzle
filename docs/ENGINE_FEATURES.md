@@ -168,9 +168,9 @@ WHERE n.nspname = $1
 
 Scope rules:
 * Only `conislocal` constraints are managed. Check constraints inherited from a partitioned parent (`conislocal = false` on child partitions) are managed through the parent table.
-* Domain check constraints (`conrelid = 0`) are out of scope.
+* Domain check constraints (`conrelid = 0`) are managed as part of the domain surface: they are introspected with the owning domain and diffed via `ALTER DOMAIN ... ADD/DROP CONSTRAINT` (drops gated by `Options.AllowDomain` + `DROP_DOMAIN`).
 * Constraints PostgreSQL auto-names (inline `CHECK` syntax, e.g. `products_price_cents_check`) are adopted for validation and redefinition, but are never auto-dropped when removed from the desired schema: they are indistinguishable in the catalog from system-generated conversion artifacts, such as the partition-bound check left behind by `DETACH PARTITION ... CONCURRENTLY`. Explicitly named constraints (`CONSTRAINT name CHECK`) are fully managed, including drops guarded by `Options.AllowDropCheck`.
-* SQLite does not support declarative check-constraint management; SQLite `CHECK` DDL is neither introspected nor diffed.
+* SQLite check constraints are parsed from `sqlite_schema.sql` (named and inline), emitted on create and 12-step rebuild, and diffed; removals are destructive and gated by `Options.AllowDropCheck` + `DROP_CHECK`. SQLite has no `NOT VALID`/`VALIDATE` path, so check drift always rebuilds the table.
 
 ### Non-blocking execution
 

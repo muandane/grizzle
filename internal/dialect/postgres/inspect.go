@@ -1078,14 +1078,23 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 	}
 	_ = seqRows.Close()
 
-	// 6f. Domains
+	// 6f. Managed domains. Desired side comes from the shadow compile of
+	// SchemaSQL (CREATE DOMAIN compiles in the shadow schema); base type,
+	// nullability, default, and CHECK constraints are diffed declaratively.
 	domainQuery := `
 		SELECT
-			t.typname AS domain_name
+			t.typname AS domain_name,
+			format_type(t.typbasetype, t.typtypmod) AS base_type,
+			t.typnotnull AS not_null,
+			COALESCE(pg_get_expr(t.typdefaultbin, 0), '') AS default_expr
 		FROM pg_type t
 		JOIN pg_namespace n ON n.oid = t.typnamespace
 		WHERE n.nspname = $1
 		  AND t.typtype = 'd'
+		  AND NOT EXISTS (
+		      SELECT 1 FROM pg_depend d
+		      WHERE d.objid = t.oid AND d.deptype = 'e'
+		  )
 		ORDER BY t.typname;
 	`
 	domainRows, err := dbtx.QueryContext(ctx, domainQuery, schemaName)
@@ -1094,18 +1103,67 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 	}
 	defer func() { _ = domainRows.Close() }()
 
+	var domainNames []string
 	for domainRows.Next() {
-		var domainName string
-		if err := domainRows.Scan(&domainName); err != nil {
+		var domainName, baseType, defaultExpr string
+		var notNull bool
+		if err := domainRows.Scan(&domainName, &baseType, &notNull, &defaultExpr); err != nil {
 			return nil, fmt.Errorf("scanning domain in schema %q: %w", schemaName, err)
 		}
-		s.Unmanaged["domain:"+domainName] = &schema.UnmanagedObject{
-			Name: domainName,
-			Kind: schema.UnmanagedDomain,
+		if s.Domains == nil {
+			s.Domains = make(map[string]*schema.Domain)
 		}
+		s.Domains[domainName] = &schema.Domain{
+			Name:       domainName,
+			BaseType:   baseType,
+			IsNullable: !notNull,
+			Default:    defaultExpr,
+		}
+		domainNames = append(domainNames, domainName)
 	}
 	if err := domainRows.Err(); err != nil {
 		return nil, err
+	}
+	_ = domainRows.Close()
+
+	// 6f.1 Domain CHECK constraints (conrelid = 0, contypid = domain type).
+	if len(domainNames) > 0 {
+		domainCheckQuery := `
+			SELECT
+				t.typname AS domain_name,
+				con.conname AS constraint_name,
+				pg_get_constraintdef(con.oid) AS constraint_def
+			FROM pg_constraint con
+			JOIN pg_type t ON t.oid = con.contypid
+			JOIN pg_namespace n ON n.oid = t.typnamespace
+			WHERE n.nspname = $1
+			  AND con.conrelid = 0
+			ORDER BY t.typname, con.conname;
+		`
+		dCheckRows, err := dbtx.QueryContext(ctx, domainCheckQuery, schemaName)
+		if err != nil {
+			return nil, fmt.Errorf("inspecting domain constraints in schema %q: %w", schemaName, err)
+		}
+		for dCheckRows.Next() {
+			var domainName, conName, conDef string
+			if err := dCheckRows.Scan(&domainName, &conName, &conDef); err != nil {
+				_ = dCheckRows.Close()
+				return nil, fmt.Errorf("scanning domain constraint in schema %q: %w", schemaName, err)
+			}
+			if d := s.Domains[domainName]; d != nil {
+				d.Checks = append(d.Checks, &schema.CheckConstraint{
+					Name:       conName,
+					TableName:  domainName,
+					Definition: conDef,
+					IsValid:    true,
+				})
+			}
+		}
+		if err := dCheckRows.Err(); err != nil {
+			_ = dCheckRows.Close()
+			return nil, err
+		}
+		_ = dCheckRows.Close()
 	}
 
 	return s, nil

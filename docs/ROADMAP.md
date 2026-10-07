@@ -116,7 +116,7 @@ Ordered by expected impact; nothing here blocks the first release.
 
 - [x] **Declarative management surface expansion** — shipped (see "Managed surface expansion" below): extensions, RLS + policies, functions, triggers, and views/matviews are now first-class managed constructs.
 - [x] **SQLite declarative CHECK constraints** — named and inline CHECK constraints are parsed from `sqlite_schema.sql`, emitted on create/rebuild, and diffed (check drift triggers a rebuild; removals gated by `AllowDropCheck` + `DROP_CHECK`).
-- [ ] **Domain CHECK management** — domain constraints (`pg_constraint.conrelid = 0`) are inventory-only.
+- [x] **Domain CHECK management** — domains are managed end-to-end: base type/nullability/default diffed from `pg_type` + `pg_constraint` (`conrelid = 0`), CHECK drift via `ALTER DOMAIN ADD/DROP CONSTRAINT`, drops gated by `AllowDropDomain` + `DROP_DOMAIN`.
 - [ ] **CLI backfill runner** — batched backfill is library-only (`Options.Backfill`); a CLI runner would need a durable batching contract.
 - [ ] **Multi-schema SQLite** — rejected today (`ErrUnsupportedMultiSchema`).
 - [ ] **v1.0.0 API freeze** — remove `Experimental:` markers once rename mapping, staged plans, and backfill batching stabilize.
@@ -131,10 +131,11 @@ Declarative lifecycle for objects previously detected-and-protected. Each constr
 - **Functions** — canonical `pg_get_functiondef` comparison with search-path-independent inspection; body drift replaces in place, signature drift is DROP+CREATE. `DROP_FUNCTION` critical + `AllowDropFunction`; `SECURITY_DEFINER` warning.
 - **Procedures** — managed like functions (`pg_get_functiondef` covers both); body drift → `CREATE OR REPLACE PROCEDURE`, signature drift DROP+CREATE, drops share the `AllowDropFunction` gate. Window functions (prokind `w`) remain protected.
 - **Aggregates** — canonical definition reconstructed from `pg_aggregate` catalog fields (`pg_get_functiondef` does not support aggregates); any drift is DROP+CREATE (Postgres has no `CREATE OR REPLACE AGGREGATE`); created after and dropped before their support functions via dedicated `CREATE_AGGREGATE`/`DROP_AGGREGATE` plan steps sharing the function gate. Ordered-set/hypothetical aggregates remain protected.
+- **Domains** — managed types diffed from `pg_type` + `pg_constraint` (`conrelid = 0`); base type/nullability/default drift is DROP+CREATE (retype drop sorts before the replacement create via `DROP_DOMAIN_RETYPE`), CHECK drift is `ALTER DOMAIN ADD/DROP CONSTRAINT`; drops gated by `AllowDropDomain` + `DROP_DOMAIN` (CRITICAL), no implicit `CASCADE`. Extension-owned domains (`pg_depend.deptype = 'e'`) remain excluded.
 - **Triggers** — `pg_get_triggerdef` canonical; surviving managed triggers fold into `UNMANAGED_DEPENDENCY` so dependent column drops stay blocked until the hazard is accepted. `DROP_TRIGGER` critical + `AllowDropTrigger`.
 - **Views / materialized views** — `pg_get_viewdef` canonical; append-only column growth replaces in place, everything else is DROP+CREATE; matviews additionally emit `REFRESH MATERIALIZED VIEW`. `DROP_VIEW` critical + `AllowDropView`.
 - **Lint L009** — rejects DML in `SchemaSQL` (silently ignored today; seeds belong in `SeedSQL`).
-- **Export** — reversal (`Down`) SQL for policy/RLS/function/trigger/view/comment creation (comments restore the previous text; aggregates reverse to `DROP AGGREGATE`); extension creation deliberately irreversible.
+- **Export** — reversal (`Down`) SQL for policy/RLS/function/trigger/view/comment creation (comments restore the previous text; aggregates reverse to `DROP AGGREGATE`; domain creation and `ALTER DOMAIN ... ADD CONSTRAINT` reverse to `DROP DOMAIN` / `DROP CONSTRAINT`); extension creation deliberately irreversible.
 
 ### Deferred (rationale)
 

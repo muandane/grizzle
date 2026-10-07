@@ -48,13 +48,26 @@ const (
 	// hazards remain shared with functions (AllowFunction / DROP_FUNCTION).
 	ChangeCreateAggregate ChangeType = "CREATE_AGGREGATE"
 	ChangeDropAggregate   ChangeType = "DROP_AGGREGATE"
-	ChangeCreateTrigger   ChangeType = "CREATE_TRIGGER"
-	ChangeDropTrigger     ChangeType = "DROP_TRIGGER"
-	ChangeCreateView      ChangeType = "CREATE_VIEW"
-	ChangeDropView        ChangeType = "DROP_VIEW"
-	ChangeRefreshMatView  ChangeType = "REFRESH_MATVIEW"
-	ChangeCommentTable    ChangeType = "COMMENT_TABLE"
-	ChangeCommentColumn   ChangeType = "COMMENT_COLUMN"
+	// ChangeCreateDomain / ChangeAlterDomain / ChangeDropDomainConstraint /
+	// ChangeDropDomain manage PostgreSQL domains. ALTER_DOMAIN adds a domain
+	// constraint; dropping a constraint is its own type so plan sorting runs
+	// it before the replacement ADD (same-name constraint redefinition).
+	// ChangeDropDomainRetype is the drop half of a base-type/nullability/
+	// default rebuild: it must run before the replacement CREATE_DOMAIN
+	// (same name), so it sorts early — unlike a live-only DROP_DOMAIN, which
+	// must wait until dependent tables have been dropped.
+	ChangeCreateDomain         ChangeType = "CREATE_DOMAIN"
+	ChangeAlterDomain          ChangeType = "ALTER_DOMAIN"
+	ChangeDropDomainConstraint ChangeType = "DROP_DOMAIN_CONSTRAINT"
+	ChangeDropDomain           ChangeType = "DROP_DOMAIN"
+	ChangeDropDomainRetype     ChangeType = "DROP_DOMAIN_RETYPE"
+	ChangeCreateTrigger        ChangeType = "CREATE_TRIGGER"
+	ChangeDropTrigger          ChangeType = "DROP_TRIGGER"
+	ChangeCreateView           ChangeType = "CREATE_VIEW"
+	ChangeDropView             ChangeType = "DROP_VIEW"
+	ChangeRefreshMatView       ChangeType = "REFRESH_MATVIEW"
+	ChangeCommentTable         ChangeType = "COMMENT_TABLE"
+	ChangeCommentColumn        ChangeType = "COMMENT_COLUMN"
 )
 
 // Step represents a single atomic DDL migration statement.
@@ -111,6 +124,7 @@ type DropPolicy struct {
 	AllowPolicy    bool `json:"allow_policy"`
 	AllowTrigger   bool `json:"allow_trigger"`
 	AllowView      bool `json:"allow_view"`
+	AllowDomain    bool `json:"allow_domain"`
 }
 
 // IsAllowed checks if a given migration step is permitted by the policy.
@@ -143,6 +157,10 @@ func (p DropPolicy) IsAllowed(s Step) bool {
 		return p.AllowTrigger
 	case ChangeDropView:
 		return p.AllowView
+	case ChangeDropDomain, ChangeDropDomainConstraint, ChangeDropDomainRetype:
+		// Dropping a domain (or a domain constraint) removes validation and
+		// can strand columns typed by the domain; a single gate covers all.
+		return p.AllowDomain
 	default:
 		return false
 	}
@@ -272,7 +290,7 @@ func (p *Plan) Additions() int {
 		switch s.Type {
 		case ChangeCreateEnum, ChangeCreateTable, ChangeAddColumn, ChangeCreateIndex, ChangeAddFK, ChangeAddCheck,
 			ChangeCreateExtension, ChangeCreatePolicy, ChangeCreateFunction, ChangeCreateAggregate, ChangeCreateTrigger, ChangeCreateView,
-			ChangeEnableRLS, ChangeForceRLS:
+			ChangeEnableRLS, ChangeForceRLS, ChangeCreateDomain:
 			count++
 		}
 	}
@@ -285,7 +303,7 @@ func (p *Plan) Modifications() int {
 	for _, s := range p.Steps {
 		switch s.Type {
 		case ChangeAlterColumn, ChangeAlterEnum, ChangeRefreshMatView,
-			ChangeDisableRLS, ChangeNoForceRLS:
+			ChangeDisableRLS, ChangeNoForceRLS, ChangeAlterDomain:
 			count++
 		}
 	}
@@ -298,7 +316,8 @@ func (p *Plan) Deletions() int {
 	for _, s := range p.Steps {
 		switch s.Type {
 		case ChangeDropTable, ChangeDropColumn, ChangeDropIndex, ChangeDropFK, ChangeDropCheck,
-			ChangeDropExtension, ChangeDropPolicy, ChangeDropFunction, ChangeDropAggregate, ChangeDropTrigger, ChangeDropView:
+			ChangeDropExtension, ChangeDropPolicy, ChangeDropFunction, ChangeDropAggregate, ChangeDropTrigger, ChangeDropView,
+			ChangeDropDomain, ChangeDropDomainConstraint, ChangeDropDomainRetype:
 			count++
 		}
 	}
@@ -370,6 +389,8 @@ const (
 	HazardDropTrigger HazardCode = "DROP_TRIGGER"
 	// HazardDropView indicates dropping a view or materialized view.
 	HazardDropView HazardCode = "DROP_VIEW"
+	// HazardDropDomain indicates dropping a domain or a domain CHECK constraint.
+	HazardDropDomain HazardCode = "DROP_DOMAIN"
 	// HazardCommentClear indicates an existing COMMENT is being replaced or cleared.
 	HazardCommentClear HazardCode = "COMMENT_CLEAR"
 )
@@ -639,6 +660,24 @@ func stepHazards(s Step) []Hazard {
 			Type:        s.Type,
 			Table:       s.Table,
 			Description: fmt.Sprintf("View %q will be dropped", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeDropDomain, ChangeDropDomainRetype:
+		hazards = append(hazards, Hazard{
+			Code:        HazardDropDomain,
+			Level:       HazardLevelCritical,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Domain %q will be dropped; columns typed by it must be migrated first", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeDropDomainConstraint:
+		hazards = append(hazards, Hazard{
+			Code:        HazardDropDomain,
+			Level:       HazardLevelCritical,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("CHECK constraint on domain %q will be dropped; existing values will no longer be validated", s.Table),
 			SQL:         s.SQL,
 		})
 	case ChangeCommentTable, ChangeCommentColumn:

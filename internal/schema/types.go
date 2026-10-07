@@ -12,6 +12,7 @@ type Schema struct {
 	Enums      map[string]*Enum            `json:"enums"`
 	Extensions map[string]*Extension       `json:"extensions,omitempty"`
 	Routines   map[string]*Routine         `json:"routines,omitempty"`
+	Domains    map[string]*Domain          `json:"domains,omitempty"`
 	Views      map[string]*View            `json:"views,omitempty"`
 	Unmanaged  map[string]*UnmanagedObject `json:"unmanaged,omitempty"`
 
@@ -45,6 +46,15 @@ type Routine struct {
 // identity arguments that disambiguate overloads.
 func RoutineKey(name, identityArgs string) string {
 	return name + "(" + strings.TrimSpace(identityArgs) + ")"
+}
+
+// Domain represents a managed PostgreSQL domain (CREATE DOMAIN).
+type Domain struct {
+	Name       string             `json:"name"`
+	BaseType   string             `json:"base_type"`
+	IsNullable bool               `json:"is_nullable"`
+	Default    string             `json:"default,omitempty"`
+	Checks     []*CheckConstraint `json:"checks,omitempty"`
 }
 
 // View represents a managed SQL VIEW or MATERIALIZED VIEW.

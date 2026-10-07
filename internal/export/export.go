@@ -164,7 +164,7 @@ func isStepReversible(s plan.Step) bool {
 	case plan.ChangeCreateTable, plan.ChangeAddColumn, plan.ChangeCreateIndex, plan.ChangeAddFK, plan.ChangeAddCheck, plan.ChangeRenameColumn, plan.ChangeAttachPartition,
 		plan.ChangeCreatePolicy, plan.ChangeEnableRLS, plan.ChangeDisableRLS, plan.ChangeForceRLS, plan.ChangeNoForceRLS,
 		plan.ChangeCreateFunction, plan.ChangeCreateAggregate, plan.ChangeCreateTrigger, plan.ChangeCreateView, plan.ChangeRefreshMatView,
-		plan.ChangeCommentTable, plan.ChangeCommentColumn:
+		plan.ChangeCommentTable, plan.ChangeCommentColumn, plan.ChangeCreateDomain, plan.ChangeAlterDomain:
 		return true
 	default:
 		// ChangeCreateExtension is intentionally irreversible: uninstalling an
@@ -255,6 +255,20 @@ func reverseStepSQL(s plan.Step) string {
 		}
 		return fmt.Sprintf("-- Reversal not derivable for %s", s.Type)
 
+	case plan.ChangeCreateDomain:
+		if name, ok := domainName(s.SQL); ok {
+			return fmt.Sprintf("DROP DOMAIN IF EXISTS %s;", name)
+		}
+		return fmt.Sprintf("-- Reversal not derivable for %s", s.Type)
+
+	case plan.ChangeAlterDomain:
+		domName := domainRef(s.SQL)
+		conName := plan.ExtractConstraintName(s.SQL, "ADD")
+		if domName != "" && conName != "" {
+			return fmt.Sprintf("ALTER DOMAIN %s DROP CONSTRAINT IF EXISTS %s;", domName, conName)
+		}
+		return fmt.Sprintf("-- Reversal not derivable for %s", s.Type)
+
 	case plan.ChangeCreateTrigger:
 		trgName := ""
 		if m := triggerNameRegex.FindStringSubmatch(s.SQL); len(m) == 2 {
@@ -329,6 +343,34 @@ func functionSignature(sql string) (name, args string, ok bool) {
 		}
 	}
 	return "", "", false
+}
+
+// domainRef extracts the schema-qualified domain reference from a rendered
+// domain DDL statement (CREATE DOMAIN / ALTER DOMAIN), preserving the
+// "schema".name quoting of the source SQL.
+func domainRef(sql string) string {
+	const kw = "DOMAIN"
+	idx := strings.Index(strings.ToUpper(sql), kw)
+	if idx < 0 {
+		return ""
+	}
+	rest := strings.TrimSpace(sql[idx+len(kw):])
+	fields := strings.Fields(rest)
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
+}
+
+// domainName extracts the unqualified domain name from a rendered
+// CREATE DOMAIN statement, stripping optional schema qualification.
+func domainName(sql string) (name string, ok bool) {
+	ref := domainRef(sql)
+	if ref == "" {
+		return "", false
+	}
+	parts := strings.Split(ref, ".")
+	return strings.Trim(parts[len(parts)-1], `"`), true
 }
 
 // aggregateSignature extracts the name and identity argument list from a

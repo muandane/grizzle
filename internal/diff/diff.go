@@ -29,6 +29,8 @@ type Change struct {
 	Extension         *schema.Extension
 	Policy            *schema.Policy
 	Routine           *schema.Routine
+	Domain            *schema.Domain
+	OldDomain         *schema.Domain
 	Trigger           *schema.Trigger
 	View              *schema.View
 	Replace           bool
@@ -813,6 +815,11 @@ func DiffWithMappings(live, desired *schema.Schema, targetSchema, shadowSchema s
 	// AllowDropFunction.
 	changes = append(changes, diffRoutines(live, desired, targetSchema, normalize)...)
 
+	// 4b. Domain diff: create missing, DROP + CREATE on base type/nullability/
+	// default drift, ALTER DOMAIN ADD/DROP CONSTRAINT on CHECK drift, drop
+	// live-only behind AllowDomain.
+	changes = append(changes, diffDomains(live, desired, targetSchema, normalize)...)
+
 	// 5. Views diff: create missing, CREATE OR REPLACE on append-columns-only
 	// drift, DROP + CREATE otherwise, drop live-only behind AllowDropView.
 	changes = append(changes, diffViews(live, desired, targetSchema, normalize)...)
@@ -1075,6 +1082,146 @@ func routineDropType(kind string) plan.ChangeType {
 		return plan.ChangeDropAggregate
 	}
 	return plan.ChangeDropFunction
+}
+
+// diffDomains compares live and desired managed domains. Base type,
+// nullability, or default drift is DROP + CREATE (Postgres cannot alter a
+// domain's base type). CHECK drift becomes ALTER DOMAIN ADD/DROP CONSTRAINT.
+// Live-only domains are dropped behind AllowDomain.
+func diffDomains(live, desired *schema.Schema, targetSchema string, normalize func(string) string) []Change {
+	var changes []Change
+	for _, dDom := range sortedDomains(desired) {
+		dCopy := domainDef(dDom, normalize)
+		lDom, exists := live.Domains[dDom.Name]
+		if !exists {
+			changes = append(changes, Change{
+				Type:        plan.ChangeCreateDomain,
+				Schema:      targetSchema,
+				Table:       dDom.Name,
+				Domain:      dCopy,
+				Destructive: false,
+			})
+			continue
+		}
+
+		baseDrift := normalize(lDom.BaseType) != dCopy.BaseType ||
+			lDom.IsNullable != dCopy.IsNullable ||
+			normalize(lDom.Default) != dCopy.Default
+		if baseDrift {
+			// ALTER DOMAIN cannot change the base type; rebuild the domain.
+			// The retype drop is its own change type so sorting places it
+			// before the replacement CREATE_DOMAIN (same name), while a
+			// live-only DROP_DOMAIN waits for dependent table drops.
+			lCopy := domainDef(lDom, normalize)
+			changes = append(changes, Change{
+				Type:        plan.ChangeDropDomainRetype,
+				Schema:      targetSchema,
+				Table:       lDom.Name,
+				Domain:      lCopy,
+				Destructive: true,
+			})
+			changes = append(changes, Change{
+				Type:        plan.ChangeCreateDomain,
+				Schema:      targetSchema,
+				Table:       dDom.Name,
+				Domain:      dCopy,
+				Destructive: false,
+			})
+			continue
+		}
+
+		// CHECK drift: adds are non-destructive; removals and same-name
+		// redefinitions are gated (validation is lost mid-flight).
+		lChecks := make(map[string]*schema.CheckConstraint, len(lDom.Checks))
+		for _, c := range lDom.Checks {
+			lChecks[c.Name] = c
+		}
+		dChecks := make(map[string]*schema.CheckConstraint, len(dCopy.Checks))
+		for _, c := range dCopy.Checks {
+			dChecks[c.Name] = c
+		}
+		for _, c := range dCopy.Checks {
+			lc, exists := lChecks[c.Name]
+			if exists && normalize(lc.Definition) == normalize(c.Definition) {
+				continue
+			}
+			if exists {
+				lcCopy := *lc
+				changes = append(changes, Change{
+					Type:        plan.ChangeDropDomainConstraint,
+					Schema:      targetSchema,
+					Table:       dDom.Name,
+					Check:       &lcCopy,
+					Destructive: true,
+				})
+			}
+			cCopy := *c
+			changes = append(changes, Change{
+				Type:        plan.ChangeAlterDomain,
+				Schema:      targetSchema,
+				Table:       dDom.Name,
+				Check:       &cCopy,
+				Destructive: false,
+			})
+		}
+		for _, lc := range lDom.Checks {
+			if _, inDesired := dChecks[lc.Name]; !inDesired {
+				lcCopy := *lc
+				changes = append(changes, Change{
+					Type:        plan.ChangeDropDomainConstraint,
+					Schema:      targetSchema,
+					Table:       lDom.Name,
+					Check:       &lcCopy,
+					Destructive: true,
+				})
+			}
+		}
+	}
+	for _, lDom := range sortedDomains(live) {
+		if _, inDesired := desired.Domains[lDom.Name]; !inDesired {
+			lCopy := domainDef(lDom, normalize)
+			changes = append(changes, Change{
+				Type:        plan.ChangeDropDomain,
+				Schema:      targetSchema,
+				Table:       lDom.Name,
+				Domain:      lCopy,
+				Destructive: true,
+			})
+		}
+	}
+	return changes
+}
+
+// domainDef normalizes a domain's textual fields through the shadow→target
+// schema mapping.
+func domainDef(d *schema.Domain, normalize func(string) string) *schema.Domain {
+	copyD := *d
+	copyD.BaseType = normalize(d.BaseType)
+	copyD.Default = normalize(d.Default)
+	if len(d.Checks) > 0 {
+		checks := make([]*schema.CheckConstraint, 0, len(d.Checks))
+		for _, c := range d.Checks {
+			cCopy := *c
+			cCopy.Definition = normalize(c.Definition)
+			checks = append(checks, &cCopy)
+		}
+		copyD.Checks = checks
+	}
+	return &copyD
+}
+
+// sortedDomains returns a schema's domains in deterministic key order.
+func sortedDomains(s *schema.Schema) []*schema.Domain {
+	if s == nil || len(s.Domains) == 0 {
+		return nil
+	}
+	keys := slices.Collect(maps.Keys(s.Domains))
+	slices.Sort(keys)
+	out := make([]*schema.Domain, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, s.Domains[k])
+	}
+	return out
 }
 
 // sortedRoutines returns a schema's routines in deterministic key order.

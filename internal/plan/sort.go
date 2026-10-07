@@ -24,42 +24,47 @@ func tableKey(schemaName, tableName string) string {
 // violate the sort contract.
 func SortSteps(steps []Step) {
 	priority := map[ChangeType]int{
-		ChangeDropFK:             10, // 1. Drop old foreign keys first (unlocks referenced tables)
-		ChangeDropCheck:          15, // 1b. Drop obsolete check constraints before redefining them
-		ChangeDropIndex:          20, // 2. Drop obsolete indexes
-		ChangeDetachPartition:    25, // 2b. Detach partitions before modifying or dropping them
-		ChangeDropPolicy:         26, // 2c. Drop policies before recreating
-		ChangeDropTrigger:        27, // 2d. Drop triggers before column/table drops or function replaces
-		ChangeDropAggregate:      28, // 2e'. Drop aggregates before their support functions (pg_depend)
-		ChangeDropView:           28, // 2e. Drop views before underlying table drops
-		ChangeDropFunction:       29, // 2f. Drop functions after dependents
-		ChangeDropExtension:      29, // 2g. Drop extensions last among early drops
-		ChangeCreateExtension:    5,  // 0. Extensions before enums/tables (provides types)
-		ChangeCreateEnum:         30, // 3. Create new enum types before tables use them
-		ChangeAlterEnum:          35, // 4. Add new enum values before tables insert/alter
-		ChangeCreateTable:        40, // 5. Create bare tables (PKs included, FKs deferred; parent tables before partitions)
-		ChangeAttachPartition:    42, // 5a. Attach existing tables to partitioned tables
-		ChangeRenameColumn:       45, // 5b. Rename columns before adding or altering other columns
-		ChangeCreateFunction:     48, // 5c. Functions before triggers/views that call them
-		ChangeCreateAggregate:    49, // 5c'. Aggregates after their support functions (pg_depend)
-		ChangeAddColumn:          50, // 6. Add new columns
-		ChangeAlterColumn:        60, // 7. Modify column types, nullability, defaults
-		ChangeCreateIndex:        70, // 8. Build new indexes
-		ChangeAddFK:              80, // 9. Add foreign keys (NOT VALID) now that all tables and columns exist
-		ChangeAddCheck:           82, // 9b. Add check constraints (NOT VALID) after all tables and columns exist
-		ChangeValidateConstraint: 85, // 10. Validate foreign keys and check constraints
-		ChangeEnableRLS:          86, // 10a. Enable RLS before creating policies
-		ChangeForceRLS:           86,
-		ChangeDisableRLS:         86,
-		ChangeNoForceRLS:         86,
-		ChangeCreatePolicy:       87, // 10b. Policies after RLS enabled
-		ChangeCreateTrigger:      88, // 10c. Triggers after functions and columns
-		ChangeCommentTable:       89, // 10c'. Comments after all objects exist
-		ChangeCommentColumn:      89,
-		ChangeCreateView:         95,  // 10d. Views after tables/functions
-		ChangeRefreshMatView:     96,  // 10e. Refresh matviews after create
-		ChangeDropColumn:         90,  // 11. Drop columns (if allowed)
-		ChangeDropTable:          100, // 12. Drop tables (if allowed)
+		ChangeDropFK:               10, // 1. Drop old foreign keys first (unlocks referenced tables)
+		ChangeDropCheck:            15, // 1b. Drop obsolete check constraints before redefining them
+		ChangeDropIndex:            20, // 2. Drop obsolete indexes
+		ChangeDetachPartition:      25, // 2b. Detach partitions before modifying or dropping them
+		ChangeDropPolicy:           26, // 2c. Drop policies before recreating
+		ChangeDropTrigger:          27, // 2d. Drop triggers before column/table drops or function replaces
+		ChangeDropAggregate:        28, // 2e'. Drop aggregates before their support functions (pg_depend)
+		ChangeDropDomainRetype:     28, // 2e''. Drop rebuilt domains before the replacement CREATE_DOMAIN
+		ChangeDropView:             28, // 2e. Drop views before underlying table drops
+		ChangeDropFunction:         29, // 2f. Drop functions after dependents
+		ChangeDropExtension:        29, // 2g. Drop extensions last among early drops
+		ChangeCreateExtension:      5,  // 0. Extensions before enums/tables (provides types)
+		ChangeCreateEnum:           30, // 3. Create new enum types before tables use them
+		ChangeAlterEnum:            35, // 4. Add new enum values before tables insert/alter
+		ChangeCreateDomain:         36, // 4b. Create domains before tables/columns use them
+		ChangeCreateTable:          40, // 5. Create bare tables (PKs included, FKs deferred; parent tables before partitions)
+		ChangeAttachPartition:      42, // 5a. Attach existing tables to partitioned tables
+		ChangeRenameColumn:         45, // 5b. Rename columns before adding or altering other columns
+		ChangeCreateFunction:       48, // 5c. Functions before triggers/views that call them
+		ChangeCreateAggregate:      49, // 5c'. Aggregates after their support functions (pg_depend)
+		ChangeAddColumn:            50, // 6. Add new columns
+		ChangeAlterColumn:          60, // 7. Modify column types, nullability, defaults
+		ChangeCreateIndex:          70, // 8. Build new indexes
+		ChangeAddFK:                80, // 9. Add foreign keys (NOT VALID) now that all tables and columns exist
+		ChangeAddCheck:             82, // 9b. Add check constraints (NOT VALID) after all tables and columns exist
+		ChangeDropDomainConstraint: 84, // 9c. Drop domain constraints before replacements are added
+		ChangeValidateConstraint:   85, // 10. Validate foreign keys and check constraints
+		ChangeAlterDomain:          87, // 10b'. Alter domains (add constraints) after tables exist
+		ChangeEnableRLS:            86, // 10a. Enable RLS before creating policies
+		ChangeForceRLS:             86,
+		ChangeDisableRLS:           86,
+		ChangeNoForceRLS:           86,
+		ChangeCreatePolicy:         87, // 10b. Policies after RLS enabled
+		ChangeCreateTrigger:        88, // 10c. Triggers after functions and columns
+		ChangeCommentTable:         89, // 10c'. Comments after all objects exist
+		ChangeCommentColumn:        89,
+		ChangeCreateView:           95,  // 10d. Views after tables/functions
+		ChangeRefreshMatView:       96,  // 10e. Refresh matviews after create
+		ChangeDropColumn:           90,  // 11. Drop columns (if allowed)
+		ChangeDropTable:            100, // 12. Drop tables (if allowed)
+		ChangeDropDomain:           101, // 13. Drop domains after dependent tables/columns are gone
 	}
 
 	// Build relational dependency graph: referencingTable -> referencedTable

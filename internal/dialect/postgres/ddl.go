@@ -365,6 +365,49 @@ func GenerateDropFunctionSQL(targetSchema string, r *schema.Routine) string {
 	return fmt.Sprintf("DROP %s IF EXISTS %q.%q(%s);", kind, targetSchema, r.Name, r.IdentityArgs)
 }
 
+// GenerateCreateDomainSQL renders CREATE DOMAIN from inspected IR. BaseType
+// and Default are already normalized (shadow schema unmapped) by the diff
+// stage; constraint definitions are canonical pg_get_constraintdef output.
+func GenerateCreateDomainSQL(targetSchema string, d *schema.Domain) string {
+	if d == nil {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "CREATE DOMAIN %q.%q AS %s", targetSchema, d.Name, d.BaseType)
+	if d.Default != "" {
+		fmt.Fprintf(&b, " DEFAULT %s", d.Default)
+	}
+	if !d.IsNullable {
+		b.WriteString(" NOT NULL")
+	}
+	for _, c := range d.Checks {
+		fmt.Fprintf(&b, " CONSTRAINT %q %s", c.Name, c.Definition)
+	}
+	b.WriteString(";")
+	return b.String()
+}
+
+// GenerateAlterDomainSQL renders ALTER DOMAIN ... ADD CONSTRAINT. Dropping a
+// domain constraint has its own change type and generator.
+func GenerateAlterDomainSQL(targetSchema, domainName string, c *schema.CheckConstraint) string {
+	if c == nil {
+		return ""
+	}
+	return fmt.Sprintf("ALTER DOMAIN %q.%q ADD CONSTRAINT %q %s;", targetSchema, domainName, c.Name, c.Definition)
+}
+
+// GenerateDropDomainConstraintSQL renders ALTER DOMAIN ... DROP CONSTRAINT.
+func GenerateDropDomainConstraintSQL(targetSchema, domainName, constraintName string) string {
+	return fmt.Sprintf("ALTER DOMAIN %q.%q DROP CONSTRAINT %q;", targetSchema, domainName, constraintName)
+}
+
+// GenerateDropDomainSQL renders DROP DOMAIN without CASCADE: domains with
+// dependent columns fail at apply time, which surfaces the dependency instead
+// of silently destroying it.
+func GenerateDropDomainSQL(targetSchema, domainName string) string {
+	return fmt.Sprintf("DROP DOMAIN IF EXISTS %q.%q;", targetSchema, domainName)
+}
+
 // GenerateCreateTriggerSQL returns the canonical CREATE TRIGGER statement
 // produced by pg_get_triggerdef (schema-qualified table references already
 // unmapped by the diff stage).
@@ -537,6 +580,18 @@ func RenderChangeWithOpts(targetSchema string, c diff.Change, opts RenderOpts) p
 		step.SQL = GenerateCreateFunctionSQL(c.Routine)
 	case plan.ChangeDropFunction, plan.ChangeDropAggregate:
 		step.SQL = GenerateDropFunctionSQL(effectiveSchema, c.Routine)
+	case plan.ChangeCreateDomain:
+		step.SQL = GenerateCreateDomainSQL(effectiveSchema, c.Domain)
+	case plan.ChangeAlterDomain:
+		step.SQL = GenerateAlterDomainSQL(effectiveSchema, c.Table, c.Check)
+	case plan.ChangeDropDomainConstraint:
+		conName := ""
+		if c.Check != nil {
+			conName = c.Check.Name
+		}
+		step.SQL = GenerateDropDomainConstraintSQL(effectiveSchema, c.Table, conName)
+	case plan.ChangeDropDomain, plan.ChangeDropDomainRetype:
+		step.SQL = GenerateDropDomainSQL(effectiveSchema, c.Table)
 	case plan.ChangeCreateTrigger:
 		step.SQL = GenerateCreateTriggerSQL(c.Trigger)
 	case plan.ChangeDropTrigger:

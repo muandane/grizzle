@@ -155,6 +155,7 @@ const (
 	HazardSecurityDefiner        = plan.HazardSecurityDefiner
 	HazardDropTrigger            = plan.HazardDropTrigger
 	HazardDropView               = plan.HazardDropView
+	HazardDropDomain             = plan.HazardDropDomain
 )
 
 // UnmanagedObject represents an unmanaged database object detected during introspection.
