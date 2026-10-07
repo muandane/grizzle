@@ -11,6 +11,22 @@ import (
 	"github.com/muandane/grizzle/internal/schema"
 )
 
+// polCmdName converts pg_policy.polcmd to its SQL keyword.
+func polCmdName(cmd string) string {
+	switch cmd {
+	case "r":
+		return "SELECT"
+	case "a":
+		return "INSERT"
+	case "w":
+		return "UPDATE"
+	case "d":
+		return "DELETE"
+	default:
+		return "ALL"
+	}
+}
+
 // Inspect reads the relational state of the specified schema directly from pg_catalog.
 func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema.Schema, error) {
 	s := &schema.Schema{
@@ -311,6 +327,106 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 		return nil, err
 	}
 	_ = inhRows.Close()
+
+	// 2d. Inspect RLS flags
+	rlsQuery := `
+		SELECT
+			c.relname AS table_name,
+			c.relrowsecurity AS rls_enabled,
+			c.relforcerowsecurity AS rls_forced
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1
+		  AND c.relkind IN ('r', 'p')
+		ORDER BY c.relname;
+	`
+	rlsRows, err := dbtx.QueryContext(ctx, rlsQuery, schemaName)
+	if err != nil {
+		return nil, fmt.Errorf("inspecting RLS flags in schema %q: %w", schemaName, err)
+	}
+	defer func() { _ = rlsRows.Close() }()
+	for rlsRows.Next() {
+		var tblName string
+		var rlsEnabled, rlsForced bool
+		if err := rlsRows.Scan(&tblName, &rlsEnabled, &rlsForced); err != nil {
+			return nil, fmt.Errorf("scanning RLS flags in schema %q: %w", schemaName, err)
+		}
+		if tbl, exists := s.Tables[tblName]; exists {
+			tbl.RLSEnabled = rlsEnabled
+			tbl.RLSForced = rlsForced
+		}
+	}
+	if err := rlsRows.Err(); err != nil {
+		return nil, err
+	}
+	_ = rlsRows.Close()
+
+	// 2e. Inspect row-level security policies
+	policyQuery := `
+		SELECT
+			c.relname AS table_name,
+			p.polname AS policy_name,
+			p.polcmd AS cmd,
+			p.polpermissive AS permissive,
+			COALESCE(pg_get_expr(p.polqual, p.polrelid), '') AS using_expr,
+			COALESCE(pg_get_expr(p.polwithcheck, p.polrelid), '') AS with_check_expr,
+			COALESCE((
+				SELECT string_agg(CASE WHEN r = 0 THEN 'public' ELSE COALESCE(a.rolname, r::text) END, ',' ORDER BY r)
+				FROM unnest(p.polroles) AS r
+				LEFT JOIN pg_authid a ON a.oid = r
+			), '') AS roles
+		FROM pg_policy p
+		JOIN pg_class c ON c.oid = p.polrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1
+		ORDER BY c.relname, p.polname;
+	`
+	policyRows, err := dbtx.QueryContext(ctx, policyQuery, schemaName)
+	if err != nil {
+		return nil, fmt.Errorf("inspecting policies in schema %q: %w", schemaName, err)
+	}
+	defer func() { _ = policyRows.Close() }()
+	for policyRows.Next() {
+		var (
+			tblName    string
+			policyName string
+			cmd        string
+			permissive bool
+			usingExpr  string
+			withCheck  string
+			rolesCSV   string
+		)
+		if err := policyRows.Scan(&tblName, &policyName, &cmd, &permissive, &usingExpr, &withCheck, &rolesCSV); err != nil {
+			return nil, fmt.Errorf("scanning policy in schema %q: %w", schemaName, err)
+		}
+		tbl, exists := s.Tables[tblName]
+		if !exists {
+			continue
+		}
+		if tbl.Policies == nil {
+			tbl.Policies = make(map[string]*schema.Policy)
+		}
+		var roles []string
+		if rolesCSV != "" {
+			for _, r := range strings.Split(rolesCSV, ",") {
+				if r = strings.TrimSpace(r); r != "" {
+					roles = append(roles, r)
+				}
+			}
+		}
+		tbl.Policies[policyName] = &schema.Policy{
+			Name:       policyName,
+			Cmd:        polCmdName(cmd),
+			Roles:      roles,
+			Using:      usingExpr,
+			WithCheck:  withCheck,
+			Permissive: permissive,
+		}
+	}
+	if err := policyRows.Err(); err != nil {
+		return nil, err
+	}
+	_ = policyRows.Close()
 
 	// 3. Inspect Primary Keys
 	pkQuery := `

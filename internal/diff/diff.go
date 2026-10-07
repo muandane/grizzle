@@ -203,6 +203,20 @@ func DiffWithMappings(live, desired *schema.Schema, targetSchema, shadowSchema s
 					Destructive: false,
 				})
 			}
+
+			// New table: emit RLS flags and policy creation steps (policies
+			// cannot be declared inline in CREATE TABLE).
+			changes = append(changes, diffRLSFlags(targetSchema, tblName, nil, dTable)...)
+			for _, dPol := range sortedPolicies(dTable) {
+				polCopy := *dPol
+				changes = append(changes, Change{
+					Type:        plan.ChangeCreatePolicy,
+					Schema:      targetSchema,
+					Table:       tblName,
+					Policy:      &polCopy,
+					Destructive: false,
+				})
+			}
 			continue
 		}
 
@@ -601,6 +615,54 @@ func DiffWithMappings(live, desired *schema.Schema, targetSchema, shadowSchema s
 				})
 			}
 		}
+
+		// RLS flags diff
+		changes = append(changes, diffRLSFlags(targetSchema, tblName, lTable, dTable)...)
+
+		// Policies diff: add / replace (drop+create) / drop.
+		for _, dPol := range sortedPolicies(dTable) {
+			polCopy := *dPol
+			polCopy.Using = normalize(dPol.Using)
+			polCopy.WithCheck = normalize(dPol.WithCheck)
+			lPol, inLive := lTable.Policies[dPol.Name]
+			if !inLive {
+				changes = append(changes, Change{
+					Type:        plan.ChangeCreatePolicy,
+					Schema:      targetSchema,
+					Table:       tblName,
+					Policy:      &polCopy,
+					Destructive: false,
+				})
+				continue
+			}
+			if !policiesEqual(lPol, dPol, normalize) {
+				changes = append(changes, Change{
+					Type:        plan.ChangeDropPolicy,
+					Schema:      targetSchema,
+					Table:       tblName,
+					Policy:      lPol,
+					Destructive: true,
+				})
+				changes = append(changes, Change{
+					Type:        plan.ChangeCreatePolicy,
+					Schema:      targetSchema,
+					Table:       tblName,
+					Policy:      &polCopy,
+					Destructive: false,
+				})
+			}
+		}
+		for polName, lPol := range lTable.Policies {
+			if _, inDesired := dTable.Policies[polName]; !inDesired {
+				changes = append(changes, Change{
+					Type:        plan.ChangeDropPolicy,
+					Schema:      targetSchema,
+					Table:       tblName,
+					Policy:      lPol,
+					Destructive: true,
+				})
+			}
+		}
 	}
 
 	// 3. Detect dropped tables
@@ -647,6 +709,76 @@ func DiffWithMappings(live, desired *schema.Schema, targetSchema, shadowSchema s
 	}
 
 	return changes, nil
+}
+
+// sortedPolicies returns a table's desired policies in deterministic order.
+func sortedPolicies(t *schema.Table) []*schema.Policy {
+	if t == nil || len(t.Policies) == 0 {
+		return nil
+	}
+	names := slices.Collect(maps.Keys(t.Policies))
+	slices.Sort(names)
+	out := make([]*schema.Policy, 0, len(names))
+	for _, n := range names {
+		out = append(out, t.Policies[n])
+	}
+	return out
+}
+
+// diffRLSFlags emits RLS enable/disable/force steps between live and desired
+// tables. A nil live table means the table is new: emit only desired-on flags.
+func diffRLSFlags(targetSchema, tblName string, lTable, dTable *schema.Table) []Change {
+	if dTable == nil {
+		return nil
+	}
+	var changes []Change
+	emit := func(typ plan.ChangeType) {
+		changes = append(changes, Change{
+			Type:        typ,
+			Schema:      targetSchema,
+			Table:       tblName,
+			Destructive: false,
+		})
+	}
+	liveEnabled, liveForced := false, false
+	if lTable != nil {
+		liveEnabled, liveForced = lTable.RLSEnabled, lTable.RLSForced
+	}
+	switch {
+	case dTable.RLSEnabled && !liveEnabled:
+		emit(plan.ChangeEnableRLS)
+	case !dTable.RLSEnabled && liveEnabled:
+		emit(plan.ChangeDisableRLS)
+	}
+	switch {
+	case dTable.RLSForced && !liveForced:
+		emit(plan.ChangeForceRLS)
+	case !dTable.RLSForced && liveForced:
+		emit(plan.ChangeNoForceRLS)
+	}
+	return changes
+}
+
+// policiesEqual compares live and desired policies with normalized
+// expressions, so whitespace/cast drift does not produce replace churn.
+func policiesEqual(l, d *schema.Policy, normalize func(string) string) bool {
+	if l == nil || d == nil {
+		return l == d
+	}
+	if l.Cmd != d.Cmd || l.Permissive != d.Permissive {
+		return false
+	}
+	lRoles := slices.Clone(l.Roles)
+	dRoles := slices.Clone(d.Roles)
+	slices.Sort(lRoles)
+	slices.Sort(dRoles)
+	if !slices.Equal(lRoles, dRoles) {
+		return false
+	}
+	if normalize(l.Using) != normalize(d.Using) {
+		return false
+	}
+	return normalize(l.WithCheck) == normalize(d.WithCheck)
 }
 
 func findUnmanagedDeps(unmanaged map[string]*schema.UnmanagedObject, table, column string) []string {

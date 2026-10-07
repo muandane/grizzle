@@ -278,6 +278,59 @@ func GenerateCreateExtensionSQL(ext *schema.Extension) string {
 	return fmt.Sprintf("CREATE EXTENSION IF NOT EXISTS %q;", ext.Name)
 }
 
+// GenerateRLSSQL constructs an ALTER TABLE ... [ENABLE|DISABLE|FORCE|NO FORCE] ROW LEVEL SECURITY statement.
+func GenerateRLSSQL(targetSchema, tableName string, typ plan.ChangeType) string {
+	var action string
+	switch typ {
+	case plan.ChangeEnableRLS:
+		action = "ENABLE"
+	case plan.ChangeDisableRLS:
+		action = "DISABLE"
+	case plan.ChangeForceRLS:
+		action = "FORCE"
+	case plan.ChangeNoForceRLS:
+		action = "NO FORCE"
+	default:
+		return ""
+	}
+	return fmt.Sprintf("ALTER TABLE %q.%q %s ROW LEVEL SECURITY;", targetSchema, tableName, action)
+}
+
+// GenerateCreatePolicySQL constructs a CREATE POLICY statement.
+func GenerateCreatePolicySQL(targetSchema, tableName string, p *schema.Policy) string {
+	if p == nil || p.Name == "" {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "CREATE POLICY %q ON %q.%q", p.Name, targetSchema, tableName)
+	if !p.Permissive {
+		b.WriteString(" AS RESTRICTIVE")
+	}
+	if p.Cmd != "" && p.Cmd != "ALL" {
+		b.WriteString(" FOR " + p.Cmd)
+	}
+	if len(p.Roles) > 0 {
+		quoted := make([]string, 0, len(p.Roles))
+		for _, r := range p.Roles {
+			quoted = append(quoted, fmt.Sprintf("%q", r))
+		}
+		b.WriteString(" TO " + strings.Join(quoted, ", "))
+	}
+	if strings.TrimSpace(p.Using) != "" {
+		b.WriteString(" USING (" + strings.TrimSpace(p.Using) + ")")
+	}
+	if strings.TrimSpace(p.WithCheck) != "" {
+		b.WriteString(" WITH CHECK (" + strings.TrimSpace(p.WithCheck) + ")")
+	}
+	b.WriteString(";")
+	return b.String()
+}
+
+// GenerateDropPolicySQL constructs a DROP POLICY statement.
+func GenerateDropPolicySQL(targetSchema, tableName, policyName string) string {
+	return fmt.Sprintf("DROP POLICY IF EXISTS %q ON %q.%q;", policyName, targetSchema, tableName)
+}
+
 // RenderOpts configures DDL rendering behavior such as concurrency and server version-specific syntax.
 type RenderOpts struct {
 	NonConcurrentIndexes bool
@@ -366,6 +419,16 @@ func RenderChangeWithOpts(targetSchema string, c diff.Change, opts RenderOpts) p
 	switch c.Type {
 	case plan.ChangeCreateExtension:
 		step.SQL = GenerateCreateExtensionSQL(c.Extension)
+	case plan.ChangeEnableRLS, plan.ChangeDisableRLS, plan.ChangeForceRLS, plan.ChangeNoForceRLS:
+		step.SQL = GenerateRLSSQL(effectiveSchema, c.Table, c.Type)
+	case plan.ChangeCreatePolicy:
+		step.SQL = GenerateCreatePolicySQL(effectiveSchema, c.Table, c.Policy)
+	case plan.ChangeDropPolicy:
+		polName := ""
+		if c.Policy != nil {
+			polName = c.Policy.Name
+		}
+		step.SQL = GenerateDropPolicySQL(effectiveSchema, c.Table, polName)
 	case plan.ChangeCreateEnum:
 		step.SQL = GenerateCreateEnumSQL(effectiveSchema, c.Enum)
 	case plan.ChangeAlterEnum:

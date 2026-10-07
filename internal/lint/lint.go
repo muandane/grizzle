@@ -69,6 +69,7 @@ func DefaultRules() []Rule {
 		CheckNamingConvention{},
 		DuplicateCheckConstraint{},
 		PreferNamedChecks{},
+		RLSEnableWithoutPolicies{},
 	}
 }
 
