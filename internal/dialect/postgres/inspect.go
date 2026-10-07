@@ -3,6 +3,8 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/muandane/grizzle/internal/dialect"
@@ -598,7 +600,8 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 	// 6d. Stored Functions and Procedures
 	procQuery := `
 		SELECT
-			p.proname AS proc_name
+			p.proname AS proc_name,
+			COALESCE(p.prosrc, '') AS source
 		FROM pg_proc p
 		JOIN pg_namespace n ON n.oid = p.pronamespace
 		WHERE n.nspname = $1
@@ -614,9 +617,10 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 	}
 	defer func() { _ = procRows.Close() }()
 
+	procSources := make(map[string]string)
 	for procRows.Next() {
-		var procName string
-		if err := procRows.Scan(&procName); err != nil {
+		var procName, procSource string
+		if err := procRows.Scan(&procName, &procSource); err != nil {
 			return nil, fmt.Errorf("scanning procedure in schema %q: %w", schemaName, err)
 		}
 		key := "function:" + procName
@@ -624,11 +628,92 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 			Name: procName,
 			Kind: schema.UnmanagedFunction,
 		}
+		procSources[procName] = procSource
 	}
 	if err := procRows.Err(); err != nil {
 		return nil, err
 	}
 	_ = procRows.Close()
+
+	// 6d.1 Function Table/Column Dependencies from pg_depend.
+	// SQL-standard function bodies (BEGIN ATOMIC, PostgreSQL 14+) record
+	// normal ('n') dependencies on every referenced table and column, giving
+	// exact protection parity with views.
+	funcDepQuery := `
+		SELECT
+			p.proname AS proc_name,
+			dep_c.relname AS referenced_table,
+			COALESCE(a.attname, '') AS referenced_column
+		FROM pg_proc p
+		JOIN pg_namespace n ON n.oid = p.pronamespace
+		JOIN pg_depend d ON d.objid = p.oid AND d.classid = 'pg_proc'::regclass AND d.refclassid = 'pg_class'::regclass
+		JOIN pg_class dep_c ON dep_c.oid = d.refobjid
+		LEFT JOIN pg_attribute a ON a.attrelid = dep_c.oid AND a.attnum = d.refobjsubid AND NOT a.attisdropped
+		WHERE n.nspname = $1
+		  AND d.deptype = 'n'
+		  AND dep_c.relkind IN ('r', 'p')
+		ORDER BY p.proname, dep_c.relname, a.attname;
+	`
+	funcDepRows, err := dbtx.QueryContext(ctx, funcDepQuery, schemaName)
+	if err != nil {
+		return nil, fmt.Errorf("inspecting function dependencies in schema %q: %w", schemaName, err)
+	}
+	defer func() { _ = funcDepRows.Close() }()
+
+	funcsWithDeps := make(map[string]bool)
+	seenFuncDeps := make(map[string]bool)
+	for funcDepRows.Next() {
+		var procName, refTable, refCol string
+		if err := funcDepRows.Scan(&procName, &refTable, &refCol); err != nil {
+			return nil, fmt.Errorf("scanning function dependency: %w", err)
+		}
+		obj, ok := s.Unmanaged["function:"+procName]
+		if !ok {
+			continue
+		}
+		dedupeKey := procName + "\x00" + refTable + "\x00" + refCol
+		if seenFuncDeps[dedupeKey] {
+			continue
+		}
+		seenFuncDeps[dedupeKey] = true
+		obj.DependsOn = append(obj.DependsOn, schema.DependencyRef{
+			Table:  refTable,
+			Column: refCol,
+		})
+		funcsWithDeps[procName] = true
+	}
+	if err := funcDepRows.Err(); err != nil {
+		return nil, err
+	}
+	_ = funcDepRows.Close()
+
+	// 6d.2 Heuristic source scan for string-bodied functions. Functions
+	// declared with a quoted body (LANGUAGE sql AS '...', plpgsql) record no
+	// pg_depend entries; scan their source for managed table names so
+	// destructive operations stay protected. A false positive only adds
+	// protection, never removes it.
+	for _, procName := range sortedProcNames(procSources) {
+		if funcsWithDeps[procName] {
+			continue
+		}
+		source := procSources[procName]
+		if strings.TrimSpace(source) == "" {
+			continue
+		}
+		obj, ok := s.Unmanaged["function:"+procName]
+		if !ok {
+			continue
+		}
+		for _, tblName := range sortedManagedTableNames(s) {
+			if tblName == "" {
+				continue
+			}
+			re := regexp.MustCompile(`(?i)\b` + regexp.QuoteMeta(tblName) + `\b`)
+			if re.MatchString(source) {
+				obj.DependsOn = append(obj.DependsOn, schema.DependencyRef{Table: tblName})
+			}
+		}
+	}
 
 	// 6e. Sequences not owned by managed tables
 	seqQuery := `
@@ -744,4 +829,24 @@ func qualifyCrossSchemaFK(fkDef, refSchema, refTable string) string {
 		return fkDef
 	}
 	return fkDef[:idx] + "REFERENCES " + refSchema + "." + strings.TrimSpace(rest)
+}
+
+// sortedProcNames returns proc source keys in deterministic order.
+func sortedProcNames(procSources map[string]string) []string {
+	names := make([]string, 0, len(procSources))
+	for n := range procSources {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// sortedManagedTableNames returns managed table names in deterministic order.
+func sortedManagedTableNames(s *schema.Schema) []string {
+	names := make([]string, 0, len(s.Tables))
+	for n := range s.Tables {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
 }

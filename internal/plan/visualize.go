@@ -185,6 +185,9 @@ func (p *Plan) FormatInteractiveSummary(w io.Writer) error {
 		sb.WriteString("\n")
 		for _, h := range criticalHazards {
 			fmt.Fprintf(&sb, "[%s] %s\n", h.Code, h.Description)
+			if hint := hazardRemediation(h.Code); hint != "" {
+				fmt.Fprintf(&sb, "    remediation: %s\n", hint)
+			}
 		}
 	}
 
@@ -196,6 +199,30 @@ func cleanIdentifier(ident string) string {
 	ident = strings.TrimSpace(ident)
 	ident = strings.Trim(ident, "\"`")
 	return ident
+}
+
+// hazardRemediation returns a one-line remediation hint for a critical hazard
+// code, printed under the hazard in the interactive summary. Non-critical
+// (WARNING/NOTICE) hazards need no remediation hint.
+func hazardRemediation(code HazardCode) string {
+	switch code {
+	case HazardUnmanagedDependency:
+		return "accept via AcceptHazards: UNMANAGED_DEPENDENCY, then drop/recreate the unmanaged object outside Grizzle"
+	case HazardRenameAmbiguous:
+		return "map the rename explicitly via Options.Renames (CLI: --rename old=new)"
+	case HazardDropTable:
+		return "allow via DropPolicy AllowDropTable and accept DROP_TABLE; the table and its data are permanently lost"
+	case HazardDropColumn:
+		return "allow via DropPolicy AllowDropColumn and accept DROP_COLUMN; the column and its data are permanently lost"
+	case HazardTypeNarrow:
+		return "verify existing values fit the narrower type, or widen the type instead of narrowing"
+	case HazardNotNullNoDefault:
+		return "backfill existing rows first, or add the column with a DEFAULT"
+	default:
+		// Exhaustiveness: new CRITICAL hazard codes should add a hint here.
+		// WARNING/NOTICE codes carry their own description.
+		return ""
+	}
 }
 
 func formatStepTable(s Step) string {

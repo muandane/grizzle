@@ -55,7 +55,8 @@ func TestPlan_FormatInteractiveSummary_SpecExample(t *testing.T) {
 	expected := "Planned changes:\n" +
 		"  + CREATE TABLE accounts (id, balance)\n" +
 		"  ! DROP COLUMN users.legacy_role [DROP_COLUMN: CRITICAL]\n\n" +
-		"[DROP_COLUMN] Column on table \"users\" will be dropped with all existing row values\n"
+		"[DROP_COLUMN] Column on table \"users\" will be dropped with all existing row values\n" +
+		"    remediation: allow via DropPolicy AllowDropColumn and accept DROP_COLUMN; the column and its data are permanently lost\n"
 
 	if buf.String() != expected {
 		t.Fatalf("expected:\n%s\ngot:\n%s", expected, buf.String())
@@ -117,5 +118,34 @@ func TestPlan_FormatInteractiveSummary_OperationsAndHazards(t *testing.T) {
 	}
 	if !strings.Contains(out, "[TYPE_NARROW] Column on table \"users\" has a destructive type change that may cause data loss or truncation\n") {
 		t.Errorf("missing critical hazard description, got:\n%s", out)
+	}
+}
+
+func TestPlan_FormatInteractiveSummary_UnmanagedRemediation(t *testing.T) {
+	p := &plan.Plan{
+		TargetSchema: "public",
+		Steps: []plan.Step{
+			{
+				Type:          plan.ChangeDropColumn,
+				Table:         "users",
+				Column:        "email",
+				SQL:           `ALTER TABLE "users" DROP COLUMN "email";`,
+				Destructive:   true,
+				UnmanagedDeps: []string{"VIEW:v_user_emails (column users.email)"},
+			},
+		},
+		Policy: plan.DropPolicy{AllowColumn: true},
+	}
+
+	var buf bytes.Buffer
+	if err := p.FormatInteractiveSummary(&buf); err != nil {
+		t.Fatalf("FormatInteractiveSummary failed: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "[UNMANAGED_DEPENDENCY: CRITICAL]") {
+		t.Errorf("expected UNMANAGED_DEPENDENCY badge, got:\n%s", out)
+	}
+	if !strings.Contains(out, "remediation: accept via AcceptHazards: UNMANAGED_DEPENDENCY") {
+		t.Errorf("expected remediation hint under critical hazard, got:\n%s", out)
 	}
 }

@@ -314,12 +314,15 @@ func stepHazards(s Step) []Hazard {
 	var hazards []Hazard
 	if len(s.UnmanagedDeps) > 0 {
 		hazards = append(hazards, Hazard{
-			Code:        HazardUnmanagedDependency,
-			Level:       HazardLevelCritical,
-			Type:        s.Type,
-			Table:       s.Table,
-			Description: fmt.Sprintf("Table %q operation affects unmanaged dependent object(s) [%s]", s.Table, strings.Join(s.UnmanagedDeps, ", ")),
-			SQL:         s.SQL,
+			Code:  HazardUnmanagedDependency,
+			Level: HazardLevelCritical,
+			Type:  s.Type,
+			Table: s.Table,
+			Description: fmt.Sprintf(
+				"Table %q operation affects unmanaged dependent object(s) [%s]; Grizzle does not manage these objects, so the operation can leave them broken. Remediation: accept with AcceptHazards: UNMANAGED_DEPENDENCY and drop/recreate the unmanaged object(s) outside Grizzle, or remove this operation",
+				s.Table, strings.Join(s.UnmanagedDeps, ", "),
+			),
+			SQL: s.SQL,
 		})
 	}
 	if s.IsGeneratedRewrite {
