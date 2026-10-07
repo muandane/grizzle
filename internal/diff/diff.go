@@ -217,6 +217,18 @@ func DiffWithMappings(live, desired *schema.Schema, targetSchema, shadowSchema s
 					Destructive: false,
 				})
 			}
+			// New table: emit trigger creation (sorted after functions).
+			for _, dTrg := range sortedTriggers(dTable) {
+				trgCopy := *dTrg
+				trgCopy.Definition = normalize(dTrg.Definition)
+				changes = append(changes, Change{
+					Type:        plan.ChangeCreateTrigger,
+					Schema:      targetSchema,
+					Table:       tblName,
+					Trigger:     &trgCopy,
+					Destructive: false,
+				})
+			}
 			continue
 		}
 
@@ -428,7 +440,10 @@ func DiffWithMappings(live, desired *schema.Schema, targetSchema, shadowSchema s
 					OldColumn:         lCol,
 					Destructive:       true,
 					IsRenameCandidate: isAmbiguousCandidate,
-					UnmanagedDeps:     findUnmanagedDeps(live.Unmanaged, tblName, colName),
+					UnmanagedDeps: slices.Concat(
+						findUnmanagedDeps(live.Unmanaged, tblName, colName),
+						findSurvivingTriggerDeps(lTable, dTable, normalize),
+					),
 				})
 			}
 		}
@@ -663,6 +678,57 @@ func DiffWithMappings(live, desired *schema.Schema, targetSchema, shadowSchema s
 				})
 			}
 		}
+
+		// Triggers diff: create missing, DROP + CREATE when the canonical
+		// definition drifts (Postgres has no CREATE OR REPLACE TRIGGER),
+		// drop live-only triggers behind AllowDropTrigger.
+		for _, dTrg := range sortedTriggers(dTable) {
+			dDef := normalize(dTrg.Definition)
+			trgCopy := *dTrg
+			trgCopy.Definition = dDef
+			lTrg, inLive := lTable.Triggers[dTrg.Name]
+			if !inLive {
+				changes = append(changes, Change{
+					Type:        plan.ChangeCreateTrigger,
+					Schema:      targetSchema,
+					Table:       tblName,
+					Trigger:     &trgCopy,
+					Destructive: false,
+				})
+				continue
+			}
+			if normalize(lTrg.Definition) != dDef {
+				lTrgCopy := *lTrg
+				lTrgCopy.Definition = normalize(lTrg.Definition)
+				changes = append(changes, Change{
+					Type:        plan.ChangeDropTrigger,
+					Schema:      targetSchema,
+					Table:       tblName,
+					Trigger:     &lTrgCopy,
+					Destructive: true,
+				})
+				changes = append(changes, Change{
+					Type:        plan.ChangeCreateTrigger,
+					Schema:      targetSchema,
+					Table:       tblName,
+					Trigger:     &trgCopy,
+					Destructive: false,
+				})
+			}
+		}
+		for trgName, lTrg := range lTable.Triggers {
+			if _, inDesired := dTable.Triggers[trgName]; !inDesired {
+				lTrgCopy := *lTrg
+				lTrgCopy.Definition = normalize(lTrg.Definition)
+				changes = append(changes, Change{
+					Type:        plan.ChangeDropTrigger,
+					Schema:      targetSchema,
+					Table:       tblName,
+					Trigger:     &lTrgCopy,
+					Destructive: true,
+				})
+			}
+		}
 	}
 
 	// 3. Detect dropped tables
@@ -873,6 +939,44 @@ func policiesEqual(l, d *schema.Policy, normalize func(string) string) bool {
 		return false
 	}
 	return normalize(l.WithCheck) == normalize(d.WithCheck)
+}
+
+// findSurvivingTriggerDeps lists managed triggers that survive the diff
+// (present with an identical canonical definition in the desired table).
+// Trigger definitions rarely name columns — the referenced columns live in
+// the executed function's body — so any surviving trigger on the table is
+// treated as dependent on every dropped column of that table, mirroring the
+// table-level dependency of the pre-Phase-1 unmanaged trigger registration.
+// Triggers being dropped or replaced are excluded: their DROP step sorts
+// before the column drop, so the dependency is resolved first.
+func findSurvivingTriggerDeps(lTable, dTable *schema.Table, normalize func(string) string) []string {
+	if lTable == nil || dTable == nil {
+		return nil
+	}
+	var deps []string
+	for name, lTrg := range lTable.Triggers {
+		dTrg, survives := dTable.Triggers[name]
+		if !survives || normalize(lTrg.Definition) != normalize(dTrg.Definition) {
+			continue
+		}
+		deps = append(deps, fmt.Sprintf("%s:%s", schema.UnmanagedTrigger, name))
+	}
+	slices.Sort(deps)
+	return deps
+}
+
+// sortedTriggers returns a table's triggers in deterministic name order.
+func sortedTriggers(t *schema.Table) []*schema.Trigger {
+	if t == nil || len(t.Triggers) == 0 {
+		return nil
+	}
+	names := slices.Collect(maps.Keys(t.Triggers))
+	slices.Sort(names)
+	out := make([]*schema.Trigger, 0, len(names))
+	for _, n := range names {
+		out = append(out, t.Triggers[n])
+	}
+	return out
 }
 
 func findUnmanagedDeps(unmanaged map[string]*schema.UnmanagedObject, table, column string) []string {

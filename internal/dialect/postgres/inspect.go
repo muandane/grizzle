@@ -428,6 +428,49 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 	}
 	_ = policyRows.Close()
 
+	// 2f. Inspect triggers on tables (managed surface). pg_get_triggerdef
+	// gives the canonical definition; the ON <table> reference inside it is
+	// schema-qualified and unmapped by the diff normalize step for shadow
+	// introspection.
+	triggerQuery := `
+		SELECT
+			c.relname AS table_name,
+			t.tgname AS trigger_name,
+			pg_get_triggerdef(t.oid) AS definition
+		FROM pg_trigger t
+		JOIN pg_class c ON c.oid = t.tgrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1
+		  AND NOT t.tgisinternal
+		ORDER BY c.relname, t.tgname;
+	`
+	triggerRows, err := dbtx.QueryContext(ctx, triggerQuery, schemaName)
+	if err != nil {
+		return nil, fmt.Errorf("inspecting triggers in schema %q: %w", schemaName, err)
+	}
+	defer func() { _ = triggerRows.Close() }()
+	for triggerRows.Next() {
+		var tblName, triggerName, definition string
+		if err := triggerRows.Scan(&tblName, &triggerName, &definition); err != nil {
+			return nil, fmt.Errorf("scanning trigger in schema %q: %w", schemaName, err)
+		}
+		tbl, exists := s.Tables[tblName]
+		if !exists {
+			continue
+		}
+		if tbl.Triggers == nil {
+			tbl.Triggers = make(map[string]*schema.Trigger)
+		}
+		tbl.Triggers[triggerName] = &schema.Trigger{
+			Name:       triggerName,
+			Definition: definition,
+		}
+	}
+	if err := triggerRows.Err(); err != nil {
+		return nil, err
+	}
+	_ = triggerRows.Close()
+
 	// 3. Inspect Primary Keys
 	pkQuery := `
 		SELECT
@@ -710,43 +753,9 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 	}
 	_ = depRows.Close()
 
-	// 6c. Triggers on Tables
-	trgQuery := `
-		SELECT
-			t.tgname AS trigger_name,
-			c.relname AS table_name
-		FROM pg_trigger t
-		JOIN pg_class c ON c.oid = t.tgrelid
-		JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE n.nspname = $1
-		  AND NOT t.tgisinternal
-		ORDER BY t.tgname;
-	`
-	trgRows, err := dbtx.QueryContext(ctx, trgQuery, schemaName)
-	if err != nil {
-		return nil, fmt.Errorf("inspecting triggers in schema %q: %w", schemaName, err)
-	}
-	defer func() { _ = trgRows.Close() }()
-
-	for trgRows.Next() {
-		var trgName, tblName string
-		if err := trgRows.Scan(&trgName, &tblName); err != nil {
-			return nil, fmt.Errorf("scanning trigger in schema %q: %w", schemaName, err)
-		}
-		key := "trigger:" + tblName + "." + trgName
-		s.Unmanaged[key] = &schema.UnmanagedObject{
-			Name:  trgName,
-			Kind:  schema.UnmanagedTrigger,
-			Table: tblName,
-			DependsOn: []schema.DependencyRef{
-				{Table: tblName},
-			},
-		}
-	}
-	if err := trgRows.Err(); err != nil {
-		return nil, err
-	}
-	_ = trgRows.Close()
+	// 6c. Triggers on managed tables are collected in 2f (Table.Triggers).
+	// Triggers are part of the managed surface as of Phase 1; no unmanaged
+	// trigger registration is needed here.
 
 	// 6d. Managed routines. Plain SQL/plpgsql functions become part of the
 	// managed surface: desired side comes from the shadow compile, keyed by

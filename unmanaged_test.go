@@ -271,9 +271,9 @@ func TestUnmanaged_PostgresIntegration(t *testing.T) {
 		t.Fatalf("setup failed: %v", err)
 	}
 
-	// 2. Desired schema drops email. The trigger function is declared so it
-	// stays managed and matches live; the unmanaged trigger on accounts
-	// still carries the dependency hazard.
+	// 2. Desired schema drops email. The trigger function and trigger are
+	// declared so they stay managed and match live; the unmanaged view on
+	// accounts still carries the dependency hazard.
 	desiredSQL := `
 		CREATE TABLE accounts (
 			id INT PRIMARY KEY,
@@ -284,6 +284,7 @@ func TestUnmanaged_PostgresIntegration(t *testing.T) {
 			RETURN NEW;
 		END;
 		$$ LANGUAGE plpgsql;
+		CREATE TRIGGER trg_audit BEFORE INSERT ON accounts FOR EACH ROW EXECUTE FUNCTION trg_noop_fn();
 	`
 
 	opts := grizzle.Options{

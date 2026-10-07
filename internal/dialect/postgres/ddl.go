@@ -362,6 +362,28 @@ func GenerateDropFunctionSQL(targetSchema string, r *schema.Routine) string {
 	return fmt.Sprintf("DROP %s IF EXISTS %q.%q(%s);", kind, targetSchema, r.Name, r.IdentityArgs)
 }
 
+// GenerateCreateTriggerSQL returns the canonical CREATE TRIGGER statement
+// produced by pg_get_triggerdef (schema-qualified table references already
+// unmapped by the diff stage).
+func GenerateCreateTriggerSQL(t *schema.Trigger) string {
+	if t == nil {
+		return ""
+	}
+	def := strings.TrimSpace(t.Definition)
+	if def == "" {
+		return ""
+	}
+	if !strings.HasSuffix(def, ";") {
+		def += ";"
+	}
+	return def
+}
+
+// GenerateDropTriggerSQL constructs a DROP TRIGGER statement.
+func GenerateDropTriggerSQL(targetSchema, tableName, triggerName string) string {
+	return fmt.Sprintf("DROP TRIGGER IF EXISTS %q ON %q.%q;", triggerName, targetSchema, tableName)
+}
+
 // RenderOpts configures DDL rendering behavior such as concurrency and server version-specific syntax.
 type RenderOpts struct {
 	NonConcurrentIndexes bool
@@ -464,6 +486,14 @@ func RenderChangeWithOpts(targetSchema string, c diff.Change, opts RenderOpts) p
 		step.SQL = GenerateCreateFunctionSQL(c.Routine)
 	case plan.ChangeDropFunction:
 		step.SQL = GenerateDropFunctionSQL(effectiveSchema, c.Routine)
+	case plan.ChangeCreateTrigger:
+		step.SQL = GenerateCreateTriggerSQL(c.Trigger)
+	case plan.ChangeDropTrigger:
+		trgName := ""
+		if c.Trigger != nil {
+			trgName = c.Trigger.Name
+		}
+		step.SQL = GenerateDropTriggerSQL(effectiveSchema, c.Table, trgName)
 	case plan.ChangeCreateEnum:
 		step.SQL = GenerateCreateEnumSQL(effectiveSchema, c.Enum)
 	case plan.ChangeAlterEnum:
