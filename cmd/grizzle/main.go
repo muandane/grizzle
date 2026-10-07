@@ -112,7 +112,7 @@ func setupLogger(jsonLog bool) {
 }
 
 var (
-	version = "v0.2.0"
+	version = "v0.3.0"
 	commit  = "none"
 	date    = "unknown"
 )
