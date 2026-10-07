@@ -7,10 +7,10 @@ Thank you for your interest in contributing to Grizzle! We welcome pull requests
 Grizzle follows a strict functional core / imperative shell architecture enforced by static analysis (`architecture_test.go` and `depguard`):
 
 ```
-schema  <──  scope, diff, plan, export  <──  dialect  <──  exec, history  <──  grizzle (root)
+schema  <──  scope, diff, plan, export, lint  <──  dialect  <──  exec, history  <──  grizzle (root)
 ```
 
-1. **Pure Core (`internal/schema`, `internal/scope`, `internal/diff`, `internal/plan`, `internal/export`)**:
+1. **Pure Core (`internal/schema`, `internal/scope`, `internal/diff`, `internal/plan`, `internal/export`, `internal/lint`)**:
    - Must be 100% deterministic and free of I/O.
    - **Never** import `database/sql`, `context`, `net`, `os`, `slog`, or any execution packages.
    - Sort all maps and slices before output to ensure deterministic hashes and stable golden files.

@@ -1,0 +1,7 @@
+L001 [ERROR] audit_log: table has no primary key
+L002 [WARNING] Posts.UserId: foreign key columns are not covered by any index; parent-table changes will sequential-scan this table
+L003 [WARNING] Posts.Posts: table name Posts is not lowercase snake_case
+L003 [WARNING] Posts.UserId: column name UserId is not lowercase snake_case
+L003 [WARNING] UserRole.UserRole: enum name UserRole is not lowercase snake_case
+L004 [WARNING] Posts.id: column uses a legacy SERIAL/nextval default; prefer GENERATED ALWAYS AS IDENTITY
+6 diagnostic(s), 1 error(s), 5 warning(s)

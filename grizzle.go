@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"slices"
 	"strings"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/muandane/grizzle/internal/dialect/postgres"
 	"github.com/muandane/grizzle/internal/exec"
 	"github.com/muandane/grizzle/internal/export"
+	"github.com/muandane/grizzle/internal/lint"
 	"github.com/muandane/grizzle/internal/plan"
 	"github.com/muandane/grizzle/internal/schema"
 )
@@ -532,4 +534,92 @@ func Export(p *Plan, format ExportFormat, version string, timestamp ...time.Time
 // ParsePlanJSON parses a serialized plan JSON string or bytes into a *Plan, returning the recorded plan hash.
 func ParsePlanJSON(data []byte) (*Plan, string, error) {
 	return plan.ParsePlanJSON(data)
+}
+
+// LintDiagnostic is a single static lint finding against a schema element.
+type LintDiagnostic = lint.Diagnostic
+
+// LintSeverity indicates how strongly a lint diagnostic should block a release.
+type LintSeverity = lint.Severity
+
+// LintRule is a pure check executed against the desired schema IR.
+type LintRule = lint.Rule
+
+const (
+	// LintSeverityError marks a structural anti-pattern that must be fixed.
+	LintSeverityError = lint.SeverityError
+	// LintSeverityWarning marks a recommendation that may be ignored deliberately.
+	LintSeverityWarning = lint.SeverityWarning
+)
+
+// CompileSchema compiles opts.SchemaSQL into the desired SchemaIR without
+// diffing or executing anything. For PostgreSQL the compilation happens in the
+// shadow schema inside an always-rolled-back transaction (requires a
+// connection to the target database); for SQLite it happens in an in-memory
+// database, making it fully offline.
+func CompileSchema(ctx context.Context, db *sql.DB, opts Options) (*SchemaIR, error) {
+	if strings.TrimSpace(opts.SchemaSQL) == "" {
+		return nil, ErrEmptySchema
+	}
+	if db == nil {
+		return nil, fmt.Errorf("grizzle: database connection is nil")
+	}
+	if opts.Dialect == DialectAuto {
+		d, err := detectDialect(ctx, db)
+		if err != nil {
+			return nil, err
+		}
+		opts.Dialect = d
+	}
+	switch opts.Dialect {
+	case DialectSQLite:
+		return exec.CompileSchemaSQLite(ctx, opts.SchemaSQL)
+	case DialectPostgres:
+		if len(opts.TargetSchemas) > 1 {
+			return nil, ErrUnsupportedMultiSchema
+		}
+		targetSchema := cmp.Or(opts.TargetSchema, "public")
+		shadowSchema := cmp.Or(opts.ShadowSchema, "_grizzle_shadow")
+		return exec.CompileSchemaPostgres(ctx, db, exec.PostgresExecConfig{
+			TargetSchema: targetSchema,
+			ShadowSchema: shadowSchema,
+			SchemaSQL:    opts.SchemaSQL,
+		})
+	default:
+		return nil, fmt.Errorf("grizzle: unsupported dialect %q", opts.Dialect)
+	}
+}
+
+// LintSchema runs rules (defaulting to DefaultLintRules) against the compiled
+// schema IR and returns deterministically sorted diagnostics.
+func LintSchema(s *SchemaIR, rules ...LintRule) []LintDiagnostic {
+	if len(rules) == 0 {
+		rules = DefaultLintRules()
+	}
+	return lint.Lint(s, rules...)
+}
+
+// DefaultLintRules returns the built-in lint rule set (L001..L004).
+func DefaultLintRules() []LintRule {
+	return lint.DefaultRules()
+}
+
+// LintHasErrors reports whether any diagnostic has severity ERROR.
+func LintHasErrors(diags []LintDiagnostic) bool {
+	return lint.HasErrors(diags)
+}
+
+// LintFormatText renders diagnostics as human-readable text.
+func LintFormatText(w io.Writer, diags []LintDiagnostic) error {
+	return lint.FormatText(w, diags)
+}
+
+// LintFormatJSON renders diagnostics as a JSON array.
+func LintFormatJSON(w io.Writer, diags []LintDiagnostic) error {
+	return lint.FormatJSON(w, diags)
+}
+
+// LintFormatGitHub renders diagnostics as GitHub Actions annotations.
+func LintFormatGitHub(w io.Writer, diags []LintDiagnostic) error {
+	return lint.FormatGitHub(w, diags)
 }

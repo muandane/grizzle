@@ -92,7 +92,7 @@ var (
 
 func run(args []string) int {
 	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "Usage: grizzle <plan|apply|check|export|init|version> [flags]")
+		fmt.Fprintln(os.Stderr, "Usage: grizzle <plan|apply|check|lint|export|init|version> [flags]")
 		return 1
 	}
 
@@ -119,6 +119,7 @@ func run(args []string) int {
 		templateFlag = fs.String("template", "", "Project template: sqlc, stdlib, or sqlite")
 		dirFlag      = fs.String("dir", ".", "Destination directory for init")
 		forceFlag    = fs.Bool("force", false, "Overwrite existing files during init")
+		failOnWarn   = fs.Bool("fail-on-warning", false, "Fail lint when warnings are reported")
 	)
 
 	var hazards hazardFlags
@@ -144,11 +145,17 @@ func run(args []string) int {
 		return runApply(ctx, dsn, *planFile, *schemaFile, *expectedHash, *allowDrop, hazards)
 	case "check":
 		return runCheck(ctx, dsn, *schemaFile, *allowDrop)
+	case "lint":
+		lintFormat := *formatFlag
+		if lintFormat == "sql" {
+			lintFormat = "text"
+		}
+		return runLint(ctx, dsn, *schemaFile, lintFormat, *failOnWarn)
 	case "export":
 		return runExport(ctx, dsn, *planFile, *schemaFile, *formatFlag, *versionFlag, *outFile, *allowDrop)
 	default:
 		slog.Error("unknown command", "command", command)
-		fmt.Fprintf(os.Stderr, "Unknown command: %q. Expected plan, apply, check, export, or init.\n", command)
+		fmt.Fprintf(os.Stderr, "Unknown command: %q. Expected plan, apply, check, lint, export, or init.\n", command)
 		return 1
 	}
 }
