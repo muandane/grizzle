@@ -151,7 +151,11 @@ Supported hazard codes:
 | `DROP_DOMAIN` | `CRITICAL` | Domain or domain CHECK constraint dropped; dependent columns must be migrated first |
 | `REVOKE_PRIVILEGE` | `CRITICAL` | Privilege revoked from a grantee (access loss); requires `AllowRevoke` |
 | `DROP_ROLE` | `CRITICAL` | Grizzle-managed role dropped (memberships and grants disappear); requires `AllowDropRole`; refused outright if the role owns cluster objects |
+| `DROP_PUBLICATION` | `CRITICAL` | Grizzle-managed publication dropped (subscribers stop receiving changes); requires `AllowDropPublication` |
+| `DROP_EVENT_TRIGGER` | `CRITICAL` | Grizzle-managed event trigger dropped (DDL auditing/enforcement stops firing); requires `AllowDropEventTrigger` |
 | `GRANT_PUBLIC` | `WARNING` | Privileges granted to `PUBLIC` (ambient access for every role) |
+| `EVENT_TRIGGER_SUPERUSER` | `WARNING` | Event-trigger DDL may require superuser or elevated privileges |
+| `PUBLICATION_ALL_TABLES` | `NOTICE` | Publication publishes ALL tables, including future ones |
 | `PARTITION_ATTACH_SCAN` | `WARNING` | Attaching existing standalone table to parent partitioned table requires validation scan under `ACCESS EXCLUSIVE` lock |
 | `PARTITION_PENDING_DETACH` | `WARNING` | Interrupted pending-detach partition state requiring finalization (`FINALIZE`) |
 | `EXTENSION_PRIVILEGE` | `WARNING` | `CREATE EXTENSION` may require superuser or elevated privileges |
@@ -170,10 +174,9 @@ Supported hazard codes:
 
 ### Invariant 4b: Unmanaged objects policy — detected, protected, not managed
 
-Most schema constructs declared in `SchemaSQL` are managed declaratively (tables, columns, indexes, enums, CHECK/FK constraints, extensions, RLS + policies, COMMENT ON, functions, procedures, aggregates, domains, triggers, views/matviews). The objects Grizzle deliberately leaves unmanaged are those without a clean shadow-compile or diff story:
+Most schema constructs declared in `SchemaSQL` are managed declaratively (tables, columns, indexes, enums, CHECK/FK constraints, extensions, RLS + policies, COMMENT ON, functions, procedures, aggregates, domains, triggers, views/matviews), and cluster-catalog objects (publications, event triggers) are managed via the `CatalogSQL` side-channel. The objects Grizzle deliberately leaves unmanaged are those without a clean shadow-compile or diff story:
 
-* Event triggers (`CREATE EVENT TRIGGER` — database-level; on the roadmap via a catalog-file contract)
-* Publications, subscriptions, and replication slots (`CREATE PUBLICATION` etc. — database/cluster-level)
+* Subscriptions and replication slots (`CREATE SUBSCRIPTION` etc. — cluster-attached replication consumers with side effects beyond any single managed database)
 * Standalone sequences not owned by managed tables
 * Window functions (`prokind = 'w'`) and ordered-set/hypothetical aggregates, which fall outside the managed routine surface
 * Extension-owned objects (e.g. types and functions installed by `citext`, `pgcrypto`)

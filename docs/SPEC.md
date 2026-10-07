@@ -224,6 +224,52 @@ Semantics:
 - Role steps sort after all schema DDL; `RolesSQL` participates in
   `Plan.Hash()` when non-empty. SQLite + non-empty `RolesSQL` is rejected.
 
+#### CatalogSQL contract (PostgreSQL)
+
+`CatalogSQL` is a side-channel file (CLI: `--catalog catalog.sql`) holding the
+desired cluster-catalog state for logical-replication publications and DDL
+event triggers. Like `RolesSQL` it is **never** shadow-compiled and never
+belongs in `SchemaSQL`: publications and event triggers are environment-level
+concerns with no shadow-compile story, and event-trigger DDL cannot run
+inside the shadow-compile transaction model.
+
+```sql
+-- catalog.sql — only these statement forms are accepted:
+CREATE PUBLICATION docs_pub FOR TABLE docs, comments;
+CREATE PUBLICATION analytics_pub FOR TABLES IN SCHEMA analytics; -- PostgreSQL 15+
+CREATE PUBLICATION all_pub FOR ALL TABLES;
+CREATE PUBLICATION ins_only WITH (publish = 'insert');           -- defaults to all four
+CREATE EVENT TRIGGER audit_ddl ON ddl_command_end EXECUTE FUNCTION log_ddl();
+CREATE EVENT TRIGGER block_drop ON sql_drop WHEN TAG IN ('DROP TABLE') EXECUTE FUNCTION refuse_ddl();
+```
+
+Semantics:
+
+- Statement scan rejects anything else (`ALTER PUBLICATION`, `DROP
+  PUBLICATION`, `WHEN VALUE IN`, schema DDL — `ErrInvalidOptions`); no
+  silent ignoring.
+- Publications are diffed on membership and `publish` flags from
+  `pg_publication` / `pg_publication_rel` / `pg_publication_namespace`:
+  missing → create, drift → `ALTER PUBLICATION`, drop → gated by
+  `AllowDropPublication` + `DROP_PUBLICATION` (CRITICAL). Unqualified
+  `TABLE` names resolve against the primary target schema.
+- Event triggers are diffed on event, tag filter, function, and enabled
+  state from `pg_event_trigger`: definition drift is DROP+CREATE
+  (PostgreSQL has no in-place ALTER for event/tags/function);
+  enabled-only drift renders `ALTER EVENT TRIGGER ENABLE/DISABLE`.
+- Event-trigger functions must exist (managed routines from `SchemaSQL`
+  or live objects); the sync aborts naming the missing function.
+- Drops are narrow: only objects stamped with the `grizzle-managed`
+  catalog comment are considered for dropping (behind
+  `AllowDropEventTrigger` + `DROP_EVENT_TRIGGER`, CRITICAL);
+  operator-created publications and event triggers are never swept.
+- `CREATE EVENT TRIGGER` DDL may require superuser; every plan step
+  touching one emits `EVENT_TRIGGER_SUPERUSER` (WARNING). `FOR ALL
+  TABLES` breadth emits `PUBLICATION_ALL_TABLES` (NOTICE).
+- Catalog steps sort after roles and grants; `CatalogSQL` participates
+  in `Plan.Hash()` when non-empty. SQLite + non-empty `CatalogSQL` is
+  rejected.
+
 ```go
 type ApplyOpts struct {
     ExpectedHash  string
@@ -263,6 +309,10 @@ type Plan struct {
     // roles/grants side-channel).
     RolesSQL string
 
+    // Approval-sensitive: participates in Hash() when non-empty (desired
+    // publications/event-triggers side-channel).
+    CatalogSQL string
+
     // Approval-sensitive: participates in Hash() because it changes generated SQL.
     NonConcurrentIndexes bool
 
@@ -275,7 +325,7 @@ type Plan struct {
     StatementTimeout time.Duration
 }
 
-func (p *Plan) Hash() string // schema(s), scope, renames, expand, policy, NonConcurrentIndexes, SchemaSQL, RolesSQL, ordered steps
+func (p *Plan) Hash() string // schema(s), scope, renames, expand, policy, NonConcurrentIndexes, SchemaSQL, RolesSQL, CatalogSQL, ordered steps
 func (p *Plan) ValidateExecutionFields() error
 func (p *Plan) Hazards() []Hazard
 func (p *Plan) Additions() int
@@ -289,9 +339,9 @@ func (p *Plan) String() string
 type HazardLevel string
 
 const (
-    HazardLevelCritical HazardLevel = "CRITICAL" // Data destruction (DROP TABLE/COLUMN, DROP_EXTENSION, DROP_POLICY, DROP_FUNCTION, DROP_TRIGGER, DROP_VIEW, DROP_DOMAIN, DROP_ROLE, REVOKE_PRIVILEGE, TYPE_NARROW, RENAME_AMBIGUOUS, UNMANAGED_DEPENDENCY, GENERATED_REWRITE)
-    HazardLevelWarning  HazardLevel = "WARNING"  // Execution or lockout risk (EXTENSION_PRIVILEGE, GRANT_PUBLIC, RLS_ENABLE, SECURITY_DEFINER, PARTITION_ATTACH_SCAN, PARTITION_PENDING_DETACH)
-    HazardLevelNotice   HazardLevel = "NOTICE"   // Locking or performance impact (INDEX creation/drop, FK drop, COMMENT_CLEAR)
+    HazardLevelCritical HazardLevel = "CRITICAL" // Data destruction (DROP TABLE/COLUMN, DROP_EXTENSION, DROP_POLICY, DROP_FUNCTION, DROP_TRIGGER, DROP_VIEW, DROP_DOMAIN, DROP_ROLE, REVOKE_PRIVILEGE, DROP_PUBLICATION, DROP_EVENT_TRIGGER, TYPE_NARROW, RENAME_AMBIGUOUS, UNMANAGED_DEPENDENCY, GENERATED_REWRITE)
+    HazardLevelWarning  HazardLevel = "WARNING"  // Execution or lockout risk (EXTENSION_PRIVILEGE, GRANT_PUBLIC, EVENT_TRIGGER_SUPERUSER, RLS_ENABLE, SECURITY_DEFINER, PARTITION_ATTACH_SCAN, PARTITION_PENDING_DETACH)
+    HazardLevelNotice   HazardLevel = "NOTICE"   // Locking or performance impact (INDEX creation/drop, FK drop, COMMENT_CLEAR, PUBLICATION_ALL_TABLES)
 )
 
 // ValidateExecutionFields bounds persisted timeouts to [0, 24h].
@@ -326,6 +376,10 @@ const (
     HazardRevokePrivilege        HazardCode = "REVOKE_PRIVILEGE"
     HazardDropRole               HazardCode = "DROP_ROLE"
     HazardGrantPublic            HazardCode = "GRANT_PUBLIC"
+    HazardDropPublication        HazardCode = "DROP_PUBLICATION"
+    HazardDropEventTrigger       HazardCode = "DROP_EVENT_TRIGGER"
+    HazardEventTriggerSuperuser  HazardCode = "EVENT_TRIGGER_SUPERUSER"
+    HazardPublicationAllTables   HazardCode = "PUBLICATION_ALL_TABLES"
 )
 
 type Hazard struct {
@@ -370,6 +424,8 @@ type Hazard struct {
 | `Triggers` | Yes | `pg_trigger` + canonical `pg_get_triggerdef`; drift → DROP+CREATE; drops gated by `AllowDropTrigger` + `DROP_TRIGGER` (CRITICAL); surviving managed triggers block dependent column drops via `UNMANAGED_DEPENDENCY` |
 | `Views` & `Materialized Views` | Yes | Canonical `pg_get_viewdef`; append-only column changes replace in place (`CREATE OR REPLACE VIEW`), otherwise DROP+CREATE; matviews always DROP+CREATE plus `REFRESH MATERIALIZED VIEW`; drops gated by `AllowDropView` + `DROP_VIEW` (CRITICAL) |
 | `Roles & Grants` | Yes | Via the `RolesSQL` side-channel (§2.2), never in `SchemaSQL`: managed `NOLOGIN` roles and object grants diffed against `pg_authid` + ACLs (`aclexplode`); missing → `GRANT`, surplus → `REVOKE` gated by `AllowRevoke` + `REVOKE_PRIVILEGE` (CRITICAL); marker-stamped roles dropped behind `AllowDropRole` + `DROP_ROLE` (CRITICAL) with ownership refusal; grants to `PUBLIC`/unmanaged grantees never revoked; `GRANT ... TO PUBLIC` emits `GRANT_PUBLIC` (WARNING) |
+| `Publications` | Yes | Via the `CatalogSQL` side-channel (§2.2), never in `SchemaSQL`: membership and `publish` flags diffed from `pg_publication` / `pg_publication_rel` / `pg_publication_namespace`; drift → `ALTER PUBLICATION`; drops gated by `AllowDropPublication` + `DROP_PUBLICATION` (CRITICAL), narrow to marker-stamped objects; `FOR ALL TABLES` emits `PUBLICATION_ALL_TABLES` (NOTICE); schema-level publications require PostgreSQL 15+ |
+| `Event Triggers` | Yes | Via the `CatalogSQL` side-channel (§2.2), never in `SchemaSQL`: event/tag/function/enabled state diffed from `pg_event_trigger`; definition drift is DROP+CREATE, enabled-only drift renders `ALTER EVENT TRIGGER ENABLE/DISABLE`; creation refuses missing trigger functions; drops gated by `AllowDropEventTrigger` + `DROP_EVENT_TRIGGER` (CRITICAL), narrow to marker-stamped objects; `EVENT_TRIGGER_SUPERUSER` (WARNING) on any event-trigger step |
 
 ### SQLite
 
@@ -406,10 +462,10 @@ If `AllowDrop` is false (the default), Grizzle refuses to execute any plan conta
 PostgreSQL migrations acquire advisory locks (`pg_advisory_xact_lock` or session lock for concurrent indexes). Grizzle recomputes the diff post-lock to avoid TOCTOU races.
 
 ### Invariant 3: Hazard gating
-Critical hazards (`DROP_TABLE`, `DROP_COLUMN`, `TYPE_NARROW`, `RENAME_AMBIGUOUS`, `UNMANAGED_DEPENDENCY`, `GENERATED_REWRITE`, `DROP_ROLE`, `REVOKE_PRIVILEGE`) fail execution unless accepted via `AcceptHazards`.
+Critical hazards (`DROP_TABLE`, `DROP_COLUMN`, `TYPE_NARROW`, `RENAME_AMBIGUOUS`, `UNMANAGED_DEPENDENCY`, `GENERATED_REWRITE`, `DROP_ROLE`, `REVOKE_PRIVILEGE`, `DROP_PUBLICATION`, `DROP_EVENT_TRIGGER`) fail execution unless accepted via `AcceptHazards`.
 
 ### Invariant 4: Plan/Apply approval hash
-`Plan.Hash()` digests approval-sensitive intent (target schemas, scope, renames, expand/contract, policy, NonConcurrentIndexes, SchemaSQL, RolesSQL, ordered steps). `Apply` / `DryRunVerifyPlan` verify against `ExpectedHash`, aborting with `ErrPlanDrift` on mismatch. History is advisory (Model B): DDL commits first; a failed history write returns `ErrHistoryRecord` while leaving schema changes applied.
+`Plan.Hash()` digests approval-sensitive intent (target schemas, scope, renames, expand/contract, policy, NonConcurrentIndexes, SchemaSQL, RolesSQL, CatalogSQL, ordered steps). `Apply` / `DryRunVerifyPlan` verify against `ExpectedHash`, aborting with `ErrPlanDrift` on mismatch. History is advisory (Model B): DDL commits first; a failed history write returns `ErrHistoryRecord` while leaving schema changes applied.
 
 ### Invariant 5: Timeouts and retry
 `LockTimeout` and `StatementTimeout` protect production availability. `LockTimeout` bounds the **total** advisory-lock acquisition wait across all retry attempts (including backoff); preamble work (hooks, schema setup, session timeout statements) and DDL execution do not consume the budget — each attempt's acquisition timer is armed when acquisition begins. PostgreSQL lock-contention and deadlock failures (SQLSTATE `55P03`, `40P01`) are classified via `exec.IsRetryable` and retried with exponential backoff and randomized jitter; retries halt immediately once any DDL step commits.
