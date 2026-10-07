@@ -27,34 +27,58 @@ schema  <──  scope, diff, plan, export  <──  dialect  <──  exec, his
 
 ---
 
-## Local Development Workflow
+## Local Development Workflow (devenv)
+
+Grizzle uses [devenv](https://devenv.sh) (Nix-based) as the single source of truth for the local development environment: pinned Go, golangci-lint, PostgreSQL 16, git hooks, and quality-gate scripts. **There is no Makefile** — do not add one.
 
 ### Prerequisites
 
-- Go 1.22+
-- Docker or a local PostgreSQL instance (PostgreSQL 14, 15, 16, or 17)
-- `golangci-lint` (v1.57+)
+- [devenv](https://devenv.sh/getting-started/) (`devenv 2.x`) and [direnv](https://direnv.net/)
+- First run: `direnv allow` (or enter `devenv shell`) — this provisions Go/golangci-lint/PostgreSQL and installs the local git hooks
+- `devenv up` — start the background PostgreSQL service (needed for integration tests)
 
 ### Commands
 
-Grizzle provides a `Makefile` with common targets:
+All commands are available directly in the devenv shell (mirroring the GitHub Actions CI):
 
 ```bash
-# Run linter
-make lint
+# Format both Go modules
+fmt
 
-# Run pure unit tests with race detector
-make test
+# Static analysis (go vet) on both modules
+vet
 
-# Run integration tests against PostgreSQL (requires DATABASE_URL or POSTGRES_DSN)
-DATABASE_URL="postgres://postgres:secret@localhost:5432/postgres?sslmode=disable" make test-integration
+# golangci-lint on both modules
+lint
 
-# Run entire local CI suite (lint + unit tests + integration tests)
-DATABASE_URL="postgres://postgres:secret@localhost:5432/postgres?sslmode=disable" make ci
+# Pure unit tests with race detector (both modules)
+test
+
+# Integration tests against PostgreSQL (requires `devenv up`)
+DATABASE_URL="postgres://postgres:secret@localhost:5432/postgres?sslmode=disable" test-integration
+
+# Entire local CI suite (lint + vet + unit tests + integration tests)
+ci
 
 # Update golden plan and export fixtures after intentional changes
-make golden-update
+golden-update
+
+# Utilities
+db-shell         # psql into the local test database
+db-reset         # wipe and recreate the public schema
+clean            # remove generated SQLite files and test artifacts
 ```
+
+### Local Git Hooks (pre-push CI parity)
+
+Entering the devenv shell installs git hooks so contributions are validated **locally before they ever touch the remote** (keeping GitHub Actions usage low):
+
+| Hook stage | Gates |
+|------------|-------|
+| `pre-commit` | `gofmt` check, `go vet` (both modules), `golangci-lint` (both modules) |
+| `pre-push` | `go test -race -count=1 ./...` (both modules — mirrors the CI `unit` job) |
+
+Integration tests are intentionally **not** hooked (they require `devenv up`); run `ci` for full local parity before submitting a PR that touches `internal/exec`, `internal/history`, or the public API.
 
 ---
 
@@ -84,8 +108,8 @@ All commits must follow the [Conventional Commits](https://www.conventionalcommi
 
 Before submitting a pull request, please ensure:
 
-1. `make lint` reports 0 issues.
-2. `make ci` passes completely green with `-race`.
+1. `lint` reports 0 issues (or accept the pre-commit hook gate).
+2. `ci` passes completely green with `-race`.
 3. Architecture import rules are strictly respected.
 4. No secrets or connection strings are logged or exposed.
 5. Any public API changes are documented in `docs/SPEC.md` and `CHANGELOG.md`.
