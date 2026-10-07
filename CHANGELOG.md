@@ -80,6 +80,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Automated Invalid Index Recovery**:
   - PostgreSQL schema inspection checks `pg_index.indisvalid`.
   - Broken indexes left by failed `CREATE INDEX CONCURRENTLY` executions are automatically detected and repaired via `DROP INDEX CONCURRENTLY` and clean recreation.
+- **Declarative CHECK Constraints (PostgreSQL)**:
+  - Named and inline `CHECK` table constraints introspected (`pg_constraint.contype = 'c'`, local constraints only), diffed, and managed end-to-end.
+  - Staged safely like foreign keys: `ADD CONSTRAINT ... NOT VALID` in one transaction group, then `VALIDATE CONSTRAINT` in a separate group to keep `SHARE UPDATE EXCLUSIVE` scans off the exclusive lock window (`CHECK_VALIDATE_SCAN` notice).
+  - Redefinitions emitted as drop + re-add; constraint drops guarded by `Options.AllowDropCheck` and the `DROP_CHECK` notice hazard.
+  - Constraints auto-named by PostgreSQL (inline `CHECK` syntax) are validated and redefined but never auto-dropped; explicitly named constraints are fully managed.
+  - SQLite check constraints remain out of scope (not introspected; not preserved through rebuilds).
 - **Staged Expand-and-Contract Migrations**:
   - Staged non-destructive migrations enabled via experimental `Options.ExpandContract`.
   - Plan 1 adds new columns as nullable alongside existing columns.

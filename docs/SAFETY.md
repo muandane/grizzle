@@ -148,6 +148,8 @@ Supported hazard codes:
 | `INDEX_BUILD` | `NOTICE` | Index creation table locking or execution load |
 | `DROP_INDEX` | `NOTICE` | Index removal impacting query performance |
 | `DROP_FK` | `NOTICE` | Foreign key constraint removal |
+| `DROP_CHECK` | `NOTICE` | Check constraint removal (relaxes data validation) |
+| `CHECK_VALIDATE_SCAN` | `NOTICE` | `VALIDATE CONSTRAINT` on a check constraint runs a sequential scan under `SHARE UPDATE EXCLUSIVE` |
 
 > [!IMPORTANT]
 > `AllowDrop: false` is a hard safety invariant enforced at the policy gate before hazard evaluation. Setting `AcceptHazards: []HazardCode{HazardDropColumn}` will not bypass a disabled drop policy.

@@ -161,7 +161,7 @@ func renderGoose(p *plan.Plan, version string) string {
 
 func isStepReversible(s plan.Step) bool {
 	switch s.Type {
-	case plan.ChangeCreateTable, plan.ChangeAddColumn, plan.ChangeCreateIndex, plan.ChangeAddFK, plan.ChangeRenameColumn, plan.ChangeAttachPartition:
+	case plan.ChangeCreateTable, plan.ChangeAddColumn, plan.ChangeCreateIndex, plan.ChangeAddFK, plan.ChangeAddCheck, plan.ChangeRenameColumn, plan.ChangeAttachPartition:
 		return true
 	default:
 		return false
@@ -206,6 +206,13 @@ func reverseStepSQL(s plan.Step) string {
 		}
 		if fkName != "" {
 			return fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s;", s.Table, fkName)
+		}
+		return fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT;", s.Table)
+
+	case plan.ChangeAddCheck:
+		checkName := plan.ExtractConstraintName(s.SQL, "ADD")
+		if checkName != "" {
+			return fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s;", s.Table, checkName)
 		}
 		return fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT;", s.Table)
 

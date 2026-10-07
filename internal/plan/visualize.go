@@ -43,13 +43,13 @@ func (p *Plan) Format(w io.Writer, useColor bool) error {
 		isBlocked := !p.Policy.IsAllowed(s)
 
 		switch s.Type {
-		case ChangeCreateEnum, ChangeCreateTable, ChangeAddColumn, ChangeCreateIndex, ChangeAddFK:
+		case ChangeCreateEnum, ChangeCreateTable, ChangeAddColumn, ChangeCreateIndex, ChangeAddFK, ChangeAddCheck:
 			symbol = "+"
 			color = colorGreen
 		case ChangeAlterColumn, ChangeAlterEnum:
 			symbol = "~"
 			color = colorYellow
-		case ChangeDropTable, ChangeDropColumn, ChangeDropIndex, ChangeDropFK:
+		case ChangeDropTable, ChangeDropColumn, ChangeDropIndex, ChangeDropFK, ChangeDropCheck:
 			symbol = "-"
 			color = colorRed
 		}
@@ -147,11 +147,11 @@ func (p *Plan) FormatInteractiveSummary(w io.Writer) error {
 			symbol = "!"
 		} else {
 			switch s.Type {
-			case ChangeCreateEnum, ChangeCreateTable, ChangeAddColumn, ChangeCreateIndex, ChangeAddFK, ChangeAttachPartition:
+			case ChangeCreateEnum, ChangeCreateTable, ChangeAddColumn, ChangeCreateIndex, ChangeAddFK, ChangeAddCheck, ChangeAttachPartition:
 				symbol = "+"
 			case ChangeAlterColumn, ChangeAlterEnum, ChangeValidateConstraint, ChangeRenameColumn:
 				symbol = "~"
-			case ChangeDropTable, ChangeDropColumn, ChangeDropIndex, ChangeDropFK, ChangeDetachPartition:
+			case ChangeDropTable, ChangeDropColumn, ChangeDropIndex, ChangeDropFK, ChangeDropCheck, ChangeDetachPartition:
 				symbol = "-"
 			}
 		}
@@ -289,6 +289,38 @@ func extractIndexName(sqlStr string) string {
 	return ""
 }
 
+// ExtractConstraintName extracts the constraint name from a constraint DDL
+// statement rendered by the postgres dialect. verb selects the clause to scan:
+// "ADD", "DROP", or "VALIDATE".
+func ExtractConstraintName(sqlStr, verb string) string {
+	upper := strings.ToUpper(sqlStr)
+	var idx int
+	switch strings.ToUpper(verb) {
+	case "ADD":
+		idx = strings.Index(upper, "ADD CONSTRAINT")
+	case "DROP":
+		idx = strings.Index(upper, "DROP CONSTRAINT")
+	case "VALIDATE":
+		idx = strings.Index(upper, "VALIDATE CONSTRAINT")
+	default:
+		return ""
+	}
+	if idx == -1 {
+		return ""
+	}
+	rest := sqlStr[idx:]
+	// Skip the matched clause and an optional IF EXISTS.
+	fields := strings.Fields(rest)
+	skip := 2
+	if len(fields) > 2 && strings.EqualFold(fields[2], "IF") {
+		skip = 4 // DROP CONSTRAINT IF EXISTS
+	}
+	if len(fields) <= skip {
+		return ""
+	}
+	return cleanIdentifier(fields[skip])
+}
+
 func stepOperationSummary(s Step) string {
 	tbl := formatStepTable(s)
 	col := cleanIdentifier(s.Column)
@@ -358,7 +390,22 @@ func stepOperationSummary(s Step) string {
 	case ChangeDropFK:
 		return fmt.Sprintf("DROP FOREIGN KEY ON %s", tbl)
 
+	case ChangeAddCheck:
+		if name := ExtractConstraintName(s.SQL, "ADD"); name != "" {
+			return fmt.Sprintf("ADD CHECK CONSTRAINT %s ON %s", name, tbl)
+		}
+		return fmt.Sprintf("ADD CHECK CONSTRAINT ON %s", tbl)
+
+	case ChangeDropCheck:
+		if name := ExtractConstraintName(s.SQL, "DROP"); name != "" {
+			return fmt.Sprintf("DROP CHECK CONSTRAINT %s ON %s", name, tbl)
+		}
+		return fmt.Sprintf("DROP CHECK CONSTRAINT ON %s", tbl)
+
 	case ChangeValidateConstraint:
+		if name := ExtractConstraintName(s.SQL, "VALIDATE"); name != "" {
+			return fmt.Sprintf("VALIDATE CONSTRAINT %s ON %s", name, tbl)
+		}
 		if col != "" {
 			return fmt.Sprintf("VALIDATE CONSTRAINT %s ON %s", col, tbl)
 		}

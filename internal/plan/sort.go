@@ -18,6 +18,7 @@ func tableKey(schemaName, tableName string) string {
 func SortSteps(steps []Step) {
 	priority := map[ChangeType]int{
 		ChangeDropFK:             10,  // 1. Drop old foreign keys first (unlocks referenced tables)
+		ChangeDropCheck:          15,  // 1b. Drop obsolete check constraints before redefining them
 		ChangeDropIndex:          20,  // 2. Drop obsolete indexes
 		ChangeDetachPartition:    25,  // 2b. Detach partitions before modifying or dropping them
 		ChangeCreateEnum:         30,  // 3. Create new enum types before tables use them
@@ -29,7 +30,8 @@ func SortSteps(steps []Step) {
 		ChangeAlterColumn:        60,  // 7. Modify column types, nullability, defaults
 		ChangeCreateIndex:        70,  // 8. Build new indexes
 		ChangeAddFK:              80,  // 9. Add foreign keys (NOT VALID) now that all tables and columns exist
-		ChangeValidateConstraint: 85,  // 10. Validate foreign keys
+		ChangeAddCheck:           82,  // 9b. Add check constraints (NOT VALID) after all tables and columns exist
+		ChangeValidateConstraint: 85,  // 10. Validate foreign keys and check constraints
 		ChangeDropColumn:         90,  // 11. Drop columns (if allowed)
 		ChangeDropTable:          100, // 12. Drop tables (if allowed)
 	}

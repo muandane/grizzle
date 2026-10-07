@@ -52,6 +52,7 @@ type Options struct {
 	AllowDropColumn *bool
 	AllowDropIndex  *bool
 	AllowDropFK     *bool
+	AllowDropCheck  *bool
 
 	// ExcludeTables defines table names or glob patterns (e.g. "spatial_ref_sys", "asynq_*")
 	// that Grizzle will never manage, alter, or drop.
@@ -355,11 +356,17 @@ func resolveDropPolicy(opts Options) plan.DropPolicy {
 		allowFK = *opts.AllowDropFK
 	}
 
+	allowCheck := opts.AllowDrop
+	if opts.AllowDropCheck != nil {
+		allowCheck = *opts.AllowDropCheck
+	}
+
 	return plan.DropPolicy{
 		AllowTable:  allowTable,
 		AllowColumn: allowColumn,
 		AllowIndex:  allowIndex,
 		AllowFK:     allowFK,
+		AllowCheck:  allowCheck,
 	}
 }
 

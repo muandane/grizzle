@@ -149,17 +149,28 @@ CREATE TABLE products (
 
 ### Catalog introspection
 
-Introspect check constraints via `pg_constraint`:
+Introspect locally declared check constraints via `pg_constraint`:
 
 ```sql
 SELECT
-    conname AS constraint_name,
-    conrelid::regclass::text AS table_name,
-    pg_get_constraintdef(oid) AS definition,
-    convalidated AS is_validated
-FROM pg_constraint
-WHERE contype = 'c' AND connamespace = $1::regnamespace;
+    c.relname AS table_name,
+    con.conname AS constraint_name,
+    pg_get_constraintdef(con.oid) AS definition,
+    con.convalidated AS is_validated
+FROM pg_constraint con
+JOIN pg_class c ON c.oid = con.conrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = $1
+  AND con.contype = 'c'
+  AND con.conislocal
+  AND c.relkind IN ('r', 'p');
 ```
+
+Scope rules:
+* Only `conislocal` constraints are managed. Check constraints inherited from a partitioned parent (`conislocal = false` on child partitions) are managed through the parent table.
+* Domain check constraints (`conrelid = 0`) are out of scope.
+* Constraints PostgreSQL auto-names (inline `CHECK` syntax, e.g. `products_price_cents_check`) are adopted for validation and redefinition, but are never auto-dropped when removed from the desired schema: they are indistinguishable in the catalog from system-generated conversion artifacts, such as the partition-bound check left behind by `DETACH PARTITION ... CONCURRENTLY`. Explicitly named constraints (`CONSTRAINT name CHECK`) are fully managed, including drops guarded by `Options.AllowDropCheck`.
+* SQLite does not support declarative check-constraint management; SQLite `CHECK` DDL is neither introspected nor diffed.
 
 ### Non-blocking execution
 
@@ -174,7 +185,7 @@ Adding a check constraint with `CHECK (expr)` scans the entire table under `ACCE
    ```sql
    ALTER TABLE products VALIDATE CONSTRAINT check_positive_price;
    ```
-   This runs a sequential table scan under `SHARE UPDATE EXCLUSIVE` lock, permitting concurrent `SELECT`, `INSERT`, `UPDATE`, and `DELETE` queries.
+   This runs a sequential table scan under `SHARE UPDATE EXCLUSIVE` lock, permitting concurrent `SELECT`, `INSERT`, `UPDATE`, and `DELETE` queries. The validate step emits a `CHECK_VALIDATE_SCAN` notice hazard.
 
 ---
 
