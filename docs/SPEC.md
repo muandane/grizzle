@@ -253,7 +253,7 @@ type Hazard struct {
 | :--- | :---: | :--- |
 | `Views` & `Materialized Views` | Protected | Introspected and dependency-graphed; destructive changes blocked via `UNMANAGED_DEPENDENCY` |
 | `Triggers` | Protected | Preserved on managed tables; drop/alter operations on dependencies blocked |
-| `Functions` & `Procedures` | Protected | Introspected; column/table dependencies protected from destructive alterations |
+| `Functions` & `Procedures` | Protected | Introspected with table/column dependencies: `pg_depend` for SQL-standard (`BEGIN ATOMIC`) bodies, conservative source scan for quoted string bodies; destructive alterations on dependents blocked via `UNMANAGED_DEPENDENCY` |
 | `Sequences` (unowned) | Protected | Never dropped or managed |
 | `Domains` | Protected | Introspected and protected |
 
