@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v0.2.0] - 2026-10-07
+
 ### Breaking
 - **Plan hash format**: `Plan.Hash()` now includes `DropPolicy`, `NonConcurrentIndexes`, and `SchemaSQL` (approval-sensitive intent). Previously approved plan artifacts will fail `ExpectedHash` / envelope verification (`ErrPlanDrift`).
 - **Plan artifact no longer persists lock/shadow identity**: `lock_id`, `lock_namespace`, and `shadow_schema` are removed from the plan document. Lock identity is derived at apply time from trusted target identity + runtime `ApplyOpts.LockNamespace`; shadow schemas are generated ephemerally per run.

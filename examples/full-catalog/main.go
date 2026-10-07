@@ -1,6 +1,7 @@
 // Package main demonstrates Grizzle's full managed surface: extensions,
-// tables with RLS + policies, functions, triggers, and (materialized) views —
-// all declared in one schema.sql and synced in-process on boot.
+// domains, tables with RLS + policies, COMMENT ON, functions, procedures,
+// triggers, and (materialized) views — all declared in one schema.sql and
+// synced in-process on boot.
 package main
 
 import (
@@ -39,9 +40,9 @@ func main() {
 	}
 
 	targetSchema := os.Getenv("PG_SCHEMA")
-	// Sync the full catalog: extension, table, RLS, policy, functions,
-	// trigger, and views. Destructive steps stay gated by default; accept
-	// them explicitly when you need them.
+	// Sync the full catalog: extension, domain, table, comments, RLS,
+	// policy, functions, procedure, trigger, and views. Destructive steps
+	// stay gated by default; accept them explicitly when you need them.
 	err = grizzle.Sync(syncCtx, db, grizzle.Options{
 		TargetSchema: targetSchema,
 		SchemaSQL:    schemaSQL,
