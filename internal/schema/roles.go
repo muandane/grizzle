@@ -33,9 +33,10 @@ type RolesSpec struct {
 }
 
 var (
-	// createRoleRe matches CREATE/ALTER ROLE name (options are ignored:
-	// managed roles are forced to NOLOGIN at render time).
-	createRoleRe = regexp.MustCompile(`(?i)^(?:CREATE|ALTER)\s+(?:ROLE|USER)\s+("([^"]+)"|[\w]+)`)
+	// createRoleRe captures the name from a CREATE ROLE/USER declaration.
+	createRoleRe          = regexp.MustCompile(`(?i)^CREATE\s+(?:ROLE|USER)\s+` + catalogIdentifierPattern)
+	createRoleStatementRe = regexp.MustCompile(`(?is)^CREATE\s+(?:ROLE|USER)\s+` + catalogIdentifierPattern + `(?:\s+(?:WITH\s+)?NOLOGIN)?$`)
+	rolePasswordRe        = regexp.MustCompile(`(?i)\s+(?:WITH\s+)?(?:ENCRYPTED\s+)?PASSWORD\b`)
 
 	// grantRe matches GRANT privilege[, ...] ON [TABLE|SEQUENCE|DATABASE|SCHEMA|FUNCTION]
 	// object[, ...] TO grantee[, ...] [WITH GRANT OPTION]. The object slot
@@ -89,10 +90,9 @@ func ParseRolesSQL(sql string) *RolesSpec {
 		}
 		upper := strings.ToUpper(trimmed)
 		switch {
-		case strings.HasPrefix(upper, "CREATE ROLE") || strings.HasPrefix(upper, "CREATE USER"),
-			strings.HasPrefix(upper, "ALTER ROLE") || strings.HasPrefix(upper, "ALTER USER"):
+		case strings.HasPrefix(upper, "CREATE ROLE") || strings.HasPrefix(upper, "CREATE USER"):
 			if m := createRoleRe.FindStringSubmatch(trimmed); m != nil {
-				name := strings.Trim(m[1], `"`)
+				name := statementIdentifier(m)
 				if name != "" {
 					spec.Roles[strings.ToLower(name)] = &Role{Name: name}
 				}
@@ -352,16 +352,25 @@ func splitList(s string) []string {
 	var parts []string
 	var cur strings.Builder
 	inQuote := false
-	for _, r := range s {
-		switch {
-		case r == '"':
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '"':
+			cur.WriteByte(s[i])
+			if inQuote && i+1 < len(s) && s[i+1] == '"' {
+				cur.WriteByte(s[i+1])
+				i++
+				continue
+			}
 			inQuote = !inQuote
-			cur.WriteRune(r)
-		case r == ',' && !inQuote:
+		case ',':
+			if inQuote {
+				cur.WriteByte(s[i])
+				continue
+			}
 			parts = append(parts, strings.TrimSpace(cur.String()))
 			cur.Reset()
 		default:
-			cur.WriteRune(r)
+			cur.WriteByte(s[i])
 		}
 	}
 	if tail := strings.TrimSpace(cur.String()); tail != "" {
@@ -391,33 +400,48 @@ func slicesCloneStrings(in []string) []string {
 // operator-created roles are never swept when they leave the desired state.
 const RoleManagedComment = "grizzle-managed"
 
-// ValidateRolesSQL enforces the RolesSQL statement contract. Role declarations,
-// role alterations, and object-privilege GRANT/REVOKE statements are accepted;
-// anything else fails loudly instead of being silently ignored by the
-// statement scan.
+// ValidateRolesSQL enforces the RolesSQL statement contract. Supported role
+// declarations and object-privilege GRANT/REVOKE statements are accepted;
+// unsupported role configuration fails loudly instead of being silently
+// ignored by the statement scan.
 func ValidateRolesSQL(sql string) error {
 	for _, stmt := range SplitStatements(sql) {
 		trimmed := stripLeadingComments(stmt)
 		if trimmed == "" {
 			continue
 		}
+		if containsSQLCommentOutsideQuotes(trimmed) {
+			return fmt.Errorf("unsupported SQL comment in RolesSQL statement: %q", trimmed)
+		}
 		upper := strings.ToUpper(trimmed)
 		switch {
 		case strings.HasPrefix(upper, "CREATE ROLE"), strings.HasPrefix(upper, "CREATE USER"),
-			strings.HasPrefix(upper, "ALTER ROLE"), strings.HasPrefix(upper, "ALTER USER"):
-			if createRoleRe.FindStringSubmatch(trimmed) == nil {
-				return fmt.Errorf("unsupported role statement in RolesSQL (expected CREATE/ALTER ROLE <name> [options]): %q", trimmed)
+			strings.HasPrefix(upper, "ALTER ROLE"), strings.HasPrefix(upper, "ALTER USER"),
+			strings.HasPrefix(upper, "DROP ROLE"), strings.HasPrefix(upper, "DROP USER"):
+			switch {
+			case strings.HasPrefix(upper, "ALTER ROLE"), strings.HasPrefix(upper, "ALTER USER"):
+				return fmt.Errorf("role configuration is not supported yet in PR1; ALTER ROLE/USER is reserved for PR2: %q", trimmed)
+			case strings.HasPrefix(upper, "DROP ROLE"), strings.HasPrefix(upper, "DROP USER"):
+				return fmt.Errorf("DROP ROLE/USER is not supported in the declarative role contract: %q", trimmed)
+			case rolePasswordRe.MatchString(trimmed):
+				return fmt.Errorf("passworded roles are not supported yet in PR1: %q", trimmed)
+			case createRoleStatementRe.FindStringSubmatch(trimmed) == nil:
+				return fmt.Errorf("unsupported role declaration in RolesSQL (only CREATE ROLE/USER [NOLOGIN] is supported): %q", trimmed)
 			}
 		case strings.HasPrefix(upper, "GRANT"):
 			if grantRe.FindStringSubmatch(trimmed) == nil {
 				return fmt.Errorf("unsupported GRANT form in RolesSQL (expected GRANT <privileges> ON [KIND] <object> TO <grantee>): %q", trimmed)
 			}
 		case strings.HasPrefix(upper, "REVOKE"):
-			if revokeRe.FindStringSubmatch(trimmed) == nil {
+			matches := revokeRe.FindStringSubmatch(trimmed)
+			if matches == nil {
 				return fmt.Errorf("unsupported REVOKE form in RolesSQL (expected REVOKE <privileges> ON [KIND] <object> FROM <grantee>): %q", trimmed)
 			}
+			if strings.TrimSpace(matches[1]) != "" {
+				return fmt.Errorf("per-privilege grant-option revocation is not supported in PR1: %q", trimmed)
+			}
 		default:
-			return fmt.Errorf("unsupported statement in RolesSQL (only CREATE/ALTER ROLE and GRANT/REVOKE are managed): %q", trimmed)
+			return fmt.Errorf("unsupported statement in RolesSQL (only CREATE ROLE/USER [NOLOGIN] and GRANT/REVOKE are managed): %q", trimmed)
 		}
 	}
 	return nil

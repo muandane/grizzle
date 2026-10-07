@@ -83,12 +83,31 @@ func TestValidateRolesSQL_RejectsUnsupportedStatements(t *testing.T) {
 func TestValidateRolesSQL_UnifiedForms(t *testing.T) {
 	valid := `
 		CREATE ROLE app_read;
-		ALTER ROLE app_read SET search_path = public;
 		GRANT SELECT ON docs TO app_read;
 		REVOKE INSERT ON docs FROM app_read;
 	`
 	if err := ValidateRolesSQL(valid); err != nil {
 		t.Fatalf("unified role statements must pass: %v", err)
+	}
+}
+
+func TestValidateRolesSQL_RejectsUnsupportedRoleForms(t *testing.T) {
+	tests := []struct {
+		sql     string
+		message string
+	}{
+		{`ALTER ROLE app_read SET search_path = public;`, "role configuration is not supported yet"},
+		{`CREATE ROLE app_read PASSWORD 'secret';`, "passworded roles are not supported yet"},
+		{`DROP ROLE app_read;`, "DROP ROLE/USER is not supported"},
+		{`REVOKE GRANT OPTION FOR SELECT ON docs FROM app_read;`, "per-privilege grant-option revocation"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.message, func(t *testing.T) {
+			err := ValidateRolesSQL(tt.sql)
+			if err == nil || !strings.Contains(err.Error(), tt.message) {
+				t.Fatalf("ValidateRolesSQL(%q) = %v, want error containing %q", tt.sql, err, tt.message)
+			}
+		})
 	}
 }
 

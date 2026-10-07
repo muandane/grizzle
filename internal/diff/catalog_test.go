@@ -198,3 +198,43 @@ func TestCatalogDiff_NarrowDrops(t *testing.T) {
 		}
 	})
 }
+
+func TestCatalogDiff_ExplicitDropOnlyTargetsNamedObject(t *testing.T) {
+	desired := schema.MergeCatalogSpecs(nil, schema.ParseCatalogSQL(`DROP PUBLICATION stale_pub;`))
+	live := &CatalogLiveState{
+		Publications: map[string]*PublicationState{
+			"stale_pub": {Name: "stale_pub", Managed: true},
+			"keep_pub":  {Name: "keep_pub", Managed: true},
+		},
+		EventTriggers: map[string]*EventTriggerState{},
+	}
+	changes := CatalogDiff(desired, live, "public")
+	if len(changes) != 1 || changes[0].Type != plan.ChangeDropPublication ||
+		changes[0].Table != "stale_pub" {
+		t.Fatalf("explicit DROP must target only its named publication: %+v", changes)
+	}
+}
+
+func TestCatalogDiff_OperationOnlyPatchDoesNotSweepUnrelatedManagedObjects(t *testing.T) {
+	desired := schema.MergeCatalogSpecs(
+		schema.ParseCatalogSQL(`CREATE PUBLICATION desired_pub FOR TABLE docs;`),
+		schema.ParseCatalogSQL(`ALTER PUBLICATION desired_pub ADD TABLE audit;`),
+	)
+	live := &CatalogLiveState{
+		Publications: map[string]*PublicationState{
+			"desired_pub": {
+				Name: "desired_pub", Managed: true,
+				Tables:        []string{"public.docs"},
+				PublishInsert: true, PublishUpdate: true, PublishDelete: true, PublishTruncate: true,
+			},
+			"keep_pub": {Name: "keep_pub", Managed: true},
+		},
+		EventTriggers: map[string]*EventTriggerState{},
+	}
+	changes := CatalogDiff(desired, live, "public")
+	for _, change := range changes {
+		if change.Type == plan.ChangeDropPublication && change.Table == "keep_pub" {
+			t.Fatalf("operation-only patch must not sweep unrelated publication: %+v", changes)
+		}
+	}
+}

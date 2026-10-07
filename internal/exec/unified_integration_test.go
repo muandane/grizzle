@@ -47,13 +47,20 @@ func TestUnifiedSchemaSQL_Lifecycle(t *testing.T) {
 		GRANT SELECT ON docs TO %s;
 		CREATE PUBLICATION %s FOR TABLE docs;
 		CREATE EVENT TRIGGER %s ON ddl_command_end EXECUTE FUNCTION %s();
-	`, functionName, roleName, roleName, publicationName, eventTriggerName, functionName)
+		ALTER EVENT TRIGGER %s DISABLE;
+	`, functionName, roleName, roleName, publicationName, eventTriggerName, functionName, eventTriggerName)
 
 	cfg := exec.PostgresExecConfig{
-		TargetSchema:     targetSchema,
-		SchemaSQL:        schemaSQL,
-		Filters:          scope.Filters{},
-		Policy:           plan.DropPolicy{},
+		TargetSchema: targetSchema,
+		SchemaSQL:    schemaSQL,
+		Filters:      scope.Filters{},
+		Policy:       plan.DropPolicy{},
+		CatalogSQL: fmt.Sprintf(`
+			CREATE PUBLICATION %s FOR TABLE docs;
+			ALTER PUBLICATION %s SET (publish = 'insert');
+			CREATE EVENT TRIGGER %s ON ddl_command_end EXECUTE FUNCTION %s();
+			ALTER EVENT TRIGGER %s DISABLE;
+		`, publicationName, publicationName, eventTriggerName, functionName, eventTriggerName),
 		LockTimeout:      5 * time.Second,
 		StatementTimeout: 30 * time.Second,
 	}
@@ -78,6 +85,27 @@ func TestUnifiedSchemaSQL_Lifecycle(t *testing.T) {
 	if tableExists != 1 || roleExists != 1 || publicationExists != 1 || triggerExists != 1 {
 		t.Fatalf("unified objects missing: table=%d role=%d publication=%d event_trigger=%d",
 			tableExists, roleExists, publicationExists, triggerExists)
+	}
+	var pubAllTables bool
+	if err := db.QueryRow(`SELECT p.puballtables FROM pg_publication p WHERE p.pubname = $1;`, publicationName).Scan(&pubAllTables); err != nil {
+		t.Fatalf("querying publication membership mode: %v", err)
+	}
+	if pubAllTables {
+		t.Fatal("CatalogSQL CREATE must overlay the SchemaSQL publication")
+	}
+	var publish string
+	if err := db.QueryRow(`SELECT p.pubinsert::text || p.pubupdate::text || p.pubdelete::text || p.pubtruncate::text FROM pg_publication p WHERE p.pubname = $1;`, publicationName).Scan(&publish); err != nil {
+		t.Fatalf("querying publication publish flags: %v", err)
+	}
+	if publish != "truefalsefalsefalse" {
+		t.Fatalf("CatalogSQL ALTER must apply after its overlay CREATE, got %s", publish)
+	}
+	var triggerEnabled bool
+	if err := db.QueryRow(`SELECT e.evtenabled = 'O' FROM pg_event_trigger e WHERE e.evtname = $1;`, eventTriggerName).Scan(&triggerEnabled); err != nil {
+		t.Fatalf("querying event trigger enabled state: %v", err)
+	}
+	if triggerEnabled {
+		t.Fatal("disabled event trigger must remain disabled after CREATE and overlay ALTER")
 	}
 
 	plan, err := exec.PlanDiffPostgres(ctx, db, cfg)

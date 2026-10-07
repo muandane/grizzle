@@ -168,6 +168,31 @@ CREATE PUBLICATION pub_b FOR TABLE public.docs;
 	})
 }
 
+func TestParseCatalogSQL_PreservesEscapedQuotedIdentifiers(t *testing.T) {
+	sql := `CREATE PUBLICATION "pub""name" FOR TABLE "semi;colon", "weird.schema"."table""name";
+CREATE EVENT TRIGGER "trig""name" ON ddl_command_end
+	WHEN TAG IN ('O''TABLE') EXECUTE FUNCTION "fn""name"();`
+	if err := ValidateCatalogSQL(sql); err != nil {
+		t.Fatalf("quoted catalog identifiers should validate: %v", err)
+	}
+	spec := ParseCatalogSQL(sql)
+	if len(spec.Publications) != 1 || spec.Publications[0].Name != `pub"name` {
+		t.Fatalf("publication identifier was not decoded correctly: %+v", spec.Publications)
+	}
+	if got := spec.Publications[0].Tables; len(got) != 2 || got[0] != `"semi;colon"` ||
+		got[1] != `"weird.schema"."table""name"` {
+		t.Fatalf("publication membership was not preserved: %v", got)
+	}
+	if len(spec.EventTriggers) != 1 {
+		t.Fatalf("event trigger was not parsed: %+v", spec.EventTriggers)
+	}
+	trigger := spec.EventTriggers[0]
+	if trigger.Name != `trig"name` || trigger.Function != `fn"name` ||
+		len(trigger.Tags) != 1 || trigger.Tags[0] != "O'TABLE" {
+		t.Fatalf("event-trigger identifiers/tags were not decoded: %+v", trigger)
+	}
+}
+
 func TestParseCatalogSQL_AlterAndDropForms(t *testing.T) {
 	spec := ParseCatalogSQL(`
 		CREATE PUBLICATION docs_pub FOR TABLE docs;
@@ -198,6 +223,55 @@ func TestParseCatalogSQL_AlterAndDropForms(t *testing.T) {
 	}
 }
 
+func TestMergeCatalogSpecs_OverlaysThenAppliesOperations(t *testing.T) {
+	schemaSpec := ParseCatalogSQL(`CREATE PUBLICATION docs_pub FOR ALL TABLES;`)
+	sideSpec := ParseCatalogSQL(`
+		CREATE PUBLICATION docs_pub FOR TABLE docs;
+		ALTER PUBLICATION docs_pub ADD TABLE audit;
+	`)
+	if err := ValidateCatalogSpecMerge(schemaSpec, sideSpec); err != nil {
+		t.Fatalf("overlay with side-channel CREATE and ALTER should validate: %v", err)
+	}
+	merged := MergeCatalogSpecs(schemaSpec, sideSpec)
+	if len(merged.Publications) != 1 || merged.Publications[0].AllTables ||
+		len(merged.Publications[0].Tables) != 2 {
+		t.Fatalf("side-channel CREATE must overlay before its ALTER: %+v", merged.Publications)
+	}
+
+	sideAlter := ParseCatalogSQL(`ALTER PUBLICATION docs_pub SET TABLE audit;`)
+	if err := ValidateCatalogSpecMerge(schemaSpec, sideAlter); err != nil {
+		t.Fatalf("side-channel ALTER should apply to SchemaSQL base: %v", err)
+	}
+	merged = MergeCatalogSpecs(schemaSpec, sideAlter)
+	if len(merged.Publications) != 1 || len(merged.Publications[0].Tables) != 1 ||
+		merged.Publications[0].Tables[0] != "audit" {
+		t.Fatalf("side-channel ALTER should apply after SchemaSQL base: %+v", merged.Publications)
+	}
+
+	if err := ValidateCatalogSpecMerge(nil, ParseCatalogSQL(`ALTER PUBLICATION missing ADD TABLE docs;`)); err == nil {
+		t.Fatal("ALTER without a declaration must fail validation")
+	}
+}
+
+func TestMergeCatalogSpecs_ExplicitDropDoesNotSweep(t *testing.T) {
+	merged := MergeCatalogSpecs(nil, ParseCatalogSQL(`DROP PUBLICATION docs_pub;`))
+	if !merged.ExplicitDropsOnly() || !merged.PublicationExplicitlyDropped("docs_pub") {
+		t.Fatalf("drop-only catalog input must remain an explicit drop: %+v", merged)
+	}
+}
+
+func TestMergeCatalogSpecs_OperationOnlyPatchSuppressesImplicitDrops(t *testing.T) {
+	schemaSpec := ParseCatalogSQL(`CREATE PUBLICATION docs_pub FOR TABLE docs;`)
+	sideSpec := ParseCatalogSQL(`ALTER PUBLICATION docs_pub ADD TABLE audit;`)
+	merged := MergeCatalogSpecs(schemaSpec, sideSpec)
+	if !merged.SuppressImplicitDrops() {
+		t.Fatal("operation-only side-channel patch must not imply unrelated managed drops")
+	}
+	if len(merged.Publications) != 1 || len(merged.Publications[0].Tables) != 2 {
+		t.Fatalf("operation-only patch should retain and alter its base declaration: %+v", merged.Publications)
+	}
+}
+
 func TestValidateCatalogSQL(t *testing.T) {
 	valid := []string{
 		"",
@@ -217,9 +291,21 @@ func TestValidateCatalogSQL(t *testing.T) {
 		"GRANT SELECT ON TABLE docs TO app_read;",
 		"CREATE EVENT TRIGGER t ON ddl_command_start WHEN VALUE IN ('x') EXECUTE FUNCTION f();",
 		"CREATE PUBLICATION p SET (publish = 'insert');",
+		"CREATE PUBLICATION p FOR VIEW docs;",
+		"CREATE PUBLICATION p WITH (publish = 'insert, vacuum);",
+		"CREATE PUBLICATION p WITH (publish = 'insert, insert');",
+		"CREATE PUBLICATION p FOR TABLE docs,;",
+		"CREATE PUBLICATION p FOR TABLE ONLY docs;",
+		"CREATE PUBLICATION p FOR TABLE docs.*;",
+		"CREATE PUBLICATION p FOR TABLES IN SCHEMA public.docs;",
 		"ALTER PUBLICATION p;",
 		"ALTER PUBLICATION p RENAME TO renamed;",
+		"ALTER PUBLICATION p ADD TABLE docs,;",
 		"ALTER EVENT TRIGGER t ENABLE ALWAYS;",
+		"CREATE EVENT TRIGGER t ON ddl_command_end WHEN TAG IN ('x') trailing EXECUTE FUNCTION f();",
+		"CREATE EVENT TRIGGER t ON unsupported_event EXECUTE FUNCTION f();",
+		"CREATE EVENT TRIGGER t ON ddl_command_end EXECUTE FUNCTION f() trailing;",
+		"CREATE PUBLICATION p FOR TABLE docs -- trailing comment\n;",
 		"DROP PUBLICATION;",
 		"DROP EVENT TRIGGER;",
 	}

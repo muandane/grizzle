@@ -70,8 +70,10 @@ func desiredCatalogSpec(cfg PostgresExecConfig) (*schema.CatalogSpec, error) {
 	if strings.TrimSpace(groups.CatalogSQL) == "" && strings.TrimSpace(cfg.CatalogSQL) == "" {
 		return nil, nil
 	}
-	return schema.MergeCatalogSpecs(
-		schema.ParseCatalogSQL(groups.CatalogSQL),
-		schema.ParseCatalogSQL(cfg.CatalogSQL),
-	), nil
+	schemaSpec := schema.ParseCatalogSQL(groups.CatalogSQL)
+	sideSpec := schema.ParseCatalogSQL(cfg.CatalogSQL)
+	if err := schema.ValidateCatalogSpecMerge(schemaSpec, sideSpec); err != nil {
+		return nil, fmt.Errorf("validating catalog statement bases: %w", err)
+	}
+	return schema.MergeCatalogSpecs(schemaSpec, sideSpec), nil
 }

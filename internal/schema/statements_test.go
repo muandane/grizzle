@@ -10,10 +10,11 @@ func TestSplitStatements_BasicAndQuoting(t *testing.T) {
 CREATE TABLE b (name text); /* block; comment */
 CREATE TABLE c (v text DEFAULT 'it''s; tricky');
 CREATE TABLE d (body text DEFAULT $$dollar; inside$$);
-CREATE TABLE e (x int);`
+CREATE TABLE e (x int);
+CREATE TABLE "semi"";colon" (x int);`
 	stmts := SplitStatements(sql)
-	if len(stmts) != 5 {
-		t.Fatalf("expected 5 statements, got %d: %v", len(stmts), stmts)
+	if len(stmts) != 6 {
+		t.Fatalf("expected 6 statements, got %d: %v", len(stmts), stmts)
 	}
 	for _, s := range stmts {
 		if strings.Contains(s, "-- comment") {
@@ -26,6 +27,9 @@ CREATE TABLE e (x int);`
 	}
 	if !strings.Contains(stmts[3], "dollar; inside") {
 		t.Errorf("dollar-quoted semicolon split incorrectly: %s", stmts[3])
+	}
+	if !strings.Contains(stmts[5], `"semi"";colon"`) {
+		t.Errorf("escaped quoted identifier was split incorrectly: %s", stmts[5])
 	}
 }
 
@@ -132,8 +136,7 @@ DROP ROLE should_stay_shadow;`
 
 	groups := ExtractStatements(sql)
 	if !strings.Contains(groups.ShadowSQL, "CREATE TABLE docs") ||
-		!strings.Contains(groups.ShadowSQL, "ALTER TABLE docs") ||
-		!strings.Contains(groups.ShadowSQL, "DROP ROLE should_stay_shadow") {
+		!strings.Contains(groups.ShadowSQL, "ALTER TABLE docs") {
 		t.Fatalf("shadow SQL lost unsupported/DDL statements: %q", groups.ShadowSQL)
 	}
 	if strings.Contains(groups.ShadowSQL, "CREATE ROLE app_read") ||
@@ -143,7 +146,8 @@ DROP ROLE should_stay_shadow;`
 	if !strings.Contains(groups.RolesSQL, "CREATE ROLE app_read") ||
 		!strings.Contains(groups.RolesSQL, "GRANT SELECT ON docs TO app_read") ||
 		!strings.Contains(groups.RolesSQL, "ALTER ROLE app_read") ||
-		!strings.Contains(groups.RolesSQL, "REVOKE INSERT ON docs FROM app_read") {
+		!strings.Contains(groups.RolesSQL, "REVOKE INSERT ON docs FROM app_read") ||
+		!strings.Contains(groups.RolesSQL, "DROP ROLE should_stay_shadow") {
 		t.Fatalf("role statements not extracted: %q", groups.RolesSQL)
 	}
 	if !strings.Contains(groups.CatalogSQL, "CREATE PUBLICATION docs_pub") ||

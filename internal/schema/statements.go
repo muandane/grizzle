@@ -23,7 +23,7 @@ type StatementGroups struct {
 }
 
 var (
-	roleStatementRe    = regexp.MustCompile(`(?is)^(?:GRANT|REVOKE)\b|^CREATE\s+(?:ROLE|USER)\b|^ALTER\s+(?:ROLE|USER)\b`)
+	roleStatementRe    = regexp.MustCompile(`(?is)^(?:GRANT|REVOKE)\b|^CREATE\s+(?:ROLE|USER)\b|^ALTER\s+(?:ROLE|USER)\b|^DROP\s+(?:ROLE|USER)\b`)
 	catalogStatementRe = regexp.MustCompile(`(?is)^(?:CREATE|ALTER|DROP)\s+(?:PUBLICATION\b|EVENT\s+TRIGGER\b)`)
 )
 
@@ -111,11 +111,17 @@ func SplitStatements(sql string) []string {
 		if ch == '"' {
 			start := i
 			i++
-			for i < n && sql[i] != '"' {
+			for i < n {
+				if sql[i] != '"' {
+					i++
+					continue
+				}
+				if i+1 < n && sql[i+1] == '"' {
+					i += 2
+					continue
+				}
 				i++
-			}
-			if i < n {
-				i++
+				break
 			}
 			b.WriteString(sql[start:i])
 			continue

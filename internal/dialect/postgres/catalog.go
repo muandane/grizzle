@@ -91,7 +91,7 @@ func InspectLiveCatalog(ctx context.Context, dbtx dialect.DBTX) (*LiveCatalog, e
 				return err
 			}
 			if ps, ok := live.Publications[strings.ToLower(pub)]; ok {
-				ps.Tables = append(ps.Tables, strings.ToLower(schema)+"."+strings.ToLower(table))
+				ps.Tables = append(ps.Tables, canonicalLiveIdentifier(schema)+"."+canonicalLiveIdentifier(table))
 			}
 			return nil
 		})
@@ -125,7 +125,7 @@ func InspectLiveCatalog(ctx context.Context, dbtx dialect.DBTX) (*LiveCatalog, e
 					return err
 				}
 				if ps, ok := live.Publications[strings.ToLower(pub)]; ok {
-					ps.Schemas = append(ps.Schemas, strings.ToLower(schema))
+					ps.Schemas = append(ps.Schemas, canonicalLiveIdentifier(schema))
 				}
 				return nil
 			})
@@ -207,7 +207,11 @@ func serverAtLeast15(ctx context.Context, dbtx dialect.DBTX) (bool, error) {
 func EventTriggerFunctionExists(ctx context.Context, dbtx dialect.DBTX, functionName string) (bool, error) {
 	var exists bool
 	err := dbtx.QueryRowContext(ctx, `
-		SELECT EXISTS (SELECT 1 FROM pg_proc p WHERE p.proname = lower($1));
+		SELECT EXISTS (
+			SELECT 1
+			FROM pg_proc p
+			WHERE p.proname = $1 OR p.proname = lower($1)
+		);
 	`, functionName).Scan(&exists)
 	if err != nil {
 		return false, fmt.Errorf("checking event-trigger function %q: %w", functionName, err)
@@ -218,7 +222,7 @@ func EventTriggerFunctionExists(ctx context.Context, dbtx dialect.DBTX, function
 // GenerateCreatePublicationSQL renders the desired publication.
 func GenerateCreatePublicationSQL(p *schema.Publication) string {
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "CREATE PUBLICATION %q", p.Name)
+	fmt.Fprintf(&sb, "CREATE PUBLICATION %s", quoteIdentifier(p.Name))
 	switch {
 	case p.AllTables:
 		sb.WriteString(" FOR ALL TABLES")
@@ -239,64 +243,84 @@ func GenerateAlterPublicationSQL(want, old *schema.Publication) string {
 	var out []string
 	if want.AllTables != old.AllTables {
 		if want.AllTables {
-			out = append(out, fmt.Sprintf("ALTER PUBLICATION %q SET ALL TABLES;", want.Name))
+			out = append(out, fmt.Sprintf("ALTER PUBLICATION %s SET ALL TABLES;", quoteIdentifier(want.Name)))
 		} else {
-			// Leaving FOR ALL TABLES: set the explicit membership in one
-			// statement (empty desired membership simply clears everything
-			// via the DROP statements below — the SET line is skipped).
+			// PostgreSQL has no valid empty SET TABLE form. Recreate the
+			// publication when ALL TABLES must become an empty explicit set.
+			if len(want.Tables) == 0 && len(want.Schemas) == 0 {
+				return recreatePublicationSQL(want)
+			}
+			// Leaving FOR ALL TABLES resets explicit membership. Set one
+			// base membership form, then add the other membership kind if
+			// both are desired.
 			switch {
 			case len(want.Tables) > 0:
-				out = append(out, fmt.Sprintf("ALTER PUBLICATION %q SET TABLE %s;", want.Name, strings.Join(quoteQualifiedList(want.Tables), ", ")))
+				out = append(out, fmt.Sprintf("ALTER PUBLICATION %s SET TABLE %s;", quoteIdentifier(want.Name), strings.Join(quoteQualifiedList(want.Tables), ", ")))
+				if len(want.Schemas) > 0 {
+					out = append(out, fmt.Sprintf("ALTER PUBLICATION %s ADD TABLES IN SCHEMA %s;", quoteIdentifier(want.Name), strings.Join(quoteQualifiedList(want.Schemas), ", ")))
+				}
 			case len(want.Schemas) > 0:
-				out = append(out, fmt.Sprintf("ALTER PUBLICATION %q SET TABLES IN SCHEMA %s;", want.Name, strings.Join(quoteQualifiedList(want.Schemas), ", ")))
+				out = append(out, fmt.Sprintf("ALTER PUBLICATION %s SET TABLES IN SCHEMA %s;", quoteIdentifier(want.Name), strings.Join(quoteQualifiedList(want.Schemas), ", ")))
 			}
 		}
 	}
-	if !want.AllTables {
-		addTables, dropTables := nameSetDelta(canonicalPubTables(old.Tables), want.Tables)
+	if !want.AllTables && !old.AllTables {
+		addTables, dropTables := nameSetDelta(canonicalPubTables(old.Tables), canonicalPubTables(want.Tables))
 		if len(dropTables) > 0 {
-			out = append(out, fmt.Sprintf("ALTER PUBLICATION %q DROP TABLE %s;", want.Name, strings.Join(quoteQualifiedList(dropTables), ", ")))
+			out = append(out, fmt.Sprintf("ALTER PUBLICATION %s DROP TABLE %s;", quoteIdentifier(want.Name), strings.Join(quoteQualifiedList(dropTables), ", ")))
 		}
 		if len(addTables) > 0 {
-			out = append(out, fmt.Sprintf("ALTER PUBLICATION %q ADD TABLE %s;", want.Name, strings.Join(quoteQualifiedList(addTables), ", ")))
+			out = append(out, fmt.Sprintf("ALTER PUBLICATION %s ADD TABLE %s;", quoteIdentifier(want.Name), strings.Join(quoteQualifiedList(addTables), ", ")))
 		}
 		addSchemas, dropSchemas := nameSetDelta(old.Schemas, want.Schemas)
 		if len(dropSchemas) > 0 {
-			out = append(out, fmt.Sprintf("ALTER PUBLICATION %q DROP TABLES IN SCHEMA %s;", want.Name, strings.Join(quoteQualifiedList(dropSchemas), ", ")))
+			out = append(out, fmt.Sprintf("ALTER PUBLICATION %s DROP TABLES IN SCHEMA %s;", quoteIdentifier(want.Name), strings.Join(quoteQualifiedList(dropSchemas), ", ")))
 		}
 		if len(addSchemas) > 0 {
-			out = append(out, fmt.Sprintf("ALTER PUBLICATION %q ADD TABLES IN SCHEMA %s;", want.Name, strings.Join(quoteQualifiedList(addSchemas), ", ")))
+			out = append(out, fmt.Sprintf("ALTER PUBLICATION %s ADD TABLES IN SCHEMA %s;", quoteIdentifier(want.Name), strings.Join(quoteQualifiedList(addSchemas), ", ")))
 		}
 	}
 	if want.PublishInsert != old.PublishInsert || want.PublishUpdate != old.PublishUpdate ||
 		want.PublishDelete != old.PublishDelete || want.PublishTruncate != old.PublishTruncate {
-		out = append(out, fmt.Sprintf("ALTER PUBLICATION %q SET (publish = '%s');", want.Name, publishFlagString(want)))
+		out = append(out, fmt.Sprintf("ALTER PUBLICATION %s SET (publish = '%s');", quoteIdentifier(want.Name), publishFlagString(want)))
 	}
 	return strings.Join(out, "\n")
 }
 
+func recreatePublicationSQL(publication *schema.Publication) string {
+	return strings.Join([]string{
+		GenerateDropPublicationSQL(publication.Name),
+		GenerateCreatePublicationSQL(publication),
+		GeneratePublicationCommentSQL(publication.Name),
+	}, "\n")
+}
+
 // GenerateDropPublicationSQL renders DROP PUBLICATION.
 func GenerateDropPublicationSQL(name string) string {
-	return fmt.Sprintf("DROP PUBLICATION %q;", name)
+	return fmt.Sprintf("DROP PUBLICATION %s;", quoteIdentifier(name))
 }
 
 // GeneratePublicationCommentSQL stamps the managed-publication marker.
 func GeneratePublicationCommentSQL(name string) string {
-	return fmt.Sprintf("COMMENT ON PUBLICATION %q IS '%s';", name, schema.PublicationManagedComment)
+	return fmt.Sprintf("COMMENT ON PUBLICATION %s IS '%s';", quoteIdentifier(name), schema.PublicationManagedComment)
 }
 
 // GenerateCreateEventTriggerSQL renders the desired event trigger.
 func GenerateCreateEventTriggerSQL(e *schema.EventTrigger) string {
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "CREATE EVENT TRIGGER %q ON %s", e.Name, strings.ToUpper(e.Event))
+	fmt.Fprintf(&sb, "CREATE EVENT TRIGGER %s ON %s", quoteIdentifier(e.Name), strings.ToUpper(e.Event))
 	if len(e.Tags) > 0 {
 		quoted := make([]string, 0, len(e.Tags))
 		for _, tag := range e.Tags {
-			quoted = append(quoted, fmt.Sprintf("'%s'", tag))
+			quoted = append(quoted, "'"+strings.ReplaceAll(tag, "'", "''")+"'")
 		}
 		fmt.Fprintf(&sb, " WHEN TAG IN (%s)", strings.Join(quoted, ", "))
 	}
-	fmt.Fprintf(&sb, " EXECUTE FUNCTION %s();", e.Function)
+	fmt.Fprintf(&sb, " EXECUTE FUNCTION %s();", quoteIdentifier(e.Function))
+	if !e.Enabled {
+		sb.WriteString("\n")
+		sb.WriteString(GenerateAlterEventTriggerEnabledSQL(e))
+	}
 	return sb.String()
 }
 
@@ -304,9 +328,9 @@ func GenerateCreateEventTriggerSQL(e *schema.EventTrigger) string {
 // desired enabled state.
 func GenerateAlterEventTriggerEnabledSQL(e *schema.EventTrigger) string {
 	if e.Enabled {
-		return fmt.Sprintf("ALTER EVENT TRIGGER %q ENABLE;", e.Name)
+		return fmt.Sprintf("ALTER EVENT TRIGGER %s ENABLE;", quoteIdentifier(e.Name))
 	}
-	return fmt.Sprintf("ALTER EVENT TRIGGER %q DISABLE;", e.Name)
+	return fmt.Sprintf("ALTER EVENT TRIGGER %s DISABLE;", quoteIdentifier(e.Name))
 }
 
 // GenerateAlterEventTriggerSQL renders drift reconciliation for one event
@@ -339,12 +363,12 @@ func canonicalTagList(in []string) []string {
 
 // GenerateDropEventTriggerSQL renders DROP EVENT TRIGGER.
 func GenerateDropEventTriggerSQL(name string) string {
-	return fmt.Sprintf("DROP EVENT TRIGGER %q;", name)
+	return fmt.Sprintf("DROP EVENT TRIGGER %s;", quoteIdentifier(name))
 }
 
 // GenerateEventTriggerCommentSQL stamps the managed-event-trigger marker.
 func GenerateEventTriggerCommentSQL(name string) string {
-	return fmt.Sprintf("COMMENT ON EVENT TRIGGER %q IS '%s';", name, schema.EventTriggerManagedComment)
+	return fmt.Sprintf("COMMENT ON EVENT TRIGGER %s IS '%s';", quoteIdentifier(name), schema.EventTriggerManagedComment)
 }
 
 // publishFlagString renders the comma-separated publish option list for the
@@ -370,20 +394,95 @@ func publishFlagString(p *schema.Publication) string {
 func quoteQualifiedList(names []string) []string {
 	out := make([]string, 0, len(names))
 	for _, n := range names {
-		parts := strings.SplitN(n, ".", 2)
+		parts := splitQualifiedIdentifier(n)
 		for i := range parts {
-			parts[i] = fmt.Sprintf("%q", parts[i])
+			parts[i] = quoteIdentifierPart(parts[i])
 		}
 		out = append(out, strings.Join(parts, "."))
 	}
 	return out
 }
 
-// canonicalPubTables lowercases a table name list for set comparison.
+func splitQualifiedIdentifier(name string) []string {
+	var parts []string
+	start := 0
+	inQuote := false
+	for i := 0; i < len(name); i++ {
+		switch name[i] {
+		case '"':
+			if inQuote && i+1 < len(name) && name[i+1] == '"' {
+				i++
+				continue
+			}
+			inQuote = !inQuote
+		case '.':
+			if !inQuote {
+				parts = append(parts, strings.TrimSpace(name[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	parts = append(parts, strings.TrimSpace(name[start:]))
+	return parts
+}
+
+func quoteIdentifierPart(part string) string {
+	part = strings.TrimSpace(part)
+	if len(part) >= 2 && part[0] == '"' && part[len(part)-1] == '"' {
+		part = strings.ReplaceAll(part[1:len(part)-1], `""`, `"`)
+	}
+	return quoteIdentifier(part)
+}
+
+func quoteIdentifier(identifier string) string {
+	return `"` + strings.ReplaceAll(identifier, `"`, `""`) + `"`
+}
+
+func canonicalLiveIdentifier(identifier string) string {
+	if isSimpleLowerIdentifier(identifier) {
+		return strings.ToLower(identifier)
+	}
+	return quoteIdentifier(identifier)
+}
+
+func isSimpleLowerIdentifier(identifier string) bool {
+	if identifier == "" {
+		return false
+	}
+	for i, r := range identifier {
+		if i == 0 {
+			if r != '_' && (r < 'a' || r > 'z') {
+				return false
+			}
+			continue
+		}
+		if r != '_' && (r < 'a' || r > 'z') &&
+			(r < '0' || r > '9') && r != '$' {
+			return false
+		}
+	}
+	return true
+}
+
+// canonicalPubTables canonicalizes schema-qualified table names for set
+// comparison while retaining quoted identifiers whose case or punctuation
+// is significant.
 func canonicalPubTables(in []string) []string {
 	out := make([]string, 0, len(in))
 	for _, s := range in {
-		out = append(out, strings.ToLower(s))
+		parts := splitQualifiedIdentifier(s)
+		for i, part := range parts {
+			part = strings.TrimSpace(part)
+			if len(part) >= 2 && part[0] == '"' && part[len(part)-1] == '"' {
+				part = strings.ReplaceAll(part[1:len(part)-1], `""`, `"`)
+			}
+			if isSimpleLowerIdentifier(part) {
+				parts[i] = strings.ToLower(part)
+			} else {
+				parts[i] = quoteIdentifier(part)
+			}
+		}
+		out = append(out, strings.Join(parts, "."))
 	}
 	return out
 }

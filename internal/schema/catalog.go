@@ -48,15 +48,50 @@ type CatalogSpec struct {
 	Publications  []*Publication  `json:"publications"`
 	EventTriggers []*EventTrigger `json:"event_triggers"`
 
-	droppedPublications  map[string]bool
-	droppedEventTriggers map[string]bool
+	droppedPublications   map[string]bool
+	droppedEventTriggers  map[string]bool
+	operations            []catalogOperation
+	hasCatalogStatements  bool
+	hasCreateStatements   bool
+	explicitDropsOnly     bool
+	suppressImplicitDrops bool
+}
+
+type catalogOperationKind uint8
+
+const (
+	catalogPublicationOperation catalogOperationKind = iota
+	catalogEventTriggerOperation
+)
+
+type catalogOperationAction uint8
+
+const (
+	catalogCreateOperation catalogOperationAction = iota
+	catalogAlterOperation
+	catalogDropOperation
+)
+
+type catalogOperation struct {
+	kind         catalogOperationKind
+	action       catalogOperationAction
+	name         string
+	publication  *Publication
+	eventTrigger *EventTrigger
+	alterClause  string
 }
 
 var (
+	// catalogIdentifierPattern captures a SQL identifier while preserving
+	// escaped double quotes in quoted identifiers.
+	catalogIdentifierPartPattern = `(?:"(?:""|[^"])*"|[A-Za-z_][A-Za-z0-9_$]*)`
+	catalogIdentifierPattern     = `("((?:""|[^"])*)"|[A-Za-z_][A-Za-z0-9_$]*)`
+	catalogIdentifierPartRe      = regexp.MustCompile(`^` + catalogIdentifierPartPattern + `$`)
+
 	// createPublicationRe matches CREATE PUBLICATION name [FOR ...] [WITH (...)].
-	// Captures: (1) publication name, (2) the FOR clause if present,
-	// (3) the WITH clause if present.
-	createPublicationRe = regexp.MustCompile(`(?is)^CREATE\s+PUBLICATION\s+("([^"]+)"|[\w]+)(?:\s+(FOR\b[^;]+?))?(?:\s+(WITH\s*\(.*\)))?\s*$`)
+	// Captures: (1) publication name, (2) quoted-name contents when quoted,
+	// (3) the FOR clause if present, (4) the WITH clause if present.
+	createPublicationRe = regexp.MustCompile(`(?is)^CREATE\s+PUBLICATION\s+` + catalogIdentifierPattern + `(?:\s+(FOR\b.*?))?(?:\s+(WITH\s*\(.*\)))?\s*$`)
 
 	// publicationForAllRe matches the FOR ALL TABLES membership clause.
 	publicationForAllRe = regexp.MustCompile(`(?i)^ALL\s+TABLES\s*$`)
@@ -65,19 +100,37 @@ var (
 	publicationForTablesRe = regexp.MustCompile(`(?i)^TABLES\s+IN\s+SCHEMA\s+(.+)$|^TABLE\s+(.+)$`)
 
 	// publishOptionsRe extracts the publish option value from WITH (...).
-	publishOptionsRe = regexp.MustCompile(`(?i)publish\s*=\s*'([^']*)'`)
+	publishOptionsRe  = regexp.MustCompile(`(?i)publish\s*=\s*'([^']*)'`)
+	publicationWithRe = regexp.MustCompile(`(?is)^WITH\s*\(\s*publish\s*=\s*'([^']*)'\s*\)$`)
 
 	// createEventTriggerRe matches
 	// CREATE EVENT TRIGGER name ON event [WHEN TAG IN (...)] EXECUTE FUNCTION f().
-	// Captures: (1) name, (2) event, (3) optional WHEN clause, (4) function.
-	createEventTriggerRe = regexp.MustCompile(`(?is)^CREATE\s+EVENT\s+TRIGGER\s+("([^"]+)"|[\w]+)\s+ON\s+([\w]+)(?:\s+(WHEN\b.*?))?\s+EXECUTE\s+(?:FUNCTION|PROCEDURE)\s+([\w"]+)\s*\(\s*\)\s*$`)
+	// Captures: (1) name, (2) quoted-name contents when quoted, (3) event,
+	// (4) optional WHEN clause, (5) function.
+	createEventTriggerRe = regexp.MustCompile(`(?is)^CREATE\s+EVENT\s+TRIGGER\s+` + catalogIdentifierPattern + `\s+ON\s+([A-Za-z_][A-Za-z0-9_$]*)(?:\s+(WHEN\b.*?))?\s+EXECUTE\s+(?:FUNCTION|PROCEDURE)\s+(` + catalogIdentifierPartPattern + `)\s*\(\s*\)\s*$`)
 
-	alterPublicationRe        = regexp.MustCompile(`(?is)^ALTER\s+PUBLICATION\s+("([^"]+)"|[\w]+)\s+(.+)$`)
-	dropPublicationRe         = regexp.MustCompile(`(?is)^DROP\s+PUBLICATION\s+(?:IF\s+EXISTS\s+)?("([^"]+)"|[\w]+)(?:\s+(?:CASCADE|RESTRICT))?$`)
-	alterEventTriggerRe       = regexp.MustCompile(`(?is)^ALTER\s+EVENT\s+TRIGGER\s+("([^"]+)"|[\w]+)\s+(.+)$`)
-	dropEventTriggerRe        = regexp.MustCompile(`(?is)^DROP\s+EVENT\s+TRIGGER\s+(?:IF\s+EXISTS\s+)?("([^"]+)"|[\w]+)(?:\s+(?:CASCADE|RESTRICT))?$`)
-	publicationPublishAlterRe = regexp.MustCompile(`(?is)^SET\s*\(\s*publish\s*=\s*'[^']*'\s*\)$`)
+	alterPublicationRe        = regexp.MustCompile(`(?is)^ALTER\s+PUBLICATION\s+` + catalogIdentifierPattern + `\s+(.+)$`)
+	dropPublicationRe         = regexp.MustCompile(`(?is)^DROP\s+PUBLICATION\s+(?:IF\s+EXISTS\s+)?` + catalogIdentifierPattern + `(?:\s+(?:CASCADE|RESTRICT))?$`)
+	alterEventTriggerRe       = regexp.MustCompile(`(?is)^ALTER\s+EVENT\s+TRIGGER\s+` + catalogIdentifierPattern + `\s+(.+)$`)
+	dropEventTriggerRe        = regexp.MustCompile(`(?is)^DROP\s+EVENT\s+TRIGGER\s+(?:IF\s+EXISTS\s+)?` + catalogIdentifierPattern + `(?:\s+(?:CASCADE|RESTRICT))?$`)
+	publicationSetAllRe       = regexp.MustCompile(`(?is)^SET\s+ALL\s+TABLES$`)
+	publicationSetSchemasRe   = regexp.MustCompile(`(?is)^SET\s+TABLES\s+IN\s+SCHEMA\s+(.+)$`)
+	publicationSetTablesRe    = regexp.MustCompile(`(?is)^SET\s+TABLE\s+(.+)$`)
+	publicationAddSchemasRe   = regexp.MustCompile(`(?is)^ADD\s+TABLES\s+IN\s+SCHEMA\s+(.+)$`)
+	publicationDropSchemasRe  = regexp.MustCompile(`(?is)^DROP\s+TABLES\s+IN\s+SCHEMA\s+(.+)$`)
+	publicationAddTablesRe    = regexp.MustCompile(`(?is)^ADD\s+TABLE\s+(.+)$`)
+	publicationDropTablesRe   = regexp.MustCompile(`(?is)^DROP\s+TABLE\s+(.+)$`)
+	publicationPublishAlterRe = regexp.MustCompile(`(?is)^SET\s*\(\s*publish\s*=\s*'([^']*)'\s*\)$`)
+	eventTriggerWhenTagRe     = regexp.MustCompile(`(?is)^WHEN\s+TAG\s+IN\s*\(\s*'(?:''|[^'])*'(?:\s*,\s*'(?:''|[^'])*')*\s*\)$`)
+	eventTriggerTagValueRe    = regexp.MustCompile(`'((?:''|[^'])*)'`)
 )
+
+var supportedEventTriggerEvents = map[string]bool{
+	"DDL_COMMAND_START": true,
+	"DDL_COMMAND_END":   true,
+	"SQL_DROP":          true,
+	"TABLE_REWRITE":     true,
+}
 
 // ParseCatalogSQL extracts managed publications and event triggers from a
 // CatalogSQL file. CREATE PUBLICATION without a WITH (publish = ...) clause
@@ -95,45 +148,90 @@ func ParseCatalogSQL(sql string) *CatalogSpec {
 		switch {
 		case strings.HasPrefix(upper, "CREATE PUBLICATION"):
 			if p := parsePublicationStatement(trimmed); p != nil {
-				upsertPublication(spec, p)
+				spec.operations = append(spec.operations, catalogOperation{
+					kind:        catalogPublicationOperation,
+					action:      catalogCreateOperation,
+					name:        p.Name,
+					publication: p,
+				})
+				spec.hasCatalogStatements = true
+				spec.hasCreateStatements = true
 			}
 		case strings.HasPrefix(upper, "ALTER PUBLICATION"):
-			applyPublicationAlter(spec, trimmed)
+			if matches := alterPublicationRe.FindStringSubmatch(trimmed); matches != nil {
+				spec.operations = append(spec.operations, catalogOperation{
+					kind:        catalogPublicationOperation,
+					action:      catalogAlterOperation,
+					name:        statementIdentifier(matches),
+					alterClause: strings.TrimSpace(matches[3]),
+				})
+				spec.hasCatalogStatements = true
+			}
 		case strings.HasPrefix(upper, "DROP PUBLICATION"):
 			if name := statementIdentifier(dropPublicationRe.FindStringSubmatch(trimmed)); name != "" {
-				if spec.droppedPublications == nil {
-					spec.droppedPublications = make(map[string]bool)
-				}
-				spec.droppedPublications[strings.ToLower(name)] = true
-				removePublication(spec, name)
+				spec.operations = append(spec.operations, catalogOperation{
+					kind:   catalogPublicationOperation,
+					action: catalogDropOperation,
+					name:   name,
+				})
+				spec.hasCatalogStatements = true
 			}
 		case strings.HasPrefix(upper, "CREATE EVENT TRIGGER"):
 			if e := parseEventTriggerStatement(trimmed); e != nil {
-				upsertEventTrigger(spec, e)
+				spec.operations = append(spec.operations, catalogOperation{
+					kind:         catalogEventTriggerOperation,
+					action:       catalogCreateOperation,
+					name:         e.Name,
+					eventTrigger: e,
+				})
+				spec.hasCatalogStatements = true
+				spec.hasCreateStatements = true
 			}
 		case strings.HasPrefix(upper, "ALTER EVENT TRIGGER"):
-			applyEventTriggerAlter(spec, trimmed)
+			if matches := alterEventTriggerRe.FindStringSubmatch(trimmed); matches != nil {
+				spec.operations = append(spec.operations, catalogOperation{
+					kind:        catalogEventTriggerOperation,
+					action:      catalogAlterOperation,
+					name:        statementIdentifier(matches),
+					alterClause: strings.TrimSpace(matches[3]),
+				})
+				spec.hasCatalogStatements = true
+			}
 		case strings.HasPrefix(upper, "DROP EVENT TRIGGER"):
 			if name := statementIdentifier(dropEventTriggerRe.FindStringSubmatch(trimmed)); name != "" {
-				if spec.droppedEventTriggers == nil {
-					spec.droppedEventTriggers = make(map[string]bool)
-				}
-				spec.droppedEventTriggers[strings.ToLower(name)] = true
-				removeEventTrigger(spec, name)
+				spec.operations = append(spec.operations, catalogOperation{
+					kind:   catalogEventTriggerOperation,
+					action: catalogDropOperation,
+					name:   name,
+				})
+				spec.hasCatalogStatements = true
 			}
 		}
 	}
-	return spec
+	materialized, _ := applyCatalogOperations(nil, spec.operations, false)
+	materialized.operations = append([]catalogOperation(nil), spec.operations...)
+	materialized.hasCatalogStatements = spec.hasCatalogStatements
+	materialized.hasCreateStatements = spec.hasCreateStatements
+	materialized.suppressImplicitDrops = spec.hasCatalogStatements && !spec.hasCreateStatements
+	return materialized
 }
 
 func statementIdentifier(matches []string) string {
 	if len(matches) < 2 {
 		return ""
 	}
-	if matches[2] != "" {
-		return matches[2]
+	if len(matches) > 2 && matches[2] != "" {
+		return strings.ReplaceAll(matches[2], `""`, `"`)
 	}
-	return strings.Trim(matches[1], `"`)
+	return decodeIdentifier(matches[1])
+}
+
+func decodeIdentifier(identifier string) string {
+	identifier = strings.TrimSpace(identifier)
+	if len(identifier) >= 2 && identifier[0] == '"' && identifier[len(identifier)-1] == '"' {
+		return strings.ReplaceAll(identifier[1:len(identifier)-1], `""`, `"`)
+	}
+	return strings.ToLower(identifier)
 }
 
 func upsertPublication(spec *CatalogSpec, publication *Publication) {
@@ -196,60 +294,135 @@ func findEventTrigger(spec *CatalogSpec, name string) *EventTrigger {
 	return nil
 }
 
-func applyPublicationAlter(spec *CatalogSpec, stmt string) {
-	matches := alterPublicationRe.FindStringSubmatch(stmt)
-	if matches == nil {
-		return
+func applyCatalogOperations(base *CatalogSpec, operations []catalogOperation, strict bool) (*CatalogSpec, error) {
+	out := &CatalogSpec{}
+	if base != nil {
+		for _, publication := range base.Publications {
+			upsertPublication(out, clonePublication(publication))
+		}
+		for _, trigger := range base.EventTriggers {
+			upsertEventTrigger(out, cloneEventTrigger(trigger))
+		}
+		out.droppedPublications = cloneBoolMap(base.droppedPublications)
+		out.droppedEventTriggers = cloneBoolMap(base.droppedEventTriggers)
 	}
-	publication := findPublication(spec, statementIdentifier(matches))
-	if publication == nil {
-		return
+	for _, operation := range operations {
+		switch operation.kind {
+		case catalogPublicationOperation:
+			switch operation.action {
+			case catalogCreateOperation:
+				upsertPublication(out, clonePublication(operation.publication))
+				delete(out.droppedPublications, strings.ToLower(operation.name))
+			case catalogAlterOperation:
+				publication := findPublication(out, operation.name)
+				if publication == nil {
+					if strict {
+						return nil, fmt.Errorf("ALTER PUBLICATION %q requires a CREATE PUBLICATION declaration in SchemaSQL or CatalogSQL", operation.name)
+					}
+					continue
+				}
+				if !applyPublicationAlterClause(publication, operation.alterClause) && strict {
+					return nil, fmt.Errorf("unsupported ALTER PUBLICATION form for %q: %q", operation.name, operation.alterClause)
+				}
+			case catalogDropOperation:
+				removePublication(out, operation.name)
+				if out.droppedPublications == nil {
+					out.droppedPublications = make(map[string]bool)
+				}
+				out.droppedPublications[strings.ToLower(operation.name)] = true
+			}
+		case catalogEventTriggerOperation:
+			switch operation.action {
+			case catalogCreateOperation:
+				upsertEventTrigger(out, cloneEventTrigger(operation.eventTrigger))
+				delete(out.droppedEventTriggers, strings.ToLower(operation.name))
+			case catalogAlterOperation:
+				trigger := findEventTrigger(out, operation.name)
+				if trigger == nil {
+					if strict {
+						return nil, fmt.Errorf("ALTER EVENT TRIGGER %q requires a CREATE EVENT TRIGGER declaration in SchemaSQL or CatalogSQL", operation.name)
+					}
+					continue
+				}
+				if !applyEventTriggerAlterClause(trigger, operation.alterClause) && strict {
+					return nil, fmt.Errorf("unsupported ALTER EVENT TRIGGER form for %q: %q", operation.name, operation.alterClause)
+				}
+			case catalogDropOperation:
+				removeEventTrigger(out, operation.name)
+				if out.droppedEventTriggers == nil {
+					out.droppedEventTriggers = make(map[string]bool)
+				}
+				out.droppedEventTriggers[strings.ToLower(operation.name)] = true
+			}
+		}
 	}
-	clause := strings.TrimSpace(matches[3])
-	upper := strings.ToUpper(clause)
-	switch {
-	case strings.HasPrefix(upper, "SET ALL TABLES"):
+	return out, nil
+}
+
+func cloneBoolMap(in map[string]bool) map[string]bool {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
+}
+
+func applyPublicationAlterClause(publication *Publication, clause string) bool {
+	clause = strings.TrimSpace(clause)
+	if publicationSetAllRe.MatchString(clause) {
 		publication.AllTables = true
 		publication.Tables = nil
 		publication.Schemas = nil
-	case strings.HasPrefix(upper, "SET TABLES IN SCHEMA "):
+		return true
+	}
+	if matches := publicationSetSchemasRe.FindStringSubmatch(clause); matches != nil {
 		publication.AllTables = false
 		publication.Tables = nil
-		publication.Schemas = splitList(strings.TrimSpace(clause[len("SET TABLES IN SCHEMA "):]))
-	case strings.HasPrefix(upper, "SET TABLE "):
+		publication.Schemas = splitList(matches[1])
+		return true
+	}
+	if matches := publicationSetTablesRe.FindStringSubmatch(clause); matches != nil {
 		publication.AllTables = false
 		publication.Schemas = nil
-		publication.Tables = splitList(strings.TrimSpace(clause[len("SET TABLE "):]))
-	case strings.HasPrefix(upper, "ADD TABLES IN SCHEMA "):
-		publication.Schemas = appendUniqueFold(publication.Schemas, splitList(strings.TrimSpace(clause[len("ADD TABLES IN SCHEMA "):]))...)
-	case strings.HasPrefix(upper, "DROP TABLES IN SCHEMA "):
-		publication.Schemas = removeFold(publication.Schemas, splitList(strings.TrimSpace(clause[len("DROP TABLES IN SCHEMA "):]))...)
-	case strings.HasPrefix(upper, "ADD TABLE "):
-		publication.Tables = appendUniqueFold(publication.Tables, splitList(strings.TrimSpace(clause[len("ADD TABLE "):]))...)
-	case strings.HasPrefix(upper, "DROP TABLE "):
-		publication.Tables = removeFold(publication.Tables, splitList(strings.TrimSpace(clause[len("DROP TABLE "):]))...)
-	case strings.HasPrefix(upper, "SET "):
-		if publish := publishOptionsRe.FindStringSubmatch(clause); publish != nil {
-			setPublishOptions(publication, publish[1])
-		}
+		publication.Tables = splitList(matches[1])
+		return true
 	}
+	if matches := publicationAddSchemasRe.FindStringSubmatch(clause); matches != nil {
+		publication.Schemas = appendUniqueFold(publication.Schemas, splitList(matches[1])...)
+		return true
+	}
+	if matches := publicationDropSchemasRe.FindStringSubmatch(clause); matches != nil {
+		publication.Schemas = removeFold(publication.Schemas, splitList(matches[1])...)
+		return true
+	}
+	if matches := publicationAddTablesRe.FindStringSubmatch(clause); matches != nil {
+		publication.Tables = appendUniqueFold(publication.Tables, splitList(matches[1])...)
+		return true
+	}
+	if matches := publicationDropTablesRe.FindStringSubmatch(clause); matches != nil {
+		publication.Tables = removeFold(publication.Tables, splitList(matches[1])...)
+		return true
+	}
+	if matches := publicationPublishAlterRe.FindStringSubmatch(clause); matches != nil {
+		setPublishOptions(publication, matches[1])
+		return true
+	}
+	return false
 }
 
-func applyEventTriggerAlter(spec *CatalogSpec, stmt string) {
-	matches := alterEventTriggerRe.FindStringSubmatch(stmt)
-	if matches == nil {
-		return
-	}
-	trigger := findEventTrigger(spec, statementIdentifier(matches))
-	if trigger == nil {
-		return
-	}
-	switch strings.ToUpper(strings.TrimSpace(matches[3])) {
+func applyEventTriggerAlterClause(trigger *EventTrigger, clause string) bool {
+	switch strings.ToUpper(strings.TrimSpace(clause)) {
 	case "ENABLE":
 		trigger.Enabled = true
 	case "DISABLE":
 		trigger.Enabled = false
+	default:
+		return false
 	}
+	return true
 }
 
 func setPublishOptions(publication *Publication, options string) {
@@ -308,41 +481,124 @@ func removeFold(values []string, removals ...string) []string {
 // optional CatalogSQL side-channel. The explicit side-channel replaces
 // SchemaSQL publications or event triggers with the same name.
 func MergeCatalogSpecs(schemaSpec, sideSpec *CatalogSpec) *CatalogSpec {
-	out := &CatalogSpec{}
-	publications := make(map[string]*Publication)
-	eventTriggers := make(map[string]*EventTrigger)
+	out, _ := mergeCatalogSpecs(schemaSpec, sideSpec, false)
+	return out
+}
 
-	for _, spec := range []*CatalogSpec{schemaSpec, sideSpec} {
-		if spec == nil {
-			continue
-		}
-		for name := range spec.droppedPublications {
-			delete(publications, name)
-		}
-		for name := range spec.droppedEventTriggers {
-			delete(eventTriggers, name)
-		}
-		for _, publication := range spec.Publications {
-			publications[strings.ToLower(publication.Name)] = clonePublication(publication)
-		}
-		for _, trigger := range spec.EventTriggers {
-			eventTriggers[strings.ToLower(trigger.Name)] = cloneEventTrigger(trigger)
-		}
-	}
+// ValidateCatalogSpecMerge verifies that ALTER statements have a declaration
+// to modify after SchemaSQL and CatalogSQL overlays are applied.
+func ValidateCatalogSpecMerge(schemaSpec, sideSpec *CatalogSpec) error {
+	_, err := mergeCatalogSpecs(schemaSpec, sideSpec, true)
+	return err
+}
 
-	for _, publication := range publications {
-		out.Publications = append(out.Publications, publication)
+func mergeCatalogSpecs(schemaSpec, sideSpec *CatalogSpec, strict bool) (*CatalogSpec, error) {
+	out, err := materializeCatalogSpec(schemaSpec, strict)
+	if err != nil {
+		return nil, err
 	}
-	for _, trigger := range eventTriggers {
-		out.EventTriggers = append(out.EventTriggers, trigger)
+	if sideSpec != nil {
+		if len(sideSpec.operations) > 0 {
+			out, err = applyCatalogOperations(out, sideSpec.operations, strict)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			overlayCatalogDeclarations(out, sideSpec)
+		}
 	}
+	out.hasCatalogStatements = hasCatalogStatements(schemaSpec) || hasCatalogStatements(sideSpec)
+	out.hasCreateStatements = hasCreateStatements(schemaSpec) || hasCreateStatements(sideSpec)
+	out.explicitDropsOnly = out.hasCatalogStatements &&
+		(len(out.Publications) == 0 && len(out.EventTriggers) == 0) &&
+		(len(out.droppedPublications) > 0 || len(out.droppedEventTriggers) > 0)
+	out.suppressImplicitDrops = suppressImplicitDrops(schemaSpec) || suppressImplicitDrops(sideSpec)
 	slices.SortFunc(out.Publications, func(a, b *Publication) int {
 		return strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name))
 	})
 	slices.SortFunc(out.EventTriggers, func(a, b *EventTrigger) int {
 		return strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name))
 	})
+	return out, nil
+}
+
+func materializeCatalogSpec(spec *CatalogSpec, strict bool) (*CatalogSpec, error) {
+	if spec == nil {
+		return &CatalogSpec{}, nil
+	}
+	if len(spec.operations) > 0 {
+		out, err := applyCatalogOperations(nil, spec.operations, strict)
+		if err != nil {
+			return nil, err
+		}
+		out.operations = append([]catalogOperation(nil), spec.operations...)
+		return out, nil
+	}
+	return cloneCatalogSpec(spec), nil
+}
+
+func overlayCatalogDeclarations(out, overlay *CatalogSpec) {
+	for name := range overlay.droppedPublications {
+		deletePublication(out, name)
+	}
+	for name := range overlay.droppedEventTriggers {
+		deleteEventTrigger(out, name)
+	}
+	for _, publication := range overlay.Publications {
+		upsertPublication(out, clonePublication(publication))
+		delete(out.droppedPublications, strings.ToLower(publication.Name))
+	}
+	for _, trigger := range overlay.EventTriggers {
+		upsertEventTrigger(out, cloneEventTrigger(trigger))
+		delete(out.droppedEventTriggers, strings.ToLower(trigger.Name))
+	}
+}
+
+func deletePublication(spec *CatalogSpec, name string) {
+	removePublication(spec, name)
+	if spec.droppedPublications == nil {
+		spec.droppedPublications = make(map[string]bool)
+	}
+	spec.droppedPublications[strings.ToLower(name)] = true
+}
+
+func deleteEventTrigger(spec *CatalogSpec, name string) {
+	removeEventTrigger(spec, name)
+	if spec.droppedEventTriggers == nil {
+		spec.droppedEventTriggers = make(map[string]bool)
+	}
+	spec.droppedEventTriggers[strings.ToLower(name)] = true
+}
+
+func cloneCatalogSpec(spec *CatalogSpec) *CatalogSpec {
+	out := &CatalogSpec{
+		hasCatalogStatements:  spec.hasCatalogStatements,
+		hasCreateStatements:   spec.hasCreateStatements,
+		explicitDropsOnly:     spec.explicitDropsOnly,
+		suppressImplicitDrops: spec.suppressImplicitDrops,
+		operations:            append([]catalogOperation(nil), spec.operations...),
+		droppedPublications:   cloneBoolMap(spec.droppedPublications),
+		droppedEventTriggers:  cloneBoolMap(spec.droppedEventTriggers),
+	}
+	for _, publication := range spec.Publications {
+		upsertPublication(out, clonePublication(publication))
+	}
+	for _, trigger := range spec.EventTriggers {
+		upsertEventTrigger(out, cloneEventTrigger(trigger))
+	}
 	return out
+}
+
+func hasCatalogStatements(spec *CatalogSpec) bool {
+	return spec != nil && spec.hasCatalogStatements
+}
+
+func hasCreateStatements(spec *CatalogSpec) bool {
+	return spec != nil && spec.hasCreateStatements
+}
+
+func suppressImplicitDrops(spec *CatalogSpec) bool {
+	return spec != nil && spec.suppressImplicitDrops
 }
 
 func clonePublication(p *Publication) *Publication {
@@ -371,7 +627,7 @@ func parsePublicationStatement(stmt string) *Publication {
 		return nil
 	}
 	p := &Publication{
-		Name:            strings.Trim(m[1], `"`),
+		Name:            statementIdentifier(m),
 		PublishInsert:   true,
 		PublishUpdate:   true,
 		PublishDelete:   true,
@@ -419,18 +675,16 @@ func parseEventTriggerStatement(stmt string) *EventTrigger {
 		return nil
 	}
 	e := &EventTrigger{
-		Name:     strings.Trim(m[1], `"`),
+		Name:     statementIdentifier(m),
 		Event:    strings.ToUpper(m[3]),
-		Function: strings.Trim(m[5], `"`),
+		Function: decodeIdentifier(m[5]),
 		Enabled:  true,
 	}
 	if whenClause := strings.TrimSpace(m[4]); whenClause != "" {
-		// WHEN TAG IN ('a', 'b') — extract the quoted tag list. Only the
-		// TAG filter is supported (VALUE IN is not diffable via catalogs
-		// and is rejected by ValidateCatalogSQL).
-		tags := regexp.MustCompile(`'([^']*)'`).FindAllStringSubmatch(whenClause, -1)
-		for _, tm := range tags {
-			e.Tags = append(e.Tags, tm[1])
+		// WHEN TAG IN ('a', 'b') — extract the quoted tag list. Validation
+		// rejects all other WHEN forms before this parser is used by sync.
+		for _, tm := range eventTriggerTagValueRe.FindAllStringSubmatch(whenClause, -1) {
+			e.Tags = append(e.Tags, strings.ReplaceAll(tm[1], "''", "'"))
 		}
 	}
 	return e
@@ -445,6 +699,32 @@ const PublicationManagedComment = "grizzle-managed"
 // event triggers it created.
 const EventTriggerManagedComment = "grizzle-managed"
 
+// PublicationExplicitlyDropped reports whether the desired catalog input
+// contains a DROP PUBLICATION for name.
+func (s *CatalogSpec) PublicationExplicitlyDropped(name string) bool {
+	return s != nil && s.droppedPublications[strings.ToLower(name)]
+}
+
+// EventTriggerExplicitlyDropped reports whether the desired catalog input
+// contains a DROP EVENT TRIGGER for name.
+func (s *CatalogSpec) EventTriggerExplicitlyDropped(name string) bool {
+	return s != nil && s.droppedEventTriggers[strings.ToLower(name)]
+}
+
+// ExplicitDropsOnly reports whether the input contains only explicit drops
+// and no remaining catalog declarations. Such input must not sweep every
+// managed catalog object as an implicit desired-state omission.
+func (s *CatalogSpec) ExplicitDropsOnly() bool {
+	return s != nil && s.explicitDropsOnly
+}
+
+// SuppressImplicitDrops reports whether this input contains only ALTER/DROP
+// operations. Such a patch requires an existing declaration and must not
+// sweep unrelated managed catalog objects that were omitted from the patch.
+func (s *CatalogSpec) SuppressImplicitDrops() bool {
+	return s != nil && s.suppressImplicitDrops
+}
+
 // ValidateCatalogSQL enforces the CatalogSQL statement contract. CREATE,
 // ALTER, and DROP publication/event-trigger statements are accepted; anything
 // else fails loudly instead of being silently ignored by the statement scan.
@@ -457,7 +737,8 @@ func ValidateCatalogSQL(sql string) error {
 		upper := strings.ToUpper(trimmed)
 		switch {
 		case strings.HasPrefix(upper, "CREATE PUBLICATION"):
-			if createPublicationRe.FindStringSubmatch(trimmed) == nil {
+			matches := createPublicationRe.FindStringSubmatch(trimmed)
+			if matches == nil || !validatePublicationCreate(matches) {
 				return fmt.Errorf("unsupported CREATE PUBLICATION form in CatalogSQL (expected CREATE PUBLICATION <name> [FOR ALL TABLES | FOR TABLE <tables> | FOR TABLES IN SCHEMA <schemas>] [WITH (publish = '...')]): %q", trimmed)
 			}
 		case strings.HasPrefix(upper, "ALTER PUBLICATION"):
@@ -470,11 +751,15 @@ func ValidateCatalogSQL(sql string) error {
 				return fmt.Errorf("unsupported DROP PUBLICATION form in CatalogSQL: %q", trimmed)
 			}
 		case strings.HasPrefix(upper, "CREATE EVENT TRIGGER"):
-			if createEventTriggerRe.FindStringSubmatch(trimmed) == nil {
+			matches := createEventTriggerRe.FindStringSubmatch(trimmed)
+			if matches == nil {
 				return fmt.Errorf("unsupported CREATE EVENT TRIGGER form in CatalogSQL (expected CREATE EVENT TRIGGER <name> ON <event> [WHEN TAG IN ('...')] EXECUTE FUNCTION <fn>()): %q", trimmed)
 			}
-			if strings.Contains(strings.ToUpper(trimmed), "VALUE IN") {
-				return fmt.Errorf("unsupported WHEN VALUE IN filter in CatalogSQL (only WHEN TAG IN is managed): %q", trimmed)
+			if !supportedEventTriggerEvents[strings.ToUpper(matches[3])] {
+				return fmt.Errorf("unsupported event-trigger event %q in CatalogSQL: %q", matches[3], trimmed)
+			}
+			if whenClause := strings.TrimSpace(matches[4]); whenClause != "" && !eventTriggerWhenTagRe.MatchString(whenClause) {
+				return fmt.Errorf("unsupported event-trigger WHEN clause in CatalogSQL (only WHEN TAG IN is managed): %q", trimmed)
 			}
 		case strings.HasPrefix(upper, "ALTER EVENT TRIGGER"):
 			matches := alterEventTriggerRe.FindStringSubmatch(trimmed)
@@ -492,27 +777,196 @@ func ValidateCatalogSQL(sql string) error {
 	return nil
 }
 
+func validatePublicationCreate(matches []string) bool {
+	if len(matches) < 5 {
+		return false
+	}
+	if forClause := strings.TrimSpace(matches[3]); forClause != "" {
+		if containsSQLCommentOutsideQuotes(forClause) {
+			return false
+		}
+		clause := strings.TrimSpace(forClause[3:])
+		if publicationForAllRe.MatchString(clause) {
+			// Valid.
+		} else if tableMatches := publicationForTablesRe.FindStringSubmatch(clause); tableMatches != nil {
+			list := tableMatches[1]
+			qualified := true
+			if list == "" {
+				list = tableMatches[2]
+				qualified = true
+			}
+			if tableMatches[1] != "" {
+				qualified = false
+			}
+			if !nonEmptyIdentifierList(list, qualified) {
+				return false
+			}
+		} else {
+			return false
+		}
+	}
+	if withClause := strings.TrimSpace(matches[4]); withClause != "" {
+		if containsSQLCommentOutsideQuotes(withClause) {
+			return false
+		}
+		withMatches := publicationWithRe.FindStringSubmatch(withClause)
+		if withMatches == nil || validatePublishOptions(withMatches[1]) != nil {
+			return false
+		}
+	}
+	return true
+}
+
+func containsSQLCommentOutsideQuotes(s string) bool {
+	inQuote := false
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '"':
+			if inQuote && i+1 < len(s) && s[i+1] == '"' {
+				i++
+				continue
+			}
+			inQuote = !inQuote
+		case '-':
+			if !inQuote && i+1 < len(s) && s[i+1] == '-' {
+				return true
+			}
+		case '/':
+			if !inQuote && i+1 < len(s) && s[i+1] == '*' {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func validatePublishOptions(options string) error {
+	seen := make(map[string]bool)
+	for _, option := range strings.Split(options, ",") {
+		option = strings.ToLower(strings.TrimSpace(option))
+		switch option {
+		case "insert", "update", "delete", "truncate":
+			if seen[option] {
+				return fmt.Errorf("duplicate publish option %q", option)
+			}
+			seen[option] = true
+		default:
+			return fmt.Errorf("unsupported publish option %q", option)
+		}
+	}
+	if len(seen) == 0 {
+		return fmt.Errorf("publish option list must not be empty")
+	}
+	return nil
+}
+
 func isSupportedPublicationAlter(clause string) bool {
 	clause = strings.TrimSpace(clause)
-	upper := strings.ToUpper(clause)
-	switch {
-	case upper == "SET ALL TABLES":
-		return true
-	case strings.HasPrefix(upper, "SET TABLES IN SCHEMA "):
-		return strings.TrimSpace(clause[len("SET TABLES IN SCHEMA "):]) != ""
-	case strings.HasPrefix(upper, "SET TABLE "):
-		return strings.TrimSpace(clause[len("SET TABLE "):]) != ""
-	case strings.HasPrefix(upper, "ADD TABLES IN SCHEMA "):
-		return strings.TrimSpace(clause[len("ADD TABLES IN SCHEMA "):]) != ""
-	case strings.HasPrefix(upper, "DROP TABLES IN SCHEMA "):
-		return strings.TrimSpace(clause[len("DROP TABLES IN SCHEMA "):]) != ""
-	case strings.HasPrefix(upper, "ADD TABLE "):
-		return strings.TrimSpace(clause[len("ADD TABLE "):]) != ""
-	case strings.HasPrefix(upper, "DROP TABLE "):
-		return strings.TrimSpace(clause[len("DROP TABLE "):]) != ""
-	default:
-		return publicationPublishAlterRe.MatchString(clause)
+	if containsSQLCommentOutsideQuotes(clause) {
+		return false
 	}
+	switch {
+	case publicationSetAllRe.MatchString(clause):
+		return true
+	case publicationSetSchemasRe.MatchString(clause):
+		return nonEmptyIdentifierList(publicationSetSchemasRe.FindStringSubmatch(clause)[1], false)
+	case publicationSetTablesRe.MatchString(clause):
+		return nonEmptyIdentifierList(publicationSetTablesRe.FindStringSubmatch(clause)[1], true)
+	case publicationAddSchemasRe.MatchString(clause):
+		return nonEmptyIdentifierList(publicationAddSchemasRe.FindStringSubmatch(clause)[1], false)
+	case publicationDropSchemasRe.MatchString(clause):
+		return nonEmptyIdentifierList(publicationDropSchemasRe.FindStringSubmatch(clause)[1], false)
+	case publicationAddTablesRe.MatchString(clause):
+		return nonEmptyIdentifierList(publicationAddTablesRe.FindStringSubmatch(clause)[1], true)
+	case publicationDropTablesRe.MatchString(clause):
+		return nonEmptyIdentifierList(publicationDropTablesRe.FindStringSubmatch(clause)[1], true)
+	case publicationPublishAlterRe.MatchString(clause):
+		matches := publicationPublishAlterRe.FindStringSubmatch(clause)
+		return validatePublishOptions(matches[1]) == nil
+	default:
+		return false
+	}
+}
+
+func nonEmptyIdentifierList(list string, qualified bool) bool {
+	items, ok := splitIdentifierList(list)
+	if !ok || len(items) == 0 {
+		return false
+	}
+	maxParts := 1
+	if qualified {
+		maxParts = 2
+	}
+	for _, item := range items {
+		parts := splitQualifiedIdentifier(item)
+		if len(parts) == 0 || len(parts) > maxParts {
+			return false
+		}
+		for _, part := range parts {
+			if !catalogIdentifierPartRe.MatchString(strings.TrimSpace(part)) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func splitIdentifierList(list string) ([]string, bool) {
+	var parts []string
+	start := 0
+	inQuote := false
+	for i := 0; i < len(list); i++ {
+		switch list[i] {
+		case '"':
+			if inQuote && i+1 < len(list) && list[i+1] == '"' {
+				i++
+				continue
+			}
+			inQuote = !inQuote
+		case ',':
+			if inQuote {
+				continue
+			}
+			item := strings.TrimSpace(list[start:i])
+			if item == "" {
+				return nil, false
+			}
+			parts = append(parts, item)
+			start = i + 1
+		}
+	}
+	if inQuote {
+		return nil, false
+	}
+	item := strings.TrimSpace(list[start:])
+	if item == "" {
+		return nil, false
+	}
+	parts = append(parts, item)
+	return parts, true
+}
+
+func splitQualifiedIdentifier(name string) []string {
+	var parts []string
+	start := 0
+	inQuote := false
+	for i := 0; i < len(name); i++ {
+		switch name[i] {
+		case '"':
+			if inQuote && i+1 < len(name) && name[i+1] == '"' {
+				i++
+				continue
+			}
+			inQuote = !inQuote
+		case '.':
+			if !inQuote {
+				parts = append(parts, strings.TrimSpace(name[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	parts = append(parts, strings.TrimSpace(name[start:]))
+	return parts
 }
 
 func isSupportedEventTriggerAlter(clause string) bool {

@@ -83,19 +83,115 @@ func sameStringSet(a, b []string) bool {
 func canonicalizePublication(p *schema.Publication, targetSchema string) *schema.Publication {
 	tables := make([]string, 0, len(p.Tables))
 	for _, t := range p.Tables {
-		lt := strings.ToLower(strings.TrimSpace(t))
-		if lt == "" {
+		if strings.TrimSpace(t) == "" {
 			continue
 		}
-		if !strings.Contains(lt, ".") {
-			lt = strings.ToLower(targetSchema) + "." + lt
-		}
-		tables = append(tables, lt)
+		tables = append(tables, canonicalQualifiedIdentifier(t, targetSchema))
 	}
 	cp := *p
-	cp.Tables = canonicalNameList(tables)
-	cp.Schemas = canonicalNameList(p.Schemas)
+	cp.Tables = canonicalQualifiedList(tables)
+	cp.Schemas = canonicalSchemaList(p.Schemas)
 	return &cp
+}
+
+func canonicalSchemaList(in []string) []string {
+	out := make([]string, 0, len(in))
+	seen := make(map[string]bool, len(in))
+	for _, name := range in {
+		parts := splitQualifiedIdentifier(name)
+		if len(parts) != 1 {
+			continue
+		}
+		name = canonicalIdentifierPart(parts[0])
+		if name != "" && !seen[name] {
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func canonicalQualifiedList(in []string) []string {
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, name := range in {
+		name = strings.TrimSpace(name)
+		if name != "" && !seen[name] {
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func canonicalQualifiedIdentifier(name, targetSchema string) string {
+	parts := splitQualifiedIdentifier(name)
+	if len(parts) == 0 {
+		return ""
+	}
+	if len(parts) == 1 {
+		parts = append([]string{targetSchema}, parts...)
+	}
+	for i, part := range parts {
+		parts[i] = canonicalIdentifierPart(part)
+	}
+	return strings.Join(parts, ".")
+}
+
+func canonicalIdentifierPart(part string) string {
+	part = strings.TrimSpace(part)
+	if len(part) >= 2 && part[0] == '"' && part[len(part)-1] == '"' {
+		part = strings.ReplaceAll(part[1:len(part)-1], `""`, `"`)
+		if isSimpleLowerIdentifier(part) {
+			return part
+		}
+		return `"` + part + `"`
+	}
+	return strings.ToLower(part)
+}
+
+func isSimpleLowerIdentifier(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i, r := range value {
+		if i == 0 {
+			if r != '_' && (r < 'a' || r > 'z') {
+				return false
+			}
+			continue
+		}
+		if r != '_' && (r < 'a' || r > 'z') &&
+			(r < '0' || r > '9') && r != '$' {
+			return false
+		}
+	}
+	return true
+}
+
+func splitQualifiedIdentifier(name string) []string {
+	var parts []string
+	start := 0
+	inQuote := false
+	for i := 0; i < len(name); i++ {
+		switch name[i] {
+		case '"':
+			if inQuote && i+1 < len(name) && name[i+1] == '"' {
+				i++
+				continue
+			}
+			inQuote = !inQuote
+		case '.':
+			if !inQuote {
+				parts = append(parts, strings.TrimSpace(name[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	parts = append(parts, strings.TrimSpace(name[start:]))
+	return parts
 }
 
 // CatalogDiff computes publication and event-trigger sync steps from the
@@ -150,6 +246,24 @@ func CatalogDiff(desired *schema.CatalogSpec, live *CatalogLiveState, targetSche
 
 	// Live-only publications: dropped only when marker-stamped.
 	for _, name := range sortedMapKeysLivePubs(live.Publications) {
+		if desired.PublicationExplicitlyDropped(name) {
+			liveOnlyPubs[name] = false
+			if live.Publications[name].Managed {
+				changes = append(changes, Change{
+					Type:        plan.ChangeDropPublication,
+					Table:       name,
+					Destructive: true,
+					Publication: &schema.Publication{Name: name},
+				})
+			}
+			continue
+		}
+		if desired.ExplicitDropsOnly() {
+			continue
+		}
+		if desired.SuppressImplicitDrops() {
+			continue
+		}
 		if !liveOnlyPubs[name] || !live.Publications[name].Managed {
 			continue
 		}
@@ -197,6 +311,24 @@ func CatalogDiff(desired *schema.CatalogSpec, live *CatalogLiveState, targetSche
 	}
 
 	for _, name := range sortedMapKeysLiveETs(live.EventTriggers) {
+		if desired.EventTriggerExplicitlyDropped(name) {
+			liveOnlyETs[name] = false
+			if live.EventTriggers[name].Managed {
+				changes = append(changes, Change{
+					Type:         plan.ChangeDropEventTrigger,
+					Table:        name,
+					Destructive:  true,
+					EventTrigger: &schema.EventTrigger{Name: name},
+				})
+			}
+			continue
+		}
+		if desired.ExplicitDropsOnly() {
+			continue
+		}
+		if desired.SuppressImplicitDrops() {
+			continue
+		}
 		if !liveOnlyETs[name] || !live.EventTriggers[name].Managed {
 			continue
 		}
@@ -231,7 +363,7 @@ func publicationHasDrift(want *schema.Publication, live *PublicationState) bool 
 // definition differs from the live one in a way that requires DROP+CREATE
 // (PostgreSQL has no ALTER EVENT TRIGGER for event/tags/function).
 func eventTriggerNeedsRecreate(want *schema.EventTrigger, live *EventTriggerState) bool {
-	if !strings.EqualFold(want.Event, live.Event) || !strings.EqualFold(want.Function, live.Function) {
+	if !strings.EqualFold(want.Event, live.Event) || want.Function != live.Function {
 		return true
 	}
 	return !sameStringSet(canonicalNameList(want.Tags), canonicalNameList(live.Tags))

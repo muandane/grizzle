@@ -459,6 +459,12 @@ func (o *Options) Validate() error {
 				return fmt.Errorf("%w: %w", ErrInvalidOptions, err)
 			}
 		}
+		if err := schema.ValidateCatalogSpecMerge(
+			schema.ParseCatalogSQL(groups.CatalogSQL),
+			schema.ParseCatalogSQL(o.CatalogSQL),
+		); err != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidOptions, err)
+		}
 	}
 	return nil
 }

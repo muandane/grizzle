@@ -202,7 +202,7 @@ authoritative. Schema DDL remains in the shadow-compiled portion of
 ```sql
 -- roles.sql or SchemaSQL — these role statement forms are accepted:
 CREATE ROLE app_read;                    -- always rendered/managed as NOLOGIN group role
-ALTER ROLE app_read SET search_path = public;
+CREATE USER app_writer WITH NOLOGIN;     -- USER is an alias for CREATE ROLE
 GRANT SELECT, INSERT ON docs TO app_read;
 GRANT ALL ON TABLE docs TO app_read WITH GRANT OPTION;
 GRANT USAGE ON SEQUENCE docs_id_seq TO app_read;
@@ -217,6 +217,9 @@ Semantics:
 - Statement scan rejects anything else (`ErrInvalidOptions`) — no silent
   ignoring. Other `SchemaSQL` statements remain in the shadow-compiled
   portion rather than being treated as RolesSQL.
+- PR1 rejects `ALTER ROLE/USER`, `DROP ROLE/USER`, password options, and
+  other role-configuration forms explicitly. Role configuration and password
+  management are reserved for PR2.
 - Declared roles are created `NOLOGIN` and stamped with a `grizzle-managed`
   catalog comment. Only marker-stamped roles absent from the desired state are
   dropped, and only behind `AllowDropRole` + `DROP_ROLE` (CRITICAL). A managed
@@ -264,6 +267,11 @@ Semantics:
   `ErrInvalidOptions`); no silent ignoring. Other `SchemaSQL` statements
   remain in the shadow-compiled portion rather than being treated as
   CatalogSQL.
+- `ALTER` statements require a matching publication or event-trigger
+  declaration across the unified file and `CatalogSQL`; a side-channel
+  `CREATE` replaces a same-name unified declaration before its side-channel
+  `ALTER`/`DROP` operations are replayed. Operation-only inputs do not imply
+  drops of unrelated managed catalog objects.
 - Publications are diffed on membership and `publish` flags from
   `pg_publication` / `pg_publication_rel` / `pg_publication_namespace`:
   missing → create, drift → `ALTER PUBLICATION`, drop → gated by

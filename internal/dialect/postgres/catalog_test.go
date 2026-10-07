@@ -1,0 +1,123 @@
+package postgres
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/muandane/grizzle/internal/schema"
+)
+
+func TestGenerateCreateEventTriggerSQL_Disabled(t *testing.T) {
+	sql := GenerateCreateEventTriggerSQL(&schema.EventTrigger{
+		Name:     "audit",
+		Event:    "ddl_command_end",
+		Function: "log_ddl",
+		Enabled:  false,
+	})
+	if !strings.Contains(sql, "CREATE EVENT TRIGGER") ||
+		!strings.Contains(sql, `ALTER EVENT TRIGGER "audit" DISABLE;`) {
+		t.Fatalf("disabled CREATE must include DISABLE: %s", sql)
+	}
+}
+
+func TestGenerateCatalogSQL_EscapesQuotedIdentifiersAndTags(t *testing.T) {
+	publicationSQL := GenerateCreatePublicationSQL(&schema.Publication{
+		Name:   `pub"name`,
+		Tables: []string{`"weird.schema"."table""name"`},
+	})
+	if !strings.Contains(publicationSQL, `CREATE PUBLICATION "pub""name" FOR TABLE "weird.schema"."table""name"`) {
+		t.Fatalf("publication identifiers must use PostgreSQL quoting: %s", publicationSQL)
+	}
+	triggerSQL := GenerateCreateEventTriggerSQL(&schema.EventTrigger{
+		Name:     `trig"name`,
+		Event:    "ddl_command_end",
+		Tags:     []string{"O'TABLE"},
+		Function: `fn"name`,
+	})
+	if !strings.Contains(triggerSQL, `CREATE EVENT TRIGGER "trig""name"`) ||
+		!strings.Contains(triggerSQL, `WHEN TAG IN ('O''TABLE')`) ||
+		!strings.Contains(triggerSQL, `EXECUTE FUNCTION "fn""name"()`) {
+		t.Fatalf("event-trigger identifiers/tags must be escaped: %s", triggerSQL)
+	}
+}
+
+func TestGenerateAlterEventTriggerSQL_DefinitionReplacementPreservesDisabled(t *testing.T) {
+	sql := GenerateAlterEventTriggerSQL(
+		&schema.EventTrigger{
+			Name:     "audit",
+			Event:    "ddl_command_end",
+			Function: "log_ddl_v2",
+			Enabled:  false,
+		},
+		&schema.EventTrigger{
+			Name:     "audit",
+			Event:    "ddl_command_end",
+			Function: "log_ddl",
+			Enabled:  true,
+		},
+	)
+	if !strings.Contains(sql, `CREATE EVENT TRIGGER "audit"`) ||
+		!strings.Contains(sql, `ALTER EVENT TRIGGER "audit" DISABLE;`) {
+		t.Fatalf("definition replacement must recreate disabled trigger: %s", sql)
+	}
+}
+
+func TestGenerateAlterPublicationSQL_AllTablesTransitions(t *testing.T) {
+	old := &schema.Publication{
+		Name:            "docs_pub",
+		AllTables:       true,
+		PublishInsert:   true,
+		PublishUpdate:   true,
+		PublishDelete:   true,
+		PublishTruncate: true,
+	}
+	explicit := &schema.Publication{
+		Name:            "docs_pub",
+		Tables:          []string{"public.docs"},
+		PublishInsert:   true,
+		PublishUpdate:   true,
+		PublishDelete:   true,
+		PublishTruncate: true,
+	}
+	sql := GenerateAlterPublicationSQL(explicit, old)
+	if !strings.Contains(sql, `ALTER PUBLICATION "docs_pub" SET TABLE "public"."docs";`) ||
+		strings.Contains(sql, `ADD TABLE "public"."docs"`) {
+		t.Fatalf("ALL TABLES -> explicit membership must emit one SET without duplicate ADD: %s", sql)
+	}
+
+	both := *explicit
+	both.Schemas = []string{"analytics"}
+	sql = GenerateAlterPublicationSQL(&both, old)
+	if !strings.Contains(sql, `ALTER PUBLICATION "docs_pub" SET TABLE "public"."docs";`) ||
+		!strings.Contains(sql, `ALTER PUBLICATION "docs_pub" ADD TABLES IN SCHEMA "analytics";`) ||
+		strings.Contains(sql, `ADD TABLE "public"."docs"`) {
+		t.Fatalf("ALL TABLES -> tables plus schemas must emit one SET and one schema ADD: %s", sql)
+	}
+
+	empty := &schema.Publication{
+		Name:            "docs_pub",
+		PublishInsert:   true,
+		PublishUpdate:   true,
+		PublishDelete:   true,
+		PublishTruncate: true,
+	}
+	sql = GenerateAlterPublicationSQL(empty, old)
+	if !strings.Contains(sql, `DROP PUBLICATION "docs_pub";`) ||
+		!strings.Contains(sql, `CREATE PUBLICATION "docs_pub"`) ||
+		strings.Contains(sql, "SET TABLE ;") {
+		t.Fatalf("ALL TABLES -> empty explicit membership must use valid recreation: %s", sql)
+	}
+
+	oldExplicit := &schema.Publication{
+		Name:            "docs_pub",
+		Tables:          []string{"public.docs"},
+		PublishInsert:   true,
+		PublishUpdate:   true,
+		PublishDelete:   true,
+		PublishTruncate: true,
+	}
+	sql = GenerateAlterPublicationSQL(empty, oldExplicit)
+	if !strings.Contains(sql, `ALTER PUBLICATION "docs_pub" DROP TABLE "public"."docs";`) {
+		t.Fatalf("explicit membership -> empty must drop existing table membership: %s", sql)
+	}
+}
