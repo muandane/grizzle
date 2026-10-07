@@ -65,6 +65,11 @@ func SortSteps(steps []Step) {
 		ChangeDropColumn:           90,  // 11. Drop columns (if allowed)
 		ChangeDropTable:            100, // 12. Drop tables (if allowed)
 		ChangeDropDomain:           101, // 13. Drop domains after dependent tables/columns are gone
+		ChangeCreateRole:           119, // 14. Create roles before grants reference them
+		ChangeRoleComment:          120, // 14b. Stamp managed-role markers
+		ChangeGrant:                121, // 15. Grants after all schema objects and roles exist
+		ChangeRevoke:               122, // 16. Revokes after grants (replacement flows)
+		ChangeDropRole:             123, // 17. Drop roles last, after their grants are gone
 	}
 
 	// Build relational dependency graph: referencingTable -> referencedTable

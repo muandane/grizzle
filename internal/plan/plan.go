@@ -68,6 +68,14 @@ const (
 	ChangeRefreshMatView       ChangeType = "REFRESH_MATVIEW"
 	ChangeCommentTable         ChangeType = "COMMENT_TABLE"
 	ChangeCommentColumn        ChangeType = "COMMENT_COLUMN"
+	// RolesSQL surface: managed NOLOGIN roles and object privilege grants.
+	// GRANT/REVOKE steps sort after all schema DDL; CREATE_ROLE precedes the
+	// grants that reference the role.
+	ChangeGrant       ChangeType = "GRANT"
+	ChangeRevoke      ChangeType = "REVOKE"
+	ChangeCreateRole  ChangeType = "CREATE_ROLE"
+	ChangeRoleComment ChangeType = "ROLE_COMMENT"
+	ChangeDropRole    ChangeType = "DROP_ROLE"
 )
 
 // Step represents a single atomic DDL migration statement.
@@ -125,6 +133,8 @@ type DropPolicy struct {
 	AllowTrigger   bool `json:"allow_trigger"`
 	AllowView      bool `json:"allow_view"`
 	AllowDomain    bool `json:"allow_domain"`
+	AllowRevoke    bool `json:"allow_revoke"`
+	AllowDropRole  bool `json:"allow_drop_role"`
 }
 
 // IsAllowed checks if a given migration step is permitted by the policy.
@@ -161,6 +171,10 @@ func (p DropPolicy) IsAllowed(s Step) bool {
 		// Dropping a domain (or a domain constraint) removes validation and
 		// can strand columns typed by the domain; a single gate covers all.
 		return p.AllowDomain
+	case ChangeRevoke:
+		return p.AllowRevoke
+	case ChangeDropRole:
+		return p.AllowDropRole
 	default:
 		return false
 	}
@@ -177,6 +191,10 @@ type Plan struct {
 	Renames        map[string]string `json:"renames,omitzero"`
 	ExpandContract bool              `json:"expand_contract,omitzero"`
 	SchemaSQL      string            `json:"schema_sql,omitzero"`
+	// RolesSQL is the desired roles/grants file (side-channel contract, never
+	// shadow-compiled). Approval-sensitive: participates in Hash() when
+	// non-empty.
+	RolesSQL string `json:"roles_sql,omitzero"`
 
 	// NonConcurrentIndexes affects generated SQL (CONCURRENTLY vs
 	// transactional CREATE INDEX) and is therefore approval-sensitive:
@@ -231,16 +249,20 @@ func (p *Plan) Hash() string {
 	if p.ExpandContract {
 		write("expand_contract:true\n")
 	}
-	write("policy:%t,%t,%t,%t,%t,%t,%t,%t,%t,%t\n",
+	write("policy:%t,%t,%t,%t,%t,%t,%t,%t,%t,%t,%t,%t,%t\n",
 		p.Policy.AllowTable, p.Policy.AllowColumn, p.Policy.AllowIndex,
 		p.Policy.AllowFK, p.Policy.AllowCheck,
 		p.Policy.AllowExtension, p.Policy.AllowFunction, p.Policy.AllowPolicy,
-		p.Policy.AllowTrigger, p.Policy.AllowView)
+		p.Policy.AllowTrigger, p.Policy.AllowView, p.Policy.AllowDomain,
+		p.Policy.AllowRevoke, p.Policy.AllowDropRole)
 	if p.NonConcurrentIndexes {
 		write("non_concurrent:true\n")
 	}
 	if p.SchemaSQL != "" {
 		write("schema_sql:%s\n", p.SchemaSQL)
+	}
+	if p.RolesSQL != "" {
+		write("roles_sql:%s\n", p.RolesSQL)
 	}
 
 	for i, s := range p.Steps {
@@ -290,7 +312,7 @@ func (p *Plan) Additions() int {
 		switch s.Type {
 		case ChangeCreateEnum, ChangeCreateTable, ChangeAddColumn, ChangeCreateIndex, ChangeAddFK, ChangeAddCheck,
 			ChangeCreateExtension, ChangeCreatePolicy, ChangeCreateFunction, ChangeCreateAggregate, ChangeCreateTrigger, ChangeCreateView,
-			ChangeEnableRLS, ChangeForceRLS, ChangeCreateDomain:
+			ChangeEnableRLS, ChangeForceRLS, ChangeCreateDomain, ChangeCreateRole, ChangeGrant:
 			count++
 		}
 	}
@@ -303,7 +325,7 @@ func (p *Plan) Modifications() int {
 	for _, s := range p.Steps {
 		switch s.Type {
 		case ChangeAlterColumn, ChangeAlterEnum, ChangeRefreshMatView,
-			ChangeDisableRLS, ChangeNoForceRLS, ChangeAlterDomain:
+			ChangeDisableRLS, ChangeNoForceRLS, ChangeAlterDomain, ChangeRevoke:
 			count++
 		}
 	}
@@ -317,7 +339,7 @@ func (p *Plan) Deletions() int {
 		switch s.Type {
 		case ChangeDropTable, ChangeDropColumn, ChangeDropIndex, ChangeDropFK, ChangeDropCheck,
 			ChangeDropExtension, ChangeDropPolicy, ChangeDropFunction, ChangeDropAggregate, ChangeDropTrigger, ChangeDropView,
-			ChangeDropDomain, ChangeDropDomainConstraint, ChangeDropDomainRetype:
+			ChangeDropDomain, ChangeDropDomainConstraint, ChangeDropDomainRetype, ChangeDropRole:
 			count++
 		}
 	}
@@ -391,6 +413,12 @@ const (
 	HazardDropView HazardCode = "DROP_VIEW"
 	// HazardDropDomain indicates dropping a domain or a domain CHECK constraint.
 	HazardDropDomain HazardCode = "DROP_DOMAIN"
+	// HazardRevokePrivilege indicates a privilege is being revoked (access loss).
+	HazardRevokePrivilege HazardCode = "REVOKE_PRIVILEGE"
+	// HazardDropRole indicates dropping a Grizzle-managed role.
+	HazardDropRole HazardCode = "DROP_ROLE"
+	// HazardGrantPublic indicates privileges are granted to PUBLIC (ambient access).
+	HazardGrantPublic HazardCode = "GRANT_PUBLIC"
 	// HazardCommentClear indicates an existing COMMENT is being replaced or cleared.
 	HazardCommentClear HazardCode = "COMMENT_CLEAR"
 )
@@ -688,6 +716,35 @@ func stepHazards(s Step) []Hazard {
 				Type:        s.Type,
 				Table:       s.Table,
 				Description: fmt.Sprintf("Existing comment on %q will be replaced or cleared", s.Table),
+				SQL:         s.SQL,
+			})
+		}
+	case ChangeRevoke:
+		hazards = append(hazards, Hazard{
+			Code:        HazardRevokePrivilege,
+			Level:       HazardLevelCritical,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Privileges on %q will be revoked; roles relying on them lose access", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeDropRole:
+		hazards = append(hazards, Hazard{
+			Code:        HazardDropRole,
+			Level:       HazardLevelCritical,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Role %q will be dropped; memberships and privileges it holds are removed", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeGrant:
+		if strings.EqualFold(s.Table, "PUBLIC") || strings.Contains(strings.ToUpper(s.SQL), "TO PUBLIC") {
+			hazards = append(hazards, Hazard{
+				Code:        HazardGrantPublic,
+				Level:       HazardLevelWarning,
+				Type:        s.Type,
+				Table:       s.Table,
+				Description: fmt.Sprintf("Privileges on %q will be granted to PUBLIC, making them available to every role", s.Table),
 				SQL:         s.SQL,
 			})
 		}

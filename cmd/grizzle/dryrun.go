@@ -13,7 +13,7 @@ import (
 
 // runDryRunApply verifies the planned DDL against live data without
 // persisting any change (live dry-run rollback verification).
-func runDryRunApply(ctx context.Context, db *sql.DB, planFile, schemaFile string, allowDrop bool, acceptedCodes []grizzle.HazardCode, renames map[string]string, expandContract bool) int {
+func runDryRunApply(ctx context.Context, db *sql.DB, planFile, schemaFile, rolesSQL string, allowDrop bool, acceptedCodes []grizzle.HazardCode, renames map[string]string, expandContract bool) int {
 	if planFile != "" {
 		planData, err := os.ReadFile(filepath.Clean(planFile)) //nolint:gosec // G304: CLI accepts user-provided plan file path
 		if err != nil {
@@ -45,6 +45,7 @@ func runDryRunApply(ctx context.Context, db *sql.DB, planFile, schemaFile string
 	}
 	opts := grizzle.Options{
 		SchemaSQL:      string(content),
+		RolesSQL:       rolesSQL,
 		AllowDrop:      allowDrop,
 		AcceptHazards:  acceptedCodes,
 		Renames:        renames,

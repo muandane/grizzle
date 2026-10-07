@@ -736,7 +736,9 @@ func TestLocking_PgTerminateBackendRecovery(t *testing.T) {
 					LIMIT 1;
 				`
 				if err := db.QueryRow(query).Scan(&pid); err == nil && pid > 0 {
-					time.Sleep(20 * time.Millisecond)
+					// Terminate immediately: sleeping here lets fast index
+					// builds finish first, which makes the sync succeed and
+					// flakes the test.
 					var success bool
 					_ = db.QueryRow("SELECT pg_terminate_backend($1);", pid).Scan(&success)
 					terminated <- true

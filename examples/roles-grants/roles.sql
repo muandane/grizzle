@@ -1,0 +1,41 @@
+-- roles.sql — desired role/privilege state for the roles-grants example.
+--
+-- Usage (PostgreSQL):
+--
+--   grizzle apply --dsn $DATABASE_URL --schema examples/roles-grants/schema.sql \
+--     --roles examples/roles-grants/roles.sql
+--
+-- Contract (docs/SPEC.md §2.2 "RolesSQL contract"):
+--   * Only CREATE ROLE/USER and GRANT statements are accepted; anything else
+--     fails with ErrInvalidOptions instead of being silently ignored.
+--   * Declared roles are created NOLOGIN (group roles). Grizzle never sets or
+--     rotates passwords; interactive-login roles stay outside the contract.
+--   * Roles Grizzle creates are stamped with a "grizzle-managed" catalog
+--     comment. Only marker-stamped roles that leave this file are dropped,
+--     and only behind AllowDropRole + the DROP_ROLE critical hazard.
+--   * Surplus grants are revoked only behind AllowRevoke + REVOKE_PRIVILEGE.
+--   * Grants to PUBLIC or to roles Grizzle does not manage are never revoked.
+--   * ALL expands to the kind-specific full privilege set (TABLE: 7 privileges,
+--     SEQUENCE: USAGE/SELECT/UPDATE, DATABASE: CONNECT/CREATE/TEMPORARY,
+--     SCHEMA: USAGE/CREATE, FUNCTION: EXECUTE).
+
+CREATE ROLE app_read;
+CREATE ROLE app_writer;
+
+-- Read-only access to the docs table.
+GRANT SELECT ON docs TO app_read;
+
+-- Full row CRUD on docs, plus the sequence backing its primary key.
+GRANT SELECT, INSERT, UPDATE, DELETE ON docs TO app_writer;
+GRANT USAGE ON SEQUENCE docs_id_seq TO app_writer;
+
+-- Schema and database level access.
+GRANT USAGE ON SCHEMA public TO app_read, app_writer;
+GRANT CONNECT ON DATABASE app TO app_read, app_writer;
+
+-- Function execution.
+GRANT EXECUTE ON FUNCTION notify_event() TO app_writer;
+
+-- A grant WITH GRANT OPTION lets the grantee re-grant the privilege;
+-- revoking it renders REVOKE GRANT OPTION FOR ...
+-- GRANT SELECT ON docs TO auditor WITH GRANT OPTION;

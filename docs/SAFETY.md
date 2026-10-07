@@ -149,6 +149,9 @@ Supported hazard codes:
 | `DROP_TRIGGER` | `CRITICAL` | Trigger dropped |
 | `DROP_VIEW` | `CRITICAL` | View or materialized view dropped |
 | `DROP_DOMAIN` | `CRITICAL` | Domain or domain CHECK constraint dropped; dependent columns must be migrated first |
+| `REVOKE_PRIVILEGE` | `CRITICAL` | Privilege revoked from a grantee (access loss); requires `AllowRevoke` |
+| `DROP_ROLE` | `CRITICAL` | Grizzle-managed role dropped (memberships and grants disappear); requires `AllowDropRole`; refused outright if the role owns cluster objects |
+| `GRANT_PUBLIC` | `WARNING` | Privileges granted to `PUBLIC` (ambient access for every role) |
 | `PARTITION_ATTACH_SCAN` | `WARNING` | Attaching existing standalone table to parent partitioned table requires validation scan under `ACCESS EXCLUSIVE` lock |
 | `PARTITION_PENDING_DETACH` | `WARNING` | Interrupted pending-detach partition state requiring finalization (`FINALIZE`) |
 | `EXTENSION_PRIVILEGE` | `WARNING` | `CREATE EXTENSION` may require superuser or elevated privileges |

@@ -592,6 +592,16 @@ func RenderChangeWithOpts(targetSchema string, c diff.Change, opts RenderOpts) p
 		step.SQL = GenerateDropDomainConstraintSQL(effectiveSchema, c.Table, conName)
 	case plan.ChangeDropDomain, plan.ChangeDropDomainRetype:
 		step.SQL = GenerateDropDomainSQL(effectiveSchema, c.Table)
+	case plan.ChangeCreateRole:
+		step.SQL = GenerateCreateRoleSQL(c.Table)
+	case plan.ChangeRoleComment:
+		step.SQL = GenerateRoleCommentSQL(c.Table)
+	case plan.ChangeDropRole:
+		step.SQL = GenerateDropRoleSQL(c.Table)
+	case plan.ChangeGrant:
+		step.SQL = GenerateGrantSQL(c.Grant)
+	case plan.ChangeRevoke:
+		step.SQL = GenerateRevokeSQL(c.Grant, c.Grant.Privileges)
 	case plan.ChangeCreateTrigger:
 		step.SQL = GenerateCreateTriggerSQL(c.Trigger)
 	case plan.ChangeDropTrigger:

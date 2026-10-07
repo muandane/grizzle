@@ -64,6 +64,16 @@ type Options struct {
     // Defaults to false for zero data loss.
     AllowDrop bool
 
+    // AllowRevoke permits privilege revocation when a RolesSQL grant is
+    // removed. Has no granular override; the REVOKE_PRIVILEGE critical
+    // hazard still requires AcceptHazards.
+    AllowRevoke bool
+
+    // AllowDropRole permits dropping a managed role that left RolesSQL.
+    // Has no granular override; the DROP_ROLE critical hazard still
+    // requires AcceptHazards.
+    AllowDropRole bool
+
     // Granular drop overrides (nil inherits from AllowDrop):
     AllowDropTable     *bool
     AllowDropColumn    *bool
@@ -155,6 +165,14 @@ type Options struct {
     // SeedForce re-runs the seed even when the same seed hash was already applied.
     SeedForce bool
 
+    // RolesSQL contains the desired roles/privileges file (PostgreSQL only;
+    // side-channel contract, never shadow-compiled). Statement-scanned for
+    // CREATE ROLE and GRANT statements, diffed against live pg_authid roles
+    // and object ACLs, and applied after all schema DDL. Only roles stamped
+    // with the grizzle-managed marker comment are ever dropped, and only
+    // behind AllowDropRole. Rejected for SQLite (ErrInvalidOptions).
+    RolesSQL string
+
     // SQLiteRebuildThreshold defines row count threshold above which SQLite table rebuilds chunk data copying by keyset.
     SQLiteRebuildThreshold int
 
@@ -167,7 +185,46 @@ type Options struct {
     // Tracer receives lifecycle spans (sync start/end, step execution, lock wait).
     Tracer Tracer
 }
+```
 
+#### RolesSQL contract (PostgreSQL)
+
+`RolesSQL` is a side-channel file (CLI: `--roles roles.sql`) holding the desired
+role and privilege state. It is **never** shadow-compiled and never belongs in
+`SchemaSQL`: roles and grants are environment-specific, and `CREATE ROLE` /
+`GRANT` cannot run inside the shadow-compile transaction model.
+
+```sql
+-- roles.sql — only these statement forms are accepted:
+CREATE ROLE app_read;                    -- always rendered/managed as NOLOGIN group role
+GRANT SELECT, INSERT ON docs TO app_read;
+GRANT ALL ON TABLE docs TO app_read WITH GRANT OPTION;
+GRANT USAGE ON SEQUENCE docs_id_seq TO app_read;
+GRANT CONNECT ON DATABASE app TO app_read;
+GRANT USAGE ON SCHEMA public TO app_read;
+GRANT EXECUTE ON FUNCTION notify_event() TO app_read;
+```
+
+Semantics:
+
+- Statement scan rejects anything else (`ErrInvalidOptions`) — no silent ignoring.
+- Declared roles are created `NOLOGIN` and stamped with a `grizzle-managed`
+  catalog comment. Only marker-stamped roles absent from the desired state are
+  dropped, and only behind `AllowDropRole` + `DROP_ROLE` (CRITICAL). A managed
+  role that owns cluster objects aborts the sync with an ownership error.
+- Grants are diffed per (object kind, object, grantee): missing → `GRANT`;
+  surplus → `REVOKE` behind `AllowRevoke` + `REVOKE_PRIVILEGE` (CRITICAL);
+  grant-option drift → `GRANT ... WITH GRANT OPTION` / `REVOKE GRANT OPTION FOR ...`.
+- Grants to `PUBLIC` or to roles Grizzle does not manage are never revoked;
+  a desired `GRANT ... TO PUBLIC` emits `GRANT_PUBLIC` (WARNING).
+- `AllowRevoke` / `AllowDropRole` inherit from `AllowDrop` or can be set
+  directly on `Options`; both round-trip through the plan artifact
+  (approval-sensitive). Unqualified `TABLE`/`SEQUENCE` objects resolve
+  against the primary target schema.
+- Role steps sort after all schema DDL; `RolesSQL` participates in
+  `Plan.Hash()` when non-empty. SQLite + non-empty `RolesSQL` is rejected.
+
+```go
 type ApplyOpts struct {
     ExpectedHash  string
     AcceptHazards []HazardCode
@@ -202,6 +259,10 @@ type Plan struct {
     ExpandContract bool
     SchemaSQL      string
 
+    // Approval-sensitive: participates in Hash() when non-empty (desired
+    // roles/grants side-channel).
+    RolesSQL string
+
     // Approval-sensitive: participates in Hash() because it changes generated SQL.
     NonConcurrentIndexes bool
 
@@ -214,7 +275,7 @@ type Plan struct {
     StatementTimeout time.Duration
 }
 
-func (p *Plan) Hash() string // schema(s), scope, renames, expand, policy, NonConcurrentIndexes, SchemaSQL, ordered steps
+func (p *Plan) Hash() string // schema(s), scope, renames, expand, policy, NonConcurrentIndexes, SchemaSQL, RolesSQL, ordered steps
 func (p *Plan) ValidateExecutionFields() error
 func (p *Plan) Hazards() []Hazard
 func (p *Plan) Additions() int
@@ -228,9 +289,9 @@ func (p *Plan) String() string
 type HazardLevel string
 
 const (
-    HazardLevelCritical HazardLevel = "CRITICAL" // Data destruction (DROP TABLE/COLUMN, DROP_EXTENSION, DROP_POLICY, DROP_FUNCTION, DROP_TRIGGER, DROP_VIEW, DROP_DOMAIN, TYPE_NARROW, RENAME_AMBIGUOUS, UNMANAGED_DEPENDENCY, GENERATED_REWRITE)
-    HazardLevelWarning  HazardLevel = "WARNING"  // Execution or lockout risk (EXTENSION_PRIVILEGE, RLS_ENABLE, SECURITY_DEFINER, PARTITION_ATTACH_SCAN, PARTITION_PENDING_DETACH)
-    HazardLevelNotice   HazardLevel = "NOTICE"   // Locking or performance impact (INDEX creation/drop, FK drop)
+    HazardLevelCritical HazardLevel = "CRITICAL" // Data destruction (DROP TABLE/COLUMN, DROP_EXTENSION, DROP_POLICY, DROP_FUNCTION, DROP_TRIGGER, DROP_VIEW, DROP_DOMAIN, DROP_ROLE, REVOKE_PRIVILEGE, TYPE_NARROW, RENAME_AMBIGUOUS, UNMANAGED_DEPENDENCY, GENERATED_REWRITE)
+    HazardLevelWarning  HazardLevel = "WARNING"  // Execution or lockout risk (EXTENSION_PRIVILEGE, GRANT_PUBLIC, RLS_ENABLE, SECURITY_DEFINER, PARTITION_ATTACH_SCAN, PARTITION_PENDING_DETACH)
+    HazardLevelNotice   HazardLevel = "NOTICE"   // Locking or performance impact (INDEX creation/drop, FK drop, COMMENT_CLEAR)
 )
 
 // ValidateExecutionFields bounds persisted timeouts to [0, 24h].
@@ -262,6 +323,9 @@ const (
     HazardDropTrigger            HazardCode = "DROP_TRIGGER"
     HazardDropView               HazardCode = "DROP_VIEW"
     HazardDropDomain             HazardCode = "DROP_DOMAIN"
+    HazardRevokePrivilege        HazardCode = "REVOKE_PRIVILEGE"
+    HazardDropRole               HazardCode = "DROP_ROLE"
+    HazardGrantPublic            HazardCode = "GRANT_PUBLIC"
 )
 
 type Hazard struct {
@@ -305,6 +369,7 @@ type Hazard struct {
 | `Domains` | Yes | Managed types diffed from `pg_type` (`typtype='d'`) + `pg_constraint` (`conrelid = 0`); base type/nullability/default drift is DROP+CREATE (no in-place retype); CHECK drift → `ALTER DOMAIN ADD/DROP CONSTRAINT`; drops gated by `AllowDropDomain` + `DROP_DOMAIN` (CRITICAL); no implicit `CASCADE` — dependent columns fail at apply |
 | `Triggers` | Yes | `pg_trigger` + canonical `pg_get_triggerdef`; drift → DROP+CREATE; drops gated by `AllowDropTrigger` + `DROP_TRIGGER` (CRITICAL); surviving managed triggers block dependent column drops via `UNMANAGED_DEPENDENCY` |
 | `Views` & `Materialized Views` | Yes | Canonical `pg_get_viewdef`; append-only column changes replace in place (`CREATE OR REPLACE VIEW`), otherwise DROP+CREATE; matviews always DROP+CREATE plus `REFRESH MATERIALIZED VIEW`; drops gated by `AllowDropView` + `DROP_VIEW` (CRITICAL) |
+| `Roles & Grants` | Yes | Via the `RolesSQL` side-channel (§2.2), never in `SchemaSQL`: managed `NOLOGIN` roles and object grants diffed against `pg_authid` + ACLs (`aclexplode`); missing → `GRANT`, surplus → `REVOKE` gated by `AllowRevoke` + `REVOKE_PRIVILEGE` (CRITICAL); marker-stamped roles dropped behind `AllowDropRole` + `DROP_ROLE` (CRITICAL) with ownership refusal; grants to `PUBLIC`/unmanaged grantees never revoked; `GRANT ... TO PUBLIC` emits `GRANT_PUBLIC` (WARNING) |
 
 ### SQLite
 
@@ -341,10 +406,10 @@ If `AllowDrop` is false (the default), Grizzle refuses to execute any plan conta
 PostgreSQL migrations acquire advisory locks (`pg_advisory_xact_lock` or session lock for concurrent indexes). Grizzle recomputes the diff post-lock to avoid TOCTOU races.
 
 ### Invariant 3: Hazard gating
-Critical hazards (`DROP_TABLE`, `DROP_COLUMN`, `TYPE_NARROW`, `RENAME_AMBIGUOUS`, `UNMANAGED_DEPENDENCY`, `GENERATED_REWRITE`) fail execution unless accepted via `AcceptHazards`.
+Critical hazards (`DROP_TABLE`, `DROP_COLUMN`, `TYPE_NARROW`, `RENAME_AMBIGUOUS`, `UNMANAGED_DEPENDENCY`, `GENERATED_REWRITE`, `DROP_ROLE`, `REVOKE_PRIVILEGE`) fail execution unless accepted via `AcceptHazards`.
 
 ### Invariant 4: Plan/Apply approval hash
-`Plan.Hash()` digests approval-sensitive intent (target schemas, scope, renames, expand/contract, policy, NonConcurrentIndexes, SchemaSQL, ordered steps). `Apply` / `DryRunVerifyPlan` verify against `ExpectedHash`, aborting with `ErrPlanDrift` on mismatch. History is advisory (Model B): DDL commits first; a failed history write returns `ErrHistoryRecord` while leaving schema changes applied.
+`Plan.Hash()` digests approval-sensitive intent (target schemas, scope, renames, expand/contract, policy, NonConcurrentIndexes, SchemaSQL, RolesSQL, ordered steps). `Apply` / `DryRunVerifyPlan` verify against `ExpectedHash`, aborting with `ErrPlanDrift` on mismatch. History is advisory (Model B): DDL commits first; a failed history write returns `ErrHistoryRecord` while leaving schema changes applied.
 
 ### Invariant 5: Timeouts and retry
 `LockTimeout` and `StatementTimeout` protect production availability. `LockTimeout` bounds the **total** advisory-lock acquisition wait across all retry attempts (including backoff); preamble work (hooks, schema setup, session timeout statements) and DDL execution do not consume the budget — each attempt's acquisition timer is armed when acquisition begins. PostgreSQL lock-contention and deadlock failures (SQLSTATE `55P03`, `40P01`) are classified via `exec.IsRetryable` and retried with exponential backoff and randomized jitter; retries halt immediately once any DDL step commits.

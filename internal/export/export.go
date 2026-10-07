@@ -164,7 +164,8 @@ func isStepReversible(s plan.Step) bool {
 	case plan.ChangeCreateTable, plan.ChangeAddColumn, plan.ChangeCreateIndex, plan.ChangeAddFK, plan.ChangeAddCheck, plan.ChangeRenameColumn, plan.ChangeAttachPartition,
 		plan.ChangeCreatePolicy, plan.ChangeEnableRLS, plan.ChangeDisableRLS, plan.ChangeForceRLS, plan.ChangeNoForceRLS,
 		plan.ChangeCreateFunction, plan.ChangeCreateAggregate, plan.ChangeCreateTrigger, plan.ChangeCreateView, plan.ChangeRefreshMatView,
-		plan.ChangeCommentTable, plan.ChangeCommentColumn, plan.ChangeCreateDomain, plan.ChangeAlterDomain:
+		plan.ChangeCommentTable, plan.ChangeCommentColumn, plan.ChangeCreateDomain, plan.ChangeAlterDomain,
+		plan.ChangeCreateRole, plan.ChangeRoleComment, plan.ChangeGrant, plan.ChangeRevoke:
 		return true
 	default:
 		// ChangeCreateExtension is intentionally irreversible: uninstalling an
@@ -296,6 +297,32 @@ func reverseStepSQL(s plan.Step) string {
 		}
 		return fmt.Sprintf(`COMMENT ON TABLE "%s"."%s" IS '%s';`, s.Schema, s.Table, escaped)
 
+	case plan.ChangeCreateRole:
+		roleName := roleRef(s.SQL)
+		if roleName != "" {
+			return fmt.Sprintf("DROP ROLE IF EXISTS %s;", roleName)
+		}
+		return fmt.Sprintf("-- Reversal not derivable for %s", s.Type)
+
+	case plan.ChangeRoleComment:
+		// The managed-role marker comment disappears with the role itself.
+		return "-- No reversal required: marker comment vanishes with the role"
+
+	case plan.ChangeGrant:
+		rev := grantReversalFields(s.SQL, "GRANT", "REVOKE")
+		if rev != "" {
+			return rev
+		}
+		return fmt.Sprintf("-- Reversal not derivable for %s", s.Type)
+
+	case plan.ChangeRevoke:
+		// Reversing a revoke restores the privilege.
+		rev := grantReversalFields(s.SQL, "REVOKE", "GRANT")
+		if rev != "" {
+			return rev
+		}
+		return fmt.Sprintf("-- Reversal not derivable for %s", s.Type)
+
 	default:
 		return fmt.Sprintf("-- Reversal not supported for %s", s.Type)
 	}
@@ -371,6 +398,44 @@ func domainName(sql string) (name string, ok bool) {
 	}
 	parts := strings.Split(ref, ".")
 	return strings.Trim(parts[len(parts)-1], `"`), true
+}
+
+// roleRef extracts the quoted or bare role name from a rendered
+// CREATE ROLE statement.
+var roleRefRegex = regexp.MustCompile(`(?i)^CREATE\s+(?:ROLE|USER)\s+("[^"]+"|[\w]+)`)
+
+func roleRef(sql string) string {
+	m := roleRefRegex.FindStringSubmatch(sql)
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
+
+// grantReversalFields rewrites a rendered GRANT/REVOKE statement into its
+// reverse verb: GRANT priv ON kind obj TO role <-> REVOKE priv ON kind obj
+// FROM role. WITH GRANT OPTION is dropped on reversal (the reversed form
+// restores base privileges).
+var grantReversalRegex = regexp.MustCompile(`(?is)^(GRANT|REVOKE)\s+(.+?)\s+ON\s+(.+?)\s+(TO|FROM)\s+(.+?)\s*$`)
+
+func grantReversalFields(sql, fromVerb, toVerb string) string {
+	if !strings.HasPrefix(strings.ToUpper(sql), fromVerb) {
+		return ""
+	}
+	m := grantReversalRegex.FindStringSubmatch(strings.TrimSuffix(strings.TrimSpace(sql), ";"))
+	if m == nil || !strings.EqualFold(m[1], fromVerb) {
+		return ""
+	}
+	grantee := strings.TrimSpace(m[5])
+	grantee = strings.TrimSuffix(grantee, "WITH GRANT OPTION")
+	return fmt.Sprintf("%s %s ON %s %s %s;", toVerb, strings.TrimSpace(m[2]), strings.TrimSpace(m[3]), joinerFor(toVerb), strings.TrimSpace(grantee))
+}
+
+func joinerFor(toVerb string) string {
+	if strings.EqualFold(toVerb, "REVOKE") {
+		return "FROM"
+	}
+	return "TO"
 }
 
 // aggregateSignature extracts the name and identity argument list from a

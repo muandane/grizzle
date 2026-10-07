@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **RolesSQL privilege sync** (`feat(plan): RolesSQL privilege sync`): new side-channel contract for grants/roles (PostgreSQL only; CLI `--roles roles.sql`, library `Options.RolesSQL`). Statement-scanned `CREATE ROLE`/`GRANT` statements are diffed against live `pg_authid` roles and object ACLs (`aclexplode`) and applied after all schema DDL. Managed roles are always `NOLOGIN` and stamped with a `grizzle-managed` catalog comment — only marker-stamped roles are dropped, and only behind `AllowDropRole` + `DROP_ROLE` (CRITICAL), with an ownership refusal when the role owns cluster objects. Missing grants become `GRANT`; surplus grants become `REVOKE` behind `AllowRevoke` + `REVOKE_PRIVILEGE` (CRITICAL); grant-option drift renders `WITH GRANT OPTION` / `REVOKE GRANT OPTION FOR`. Grants to `PUBLIC` or to roles Grizzle does not manage are never revoked; a desired `GRANT ... TO PUBLIC` emits `GRANT_PUBLIC` (WARNING). Unqualified `TABLE`/`SEQUENCE` objects resolve against the primary target schema. `RolesSQL` participates in `Plan.Hash()` when non-empty; SQLite + non-empty `RolesSQL` is rejected (`ErrInvalidOptions`). New `Options.AllowRevoke` / `Options.AllowDropRole` fields (inheriting from `AllowDrop`) round-trip through the plan artifact so policy stays approval-consistent across the post-lock re-diff. New example: `examples/roles-grants/roles.sql`.
+
 ## [v0.2.0] - 2026-10-07
 
 ### Breaking

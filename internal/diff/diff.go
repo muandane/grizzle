@@ -31,6 +31,8 @@ type Change struct {
 	Routine           *schema.Routine
 	Domain            *schema.Domain
 	OldDomain         *schema.Domain
+	Role              *schema.Role
+	Grant             *schema.Grant
 	Trigger           *schema.Trigger
 	View              *schema.View
 	Replace           bool

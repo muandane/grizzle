@@ -11,6 +11,7 @@ import (
 
 	"github.com/muandane/grizzle/internal/exec"
 	"github.com/muandane/grizzle/internal/plan"
+	"github.com/muandane/grizzle/internal/schema"
 	"github.com/muandane/grizzle/internal/scope"
 )
 
@@ -47,6 +48,16 @@ type Options struct {
 	// AllowDrop permits all destructive operations when set to true.
 	// Defaults to false for zero data loss.
 	AllowDrop bool
+
+	// AllowRevoke permits privilege revocation when a grant in RolesSQL is
+	// removed (access loss). Has no granular override; REVOKE_PRIVILEGE
+	// (CRITICAL) still requires AcceptHazards.
+	AllowRevoke bool
+
+	// AllowDropRole permits dropping a managed role that left RolesSQL.
+	// Has no granular override; DROP_ROLE (CRITICAL) still requires
+	// AcceptHazards.
+	AllowDropRole bool
 
 	// Granular drop overrides (nil inherits from AllowDrop):
 	AllowDropTable     *bool
@@ -166,6 +177,14 @@ type Options struct {
 	// SeedForce re-runs the seed even when the same seed hash was already
 	// applied.
 	SeedForce bool
+
+	// RolesSQL contains the desired roles and privilege grants
+	// (CREATE ROLE / GRANT statements), diffed against live
+	// pg_roles/pg_authid state and object ACLs. It is a side-channel
+	// contract: unlike SchemaSQL it is never shadow-compiled, and it must
+	// not contain schema DDL. Managed roles are NOLOGIN group roles;
+	// passwords are never managed. PostgreSQL only — ignored on SQLite.
+	RolesSQL string
 
 	// SQLiteRebuildThreshold defines the row count threshold above which SQLite table rebuilds
 	// chunk data copying by keyset to prevent journal memory exhaustion.
@@ -374,6 +393,9 @@ func (o *Options) Validate() error {
 		if len(o.TargetSchemas) > 1 {
 			return ErrUnsupportedMultiSchema
 		}
+		if strings.TrimSpace(o.RolesSQL) != "" {
+			return fmt.Errorf("%w: RolesSQL requires PostgreSQL; roles are not managed on SQLite", ErrInvalidOptions)
+		}
 	case DialectPostgres:
 		idents := append([]string{}, o.TargetSchemas...)
 		if o.TargetSchema != "" {
@@ -393,6 +415,11 @@ func (o *Options) Validate() error {
 			}
 			if err := validateOptionIdent(o.ShadowSchema); err != nil {
 				return fmt.Errorf("%w: shadow schema %q is not a valid SQL identifier", ErrInvalidOptions, o.ShadowSchema)
+			}
+		}
+		if strings.TrimSpace(o.RolesSQL) != "" {
+			if err := schema.ValidateRolesSQL(o.RolesSQL); err != nil {
+				return fmt.Errorf("%w: %w", ErrInvalidOptions, err)
 			}
 		}
 	}
@@ -471,6 +498,13 @@ func resolveDropPolicy(opts Options) plan.DropPolicy {
 		allowDomain = *opts.AllowDropDomain
 	}
 
+	// Privilege-loss gates follow the same blanket-override rule as every
+	// other drop gate: they can also be set directly on Options so a plan
+	// artifact's recorded policy round-trips through optionsFromPlan.
+	// CRITICAL hazards still apply.
+	allowRevoke := opts.AllowDrop || opts.AllowRevoke
+	allowDropRole := opts.AllowDrop || opts.AllowDropRole
+
 	return plan.DropPolicy{
 		AllowTable:     allowTable,
 		AllowColumn:    allowColumn,
@@ -483,6 +517,8 @@ func resolveDropPolicy(opts Options) plan.DropPolicy {
 		AllowTrigger:   allowTrigger,
 		AllowView:      allowView,
 		AllowDomain:    allowDomain,
+		AllowRevoke:    allowRevoke,
+		AllowDropRole:  allowDropRole,
 	}
 }
 

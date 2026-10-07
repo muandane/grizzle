@@ -135,9 +135,9 @@ Declarative lifecycle for objects previously detected-and-protected. Each constr
 - **Triggers** — `pg_get_triggerdef` canonical; surviving managed triggers fold into `UNMANAGED_DEPENDENCY` so dependent column drops stay blocked until the hazard is accepted. `DROP_TRIGGER` critical + `AllowDropTrigger`.
 - **Views / materialized views** — `pg_get_viewdef` canonical; append-only column growth replaces in place, everything else is DROP+CREATE; matviews additionally emit `REFRESH MATERIALIZED VIEW`. `DROP_VIEW` critical + `AllowDropView`.
 - **Lint L009** — rejects DML in `SchemaSQL` (silently ignored today; seeds belong in `SeedSQL`).
-- **Export** — reversal (`Down`) SQL for policy/RLS/function/trigger/view/comment creation (comments restore the previous text; aggregates reverse to `DROP AGGREGATE`; domain creation and `ALTER DOMAIN ... ADD CONSTRAINT` reverse to `DROP DOMAIN` / `DROP CONSTRAINT`); extension creation deliberately irreversible.
+- **Export** — reversal (`Down`) SQL for policy/RLS/function/trigger/view/comment creation (comments restore the previous text; aggregates reverse to `DROP AGGREGATE`; domain creation and `ALTER DOMAIN ... ADD CONSTRAINT` reverse to `DROP DOMAIN` / `DROP CONSTRAINT`; `GRANT`/`REVOKE` reverse to each other, `CREATE ROLE` reverses to `DROP ROLE`); extension creation deliberately irreversible.
+- **Roles & grants (`RolesSQL`)** — shipped as a side-channel contract (see SPEC §2.2 "RolesSQL contract"): `--roles roles.sql` statement-scans `CREATE ROLE`/`GRANT`, diffs against live `pg_authid` + ACLs, applies after all schema DDL. Managed `NOLOGIN` roles are marker-stamped; drops gated by `AllowDropRole` + `DROP_ROLE` (CRITICAL) with ownership refusal; revocations gated by `AllowRevoke` + `REVOKE_PRIVILEGE` (CRITICAL); `GRANT_PUBLIC` warning; grants to `PUBLIC`/unmanaged grantees are never revoked. Passwords and `ALTER ROLE` config stay out of scope.
 
 ### Deferred (rationale)
 
-- **Grants / roles / privileges** — environment-specific by nature (`GRANT` targets differ per deployment); a declarative diff would either fight operators or require per-env policy files. Re-evaluate with a roles-file contract.
 - **Publications / event triggers** — cluster-wide, schema-less objects with no shadow-compile story (the shadow schema is transactional; publications and event triggers are database-level).
