@@ -13,6 +13,20 @@ var createExtensionRe = regexp.MustCompile(
 // dmlStatementRe matches leading DML keywords for linting SchemaSQL.
 var dmlStatementRe = regexp.MustCompile(`(?is)^\s*(INSERT|UPDATE|DELETE|TRUNCATE)\b`)
 
+// StatementGroups is the result of splitting a unified SchemaSQL document.
+// Role and catalog statements are statement-scanned by their respective
+// contracts; everything else remains shadow SQL.
+type StatementGroups struct {
+	ShadowSQL  string
+	RolesSQL   string
+	CatalogSQL string
+}
+
+var (
+	roleStatementRe    = regexp.MustCompile(`(?is)^(?:GRANT|REVOKE)\b|^CREATE\s+(?:ROLE|USER)\b|^ALTER\s+(?:ROLE|USER)\b`)
+	catalogStatementRe = regexp.MustCompile(`(?is)^(?:CREATE|ALTER|DROP)\s+(?:PUBLICATION\b|EVENT\s+TRIGGER\b)`)
+)
+
 // SplitStatements splits SQL into top-level statements on unquoted semicolons,
 // preserving string literals and comments.
 func SplitStatements(sql string) []string {
@@ -124,6 +138,63 @@ func SplitStatements(sql string) []string {
 		stmts = append(stmts, stmt)
 	}
 	return stmts
+}
+
+// ExtractStatements separates a unified SchemaSQL document into SQL for the
+// PostgreSQL shadow compiler and the role/catalog statement-scanned
+// side-channels. Statements outside the explicitly recognized role/catalog
+// forms remain in ShadowSQL and are never silently discarded.
+func ExtractStatements(sql string) StatementGroups {
+	var shadow, roles, catalog []string
+	for _, stmt := range SplitStatements(sql) {
+		trimmed := stripLeadingSQLComments(stmt)
+		switch {
+		case roleStatementRe.MatchString(trimmed):
+			roles = append(roles, stmt)
+		case catalogStatementRe.MatchString(trimmed):
+			catalog = append(catalog, stmt)
+		default:
+			shadow = append(shadow, stmt)
+		}
+	}
+	return StatementGroups{
+		ShadowSQL:  joinStatements(shadow),
+		RolesSQL:   joinStatements(roles),
+		CatalogSQL: joinStatements(catalog),
+	}
+}
+
+// stripLeadingSQLComments removes whitespace and SQL comments before the
+// first statement token. It is intentionally separate from SplitStatements:
+// comments remain in each returned statement and are preserved in the
+// corresponding output bucket.
+func stripLeadingSQLComments(s string) string {
+	for {
+		s = strings.TrimSpace(s)
+		switch {
+		case strings.HasPrefix(s, "--"):
+			if newline := strings.IndexByte(s, '\n'); newline >= 0 {
+				s = s[newline+1:]
+				continue
+			}
+			return ""
+		case strings.HasPrefix(s, "/*"):
+			if end := strings.Index(s[2:], "*/"); end >= 0 {
+				s = s[end+4:]
+				continue
+			}
+			return s
+		default:
+			return s
+		}
+	}
+}
+
+func joinStatements(stmts []string) string {
+	if len(stmts) == 0 {
+		return ""
+	}
+	return strings.Join(stmts, ";\n") + ";"
 }
 
 // ParseExtensions extracts CREATE EXTENSION statements from schema SQL.

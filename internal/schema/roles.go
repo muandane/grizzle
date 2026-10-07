@@ -6,14 +6,15 @@ import (
 	"strings"
 )
 
-// Role represents a managed database role declared in RolesSQL. Managed
-// roles are always NOLOGIN group roles: Grizzle never sets or rotates
+// Role represents a managed database role declared in SchemaSQL or RolesSQL.
+// Managed roles are always NOLOGIN group roles: Grizzle never sets or rotates
 // passwords, so interactive-login roles stay outside the contract.
 type Role struct {
 	Name string `json:"name"`
 }
 
-// Grant represents a desired privilege grant scanned from RolesSQL.
+// Grant represents a desired privilege grant scanned from SchemaSQL or
+// RolesSQL.
 type Grant struct {
 	Grantee     string   `json:"grantee"`     // role name or PUBLIC
 	ObjectKind  string   `json:"object_kind"` // TABLE, SEQUENCE, DATABASE, SCHEMA, FUNCTION
@@ -22,16 +23,19 @@ type Grant struct {
 	GrantOption bool     `json:"grant_option,omitempty"`
 }
 
-// RolesSpec is the desired role/privilege state parsed from a RolesSQL file.
+// RolesSpec is the desired role/privilege state parsed from a unified schema
+// or side-channel SQL file.
 type RolesSpec struct {
 	Roles  map[string]*Role `json:"roles"`
 	Grants []*Grant         `json:"grants"`
+
+	revokes []*Grant
 }
 
 var (
-	// createRoleRe matches CREATE ROLE name (options are ignored: managed
-	// roles are forced to NOLOGIN at render time).
-	createRoleRe = regexp.MustCompile(`(?i)^CREATE\s+(?:ROLE|USER)\s+("([^"]+)"|[\w]+)`)
+	// createRoleRe matches CREATE/ALTER ROLE name (options are ignored:
+	// managed roles are forced to NOLOGIN at render time).
+	createRoleRe = regexp.MustCompile(`(?i)^(?:CREATE|ALTER)\s+(?:ROLE|USER)\s+("([^"]+)"|[\w]+)`)
 
 	// grantRe matches GRANT privilege[, ...] ON [TABLE|SEQUENCE|DATABASE|SCHEMA|FUNCTION]
 	// object[, ...] TO grantee[, ...] [WITH GRANT OPTION]. The object slot
@@ -39,6 +43,11 @@ var (
 	// (2) optional object kind, (3) object list, (4) grantee list,
 	// (5) optional "WITH GRANT OPTION".
 	grantRe = regexp.MustCompile(`(?is)^GRANT\s+(.+?)\s+ON\s+(?:(TABLE|SEQUENCE|DATABASE|SCHEMA|FUNCTION)\s+)?(.+?)\s+TO\s+(.+?)(\s+WITH\s+GRANT\s+OPTION)?\s*$`)
+
+	// revokeRe matches the desired-state counterpart of grantRe. Captures:
+	// (1) optional "GRANT OPTION FOR", (2) privileges, (3) optional object
+	// kind, (4) object list, (5) grantee list.
+	revokeRe = regexp.MustCompile(`(?is)^REVOKE\s+(GRANT\s+OPTION\s+FOR\s+)?(.+?)\s+ON\s+(?:(TABLE|SEQUENCE|DATABASE|SCHEMA|FUNCTION)\s+)?(.+?)\s+FROM\s+(.+?)(?:\s+(?:CASCADE|RESTRICT))?\s*$`)
 )
 
 // Privilege sets used to expand ALL per object kind. They mirror the
@@ -65,13 +74,14 @@ func GrantKey(kind, object, grantee string) string {
 }
 
 // ParseRolesSQL extracts managed roles and privilege grants from a RolesSQL
-// file. Statements that are not CREATE ROLE or GRANT are ignored. Multiple
+// file. Role-membership statements remain outside the managed IR. Multiple
 // objects/grantees/privileges in one statement expand to one Grant per
 // (object, grantee) pair with a deduplicated privilege list. ALL is expanded
 // to the kind-specific full privilege set so live ACL introspection compares
 // without keyword translation.
 func ParseRolesSQL(sql string) *RolesSpec {
 	spec := &RolesSpec{Roles: make(map[string]*Role)}
+	var revokes []*Grant
 	for _, stmt := range SplitStatements(sql) {
 		trimmed := stripLeadingComments(stmt)
 		if trimmed == "" {
@@ -79,7 +89,8 @@ func ParseRolesSQL(sql string) *RolesSpec {
 		}
 		upper := strings.ToUpper(trimmed)
 		switch {
-		case strings.HasPrefix(upper, "CREATE ROLE") || strings.HasPrefix(upper, "CREATE USER"):
+		case strings.HasPrefix(upper, "CREATE ROLE") || strings.HasPrefix(upper, "CREATE USER"),
+			strings.HasPrefix(upper, "ALTER ROLE") || strings.HasPrefix(upper, "ALTER USER"):
 			if m := createRoleRe.FindStringSubmatch(trimmed); m != nil {
 				name := strings.Trim(m[1], `"`)
 				if name != "" {
@@ -88,9 +99,100 @@ func ParseRolesSQL(sql string) *RolesSpec {
 			}
 		case strings.HasPrefix(upper, "GRANT"):
 			spec.Grants = append(spec.Grants, parseGrantStatement(trimmed)...)
+		case strings.HasPrefix(upper, "REVOKE"):
+			revokes = append(revokes, parseRevokeStatement(trimmed)...)
 		}
 	}
+	applyRevokes(spec, revokes)
+	spec.revokes = revokes
 	return spec
+}
+
+// MergeRolesSpecs combines role desired state from SchemaSQL with the
+// optional RolesSQL side-channel. Entries from the side-channel replace
+// SchemaSQL entries with the same role or grant identity, making the explicit
+// side-channel authoritative on duplicates.
+func MergeRolesSpecs(schemaSpec, sideSpec *RolesSpec) *RolesSpec {
+	out := &RolesSpec{Roles: make(map[string]*Role)}
+	for _, spec := range []*RolesSpec{schemaSpec, sideSpec} {
+		if spec == nil {
+			continue
+		}
+		for key, role := range spec.Roles {
+			out.Roles[key] = &Role{Name: role.Name}
+		}
+	}
+
+	out.Grants = mergeGrantSpecs(schemaSpec, sideSpec)
+	if sideSpec != nil {
+		applyRevokes(out, sideSpec.revokes)
+	}
+	return out
+}
+
+func mergeGrantSpecs(schemaSpec, sideSpec *RolesSpec) []*Grant {
+	var out []*Grant
+	for _, spec := range []*RolesSpec{schemaSpec, sideSpec} {
+		if spec == nil {
+			continue
+		}
+		var next []*Grant
+		for _, grant := range spec.Grants {
+			replaced := false
+			for i, existing := range next {
+				if sameGrantTarget(existing, grant) {
+					next[i] = mergeGrant(existing, grant)
+					replaced = true
+					break
+				}
+			}
+			if !replaced {
+				next = append(next, cloneGrant(grant))
+			}
+		}
+		if spec == sideSpec {
+			for _, grant := range next {
+				replaced := false
+				for i, existing := range out {
+					if sameGrantTarget(existing, grant) {
+						out[i] = grant
+						replaced = true
+						break
+					}
+				}
+				if !replaced {
+					out = append(out, grant)
+				}
+			}
+			continue
+		}
+		out = append(out, next...)
+	}
+	return out
+}
+
+func mergeGrant(a, b *Grant) *Grant {
+	out := cloneGrant(a)
+	for _, privilege := range b.Privileges {
+		if !containsFold(out.Privileges, privilege) {
+			out.Privileges = append(out.Privileges, privilege)
+		}
+	}
+	out.GrantOption = out.GrantOption || b.GrantOption
+	return out
+}
+
+func cloneGrant(g *Grant) *Grant {
+	if g == nil {
+		return nil
+	}
+	return &Grant{
+		Grantee:     g.Grantee,
+		ObjectKind:  g.ObjectKind,
+		ObjectName:  g.ObjectName,
+		Privileges:  slicesCloneStrings(g.Privileges),
+		GrantOption: g.GrantOption,
+	}
 }
 
 // parseGrantStatement expands one GRANT statement into per-(object, grantee)
@@ -109,16 +211,7 @@ func parseGrantStatement(stmt string) []*Grant {
 	granteeList := splitList(m[4])
 	grantOption := strings.TrimSpace(m[5]) != ""
 
-	var privileges []string
-	for _, p := range splitList(privList) {
-		pu := strings.ToUpper(p)
-		if pu == "ALL" || pu == "ALL PRIVILEGES" {
-			privileges = append(privileges, kindPrivilegeAllMap[kind]...)
-			continue
-		}
-		privileges = append(privileges, pu)
-	}
-	privileges = dedupeStrings(privileges)
+	privileges := expandPrivileges(privList, kind)
 	if len(privileges) == 0 || len(objectList) == 0 || len(granteeList) == 0 {
 		return nil
 	}
@@ -142,21 +235,116 @@ func parseGrantStatement(stmt string) []*Grant {
 	return out
 }
 
+// parseRevokeStatement expands one REVOKE statement into per-(object,
+// grantee) records. A revoke is applied to the parsed desired grants after
+// the full file is scanned, so statement order has declarative semantics.
+func parseRevokeStatement(stmt string) []*Grant {
+	m := revokeRe.FindStringSubmatch(stmt)
+	if m == nil {
+		return nil
+	}
+	privList := strings.TrimSpace(m[2])
+	kind := strings.ToUpper(strings.TrimSpace(m[3]))
+	if kind == "" {
+		kind = "TABLE"
+	}
+	objectList := splitList(m[4])
+	granteeList := splitList(m[5])
+	grantOption := strings.TrimSpace(m[1]) != ""
+
+	privileges := expandPrivileges(privList, kind)
+	if len(privileges) == 0 || len(objectList) == 0 || len(granteeList) == 0 {
+		return nil
+	}
+
+	var out []*Grant
+	for _, object := range objectList {
+		for _, grantee := range granteeList {
+			grantee = strings.Trim(grantee, `"`)
+			if grantee == "" {
+				continue
+			}
+			out = append(out, &Grant{
+				Grantee:     strings.ToUpper(grantee),
+				ObjectKind:  kind,
+				ObjectName:  object,
+				Privileges:  slicesCloneStrings(privileges),
+				GrantOption: grantOption,
+			})
+		}
+	}
+	return out
+}
+
+func expandPrivileges(privList, kind string) []string {
+	var privileges []string
+	for _, p := range splitList(privList) {
+		pu := strings.ToUpper(p)
+		if pu == "ALL" || pu == "ALL PRIVILEGES" {
+			privileges = append(privileges, kindPrivilegeAllMap[kind]...)
+			continue
+		}
+		privileges = append(privileges, pu)
+	}
+	return dedupeStrings(privileges)
+}
+
+func applyRevokes(spec *RolesSpec, revokes []*Grant) {
+	if len(revokes) == 0 || len(spec.Grants) == 0 {
+		return
+	}
+
+	for _, revoke := range revokes {
+		var kept []*Grant
+		for _, grant := range spec.Grants {
+			if !sameGrantTarget(grant, revoke) {
+				kept = append(kept, grant)
+				continue
+			}
+			if revoke.GrantOption {
+				for _, privilege := range revoke.Privileges {
+					if containsFold(grant.Privileges, privilege) {
+						grant.GrantOption = false
+						break
+					}
+				}
+				kept = append(kept, grant)
+				continue
+			}
+			remaining := grant.Privileges[:0]
+			for _, privilege := range grant.Privileges {
+				if !containsFold(revoke.Privileges, privilege) {
+					remaining = append(remaining, privilege)
+				}
+			}
+			grant.Privileges = remaining
+			if len(grant.Privileges) > 0 {
+				kept = append(kept, grant)
+			}
+		}
+		spec.Grants = kept
+	}
+}
+
+func sameGrantTarget(a, b *Grant) bool {
+	return strings.EqualFold(a.ObjectKind, b.ObjectKind) &&
+		strings.EqualFold(a.ObjectName, b.ObjectName) &&
+		strings.EqualFold(a.Grantee, b.Grantee)
+}
+
+func containsFold(values []string, want string) bool {
+	for _, value := range values {
+		if strings.EqualFold(value, want) {
+			return true
+		}
+	}
+	return false
+}
+
 // stripLeadingComments removes leading -- comment lines from a statement
 // chunk so comment-only chunks reduce to the empty string.
 func stripLeadingComments(s string) string {
-	for {
-		t := strings.TrimSpace(s)
-		if strings.HasPrefix(t, "--") {
-			idx := strings.IndexByte(t, '\n')
-			if idx < 0 {
-				return ""
-			}
-			s = t[idx+1:]
-			continue
-		}
-		return t
-	}
+	return stripLeadingSQLComments(s)
 }
 
 // splitList splits a comma-separated SQL identifier list, respecting quotes.
@@ -200,12 +388,13 @@ func slicesCloneStrings(in []string) []string {
 
 // RoleManagedComment is the catalog comment marker Grizzle stamps on roles it
 // created. Only roles carrying this marker are considered managed, so
-// operator-created roles are never swept when they leave RolesSQL.
+// operator-created roles are never swept when they leave the desired state.
 const RoleManagedComment = "grizzle-managed"
 
-// ValidateRolesSQL enforces the RolesSQL statement contract: only CREATE
-// ROLE/USER and GRANT statements are accepted. Anything else fails loudly
-// instead of being silently ignored by the statement scan.
+// ValidateRolesSQL enforces the RolesSQL statement contract. Role declarations,
+// role alterations, and object-privilege GRANT/REVOKE statements are accepted;
+// anything else fails loudly instead of being silently ignored by the
+// statement scan.
 func ValidateRolesSQL(sql string) error {
 	for _, stmt := range SplitStatements(sql) {
 		trimmed := stripLeadingComments(stmt)
@@ -215,12 +404,20 @@ func ValidateRolesSQL(sql string) error {
 		upper := strings.ToUpper(trimmed)
 		switch {
 		case strings.HasPrefix(upper, "CREATE ROLE"), strings.HasPrefix(upper, "CREATE USER"),
-			strings.HasPrefix(upper, "GRANT"):
-			if strings.HasPrefix(upper, "GRANT") && grantRe.FindStringSubmatch(trimmed) == nil {
+			strings.HasPrefix(upper, "ALTER ROLE"), strings.HasPrefix(upper, "ALTER USER"):
+			if createRoleRe.FindStringSubmatch(trimmed) == nil {
+				return fmt.Errorf("unsupported role statement in RolesSQL (expected CREATE/ALTER ROLE <name> [options]): %q", trimmed)
+			}
+		case strings.HasPrefix(upper, "GRANT"):
+			if grantRe.FindStringSubmatch(trimmed) == nil {
 				return fmt.Errorf("unsupported GRANT form in RolesSQL (expected GRANT <privileges> ON [KIND] <object> TO <grantee>): %q", trimmed)
 			}
+		case strings.HasPrefix(upper, "REVOKE"):
+			if revokeRe.FindStringSubmatch(trimmed) == nil {
+				return fmt.Errorf("unsupported REVOKE form in RolesSQL (expected REVOKE <privileges> ON [KIND] <object> FROM <grantee>): %q", trimmed)
+			}
 		default:
-			return fmt.Errorf("unsupported statement in RolesSQL (only CREATE ROLE and GRANT are managed): %q", trimmed)
+			return fmt.Errorf("unsupported statement in RolesSQL (only CREATE/ALTER ROLE and GRANT/REVOKE are managed): %q", trimmed)
 		}
 	}
 	return nil

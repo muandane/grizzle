@@ -6,9 +6,12 @@
 --     --catalog examples/catalog-sync/catalog.sql
 --
 -- Contract (docs/SPEC.md §2.2 "CatalogSQL contract"):
---   * Only CREATE PUBLICATION and CREATE EVENT TRIGGER statements are
---     accepted; anything else fails with ErrInvalidOptions instead of being
---     silently ignored. This file is never shadow-compiled.
+--   * The same catalog statements may be placed in SchemaSQL. This optional
+--     --catalog file is authoritative when a publication/event-trigger name
+--     is duplicated. CREATE/ALTER/DROP PUBLICATION and CREATE/ALTER/DROP
+--     EVENT TRIGGER statements are accepted; anything else fails with
+--     ErrInvalidOptions instead of being silently ignored. This file is
+--     never shadow-compiled.
 --   * Publications are diffed on table membership (FOR TABLE / FOR ALL
 --     TABLES / FOR TABLES IN SCHEMA — the latter requires PostgreSQL 15+)
 --     and publish flags. A missing WITH (publish = ...) clause means all

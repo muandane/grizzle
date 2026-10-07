@@ -32,7 +32,9 @@ type Options struct {
 	// Dialect explicitly defines the database engine (DialectPostgres or DialectSQLite).
 	Dialect Dialect
 
-	// SchemaSQL contains the complete DDL representing the desired state.
+	// SchemaSQL contains the complete desired state. PostgreSQL role and
+	// catalog statements may share this file; they bypass shadow compilation
+	// and are merged with the optional side-channel files.
 	SchemaSQL string
 
 	// TargetSchema is the schema to manage (defaults to "public" for Postgres, "main" for SQLite).
@@ -188,22 +190,22 @@ type Options struct {
 	// applied.
 	SeedForce bool
 
-	// RolesSQL contains the desired roles and privilege grants
-	// (CREATE ROLE / GRANT statements), diffed against live
-	// pg_roles/pg_authid state and object ACLs. It is a side-channel
-	// contract: unlike SchemaSQL it is never shadow-compiled, and it must
-	// not contain schema DDL. Managed roles are NOLOGIN group roles;
-	// passwords are never managed. PostgreSQL only — ignored on SQLite.
+	// RolesSQL optionally supplies desired roles and privilege grants
+	// alongside SchemaSQL. Duplicate role/grant identities in this explicit
+	// side-channel override entries extracted from SchemaSQL. Role statements
+	// are never shadow-compiled, and schema DDL is not valid here. Managed
+	// roles are NOLOGIN group roles; passwords are never managed. PostgreSQL
+	// only — ignored on SQLite.
 	RolesSQL string
 
-	// CatalogSQL contains the desired cluster-catalog objects
-	// (CREATE PUBLICATION / CREATE EVENT TRIGGER statements), diffed
-	// against live pg_publication and pg_event_trigger state. It is a
-	// side-channel contract: never shadow-compiled, never run inside the
-	// shadow transaction, and it must not contain schema DDL. Drops are
-	// narrow — only marker-stamped (grizzle-managed) objects are
-	// considered. Event triggers reference functions that must exist in
-	// SchemaSQL or as live objects. PostgreSQL only — rejected on SQLite.
+	// CatalogSQL optionally supplies desired cluster-catalog objects alongside
+	// SchemaSQL. Duplicate publication/event-trigger names in this explicit
+	// side-channel override entries extracted from SchemaSQL. Catalog
+	// statements are never shadow-compiled or run inside the shadow
+	// transaction, and schema DDL is not valid here. Drops are narrow — only
+	// marker-stamped (grizzle-managed) objects are considered. Event triggers
+	// reference functions that must exist in SchemaSQL or as live objects.
+	// PostgreSQL only — rejected on SQLite.
 	CatalogSQL string
 
 	// SQLiteRebuildThreshold defines the row count threshold above which SQLite table rebuilds
@@ -439,6 +441,13 @@ func (o *Options) Validate() error {
 			if err := validateOptionIdent(o.ShadowSchema); err != nil {
 				return fmt.Errorf("%w: shadow schema %q is not a valid SQL identifier", ErrInvalidOptions, o.ShadowSchema)
 			}
+		}
+		groups := schema.ExtractStatements(o.SchemaSQL)
+		if err := schema.ValidateRolesSQL(groups.RolesSQL); err != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidOptions, err)
+		}
+		if err := schema.ValidateCatalogSQL(groups.CatalogSQL); err != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidOptions, err)
 		}
 		if strings.TrimSpace(o.RolesSQL) != "" {
 			if err := schema.ValidateRolesSQL(o.RolesSQL); err != nil {

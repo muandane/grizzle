@@ -44,7 +44,9 @@ type Options struct {
     // If empty, Grizzle detects the dialect automatically from the driver type.
     Dialect Dialect
 
-    // SchemaSQL contains the complete DDL representing the desired state.
+    // SchemaSQL contains the complete desired state. PostgreSQL role and
+    // catalog statements may share this file; they bypass shadow compilation
+    // and are merged with the optional side-channel files.
     // Typically embedded at build time with //go:embed schema.sql.
     SchemaSQL string
 
@@ -165,12 +167,13 @@ type Options struct {
     // SeedForce re-runs the seed even when the same seed hash was already applied.
     SeedForce bool
 
-    // RolesSQL contains the desired roles/privileges file (PostgreSQL only;
-    // side-channel contract, never shadow-compiled). Statement-scanned for
-    // CREATE ROLE and GRANT statements, diffed against live pg_authid roles
-    // and object ACLs, and applied after all schema DDL. Only roles stamped
-    // with the grizzle-managed marker comment are ever dropped, and only
-    // behind AllowDropRole. Rejected for SQLite (ErrInvalidOptions).
+    // RolesSQL is an optional PostgreSQL side-channel overlay for
+    // SchemaSQL. Its role/grant entries override duplicate identities
+    // extracted from SchemaSQL. Role statements are never shadow-compiled;
+    // they are statement-scanned, diffed against live pg_authid roles and
+    // object ACLs, and applied after all schema DDL. Only roles stamped with
+    // the grizzle-managed marker comment are ever dropped, and only behind
+    // AllowDropRole. Rejected for SQLite (ErrInvalidOptions).
     RolesSQL string
 
     // SQLiteRebuildThreshold defines row count threshold above which SQLite table rebuilds chunk data copying by keyset.
@@ -189,25 +192,31 @@ type Options struct {
 
 #### RolesSQL contract (PostgreSQL)
 
-`RolesSQL` is a side-channel file (CLI: `--roles roles.sql`) holding the desired
-role and privilege state. It is **never** shadow-compiled and never belongs in
-`SchemaSQL`: roles and grants are environment-specific, and `CREATE ROLE` /
-`GRANT` cannot run inside the shadow-compile transaction model.
+`RolesSQL` is an optional side-channel overlay (CLI: `--roles roles.sql`) for
+the desired role and privilege state. The same role statements may appear in
+`SchemaSQL`; both inputs are statement-scanned and never shadow-compiled.
+When a role or grant identity is present in both inputs, `RolesSQL` is
+authoritative. Schema DDL remains in the shadow-compiled portion of
+`SchemaSQL`.
 
 ```sql
--- roles.sql — only these statement forms are accepted:
+-- roles.sql or SchemaSQL — these role statement forms are accepted:
 CREATE ROLE app_read;                    -- always rendered/managed as NOLOGIN group role
+ALTER ROLE app_read SET search_path = public;
 GRANT SELECT, INSERT ON docs TO app_read;
 GRANT ALL ON TABLE docs TO app_read WITH GRANT OPTION;
 GRANT USAGE ON SEQUENCE docs_id_seq TO app_read;
 GRANT CONNECT ON DATABASE app TO app_read;
 GRANT USAGE ON SCHEMA public TO app_read;
 GRANT EXECUTE ON FUNCTION notify_event() TO app_read;
+REVOKE INSERT ON docs FROM app_read;
 ```
 
 Semantics:
 
-- Statement scan rejects anything else (`ErrInvalidOptions`) — no silent ignoring.
+- Statement scan rejects anything else (`ErrInvalidOptions`) — no silent
+  ignoring. Other `SchemaSQL` statements remain in the shadow-compiled
+  portion rather than being treated as RolesSQL.
 - Declared roles are created `NOLOGIN` and stamped with a `grizzle-managed`
   catalog comment. Only marker-stamped roles absent from the desired state are
   dropped, and only behind `AllowDropRole` + `DROP_ROLE` (CRITICAL). A managed
@@ -221,33 +230,40 @@ Semantics:
   directly on `Options`; both round-trip through the plan artifact
   (approval-sensitive). Unqualified `TABLE`/`SEQUENCE` objects resolve
   against the primary target schema.
-- Role steps sort after all schema DDL; `RolesSQL` participates in
-  `Plan.Hash()` when non-empty. SQLite + non-empty `RolesSQL` is rejected.
+- Role steps sort after all schema DDL; the original `SchemaSQL` and
+  `RolesSQL` strings each participate in `Plan.Hash()` when non-empty.
+  Extracted statements are not hashed a second time. SQLite + non-empty
+  `RolesSQL` is rejected.
 
 #### CatalogSQL contract (PostgreSQL)
 
-`CatalogSQL` is a side-channel file (CLI: `--catalog catalog.sql`) holding the
-desired cluster-catalog state for logical-replication publications and DDL
-event triggers. Like `RolesSQL` it is **never** shadow-compiled and never
-belongs in `SchemaSQL`: publications and event triggers are environment-level
-concerns with no shadow-compile story, and event-trigger DDL cannot run
-inside the shadow-compile transaction model.
+`CatalogSQL` is an optional side-channel overlay (CLI: `--catalog catalog.sql`)
+for the desired cluster-catalog state of logical-replication publications and
+DDL event triggers. The same catalog statements may appear in `SchemaSQL`;
+both inputs bypass shadow compilation. When a publication or event-trigger
+name is present in both inputs, `CatalogSQL` is authoritative. Catalog DDL
+cannot run inside the shadow-compile transaction model.
 
 ```sql
--- catalog.sql — only these statement forms are accepted:
+-- catalog.sql or SchemaSQL — these catalog statement forms are accepted:
 CREATE PUBLICATION docs_pub FOR TABLE docs, comments;
 CREATE PUBLICATION analytics_pub FOR TABLES IN SCHEMA analytics; -- PostgreSQL 15+
 CREATE PUBLICATION all_pub FOR ALL TABLES;
 CREATE PUBLICATION ins_only WITH (publish = 'insert');           -- defaults to all four
+ALTER PUBLICATION docs_pub ADD TABLE audit;
+DROP PUBLICATION old_pub;
 CREATE EVENT TRIGGER audit_ddl ON ddl_command_end EXECUTE FUNCTION log_ddl();
 CREATE EVENT TRIGGER block_drop ON sql_drop WHEN TAG IN ('DROP TABLE') EXECUTE FUNCTION refuse_ddl();
+ALTER EVENT TRIGGER audit_ddl DISABLE;
+DROP EVENT TRIGGER old_audit;
 ```
 
 Semantics:
 
-- Statement scan rejects anything else (`ALTER PUBLICATION`, `DROP
-  PUBLICATION`, `WHEN VALUE IN`, schema DDL — `ErrInvalidOptions`); no
-  silent ignoring.
+- Statement scan rejects anything else (`WHEN VALUE IN`, schema DDL —
+  `ErrInvalidOptions`); no silent ignoring. Other `SchemaSQL` statements
+  remain in the shadow-compiled portion rather than being treated as
+  CatalogSQL.
 - Publications are diffed on membership and `publish` flags from
   `pg_publication` / `pg_publication_rel` / `pg_publication_namespace`:
   missing → create, drift → `ALTER PUBLICATION`, drop → gated by
@@ -266,9 +282,10 @@ Semantics:
 - `CREATE EVENT TRIGGER` DDL may require superuser; every plan step
   touching one emits `EVENT_TRIGGER_SUPERUSER` (WARNING). `FOR ALL
   TABLES` breadth emits `PUBLICATION_ALL_TABLES` (NOTICE).
-- Catalog steps sort after roles and grants; `CatalogSQL` participates
-  in `Plan.Hash()` when non-empty. SQLite + non-empty `CatalogSQL` is
-  rejected.
+- Catalog steps sort after roles and grants; the original `SchemaSQL` and
+  `CatalogSQL` strings each participate in `Plan.Hash()` when non-empty.
+  Extracted statements are not hashed a second time. SQLite + non-empty
+  `CatalogSQL` is rejected.
 
 ```go
 type ApplyOpts struct {
@@ -423,9 +440,9 @@ type Hazard struct {
 | `Domains` | Yes | Managed types diffed from `pg_type` (`typtype='d'`) + `pg_constraint` (`conrelid = 0`); base type/nullability/default drift is DROP+CREATE (no in-place retype); CHECK drift → `ALTER DOMAIN ADD/DROP CONSTRAINT`; drops gated by `AllowDropDomain` + `DROP_DOMAIN` (CRITICAL); no implicit `CASCADE` — dependent columns fail at apply |
 | `Triggers` | Yes | `pg_trigger` + canonical `pg_get_triggerdef`; drift → DROP+CREATE; drops gated by `AllowDropTrigger` + `DROP_TRIGGER` (CRITICAL); surviving managed triggers block dependent column drops via `UNMANAGED_DEPENDENCY` |
 | `Views` & `Materialized Views` | Yes | Canonical `pg_get_viewdef`; append-only column changes replace in place (`CREATE OR REPLACE VIEW`), otherwise DROP+CREATE; matviews always DROP+CREATE plus `REFRESH MATERIALIZED VIEW`; drops gated by `AllowDropView` + `DROP_VIEW` (CRITICAL) |
-| `Roles & Grants` | Yes | Via the `RolesSQL` side-channel (§2.2), never in `SchemaSQL`: managed `NOLOGIN` roles and object grants diffed against `pg_authid` + ACLs (`aclexplode`); missing → `GRANT`, surplus → `REVOKE` gated by `AllowRevoke` + `REVOKE_PRIVILEGE` (CRITICAL); marker-stamped roles dropped behind `AllowDropRole` + `DROP_ROLE` (CRITICAL) with ownership refusal; grants to `PUBLIC`/unmanaged grantees never revoked; `GRANT ... TO PUBLIC` emits `GRANT_PUBLIC` (WARNING) |
-| `Publications` | Yes | Via the `CatalogSQL` side-channel (§2.2), never in `SchemaSQL`: membership and `publish` flags diffed from `pg_publication` / `pg_publication_rel` / `pg_publication_namespace`; drift → `ALTER PUBLICATION`; drops gated by `AllowDropPublication` + `DROP_PUBLICATION` (CRITICAL), narrow to marker-stamped objects; `FOR ALL TABLES` emits `PUBLICATION_ALL_TABLES` (NOTICE); schema-level publications require PostgreSQL 15+ |
-| `Event Triggers` | Yes | Via the `CatalogSQL` side-channel (§2.2), never in `SchemaSQL`: event/tag/function/enabled state diffed from `pg_event_trigger`; definition drift is DROP+CREATE, enabled-only drift renders `ALTER EVENT TRIGGER ENABLE/DISABLE`; creation refuses missing trigger functions; drops gated by `AllowDropEventTrigger` + `DROP_EVENT_TRIGGER` (CRITICAL), narrow to marker-stamped objects; `EVENT_TRIGGER_SUPERUSER` (WARNING) on any event-trigger step |
+| `Roles & Grants` | Yes | Via unified `SchemaSQL` or the `RolesSQL` side-channel overlay (§2.2): managed `NOLOGIN` roles and object grants diffed against `pg_authid` + ACLs (`aclexplode`); duplicate side-channel identities override SchemaSQL; missing → `GRANT`, surplus → `REVOKE` gated by `AllowRevoke` + `REVOKE_PRIVILEGE` (CRITICAL); marker-stamped roles dropped behind `AllowDropRole` + `DROP_ROLE` (CRITICAL) with ownership refusal; grants to `PUBLIC`/unmanaged grantees never revoked; `GRANT ... TO PUBLIC` emits `GRANT_PUBLIC` (WARNING) |
+| `Publications` | Yes | Via unified `SchemaSQL` or the `CatalogSQL` side-channel overlay (§2.2): membership and `publish` flags diffed from `pg_publication` / `pg_publication_rel` / `pg_publication_namespace`; duplicate side-channel names override SchemaSQL; drift → `ALTER PUBLICATION`; drops gated by `AllowDropPublication` + `DROP_PUBLICATION` (CRITICAL), narrow to marker-stamped objects; `FOR ALL TABLES` emits `PUBLICATION_ALL_TABLES` (NOTICE); schema-level publications require PostgreSQL 15+ |
+| `Event Triggers` | Yes | Via unified `SchemaSQL` or the `CatalogSQL` side-channel overlay (§2.2): event/tag/function/enabled state diffed from `pg_event_trigger`; duplicate side-channel names override SchemaSQL; definition drift is DROP+CREATE, enabled-only drift renders `ALTER EVENT TRIGGER ENABLE/DISABLE`; creation refuses missing trigger functions; drops gated by `AllowDropEventTrigger` + `DROP_EVENT_TRIGGER` (CRITICAL), narrow to marker-stamped objects; `EVENT_TRIGGER_SUPERUSER` (WARNING) on any event-trigger step |
 
 ### SQLite
 

@@ -79,3 +79,49 @@ func TestValidateRolesSQL_RejectsUnsupportedStatements(t *testing.T) {
 		t.Fatalf("comment-only file must pass: %v", err)
 	}
 }
+
+func TestValidateRolesSQL_UnifiedForms(t *testing.T) {
+	valid := `
+		CREATE ROLE app_read;
+		ALTER ROLE app_read SET search_path = public;
+		GRANT SELECT ON docs TO app_read;
+		REVOKE INSERT ON docs FROM app_read;
+	`
+	if err := ValidateRolesSQL(valid); err != nil {
+		t.Fatalf("unified role statements must pass: %v", err)
+	}
+}
+
+func TestParseRolesSQL_RevokeWinsDeclaratively(t *testing.T) {
+	spec := ParseRolesSQL(`
+		CREATE ROLE app_read;
+		GRANT SELECT, INSERT ON docs TO app_read;
+		REVOKE INSERT ON docs FROM app_read;
+	`)
+	if len(spec.Grants) != 1 || len(spec.Grants[0].Privileges) != 1 || spec.Grants[0].Privileges[0] != "SELECT" {
+		t.Fatalf("REVOKE should remove the privilege from desired IR: %+v", spec.Grants)
+	}
+}
+
+func TestMergeRolesSpecs_SideChannelWinsDuplicateGrant(t *testing.T) {
+	schemaSpec := ParseRolesSQL(`CREATE ROLE app_read; GRANT SELECT ON docs TO app_read;`)
+	sideSpec := ParseRolesSQL(`CREATE ROLE app_read; GRANT INSERT ON docs TO app_read;`)
+	merged := MergeRolesSpecs(schemaSpec, sideSpec)
+	if len(merged.Roles) != 1 || len(merged.Grants) != 1 {
+		t.Fatalf("unexpected merged role spec: %+v", merged)
+	}
+	if len(merged.Grants[0].Privileges) != 1 || merged.Grants[0].Privileges[0] != "INSERT" {
+		t.Fatalf("side-channel grant should replace duplicate SchemaSQL grant: %+v", merged.Grants[0])
+	}
+
+	merged = MergeRolesSpecs(schemaSpec, ParseRolesSQL(`REVOKE SELECT ON docs FROM app_read;`))
+	if len(merged.Grants) != 0 {
+		t.Fatalf("side-channel REVOKE should override duplicate SchemaSQL grant: %+v", merged.Grants)
+	}
+
+	schemaRevoked := ParseRolesSQL(`CREATE ROLE app_read; GRANT SELECT ON docs TO app_read; REVOKE SELECT ON docs FROM app_read;`)
+	merged = MergeRolesSpecs(schemaRevoked, ParseRolesSQL(`GRANT SELECT ON docs TO app_read;`))
+	if len(merged.Grants) != 1 || len(merged.Grants[0].Privileges) != 1 || merged.Grants[0].Privileges[0] != "SELECT" {
+		t.Fatalf("side-channel GRANT should override SchemaSQL REVOKE: %+v", merged.Grants)
+	}
+}

@@ -27,6 +27,11 @@ func CompileSchemaSQLite(ctx context.Context, schemaSQL string) (*schema.Schema,
 // The shadow schema is created and dropped as part of the transaction, so no
 // durable state is modified.
 func CompileSchemaPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (*schema.Schema, error) {
+	groups, err := splitSchemaSQL(cfg.SchemaSQL)
+	if err != nil {
+		return nil, err
+	}
+
 	primarySchema := cfg.primarySchema()
 	shadowSchema := cfg.ShadowSchema
 	if shadowSchema == "" {
@@ -42,7 +47,7 @@ func CompileSchemaPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConf
 	if err := postgres.SetupShadowSchema(ctx, tx, shadowSchema); err != nil {
 		return nil, err
 	}
-	if err := postgres.RunShadowDDL(ctx, tx, shadowSchema, primarySchema, cfg.SchemaSQL); err != nil {
+	if err := postgres.RunShadowDDL(ctx, tx, shadowSchema, primarySchema, groups.ShadowSQL); err != nil {
 		return nil, err
 	}
 

@@ -114,3 +114,63 @@ CREATE INDEX idx ON users(id);
 		t.Fatalf("expected 5 DML statements, got %d: %v", len(dml), dml)
 	}
 }
+
+func TestExtractStatements_MixedSchemaSQL(t *testing.T) {
+	sql := `-- unified desired state
+CREATE TABLE docs (body text DEFAULT 'CREATE ROLE not_a_role;');
+/* The semicolon below is comment text; it must not split. */
+CREATE ROLE app_read;
+GRANT SELECT ON docs TO app_read;
+ALTER ROLE app_read SET search_path = public;
+REVOKE INSERT ON docs FROM app_read;
+CREATE PUBLICATION docs_pub FOR TABLE docs;
+CREATE EVENT TRIGGER audit_ddl ON ddl_command_end EXECUTE FUNCTION log_ddl();
+ALTER PUBLICATION docs_pub ADD TABLE audit;
+DROP EVENT TRIGGER old_audit;
+ALTER TABLE docs ADD COLUMN title text;
+DROP ROLE should_stay_shadow;`
+
+	groups := ExtractStatements(sql)
+	if !strings.Contains(groups.ShadowSQL, "CREATE TABLE docs") ||
+		!strings.Contains(groups.ShadowSQL, "ALTER TABLE docs") ||
+		!strings.Contains(groups.ShadowSQL, "DROP ROLE should_stay_shadow") {
+		t.Fatalf("shadow SQL lost unsupported/DDL statements: %q", groups.ShadowSQL)
+	}
+	if strings.Contains(groups.ShadowSQL, "CREATE ROLE app_read") ||
+		strings.Contains(groups.ShadowSQL, "CREATE PUBLICATION docs_pub") {
+		t.Fatalf("side-channel statements leaked into shadow SQL: %q", groups.ShadowSQL)
+	}
+	if !strings.Contains(groups.RolesSQL, "CREATE ROLE app_read") ||
+		!strings.Contains(groups.RolesSQL, "GRANT SELECT ON docs TO app_read") ||
+		!strings.Contains(groups.RolesSQL, "ALTER ROLE app_read") ||
+		!strings.Contains(groups.RolesSQL, "REVOKE INSERT ON docs FROM app_read") {
+		t.Fatalf("role statements not extracted: %q", groups.RolesSQL)
+	}
+	if !strings.Contains(groups.CatalogSQL, "CREATE PUBLICATION docs_pub") ||
+		!strings.Contains(groups.CatalogSQL, "CREATE EVENT TRIGGER audit_ddl") ||
+		!strings.Contains(groups.CatalogSQL, "ALTER PUBLICATION docs_pub") ||
+		!strings.Contains(groups.CatalogSQL, "DROP EVENT TRIGGER old_audit") {
+		t.Fatalf("catalog statements not extracted: %q", groups.CatalogSQL)
+	}
+}
+
+func TestExtractStatements_PreservesCommentsAndQuotedStrings(t *testing.T) {
+	sql := `/* CREATE ROLE fake; */
+CREATE TABLE docs (
+  body text DEFAULT 'CREATE PUBLICATION fake; -- not SQL'
+);
+-- CREATE EVENT TRIGGER fake;
+CREATE ROLE app_read;`
+
+	groups := ExtractStatements(sql)
+	if !strings.Contains(groups.ShadowSQL, "CREATE PUBLICATION fake; -- not SQL") {
+		t.Fatalf("quoted string was altered or split: %q", groups.ShadowSQL)
+	}
+	if !strings.Contains(groups.RolesSQL, "-- CREATE EVENT TRIGGER fake;") ||
+		!strings.Contains(groups.RolesSQL, "CREATE ROLE app_read") {
+		t.Fatalf("leading comments were not preserved with extracted statement: %q", groups.RolesSQL)
+	}
+	if strings.Contains(groups.CatalogSQL, "fake") {
+		t.Fatalf("comment/string contents were misclassified as catalog SQL: %q", groups.CatalogSQL)
+	}
+}

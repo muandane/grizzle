@@ -12,17 +12,21 @@ import (
 	"github.com/muandane/grizzle/internal/schema"
 )
 
-// diffCatalogSteps computes publication/event-trigger steps from the
-// CatalogSQL side-channel. Catalog objects are never shadow-compiled: the
-// desired state is statement-scanned from CatalogSQL, the live state is
-// inspected from pg_publication/pg_event_trigger, and the diff renders
-// CREATE/ALTER/DROP steps that sort after roles and grants.
+// diffCatalogSteps computes publication/event-trigger steps from unified
+// SchemaSQL catalog statements plus the optional CatalogSQL side-channel.
+// Catalog objects are never shadow-compiled: the desired state is
+// statement-scanned, the live state is inspected from
+// pg_publication/pg_event_trigger, and the diff renders CREATE/ALTER/DROP
+// steps that sort after roles and grants.
 func diffCatalogSteps(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig) ([]plan.Step, error) {
-	if strings.TrimSpace(cfg.CatalogSQL) == "" {
+	desired, err := desiredCatalogSpec(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if desired == nil {
 		return nil, nil
 	}
 
-	desired := schema.ParseCatalogSQL(cfg.CatalogSQL)
 	live, err := postgres.InspectLiveCatalog(ctx, dbtx)
 	if err != nil {
 		return nil, fmt.Errorf("%w: catalog: %w", plan.ErrInspectionFailed, err)
@@ -53,4 +57,21 @@ func diffCatalogSteps(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecCo
 	// global order, since the schema step list is already sorted.
 	plan.SortSteps(steps)
 	return steps, nil
+}
+
+func desiredCatalogSpec(cfg PostgresExecConfig) (*schema.CatalogSpec, error) {
+	groups, err := splitSchemaSQL(cfg.SchemaSQL)
+	if err != nil {
+		return nil, err
+	}
+	if err := schema.ValidateCatalogSQL(cfg.CatalogSQL); err != nil {
+		return nil, fmt.Errorf("validating CatalogSQL: %w", err)
+	}
+	if strings.TrimSpace(groups.CatalogSQL) == "" && strings.TrimSpace(cfg.CatalogSQL) == "" {
+		return nil, nil
+	}
+	return schema.MergeCatalogSpecs(
+		schema.ParseCatalogSQL(groups.CatalogSQL),
+		schema.ParseCatalogSQL(cfg.CatalogSQL),
+	), nil
 }

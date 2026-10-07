@@ -62,7 +62,7 @@ For a reviewable plan instead of boot sync, use `PlanDiff` then `Apply` with `Ex
 
 ## What it manages
 
-**PostgreSQL 14–18** (CI-tested): tables, columns, indexes (`CONCURRENTLY` by default), FKs (`NOT VALID` then `VALIDATE`), CHECKs, enums, domains, extensions, COMMENT ON, functions/procedures/aggregates, triggers, views/matviews, RLS + policies. Roles/grants via `--roles` / `RolesSQL`. Publications and event triggers via `--catalog` / `CatalogSQL`.
+**PostgreSQL 14–18** (CI-tested): tables, columns, indexes (`CONCURRENTLY` by default), FKs (`NOT VALID` then `VALIDATE`), CHECKs, enums, domains, extensions, COMMENT ON, functions/procedures/aggregates, triggers, views/matviews, RLS + policies, plus role/grant and publication/event-trigger statements in unified `SchemaSQL`. Optional `--roles` / `RolesSQL` and `--catalog` / `CatalogSQL` files remain supported as authoritative overlays.
 
 **SQLite 3.35+**: tables, columns, indexes, FKs, CHECKs, generated columns, and 12-step rebuilds when in-place ALTER is not enough. Pure Go (`modernc.org/sqlite`) or CGo (`mattn/go-sqlite3`).
 
@@ -102,7 +102,7 @@ Advisory locks are session-scoped. Use session pooling or a direct Postgres conn
 - [postgres-pgxpool](examples/postgres-pgxpool) — `*pgxpool.Pool`
 - [kubernetes-blueprint](examples/kubernetes-blueprint) — multi-replica boot
 - [expand-contract](examples/expand-contract) — staged rename (experimental)
-- [roles-grants](examples/roles-grants) / [catalog-sync](examples/catalog-sync) — side-channel files
+- [roles-grants](examples/roles-grants) / [catalog-sync](examples/catalog-sync) — role/catalog files and unified-schema overlays
 
 ## Docs
 

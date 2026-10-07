@@ -174,7 +174,7 @@ Supported hazard codes:
 
 ### Invariant 4b: Unmanaged objects policy — detected, protected, not managed
 
-Most schema constructs declared in `SchemaSQL` are managed declaratively (tables, columns, indexes, enums, CHECK/FK constraints, extensions, RLS + policies, COMMENT ON, functions, procedures, aggregates, domains, triggers, views/matviews), and cluster-catalog objects (publications, event triggers) are managed via the `CatalogSQL` side-channel. The objects Grizzle deliberately leaves unmanaged are those without a clean shadow-compile or diff story:
+Most schema constructs declared in `SchemaSQL` are managed declaratively (tables, columns, indexes, enums, CHECK/FK constraints, extensions, RLS + policies, COMMENT ON, functions, procedures, aggregates, domains, triggers, views/matviews). Role/grant and cluster-catalog statements (publications, event triggers) may also live in `SchemaSQL` and are statement-scanned outside shadow compilation; `RolesSQL` and `CatalogSQL` remain authoritative optional overlays. The objects Grizzle deliberately leaves unmanaged are those without a clean shadow-compile or diff story:
 
 * Subscriptions and replication slots (`CREATE SUBSCRIPTION` etc. — cluster-attached replication consumers with side effects beyond any single managed database)
 * Standalone sequences not owned by managed tables

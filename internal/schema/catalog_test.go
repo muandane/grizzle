@@ -168,6 +168,36 @@ CREATE PUBLICATION pub_b FOR TABLE public.docs;
 	})
 }
 
+func TestParseCatalogSQL_AlterAndDropForms(t *testing.T) {
+	spec := ParseCatalogSQL(`
+		CREATE PUBLICATION docs_pub FOR TABLE docs;
+		ALTER PUBLICATION docs_pub ADD TABLE audit;
+		ALTER PUBLICATION docs_pub SET (publish = 'insert');
+		CREATE EVENT TRIGGER audit ON ddl_command_end EXECUTE FUNCTION log_ddl();
+		ALTER EVENT TRIGGER audit DISABLE;
+	`)
+	if len(spec.Publications) != 1 || len(spec.Publications[0].Tables) != 2 {
+		t.Fatalf("publication ALTER statements should update desired IR: %+v", spec.Publications)
+	}
+	if spec.Publications[0].PublishInsert != true || spec.Publications[0].PublishUpdate ||
+		spec.Publications[0].PublishDelete || spec.Publications[0].PublishTruncate {
+		t.Fatalf("publication publish options not applied: %+v", spec.Publications[0])
+	}
+	if len(spec.EventTriggers) != 1 || spec.EventTriggers[0].Enabled {
+		t.Fatalf("event-trigger ALTER should update desired enabled state: %+v", spec.EventTriggers)
+	}
+
+	dropped := ParseCatalogSQL(`
+		CREATE PUBLICATION docs_pub FOR TABLE docs;
+		DROP PUBLICATION docs_pub;
+		CREATE EVENT TRIGGER audit ON ddl_command_end EXECUTE FUNCTION log_ddl();
+		DROP EVENT TRIGGER audit;
+	`)
+	if len(dropped.Publications) != 0 || len(dropped.EventTriggers) != 0 {
+		t.Fatalf("DROP statements should remove declarations from desired IR: %+v", dropped)
+	}
+}
+
 func TestValidateCatalogSQL(t *testing.T) {
 	valid := []string{
 		"",
@@ -183,17 +213,50 @@ func TestValidateCatalogSQL(t *testing.T) {
 	}
 
 	invalid := []string{
-		"ALTER PUBLICATION p ADD TABLE public.docs;",
-		"DROP PUBLICATION p;",
-		"DROP EVENT TRIGGER t;",
 		"CREATE TABLE docs (id int);",
 		"GRANT SELECT ON TABLE docs TO app_read;",
 		"CREATE EVENT TRIGGER t ON ddl_command_start WHEN VALUE IN ('x') EXECUTE FUNCTION f();",
 		"CREATE PUBLICATION p SET (publish = 'insert');",
+		"ALTER PUBLICATION p;",
+		"ALTER PUBLICATION p RENAME TO renamed;",
+		"ALTER EVENT TRIGGER t ENABLE ALWAYS;",
+		"DROP PUBLICATION;",
+		"DROP EVENT TRIGGER;",
 	}
 	for _, sql := range invalid {
 		if err := ValidateCatalogSQL(sql); err == nil {
 			t.Errorf("ValidateCatalogSQL(%q) = nil, want error", sql)
 		}
+	}
+}
+
+func TestValidateCatalogSQL_UnifiedForms(t *testing.T) {
+	valid := `
+		CREATE PUBLICATION p FOR TABLE docs;
+		ALTER PUBLICATION p ADD TABLE public.audit;
+		DROP PUBLICATION old_p;
+		CREATE EVENT TRIGGER t ON ddl_command_end EXECUTE FUNCTION f();
+		ALTER EVENT TRIGGER t DISABLE;
+		DROP EVENT TRIGGER old_t;
+	`
+	if err := ValidateCatalogSQL(valid); err != nil {
+		t.Fatalf("unified catalog statements must pass: %v", err)
+	}
+}
+
+func TestMergeCatalogSpecs_SideChannelWinsDuplicateName(t *testing.T) {
+	schemaSpec := ParseCatalogSQL(`CREATE PUBLICATION p FOR ALL TABLES;`)
+	sideSpec := ParseCatalogSQL(`CREATE PUBLICATION p FOR TABLE docs;`)
+	merged := MergeCatalogSpecs(schemaSpec, sideSpec)
+	if len(merged.Publications) != 1 {
+		t.Fatalf("unexpected merged catalog spec: %+v", merged)
+	}
+	if merged.Publications[0].Name != "p" || len(merged.Publications[0].Tables) != 1 || merged.Publications[0].AllTables {
+		t.Fatalf("side-channel publication should replace duplicate: %+v", merged.Publications[0])
+	}
+
+	merged = MergeCatalogSpecs(schemaSpec, ParseCatalogSQL(`DROP PUBLICATION p;`))
+	if len(merged.Publications) != 0 {
+		t.Fatalf("side-channel DROP should override duplicate SchemaSQL publication: %+v", merged.Publications)
 	}
 }

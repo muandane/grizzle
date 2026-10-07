@@ -6,8 +6,11 @@
 --     --roles examples/roles-grants/roles.sql
 --
 -- Contract (docs/SPEC.md §2.2 "RolesSQL contract"):
---   * Only CREATE ROLE/USER and GRANT statements are accepted; anything else
---     fails with ErrInvalidOptions instead of being silently ignored.
+--   * The same role statements may be placed in SchemaSQL. This optional
+--     --roles file is authoritative when a role/grant identity is duplicated.
+--   * CREATE/ALTER ROLE/USER and object-privilege GRANT/REVOKE statements
+--     are accepted; anything else fails with ErrInvalidOptions instead of
+--     being silently ignored.
 --   * Declared roles are created NOLOGIN (group roles). Grizzle never sets or
 --     rotates passwords; interactive-login roles stay outside the contract.
 --   * Roles Grizzle creates are stamped with a "grizzle-managed" catalog

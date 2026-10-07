@@ -112,6 +112,9 @@ func localSearchPathSQL(schemas []string) string {
 
 // DiffPostgres computes the diff and renders the sequenced migration steps for PostgreSQL.
 func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig) ([]plan.Step, error) {
+	if _, err := splitSchemaSQL(cfg.SchemaSQL); err != nil {
+		return nil, err
+	}
 	if cfg.Tracer != nil {
 		var diffSpan Span
 		ctx, diffSpan = cfg.Tracer.Start(ctx, "grizzle.diff_plan")
@@ -523,6 +526,11 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig, b
 
 	_ = ApplyTxTimeouts(ctx, shadowTx, cfg.LockTimeout, cfg.StatementTimeout)
 
+	schemaGroups, err := splitSchemaSQL(cfg.SchemaSQL)
+	if err != nil {
+		return 0, fmt.Errorf("%w: %w", plan.ErrCompilationFailed, err)
+	}
+
 	var shadowSchemas []string
 	if !isMulti {
 		shadowSchema := cfg.ShadowSchema
@@ -535,7 +543,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig, b
 			return 0, err
 		}
 
-		if err := postgres.RunShadowDDL(ctx, shadowTx, shadowSchema, primarySchema, cfg.SchemaSQL); err != nil {
+		if err := postgres.RunShadowDDL(ctx, shadowTx, shadowSchema, primarySchema, schemaGroups.ShadowSQL); err != nil {
 			if logger != nil {
 				logger.ErrorContext(ctx, "grizzle: shadow compilation failed", "error", err)
 			}
@@ -551,7 +559,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig, b
 			return 0, err
 		}
 
-		if err := postgres.RunMultiShadowDDL(ctx, shadowTx, shadowMap, targetSchemas, cfg.SchemaSQL); err != nil {
+		if err := postgres.RunMultiShadowDDL(ctx, shadowTx, shadowMap, targetSchemas, schemaGroups.ShadowSQL); err != nil {
 			if logger != nil {
 				logger.ErrorContext(ctx, "grizzle: shadow compilation failed", "error", err)
 			}
@@ -806,6 +814,11 @@ func PlanDiffPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 
 	_ = ApplyTxTimeouts(ctx, tx, cfg.LockTimeout, cfg.StatementTimeout)
 
+	schemaGroups, err := splitSchemaSQL(cfg.SchemaSQL)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", plan.ErrCompilationFailed, err)
+	}
+
 	var shadowSchemas []string
 	if !isMulti {
 		shadowSchema := cfg.ShadowSchema
@@ -819,7 +832,7 @@ func PlanDiffPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 		}
 		defer func() { _ = postgres.DropShadowSchema(context.Background(), tx, shadowSchema) }()
 
-		if err := postgres.RunShadowDDL(ctx, tx, shadowSchema, primarySchema, cfg.SchemaSQL); err != nil {
+		if err := postgres.RunShadowDDL(ctx, tx, shadowSchema, primarySchema, schemaGroups.ShadowSQL); err != nil {
 			return nil, fmt.Errorf("%w: %w", plan.ErrCompilationFailed, err)
 		}
 	} else {
@@ -833,7 +846,7 @@ func PlanDiffPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 		}
 		defer func() { _ = postgres.DropShadowSchemas(context.Background(), tx, shadowSchemas) }()
 
-		if err := postgres.RunMultiShadowDDL(ctx, tx, shadowMap, targetSchemas, cfg.SchemaSQL); err != nil {
+		if err := postgres.RunMultiShadowDDL(ctx, tx, shadowMap, targetSchemas, schemaGroups.ShadowSQL); err != nil {
 			return nil, fmt.Errorf("%w: %w", plan.ErrCompilationFailed, err)
 		}
 	}

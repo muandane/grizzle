@@ -12,17 +12,21 @@ import (
 	"github.com/muandane/grizzle/internal/schema"
 )
 
-// diffRolesSteps computes roles/grants steps from the RolesSQL side-channel.
-// Unlike schema DDL, roles are never shadow-compiled: the desired state is
-// statement-scanned from RolesSQL, the live state is inspected from
-// pg_roles/pg_authid and object ACLs, and the diff renders GRANT/REVOKE/
-// CREATE ROLE/DROP ROLE steps that sort after all schema DDL.
+// diffRolesSteps computes roles/grants steps from unified SchemaSQL role
+// statements plus the optional RolesSQL side-channel. Unlike schema DDL,
+// roles are never shadow-compiled: the desired state is statement-scanned,
+// the live state is inspected from pg_roles/pg_authid and object ACLs, and
+// the diff renders GRANT/REVOKE/CREATE ROLE/DROP ROLE steps that sort after
+// all schema DDL.
 func diffRolesSteps(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig) ([]plan.Step, error) {
-	if strings.TrimSpace(cfg.RolesSQL) == "" {
+	desired, err := desiredRolesSpec(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if desired == nil {
 		return nil, nil
 	}
 
-	desired := schema.ParseRolesSQL(cfg.RolesSQL)
 	live, err := postgres.InspectLiveRoles(ctx, dbtx, cfg.targetSchemas())
 	if err != nil {
 		return nil, fmt.Errorf("%w: roles: %w", plan.ErrInspectionFailed, err)
@@ -54,4 +58,21 @@ func diffRolesSteps(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConf
 	// order, since the schema step list is already sorted.
 	plan.SortSteps(steps)
 	return steps, nil
+}
+
+func desiredRolesSpec(cfg PostgresExecConfig) (*schema.RolesSpec, error) {
+	groups, err := splitSchemaSQL(cfg.SchemaSQL)
+	if err != nil {
+		return nil, err
+	}
+	if err := schema.ValidateRolesSQL(cfg.RolesSQL); err != nil {
+		return nil, fmt.Errorf("validating RolesSQL: %w", err)
+	}
+	if strings.TrimSpace(groups.RolesSQL) == "" && strings.TrimSpace(cfg.RolesSQL) == "" {
+		return nil, nil
+	}
+	return schema.MergeRolesSpecs(
+		schema.ParseRolesSQL(groups.RolesSQL),
+		schema.ParseRolesSQL(cfg.RolesSQL),
+	), nil
 }
