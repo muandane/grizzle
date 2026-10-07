@@ -238,7 +238,11 @@ func TestHistory_PartialOnKilledNonTxStep(t *testing.T) {
 		t.Fatalf("expected plan to have a non-tx step, got: %+v", plan.Steps)
 	}
 
-	// Hold a conflicting lock on items table so CREATE INDEX CONCURRENTLY will block
+	// Hold a conflicting lock so CREATE INDEX CONCURRENTLY blocks in the non-tx step.
+	// A fixed-time context cancel races: if it fires during advisory-lock acquire,
+	// Apply returns an error without writing history, and GetLatest still sees the
+	// initial sync's "applied" row (flake seen on PG 15 CI). Wait until the CIC
+	// query is visible, then terminate that backend so failure is always mid-non-tx.
 	lockConn, err := db.Conn(context.Background())
 	if err != nil {
 		t.Fatalf("failed acquiring lock conn: %v", err)
@@ -253,23 +257,61 @@ func TestHistory_PartialOnKilledNonTxStep(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed acquiring conflicting lock: %v", err)
 	}
-
-	// Execute Apply with a short cancel
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		time.Sleep(150 * time.Millisecond)
-		cancel()
+	defer func() {
+		_, _ = lockConn.ExecContext(context.Background(), "ROLLBACK;")
 	}()
 
-	applyErr := grizzle.Apply(ctx, db, plan, grizzle.ApplyOpts{})
-	if applyErr == nil {
-		t.Fatalf("expected Apply to fail when cancelled mid non-tx step, got nil")
+	applyDone := make(chan error, 1)
+	go func() {
+		applyDone <- grizzle.Apply(context.Background(), db, plan, grizzle.ApplyOpts{})
+	}()
+
+	terminateCtx, cancelTerminate := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancelTerminate()
+
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+
+	terminated := false
+	for !terminated {
+		select {
+		case <-terminateCtx.Done():
+			t.Fatalf("timed out waiting for CREATE INDEX CONCURRENTLY to start so it can be killed")
+		case applyErr := <-applyDone:
+			t.Fatalf("Apply finished before non-tx backend could be terminated: %v", applyErr)
+		case <-ticker.C:
+			var pid int
+			findPID := `
+				SELECT pid FROM pg_stat_activity
+				WHERE state = 'active'
+				  AND query LIKE '%CREATE INDEX CONCURRENTLY%'
+				  AND pid <> pg_backend_pid()
+				LIMIT 1`
+			if err := db.QueryRowContext(terminateCtx, findPID).Scan(&pid); err != nil || pid <= 0 {
+				continue
+			}
+			var ok bool
+			if err := db.QueryRowContext(terminateCtx, "SELECT pg_terminate_backend($1);", pid).Scan(&ok); err != nil {
+				t.Fatalf("pg_terminate_backend(%d): %v", pid, err)
+			}
+			if !ok {
+				t.Fatalf("pg_terminate_backend(%d) returned false", pid)
+			}
+			terminated = true
+		}
 	}
 
-	// Release conflicting lock
-	_, _ = lockConn.ExecContext(context.Background(), "ROLLBACK;")
+	var applyErr error
+	select {
+	case applyErr = <-applyDone:
+	case <-time.After(15 * time.Second):
+		t.Fatalf("timed out waiting for Apply to return after backend terminate")
+	}
+	if applyErr == nil {
+		t.Fatalf("expected Apply to fail when non-tx backend was terminated, got nil")
+	}
+	t.Logf("applyErr after terminate: %v", applyErr)
 
-	// Query grizzle_history using a fresh context
 	latest, err := history.GetLatest(context.Background(), db, "postgres", schema)
 	if err != nil {
 		t.Fatalf("failed fetching latest history: %v", err)
