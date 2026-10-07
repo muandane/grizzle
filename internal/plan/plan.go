@@ -76,6 +76,15 @@ const (
 	ChangeCreateRole  ChangeType = "CREATE_ROLE"
 	ChangeRoleComment ChangeType = "ROLE_COMMENT"
 	ChangeDropRole    ChangeType = "DROP_ROLE"
+	// CatalogSQL surface: publications and event triggers (statement-scan
+	// only, never shadow-compiled). Sorted after roles steps; event triggers
+	// come last because they fire on subsequent DDL.
+	ChangeCreatePublication  ChangeType = "CREATE_PUBLICATION"
+	ChangeAlterPublication   ChangeType = "ALTER_PUBLICATION"
+	ChangeDropPublication    ChangeType = "DROP_PUBLICATION"
+	ChangeCreateEventTrigger ChangeType = "CREATE_EVENT_TRIGGER"
+	ChangeAlterEventTrigger  ChangeType = "ALTER_EVENT_TRIGGER"
+	ChangeDropEventTrigger   ChangeType = "DROP_EVENT_TRIGGER"
 )
 
 // Step represents a single atomic DDL migration statement.
@@ -135,6 +144,9 @@ type DropPolicy struct {
 	AllowDomain    bool `json:"allow_domain"`
 	AllowRevoke    bool `json:"allow_revoke"`
 	AllowDropRole  bool `json:"allow_drop_role"`
+	// CatalogSQL surface gates.
+	AllowDropPublication  bool `json:"allow_drop_publication"`
+	AllowDropEventTrigger bool `json:"allow_drop_event_trigger"`
 }
 
 // IsAllowed checks if a given migration step is permitted by the policy.
@@ -175,6 +187,10 @@ func (p DropPolicy) IsAllowed(s Step) bool {
 		return p.AllowRevoke
 	case ChangeDropRole:
 		return p.AllowDropRole
+	case ChangeDropPublication:
+		return p.AllowDropPublication
+	case ChangeDropEventTrigger:
+		return p.AllowDropEventTrigger
 	default:
 		return false
 	}
@@ -195,6 +211,10 @@ type Plan struct {
 	// shadow-compiled). Approval-sensitive: participates in Hash() when
 	// non-empty.
 	RolesSQL string `json:"roles_sql,omitzero"`
+	// CatalogSQL is the desired publications/event-triggers file
+	// (side-channel contract, never shadow-compiled). Approval-sensitive:
+	// participates in Hash() when non-empty.
+	CatalogSQL string `json:"catalog_sql,omitzero"`
 
 	// NonConcurrentIndexes affects generated SQL (CONCURRENTLY vs
 	// transactional CREATE INDEX) and is therefore approval-sensitive:
@@ -249,12 +269,13 @@ func (p *Plan) Hash() string {
 	if p.ExpandContract {
 		write("expand_contract:true\n")
 	}
-	write("policy:%t,%t,%t,%t,%t,%t,%t,%t,%t,%t,%t,%t,%t\n",
+	write("policy:%t,%t,%t,%t,%t,%t,%t,%t,%t,%t,%t,%t,%t,%t,%t\n",
 		p.Policy.AllowTable, p.Policy.AllowColumn, p.Policy.AllowIndex,
 		p.Policy.AllowFK, p.Policy.AllowCheck,
 		p.Policy.AllowExtension, p.Policy.AllowFunction, p.Policy.AllowPolicy,
 		p.Policy.AllowTrigger, p.Policy.AllowView, p.Policy.AllowDomain,
-		p.Policy.AllowRevoke, p.Policy.AllowDropRole)
+		p.Policy.AllowRevoke, p.Policy.AllowDropRole,
+		p.Policy.AllowDropPublication, p.Policy.AllowDropEventTrigger)
 	if p.NonConcurrentIndexes {
 		write("non_concurrent:true\n")
 	}
@@ -263,6 +284,9 @@ func (p *Plan) Hash() string {
 	}
 	if p.RolesSQL != "" {
 		write("roles_sql:%s\n", p.RolesSQL)
+	}
+	if p.CatalogSQL != "" {
+		write("catalog_sql:%s\n", p.CatalogSQL)
 	}
 
 	for i, s := range p.Steps {
@@ -312,7 +336,8 @@ func (p *Plan) Additions() int {
 		switch s.Type {
 		case ChangeCreateEnum, ChangeCreateTable, ChangeAddColumn, ChangeCreateIndex, ChangeAddFK, ChangeAddCheck,
 			ChangeCreateExtension, ChangeCreatePolicy, ChangeCreateFunction, ChangeCreateAggregate, ChangeCreateTrigger, ChangeCreateView,
-			ChangeEnableRLS, ChangeForceRLS, ChangeCreateDomain, ChangeCreateRole, ChangeGrant:
+			ChangeEnableRLS, ChangeForceRLS, ChangeCreateDomain, ChangeCreateRole, ChangeGrant,
+			ChangeCreatePublication, ChangeCreateEventTrigger:
 			count++
 		}
 	}
@@ -325,7 +350,8 @@ func (p *Plan) Modifications() int {
 	for _, s := range p.Steps {
 		switch s.Type {
 		case ChangeAlterColumn, ChangeAlterEnum, ChangeRefreshMatView,
-			ChangeDisableRLS, ChangeNoForceRLS, ChangeAlterDomain, ChangeRevoke:
+			ChangeDisableRLS, ChangeNoForceRLS, ChangeAlterDomain, ChangeRevoke,
+			ChangeAlterPublication, ChangeAlterEventTrigger:
 			count++
 		}
 	}
@@ -339,7 +365,8 @@ func (p *Plan) Deletions() int {
 		switch s.Type {
 		case ChangeDropTable, ChangeDropColumn, ChangeDropIndex, ChangeDropFK, ChangeDropCheck,
 			ChangeDropExtension, ChangeDropPolicy, ChangeDropFunction, ChangeDropAggregate, ChangeDropTrigger, ChangeDropView,
-			ChangeDropDomain, ChangeDropDomainConstraint, ChangeDropDomainRetype, ChangeDropRole:
+			ChangeDropDomain, ChangeDropDomainConstraint, ChangeDropDomainRetype, ChangeDropRole,
+			ChangeDropPublication, ChangeDropEventTrigger:
 			count++
 		}
 	}
@@ -419,6 +446,16 @@ const (
 	HazardDropRole HazardCode = "DROP_ROLE"
 	// HazardGrantPublic indicates privileges are granted to PUBLIC (ambient access).
 	HazardGrantPublic HazardCode = "GRANT_PUBLIC"
+	// HazardDropPublication indicates dropping a managed publication.
+	HazardDropPublication HazardCode = "DROP_PUBLICATION"
+	// HazardDropEventTrigger indicates dropping a managed event trigger.
+	HazardDropEventTrigger HazardCode = "DROP_EVENT_TRIGGER"
+	// HazardEventTriggerSuperuser indicates event-trigger DDL may require
+	// superuser or elevated privileges.
+	HazardEventTriggerSuperuser HazardCode = "EVENT_TRIGGER_SUPERUSER"
+	// HazardPublicationAllTables indicates a publication publishes every
+	// table in the database (ambient replication surface).
+	HazardPublicationAllTables HazardCode = "PUBLICATION_ALL_TABLES"
 	// HazardCommentClear indicates an existing COMMENT is being replaced or cleared.
 	HazardCommentClear HazardCode = "COMMENT_CLEAR"
 )
@@ -745,6 +782,44 @@ func stepHazards(s Step) []Hazard {
 				Type:        s.Type,
 				Table:       s.Table,
 				Description: fmt.Sprintf("Privileges on %q will be granted to PUBLIC, making them available to every role", s.Table),
+				SQL:         s.SQL,
+			})
+		}
+	case ChangeDropPublication:
+		hazards = append(hazards, Hazard{
+			Code:        HazardDropPublication,
+			Level:       HazardLevelCritical,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Publication %q will be dropped; subscribers depending on it stop receiving changes", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeDropEventTrigger:
+		hazards = append(hazards, Hazard{
+			Code:        HazardDropEventTrigger,
+			Level:       HazardLevelCritical,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Event trigger %q will be dropped; its DDL auditing/enforcement stops firing", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeCreateEventTrigger, ChangeAlterEventTrigger:
+		hazards = append(hazards, Hazard{
+			Code:        HazardEventTriggerSuperuser,
+			Level:       HazardLevelWarning,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Event trigger %q DDL may require superuser or elevated privileges", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeCreatePublication, ChangeAlterPublication:
+		if strings.Contains(strings.ToUpper(s.SQL), "SET ALL TABLES") || strings.Contains(strings.ToUpper(s.SQL), "FOR ALL TABLES") {
+			hazards = append(hazards, Hazard{
+				Code:        HazardPublicationAllTables,
+				Level:       HazardLevelNotice,
+				Type:        s.Type,
+				Table:       s.Table,
+				Description: fmt.Sprintf("Publication %q publishes ALL tables, including future ones", s.Table),
 				SQL:         s.SQL,
 			})
 		}

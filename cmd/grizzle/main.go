@@ -150,6 +150,7 @@ func run(args []string) int {
 		dryRunFlag   = fs.Bool("dry-run", false, "Verify planned DDL against live data without persisting changes (apply)")
 		seedFile     = fs.String("seed", "", "Path to seed SQL file (seed)")
 		rolesFile    = fs.String("roles", "", "Path to roles SQL file (plan/apply/check): CREATE ROLE and GRANT statements diffed against live ACLs")
+		catalogFile  = fs.String("catalog", "", "Path to catalog SQL file (plan/apply/check): CREATE PUBLICATION and CREATE EVENT TRIGGER statements diffed against live catalogs")
 	)
 
 	var hazards hazardFlags
@@ -178,19 +179,31 @@ func run(args []string) int {
 		if !ok {
 			return 1
 		}
-		return runPlan(ctx, dsn, *schemaFile, rolesSQL, *outFile, *allowDrop, isJSON, isGitHub, renames, *expandContract)
+		catalogSQL, ok := readCatalogFile(*catalogFile)
+		if !ok {
+			return 1
+		}
+		return runPlan(ctx, dsn, *schemaFile, rolesSQL, catalogSQL, *outFile, *allowDrop, isJSON, isGitHub, renames, *expandContract)
 	case "apply":
 		rolesSQL, ok := readRolesFile(*rolesFile)
 		if !ok {
 			return 1
 		}
-		return runApply(ctx, dsn, *planFile, *schemaFile, rolesSQL, *expectedHash, *allowDrop, hazards, *dryRunFlag, renames, *expandContract)
+		catalogSQL, ok := readCatalogFile(*catalogFile)
+		if !ok {
+			return 1
+		}
+		return runApply(ctx, dsn, *planFile, *schemaFile, rolesSQL, catalogSQL, *expectedHash, *allowDrop, hazards, *dryRunFlag, renames, *expandContract)
 	case "check":
 		rolesSQL, ok := readRolesFile(*rolesFile)
 		if !ok {
 			return 1
 		}
-		return runCheck(ctx, dsn, *schemaFile, rolesSQL, *allowDrop, renames, *expandContract)
+		catalogSQL, ok := readCatalogFile(*catalogFile)
+		if !ok {
+			return 1
+		}
+		return runCheck(ctx, dsn, *schemaFile, rolesSQL, catalogSQL, *allowDrop, renames, *expandContract)
 	case "lint":
 		lintFormat := *formatFlag
 		if lintFormat == "sql" {
@@ -224,18 +237,32 @@ func initDB(dsn string) (*sql.DB, error) {
 // readRolesFile loads the optional --roles file. A missing path yields empty
 // content (roles management disabled); a read failure reports and fails.
 func readRolesFile(path string) (string, bool) {
+	return readOptionalSQLFile(path, "roles")
+}
+
+// readCatalogFile loads the optional --catalog file. A missing path yields
+// empty content (catalog management disabled); a read failure reports and
+// fails.
+func readCatalogFile(path string) (string, bool) {
+	return readOptionalSQLFile(path, "catalog")
+}
+
+// readOptionalSQLFile loads an optional side-channel SQL file. A missing
+// path yields empty content (feature disabled); a read failure reports and
+// fails.
+func readOptionalSQLFile(path, label string) (string, bool) {
 	if path == "" {
 		return "", true
 	}
-	content, err := os.ReadFile(filepath.Clean(path)) //nolint:gosec // G304: CLI accepts user-provided roles file path
+	content, err := os.ReadFile(filepath.Clean(path)) //nolint:gosec // G304: CLI accepts user-provided SQL file path
 	if err != nil {
-		slog.Error("reading roles file", "path", path, "err", err)
+		slog.Error("reading "+label+" file", "path", path, "err", err)
 		return "", false
 	}
 	return string(content), true
 }
 
-func loadOrComputePlan(ctx context.Context, db *sql.DB, planFile, schemaFile, rolesSQL string, allowDrop bool, acceptedCodes []grizzle.HazardCode, renames map[string]string, expandContract bool) (*grizzle.Plan, string, error) {
+func loadOrComputePlan(ctx context.Context, db *sql.DB, planFile, schemaFile, rolesSQL, catalogSQL string, allowDrop bool, acceptedCodes []grizzle.HazardCode, renames map[string]string, expandContract bool) (*grizzle.Plan, string, error) {
 	if planFile != "" {
 		planData, err := os.ReadFile(filepath.Clean(planFile)) //nolint:gosec // G304: CLI accepts user-provided plan file path
 		if err != nil {
@@ -258,6 +285,7 @@ func loadOrComputePlan(ctx context.Context, db *sql.DB, planFile, schemaFile, ro
 	opts := grizzle.Options{
 		SchemaSQL:      string(content),
 		RolesSQL:       rolesSQL,
+		CatalogSQL:     catalogSQL,
 		AllowDrop:      allowDrop,
 		AcceptHazards:  acceptedCodes,
 		Renames:        renames,
@@ -271,7 +299,7 @@ func loadOrComputePlan(ctx context.Context, db *sql.DB, planFile, schemaFile, ro
 	return computedPlan, computedPlan.Hash(), nil
 }
 
-func runPlan(ctx context.Context, dsn, schemaFile, rolesSQL, outFile string, allowDrop, jsonOutput, githubOutput bool, renames map[string]string, expandContract bool) int {
+func runPlan(ctx context.Context, dsn, schemaFile, rolesSQL, catalogSQL, outFile string, allowDrop, jsonOutput, githubOutput bool, renames map[string]string, expandContract bool) int {
 	db, err := initDB(dsn)
 	if err != nil {
 		return 1
@@ -287,6 +315,7 @@ func runPlan(ctx context.Context, dsn, schemaFile, rolesSQL, outFile string, all
 	opts := grizzle.Options{
 		SchemaSQL:      string(content),
 		RolesSQL:       rolesSQL,
+		CatalogSQL:     catalogSQL,
 		AllowDrop:      allowDrop,
 		Renames:        renames,
 		ExpandContract: expandContract,
@@ -320,7 +349,7 @@ func runPlan(ctx context.Context, dsn, schemaFile, rolesSQL, outFile string, all
 	return 0
 }
 
-func runApply(ctx context.Context, dsn, planFile, schemaFile, rolesSQL, expectedHash string, allowDrop bool, hazards []string, dryRun bool, renames map[string]string, expandContract bool) int {
+func runApply(ctx context.Context, dsn, planFile, schemaFile, rolesSQL, catalogSQL, expectedHash string, allowDrop bool, hazards []string, dryRun bool, renames map[string]string, expandContract bool) int {
 	db, err := initDB(dsn)
 	if err != nil {
 		return 1
@@ -333,10 +362,10 @@ func runApply(ctx context.Context, dsn, planFile, schemaFile, rolesSQL, expected
 	}
 
 	if dryRun {
-		return runDryRunApply(ctx, db, planFile, schemaFile, rolesSQL, allowDrop, acceptedCodes, renames, expandContract)
+		return runDryRunApply(ctx, db, planFile, schemaFile, rolesSQL, catalogSQL, allowDrop, acceptedCodes, renames, expandContract)
 	}
 
-	p, planHash, err := loadOrComputePlan(ctx, db, planFile, schemaFile, rolesSQL, allowDrop, acceptedCodes, renames, expandContract)
+	p, planHash, err := loadOrComputePlan(ctx, db, planFile, schemaFile, rolesSQL, catalogSQL, allowDrop, acceptedCodes, renames, expandContract)
 	if err != nil {
 		return 1
 	}
@@ -384,7 +413,7 @@ func runApply(ctx context.Context, dsn, planFile, schemaFile, rolesSQL, expected
 	return 0
 }
 
-func runCheck(ctx context.Context, dsn, schemaFile, rolesSQL string, allowDrop bool, renames map[string]string, expandContract bool) int {
+func runCheck(ctx context.Context, dsn, schemaFile, rolesSQL, catalogSQL string, allowDrop bool, renames map[string]string, expandContract bool) int {
 	db, err := initDB(dsn)
 	if err != nil {
 		return 1
@@ -400,6 +429,7 @@ func runCheck(ctx context.Context, dsn, schemaFile, rolesSQL string, allowDrop b
 	opts := grizzle.Options{
 		SchemaSQL:      string(content),
 		RolesSQL:       rolesSQL,
+		CatalogSQL:     catalogSQL,
 		AllowDrop:      allowDrop,
 		Renames:        renames,
 		ExpandContract: expandContract,

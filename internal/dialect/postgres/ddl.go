@@ -602,6 +602,18 @@ func RenderChangeWithOpts(targetSchema string, c diff.Change, opts RenderOpts) p
 		step.SQL = GenerateGrantSQL(c.Grant)
 	case plan.ChangeRevoke:
 		step.SQL = GenerateRevokeSQL(c.Grant, c.Grant.Privileges)
+	case plan.ChangeCreatePublication:
+		step.SQL = GenerateCreatePublicationSQL(c.Publication) + "\n" + GeneratePublicationCommentSQL(c.Publication.Name)
+	case plan.ChangeAlterPublication:
+		step.SQL = GenerateAlterPublicationSQL(c.Publication, c.OldPublication)
+	case plan.ChangeDropPublication:
+		step.SQL = GenerateDropPublicationSQL(c.Table)
+	case plan.ChangeCreateEventTrigger:
+		step.SQL = GenerateCreateEventTriggerSQL(c.EventTrigger) + "\n" + GenerateEventTriggerCommentSQL(c.EventTrigger.Name)
+	case plan.ChangeAlterEventTrigger:
+		step.SQL = GenerateAlterEventTriggerSQL(c.EventTrigger, c.OldEventTrigger)
+	case plan.ChangeDropEventTrigger:
+		step.SQL = GenerateDropEventTriggerSQL(c.Table)
 	case plan.ChangeCreateTrigger:
 		step.SQL = GenerateCreateTriggerSQL(c.Trigger)
 	case plan.ChangeDropTrigger:

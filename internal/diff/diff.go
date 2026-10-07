@@ -33,6 +33,10 @@ type Change struct {
 	OldDomain         *schema.Domain
 	Role              *schema.Role
 	Grant             *schema.Grant
+	Publication       *schema.Publication
+	OldPublication    *schema.Publication
+	EventTrigger      *schema.EventTrigger
+	OldEventTrigger   *schema.EventTrigger
 	Trigger           *schema.Trigger
 	View              *schema.View
 	Replace           bool

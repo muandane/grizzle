@@ -46,6 +46,7 @@ type PostgresExecConfig struct {
 	ShadowSchemas        []string
 	SchemaSQL            string
 	RolesSQL             string
+	CatalogSQL           string
 	LockNamespace        string
 	LockID               int64
 	Filters              scope.Filters
@@ -158,7 +159,11 @@ func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig
 		if err != nil {
 			return nil, err
 		}
-		return append(steps, rolesSteps...), nil
+		catalogSteps, err := diffCatalogSteps(ctx, dbtx, cfg)
+		if err != nil {
+			return nil, err
+		}
+		return append(steps, append(rolesSteps, catalogSteps...)...), nil
 	}
 
 	// Multi-schema diffing
@@ -209,7 +214,11 @@ func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig
 	if err != nil {
 		return nil, err
 	}
-	return append(steps, rolesSteps...), nil
+	catalogSteps, err := diffCatalogSteps(ctx, dbtx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return append(steps, append(rolesSteps, catalogSteps...)...), nil
 }
 
 // maskShadowExtensions removes shadow-installed extensions from a live
@@ -571,6 +580,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig, b
 		ExpandContract: cfg.Filters.ExpandContract,
 		SchemaSQL:      cfg.SchemaSQL,
 		RolesSQL:       cfg.RolesSQL,
+		CatalogSQL:     cfg.CatalogSQL,
 	}
 
 	// 4b. Verify expected plan hash if provided (aborts with ErrPlanDrift on mismatch)
@@ -844,6 +854,7 @@ func PlanDiffPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 		ExpandContract:       cfg.Filters.ExpandContract,
 		SchemaSQL:            cfg.SchemaSQL,
 		RolesSQL:             cfg.RolesSQL,
+		CatalogSQL:           cfg.CatalogSQL,
 		LockTimeout:          cfg.LockTimeout,
 		StatementTimeout:     cfg.StatementTimeout,
 		NonConcurrentIndexes: cfg.NonConcurrentIndexes,

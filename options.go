@@ -59,6 +59,16 @@ type Options struct {
 	// AcceptHazards.
 	AllowDropRole bool
 
+	// AllowDropPublication permits dropping a managed publication that
+	// left CatalogSQL. Has no granular override; DROP_PUBLICATION
+	// (CRITICAL) still requires AcceptHazards.
+	AllowDropPublication bool
+
+	// AllowDropEventTrigger permits dropping a managed event trigger that
+	// left CatalogSQL. Has no granular override; DROP_EVENT_TRIGGER
+	// (CRITICAL) still requires AcceptHazards.
+	AllowDropEventTrigger bool
+
 	// Granular drop overrides (nil inherits from AllowDrop):
 	AllowDropTable     *bool
 	AllowDropColumn    *bool
@@ -185,6 +195,16 @@ type Options struct {
 	// not contain schema DDL. Managed roles are NOLOGIN group roles;
 	// passwords are never managed. PostgreSQL only — ignored on SQLite.
 	RolesSQL string
+
+	// CatalogSQL contains the desired cluster-catalog objects
+	// (CREATE PUBLICATION / CREATE EVENT TRIGGER statements), diffed
+	// against live pg_publication and pg_event_trigger state. It is a
+	// side-channel contract: never shadow-compiled, never run inside the
+	// shadow transaction, and it must not contain schema DDL. Drops are
+	// narrow — only marker-stamped (grizzle-managed) objects are
+	// considered. Event triggers reference functions that must exist in
+	// SchemaSQL or as live objects. PostgreSQL only — rejected on SQLite.
+	CatalogSQL string
 
 	// SQLiteRebuildThreshold defines the row count threshold above which SQLite table rebuilds
 	// chunk data copying by keyset to prevent journal memory exhaustion.
@@ -396,6 +416,9 @@ func (o *Options) Validate() error {
 		if strings.TrimSpace(o.RolesSQL) != "" {
 			return fmt.Errorf("%w: RolesSQL requires PostgreSQL; roles are not managed on SQLite", ErrInvalidOptions)
 		}
+		if strings.TrimSpace(o.CatalogSQL) != "" {
+			return fmt.Errorf("%w: CatalogSQL requires PostgreSQL; publications and event triggers are not managed on SQLite", ErrInvalidOptions)
+		}
 	case DialectPostgres:
 		idents := append([]string{}, o.TargetSchemas...)
 		if o.TargetSchema != "" {
@@ -419,6 +442,11 @@ func (o *Options) Validate() error {
 		}
 		if strings.TrimSpace(o.RolesSQL) != "" {
 			if err := schema.ValidateRolesSQL(o.RolesSQL); err != nil {
+				return fmt.Errorf("%w: %w", ErrInvalidOptions, err)
+			}
+		}
+		if strings.TrimSpace(o.CatalogSQL) != "" {
+			if err := schema.ValidateCatalogSQL(o.CatalogSQL); err != nil {
 				return fmt.Errorf("%w: %w", ErrInvalidOptions, err)
 			}
 		}
@@ -504,21 +532,25 @@ func resolveDropPolicy(opts Options) plan.DropPolicy {
 	// CRITICAL hazards still apply.
 	allowRevoke := opts.AllowDrop || opts.AllowRevoke
 	allowDropRole := opts.AllowDrop || opts.AllowDropRole
+	allowDropPublication := opts.AllowDrop || opts.AllowDropPublication
+	allowDropEventTrigger := opts.AllowDrop || opts.AllowDropEventTrigger
 
 	return plan.DropPolicy{
-		AllowTable:     allowTable,
-		AllowColumn:    allowColumn,
-		AllowIndex:     allowIndex,
-		AllowFK:        allowFK,
-		AllowCheck:     allowCheck,
-		AllowExtension: allowExtension,
-		AllowFunction:  allowFunction,
-		AllowPolicy:    allowPolicy,
-		AllowTrigger:   allowTrigger,
-		AllowView:      allowView,
-		AllowDomain:    allowDomain,
-		AllowRevoke:    allowRevoke,
-		AllowDropRole:  allowDropRole,
+		AllowTable:            allowTable,
+		AllowColumn:           allowColumn,
+		AllowIndex:            allowIndex,
+		AllowFK:               allowFK,
+		AllowCheck:            allowCheck,
+		AllowExtension:        allowExtension,
+		AllowFunction:         allowFunction,
+		AllowPolicy:           allowPolicy,
+		AllowTrigger:          allowTrigger,
+		AllowView:             allowView,
+		AllowDomain:           allowDomain,
+		AllowRevoke:           allowRevoke,
+		AllowDropRole:         allowDropRole,
+		AllowDropPublication:  allowDropPublication,
+		AllowDropEventTrigger: allowDropEventTrigger,
 	}
 }
 
