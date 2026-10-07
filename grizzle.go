@@ -107,16 +107,16 @@ const (
 
 // HazardCode constants
 const (
-	HazardDropTable           = plan.HazardDropTable
-	HazardDropColumn          = plan.HazardDropColumn
-	HazardTypeNarrow          = plan.HazardTypeNarrow
-	HazardNotNullNoDefault    = plan.HazardNotNullNoDefault
-	HazardIndexBuild          = plan.HazardIndexBuild
-	HazardDropIndex           = plan.HazardDropIndex
-	HazardDropFK              = plan.HazardDropFK
-	HazardRenameAmbiguous     = plan.HazardRenameAmbiguous
-	HazardUnmanagedDependency = plan.HazardUnmanagedDependency
-	HazardGeneratedRewrite    = plan.HazardGeneratedRewrite
+	HazardDropTable              = plan.HazardDropTable
+	HazardDropColumn             = plan.HazardDropColumn
+	HazardTypeNarrow             = plan.HazardTypeNarrow
+	HazardNotNullNoDefault       = plan.HazardNotNullNoDefault
+	HazardIndexBuild             = plan.HazardIndexBuild
+	HazardDropIndex              = plan.HazardDropIndex
+	HazardDropFK                 = plan.HazardDropFK
+	HazardRenameAmbiguous        = plan.HazardRenameAmbiguous
+	HazardUnmanagedDependency    = plan.HazardUnmanagedDependency
+	HazardGeneratedRewrite       = plan.HazardGeneratedRewrite
 	HazardPartitionAttachScan    = plan.HazardPartitionAttachScan
 	HazardPartitionPendingDetach = plan.HazardPartitionPendingDetach
 )
@@ -377,17 +377,17 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 
 	if p.SchemaSQL != "" {
 		syncOpts := Options{
-			SchemaSQL:       p.SchemaSQL,
-			TargetSchema:    p.TargetSchema,
-			TargetSchemas:   p.TargetSchemas,
-			IncludeTables:   p.IncludeTables,
-			ExcludeTables:   p.ExcludeTables,
-			Renames:         p.Renames,
-			ExpandContract:  p.ExpandContract,
-			AllowDropTable:  &p.Policy.AllowTable,
-			AllowDropColumn: &p.Policy.AllowColumn,
-			AllowDropIndex:  &p.Policy.AllowIndex,
-			AllowDropFK:     &p.Policy.AllowFK,
+			SchemaSQL:              p.SchemaSQL,
+			TargetSchema:           p.TargetSchema,
+			TargetSchemas:          p.TargetSchemas,
+			IncludeTables:          p.IncludeTables,
+			ExcludeTables:          p.ExcludeTables,
+			Renames:                p.Renames,
+			ExpandContract:         p.ExpandContract,
+			AllowDropTable:         &p.Policy.AllowTable,
+			AllowDropColumn:        &p.Policy.AllowColumn,
+			AllowDropIndex:         &p.Policy.AllowIndex,
+			AllowDropFK:            &p.Policy.AllowFK,
 			AcceptHazards:          opts.AcceptHazards,
 			Backfill:               opts.Backfill,
 			SQLiteRebuildThreshold: opts.SQLiteRebuildThreshold,

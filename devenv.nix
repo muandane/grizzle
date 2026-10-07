@@ -40,6 +40,7 @@
     # pre-commit: fail fast on unformatted Go files
     gofmt-check = {
       enable = true;
+      always_run = true;
       name = "gofmt check";
       description = "Verify all Go files are gofmt-formatted";
       entry = builtins.toString (pkgs.writeShellScript "gofmt-check" ''
@@ -58,6 +59,7 @@
     # pre-commit: static analysis on both modules
     go-vet = {
       enable = true;
+      always_run = true;
       name = "go vet";
       description = "go vet across root and otelgrizzle modules";
       entry = builtins.toString (pkgs.writeShellScript "go-vet" ''
@@ -71,6 +73,7 @@
     # pre-commit: golangci-lint on both modules (mirrors CI lint job)
     go-lint = {
       enable = true;
+      always_run = true;
       name = "golangci-lint";
       description = "golangci-lint across root and otelgrizzle modules";
       entry = builtins.toString (pkgs.writeShellScript "go-lint" ''
@@ -84,6 +87,7 @@
     # pre-push: full unit test suite with race detector (mirrors CI unit job)
     go-unit-tests = {
       enable = true;
+      always_run = true;
       name = "go unit tests";
       description = "Race-enabled unit tests before any push to remote";
       entry = builtins.toString (pkgs.writeShellScript "go-unit-tests" ''
