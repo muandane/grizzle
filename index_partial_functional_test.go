@@ -10,13 +10,13 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	_ "github.com/jackc/pgx/v5/stdlib"
-	_ "modernc.org/sqlite"
 	"github.com/muandane/grizzle"
 	"github.com/muandane/grizzle/internal/diff"
 	"github.com/muandane/grizzle/internal/plan"
 	"github.com/muandane/grizzle/internal/schema"
 	"github.com/muandane/grizzle/internal/scope"
 	"github.com/muandane/grizzle/internal/testutil"
+	_ "modernc.org/sqlite"
 )
 
 func TestPartialAndFunctionalIndexes_PureUnit(t *testing.T) {

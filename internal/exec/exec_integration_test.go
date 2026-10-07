@@ -20,7 +20,6 @@ import (
 	"github.com/muandane/grizzle/internal/testutil"
 )
 
-
 // captureHandler tracks log message records for asserting synchronization metrics.
 type captureHandler struct {
 	applied atomic.Int32
@@ -28,8 +27,8 @@ type captureHandler struct {
 }
 
 func (h *captureHandler) Enabled(context.Context, slog.Level) bool { return true }
-func (h *captureHandler) WithAttrs([]slog.Attr) slog.Handler      { return h }
-func (h *captureHandler) WithGroup(string) slog.Handler           { return h }
+func (h *captureHandler) WithAttrs([]slog.Attr) slog.Handler       { return h }
+func (h *captureHandler) WithGroup(string) slog.Handler            { return h }
 func (h *captureHandler) Handle(_ context.Context, r slog.Record) error {
 	switch r.Message {
 	case "grizzle: synchronization finished successfully":
@@ -338,8 +337,8 @@ type attemptTrackerHandler struct {
 }
 
 func (h *attemptTrackerHandler) Enabled(context.Context, slog.Level) bool { return true }
-func (h *attemptTrackerHandler) WithAttrs([]slog.Attr) slog.Handler      { return h }
-func (h *attemptTrackerHandler) WithGroup(string) slog.Handler           { return h }
+func (h *attemptTrackerHandler) WithAttrs([]slog.Attr) slog.Handler       { return h }
+func (h *attemptTrackerHandler) WithGroup(string) slog.Handler            { return h }
 func (h *attemptTrackerHandler) Handle(_ context.Context, r slog.Record) error {
 	if r.Message == "grizzle: starting schema synchronization" {
 		h.attempts.Add(1)
@@ -482,12 +481,12 @@ func TestFK_ValidateConstraintRunsInSeparateTxAfterCommit(t *testing.T) {
 	`
 
 	cfg := exec.PostgresExecConfig{
-		TargetSchema: schema,
-		ShadowSchema: fmt.Sprintf("_shadow_%s", schema),
-		SchemaSQL:    desiredSQL,
-		LockID:       time.Now().UnixNano(),
-		Policy:       plan.DropPolicy{},
-		LockTimeout:  5 * time.Second,
+		TargetSchema:     schema,
+		ShadowSchema:     fmt.Sprintf("_shadow_%s", schema),
+		SchemaSQL:        desiredSQL,
+		LockID:           time.Now().UnixNano(),
+		Policy:           plan.DropPolicy{},
+		LockTimeout:      5 * time.Second,
 		StatementTimeout: 10 * time.Second,
 	}
 
@@ -537,5 +536,3 @@ func TestFK_ValidateConstraintRunsInSeparateTxAfterCommit(t *testing.T) {
 		t.Errorf("expected convalidated to be true after successful validation")
 	}
 }
-
-

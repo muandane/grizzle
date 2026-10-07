@@ -204,7 +204,6 @@ func WithAcceptHazards(hazards ...plan.HazardCode) Option {
 	}
 }
 
-
 // WithNonConcurrentIndexes controls whether PostgreSQL index creation should run inside the transaction.
 func WithNonConcurrentIndexes(disabled bool) Option {
 	return func(o *Options) {

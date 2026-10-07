@@ -14,11 +14,11 @@ type ChangeType string
 
 // ChangeType constants define the supported kinds of atomic schema changes.
 const (
-	ChangeCreateEnum  ChangeType = "CREATE_ENUM"
-	ChangeAlterEnum   ChangeType = "ALTER_ENUM"
-	ChangeCreateTable ChangeType = "CREATE_TABLE"
-	ChangeDropTable   ChangeType = "DROP_TABLE"
-	ChangeAddColumn   ChangeType = "ADD_COLUMN"
+	ChangeCreateEnum         ChangeType = "CREATE_ENUM"
+	ChangeAlterEnum          ChangeType = "ALTER_ENUM"
+	ChangeCreateTable        ChangeType = "CREATE_TABLE"
+	ChangeDropTable          ChangeType = "DROP_TABLE"
+	ChangeAddColumn          ChangeType = "ADD_COLUMN"
 	ChangeDropColumn         ChangeType = "DROP_COLUMN"
 	ChangeAlterColumn        ChangeType = "ALTER_COLUMN"
 	ChangeRenameColumn       ChangeType = "RENAME_COLUMN"
@@ -462,4 +462,3 @@ func (p *Plan) ValidatePolicy() error {
 	}
 	return nil
 }
-

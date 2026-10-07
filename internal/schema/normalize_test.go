@@ -200,4 +200,3 @@ func TestIsTypeNarrowing(t *testing.T) {
 		}
 	}
 }
-

@@ -119,4 +119,3 @@ func (e *DriftError) Is(target error) bool {
 func (e *DriftError) Unwrap() error {
 	return ErrDrift
 }
-

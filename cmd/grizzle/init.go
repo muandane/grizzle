@@ -241,4 +241,3 @@ func runInit(template, dir string, force bool) int {
 	}
 	return 0
 }
-

@@ -240,4 +240,3 @@ func TestPlan_ValidatePolicy(t *testing.T) {
 		t.Errorf("expected ValidatePolicy to pass when policy allows, got: %v", err)
 	}
 }
-

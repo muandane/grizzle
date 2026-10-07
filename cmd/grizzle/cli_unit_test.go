@@ -170,4 +170,3 @@ func TestCLI_Init(t *testing.T) {
 		t.Errorf("expected main.go in sqlite_proj: %v", err)
 	}
 }
-

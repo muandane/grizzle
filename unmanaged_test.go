@@ -325,4 +325,3 @@ func TestUnmanaged_PostgresIntegration(t *testing.T) {
 		t.Fatalf("expected trigger trg_audit to still exist, found count=%d", trgCount)
 	}
 }
-

@@ -1224,4 +1224,3 @@ func TestPartition_InterruptedDetach_RealPgCancelBackend(t *testing.T) {
 		t.Fatalf("expected inhdetachpending=true after real pg_cancel_backend of DETACH CONCURRENTLY, got false")
 	}
 }
-

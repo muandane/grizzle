@@ -192,4 +192,3 @@ func TestCLI_Version(t *testing.T) {
 		}
 	}
 }
-

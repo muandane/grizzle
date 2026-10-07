@@ -61,4 +61,3 @@ type DestructiveViolationError = plan.DestructiveViolationError
 
 // DriftError reports unapplied differences between the live schema and the desired schema.
 type DriftError = plan.DriftError
-

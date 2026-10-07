@@ -43,7 +43,7 @@
       name = "gofmt check";
       description = "Verify all Go files are gofmt-formatted";
       entry = builtins.toString (pkgs.writeShellScript "gofmt-check" ''
-        out=$(gofmt -l .)
+        out=$(git ls-files '*.go' | xargs gofmt -l)
         if [ -n "$out" ]; then
           echo "Files not gofmt-formatted:"
           echo "$out"

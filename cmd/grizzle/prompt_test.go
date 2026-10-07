@@ -358,4 +358,3 @@ func TestPromptInteractiveInit(t *testing.T) {
 		})
 	}
 }
-
