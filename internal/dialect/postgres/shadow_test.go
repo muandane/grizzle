@@ -1,6 +1,7 @@
 package postgres_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/muandane/grizzle/internal/dialect/postgres"
@@ -85,5 +86,22 @@ func TestComputeShadowSchemas(t *testing.T) {
 	}
 	if mMulti["identity"] != "_grizzle_shadow_identity" {
 		t.Errorf("expected _grizzle_shadow_identity, got %q", mMulti["identity"])
+	}
+}
+
+func TestComputeShadowSchemas_LongNamesBoundedAndDistinct(t *testing.T) {
+	a := strings.Repeat("a", 60)
+	b := strings.Repeat("b", 60)
+	m := postgres.ComputeShadowSchemas("_grizzle_shadow", []string{a, b})
+	if m[a] == m[b] {
+		t.Fatalf("long target schemas collapsed to same shadow name %q", m[a])
+	}
+	for target, shadow := range m {
+		if len(shadow) > 63 {
+			t.Errorf("shadow for %q exceeds 63 bytes: len=%d name=%q", target, len(shadow), shadow)
+		}
+		if shadow == target {
+			t.Errorf("shadow must never equal target %q", target)
+		}
 	}
 }

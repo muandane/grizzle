@@ -123,3 +123,41 @@ func TestSortSteps_AddFKInference(t *testing.T) {
 		t.Errorf("step 2: expected ChangeAddFK, got %v", steps[2].Type)
 	}
 }
+
+// TestSortSteps_CycleIsDeterministic verifies circular CREATE_TABLE
+// dependencies (legal when FKs are deferred) produce a stable lexical
+// remainder rather than violating the sort contract.
+func TestSortSteps_CycleIsDeterministic(t *testing.T) {
+	mk := func() []plan.Step {
+		return []plan.Step{
+			{Type: plan.ChangeCreateTable, Schema: "public", Table: "b", DependsOn: []string{"public.a"}},
+			{Type: plan.ChangeCreateTable, Schema: "public", Table: "a", DependsOn: []string{"public.b"}},
+			{Type: plan.ChangeCreateTable, Schema: "public", Table: "c"},
+		}
+	}
+	var first []string
+	for i := range 20 {
+		steps := mk()
+		plan.SortSteps(steps)
+		order := make([]string, len(steps))
+		for j, s := range steps {
+			order[j] = s.Table
+		}
+		if i == 0 {
+			first = order
+			continue
+		}
+		for j := range order {
+			if order[j] != first[j] {
+				t.Fatalf("iteration %d: non-deterministic order: got %v want %v", i, order, first)
+			}
+		}
+	}
+	// Independent table c has no deps → emitted first; a/b cycle remainder is lexical.
+	if first[0] != "c" {
+		t.Errorf("expected independent table c first, got %v", first)
+	}
+	if first[1] != "a" || first[2] != "b" {
+		t.Errorf("expected cycle remainder a then b (lexical), got %v", first)
+	}
+}

@@ -80,6 +80,43 @@ func TestPlan_Format(t *testing.T) {
 	}
 }
 
+func TestPlan_GeneratedRewrite_RequiresAcceptHazards(t *testing.T) {
+	p := &plan.Plan{
+		Steps: []plan.Step{{
+			Type:               plan.ChangeAlterColumn,
+			Table:              "products",
+			SQL:                "ALTER TABLE products DROP COLUMN tax; ALTER TABLE products ADD COLUMN tax numeric GENERATED ALWAYS AS (price * 0.2) STORED;",
+			IsGeneratedRewrite: true,
+		}},
+	}
+	err := p.ValidateHazards(nil)
+	if err == nil {
+		t.Fatal("expected ValidateHazards to block GENERATED_REWRITE without acceptance")
+	}
+	var he *plan.HazardError
+	if !errors.As(err, &he) {
+		t.Fatalf("expected HazardError, got %T: %v", err, err)
+	}
+	found := false
+	for _, h := range he.Hazards {
+		if h.Code == plan.HazardGeneratedRewrite && h.Level == plan.HazardLevelCritical {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected CRITICAL GENERATED_REWRITE in HazardError, got %+v", he.Hazards)
+	}
+	if err := p.ValidateHazards([]plan.HazardCode{plan.HazardGeneratedRewrite}); err != nil {
+		t.Fatalf("accepted GENERATED_REWRITE should pass: %v", err)
+	}
+	// Hash stable across hazard analysis (hazards are derived, not hashed).
+	h1 := p.Hash()
+	_ = p.Hazards()
+	if p.Hash() != h1 {
+		t.Fatal("Hazards() must not change plan hash")
+	}
+}
+
 func TestPlan_HasDestructive(t *testing.T) {
 	p1 := &plan.Plan{
 		Steps: []plan.Step{

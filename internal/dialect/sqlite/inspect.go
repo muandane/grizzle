@@ -111,6 +111,12 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX) (*schema.Schema, error) {
 				Name:    tblName + "_pkey",
 				Columns: pkCols,
 			}
+			// Preserve INTEGER PRIMARY KEY AUTOINCREMENT vs plain INTEGER PRIMARY KEY.
+			if len(pkCols) == 1 && tableHasSQLiteAutoincrement(tableDDL) {
+				if col := tbl.Columns[pkCols[0]]; col != nil && strings.EqualFold(col.DataType, "INTEGER") {
+					col.Autoincrement = true
+				}
+			}
 		}
 
 		// 3. Query Foreign Keys using PRAGMA foreign_key_list
@@ -275,6 +281,12 @@ func NormalizeType(t string) string {
 // NormalizeDefault standardizes default expressions in SQLite.
 func NormalizeDefault(d string) string {
 	return strings.TrimSpace(d)
+}
+
+var sqliteAutoincrementRe = regexp.MustCompile(`(?i)\bAUTOINCREMENT\b`)
+
+func tableHasSQLiteAutoincrement(tableDDL string) bool {
+	return sqliteAutoincrementRe.MatchString(tableDDL)
 }
 
 func extractSQLiteGeneratedExpr(tableSQL, colName string) string {

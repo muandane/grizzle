@@ -7,28 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking
+- **Plan hash format**: `Plan.Hash()` now includes `DropPolicy`, `NonConcurrentIndexes`, and `SchemaSQL` (approval-sensitive intent). Previously approved plan artifacts will fail `ExpectedHash` / envelope verification (`ErrPlanDrift`).
+- **Plan artifact no longer persists lock/shadow identity**: `lock_id`, `lock_namespace`, and `shadow_schema` are removed from the plan document. Lock identity is derived at apply time from trusted target identity + runtime `ApplyOpts.LockNamespace`; shadow schemas are generated ephemerally per run.
+- **`options_digest` removed** from the plan document envelope (it was non-authoritative decorative metadata).
+- **`GENERATED_REWRITE` is CRITICAL**: generated-column rewrites (drop/recreate) require explicit `AcceptHazards: GENERATED_REWRITE`.
+
 ### Added
-- **Plan Operational Fields & Document Round-Trip**:
-  - `Plan` carries persisted execution knobs (`LockID`, `LockNamespace`, `LockTimeout`, `StatementTimeout`, `NonConcurrentIndexes`, `ShadowSchema`) so direct `Apply` reproduces the locking and timeout posture used to generate the plan. They are serialized in the plan document envelope (durations as nanoseconds) and excluded from `Plan.Hash()` approval digests.
-  - `Plan.ValidateExecutionFields()` validates operational fields on load and apply: `ShadowSchema` must use the reserved `_grizzle_shadow` prefix when set, be ≤ 63 bytes (PostgreSQL `NAMEDATALEN`), be a valid SQL identifier, and never name a target or included schema; `LockNamespace` must be a valid identifier; timeouts must be within `[0, 24h]`. Violations wrap `ErrInvalidOptions`. `ParsePlanJSON` rejects tampered artifacts (e.g. `shadow_schema` rewritten to `"public"`), and `Apply` re-validates before touching the database.
-  - `grizzle.ErrHistoryRecord`: typed non-fatal error surfaced when the migration succeeds but the success-path `grizzle_history` record could not be written (detect with `errors.Is`; the schema changes remain applied). Failure-path history write failures are logged and never swallowed or misreported as success.
-  - Hook panic recovery: a panicking lifecycle hook is converted into an error carrying the full stack trace (returned to the caller and logged at ERROR); only the first line of the panic message is persisted to `grizzle_history`.
-- **Retry Classification (`exec.IsRetryable`)**:
-  - Lock-contention retries are classified by PostgreSQL SQLSTATE (`55P03` lock_timeout, `40P01` deadlock) instead of error-string matching, working through wrapped errors and PgBouncer/transaction-pooling proxies.
+- **`DryRunVerifyPlan`**: library API that dry-runs an approved plan artifact, verifying the envelope hash and re-diffing against live state so tampered target/policy/step semantics cannot silently verify a different migration. CLI `apply --dry-run --plan` is a thin adapter.
+- **`grizzle.ErrHistoryRecord`**: typed non-fatal error when the migration succeeds but the success-path `grizzle_history` record could not be written (detect with `errors.Is`; schema changes remain applied).
+- Hook panic recovery: a panicking lifecycle hook is converted into an error carrying the full stack trace (returned to the caller and logged at ERROR); only the first line of the panic message is persisted to `grizzle_history`.
+- **Retry Classification (`exec.IsRetryable`)**: lock-contention retries classified by PostgreSQL SQLSTATE (`55P03`, `40P01`).
 
 ### Changed
-- **`LockTimeout` is a total budget across retries**: the advisory-lock acquisition wait is bounded once and shared across all retry attempts (including backoff waits). Only lock waiting consumes the budget: preamble work (hooks, schema setup, session timeouts) and DDL execution are excluded — each attempt's acquisition timer is armed when acquisition begins, so slow hooks or retryable DDL failures cannot starve the acquisition window. `cfg.LockTimeout` still feeds the per-statement DDL `lock_timeout` via session timeouts. Retryable attempts exit early once waiting the backoff would exhaust the remaining budget.
-- **Unique per-call shadow schemas for `PlanDiff`**: each read-only drift check compiles in a unique `_grizzle_shadow_<hash>` schema (≤ 63 bytes), so concurrent `PlanDiff` calls never serialize on shadow DDL locks and cannot collide with a concurrently running `Sync`. Custom `Options.ShadowSchema` values without the reserved prefix are accepted but not persisted into plan artifacts (Apply re-derives the default).
-- **SQLite foreign-key pinning**: `PRAGMA foreign_keys` is toggled per-connection on a pinned `*sql.Conn` (with read-back verification) instead of on `*sql.DB`, and `PRAGMA foreign_key_check` runs inside the migration transaction on the pinned connection before commit — safe under transaction-pooling proxies.
+- **Advisory history (Model B)**: `RecordPlan` always runs after DDL commit on a dedicated connection — never inside the migration transaction — so history failure cannot roll back applied DDL.
+- **`SortSteps`**: CREATE/DROP table phases use Kahn topological ordering with deterministic lexical SCC collapse for cycles (Warshall transitive closure unchanged).
+- **`Options.Validate()`** is the canonical pure validation entry point (identifiers, timeouts, retries, SQLite rebuild params, multi-schema SQLite rejection); `prepareOptions` = Validate + dialect detection + defaults.
+- **Ephemeral shadow schemas** for Sync and PlanDiff: unique per-run names via `uniqueShadowName` + bounded `ComputeShadowSchemas` (≤ 63 bytes, collision-safe).
+- **`LockTimeout` total budget across retries** (unchanged semantics from prior unreleased work).
+- **SQLite foreign-key pinning** on a single connection for the migration transaction.
 
 ### Fixed
-- **SQLite foreign keys during migration**: `PRAGMA foreign_keys = OFF` on `*sql.DB` does not affect other pooled connections (and is a no-op inside a transaction); migrations now disable and restore foreign keys on a single pinned connection for the whole transaction.
-- **Advisory-lock release hygiene (PostgreSQL)**: lock release and session-state `RESET` run on a detached, bounded context after cancellation, and a failed release discards the connection (`driver.ErrBadConn`) so a session that may still hold advisory locks is never returned to the pool.
-- **Dialect detection via driver package path** for registered-but-unmatched driver types (e.g. wrappers around `pgx` or `sqlite`).
-- **Timeout semantics in tests**: integration timing assertions loosened to remove CI scheduling flakes; `TestTimeouts_ConflictingHolder_RetrySucceeds` updated to total-budget `LockTimeout` semantics.
-
-### Security
-- **Plan artifact validation on load**: untrusted `plan.json` documents are validated (`ValidateExecutionFields`) before use, rejecting shadow schemas that would collide with target schemas (the shadow is dropped with `CASCADE` before compilation).
+- **SQLite `INTEGER PRIMARY KEY` vs `AUTOINCREMENT`**: rebuilds preserve exact semantics (no longer force `AUTOINCREMENT` on every single-column integer PK).
+- **SQLite `WITHOUT ROWID` rebuilds**: large-table keyset batching never emits `rowid` predicates for `WITHOUT ROWID` tables (falls back to monolithic copy).
+- **Advisory-lock release hygiene (PostgreSQL)** and dialect detection via driver package path.
 
 ## [0.1.0] - 2026-10-06
 

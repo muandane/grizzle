@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"time"
 
@@ -328,7 +329,12 @@ func WithSQLiteRebuildBatching(threshold, batchSize int) Option {
 	}
 }
 
-// Validate checks whether the options are consistent and valid.
+// Validate is the canonical pure validation entry point for Options.
+// It checks SchemaSQL, strict scope, dialect value, target/shadow identifiers,
+// timeout and retry bounds, SQLite rebuild parameters, and multi-schema SQLite
+// rejection. Dialect-specific checks are skipped while Dialect is DialectAuto
+// (prepareOptions detects the dialect then re-validates). Defaults are applied
+// by prepareOptions after Validate succeeds — Validate never mutates Options.
 func (o *Options) Validate() error {
 	if strings.TrimSpace(o.SchemaSQL) == "" {
 		return ErrEmptySchema
@@ -338,10 +344,68 @@ func (o *Options) Validate() error {
 	}
 	switch o.Dialect {
 	case DialectAuto, DialectPostgres, DialectSQLite:
-		return nil
 	default:
 		return fmt.Errorf("grizzle: unsupported dialect %q", o.Dialect)
 	}
+	if o.LockTimeout < 0 {
+		return fmt.Errorf("%w: LockTimeout must be non-negative", ErrInvalidOptions)
+	}
+	if o.StatementTimeout < 0 {
+		return fmt.Errorf("%w: StatementTimeout must be non-negative", ErrInvalidOptions)
+	}
+	if o.MaxRetries < 0 {
+		return fmt.Errorf("%w: MaxRetries must be non-negative", ErrInvalidOptions)
+	}
+	if o.SQLiteRebuildThreshold < 0 {
+		return fmt.Errorf("%w: SQLiteRebuildThreshold must be non-negative", ErrInvalidOptions)
+	}
+	if o.SQLiteRebuildBatchSize < 0 {
+		return fmt.Errorf("%w: SQLiteRebuildBatchSize must be non-negative", ErrInvalidOptions)
+	}
+
+	switch o.Dialect {
+	case DialectSQLite:
+		if len(o.TargetSchemas) > 1 {
+			return ErrUnsupportedMultiSchema
+		}
+	case DialectPostgres:
+		idents := append([]string{}, o.TargetSchemas...)
+		if o.TargetSchema != "" {
+			idents = append(idents, o.TargetSchema)
+		}
+		if o.LockNamespace != "" {
+			idents = append(idents, o.LockNamespace)
+		}
+		for _, id := range idents {
+			if err := validateOptionIdent(id); err != nil {
+				return err
+			}
+		}
+		if o.ShadowSchema != "" && o.ShadowSchema != "_grizzle_shadow" {
+			if len(o.ShadowSchema) > 63 {
+				return fmt.Errorf("%w: shadow schema %q exceeds 63 bytes (PostgreSQL identifier limit)", ErrInvalidOptions, o.ShadowSchema)
+			}
+			if err := validateOptionIdent(o.ShadowSchema); err != nil {
+				return fmt.Errorf("%w: shadow schema %q is not a valid SQL identifier", ErrInvalidOptions, o.ShadowSchema)
+			}
+		}
+	}
+	return nil
+}
+
+var optionIdentRegex = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+
+func validateOptionIdent(ident string) error {
+	if ident == "" {
+		return nil
+	}
+	if len(ident) > 63 {
+		return fmt.Errorf("%w: identifier %q exceeds 63 bytes", ErrInvalidOptions, ident)
+	}
+	if !optionIdentRegex.MatchString(ident) {
+		return fmt.Errorf("%w: identifier %q is not a valid SQL identifier", ErrInvalidOptions, ident)
+	}
+	return nil
 }
 
 // resolveDropPolicy extracts the effective fine-grained drop policy from Options.

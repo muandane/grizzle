@@ -113,16 +113,20 @@ type Plan struct {
 	ExpandContract bool              `json:"expand_contract,omitzero"`
 	SchemaSQL      string            `json:"schema_sql,omitzero"`
 
-	// Execution knobs persisted with the plan so direct apply (when
-	// SchemaSQL is empty and the recorded steps run as-is) reproduces the
-	// locking and timeout posture used to generate it. These fields do NOT
-	// participate in Hash(): they are operational settings, not schema intent.
-	LockID               int64         `json:"lock_id,omitempty"`
-	LockNamespace        string        `json:"lock_namespace,omitempty"`
-	LockTimeout          time.Duration `json:"lock_timeout_ns,omitempty"`
-	StatementTimeout     time.Duration `json:"statement_timeout_ns,omitempty"`
-	NonConcurrentIndexes bool          `json:"non_concurrent_indexes,omitempty"`
-	ShadowSchema         string        `json:"shadow_schema,omitempty"`
+	// NonConcurrentIndexes affects generated SQL (CONCURRENTLY vs
+	// transactional CREATE INDEX) and is therefore approval-sensitive:
+	// it participates in Hash().
+	NonConcurrentIndexes bool `json:"non_concurrent_indexes,omitempty"`
+
+	// Operational timeouts persisted so direct apply can reproduce the
+	// timeout posture used at plan time. Bounded by ValidateExecutionFields;
+	// they do NOT participate in Hash() because they cannot change executed
+	// SQL or destructive policy. Lock identity and shadow schema names are
+	// never persisted: LockID is derived at apply from trusted target
+	// identity, LockNamespace is an ApplyOpts runtime option, and shadow
+	// schemas are generated ephemerally at apply time.
+	LockTimeout      time.Duration `json:"lock_timeout_ns,omitempty"`
+	StatementTimeout time.Duration `json:"statement_timeout_ns,omitempty"`
 }
 
 // Hash computes a deterministic SHA-256 hex digest of the canonical step list and scope.
@@ -161,6 +165,15 @@ func (p *Plan) Hash() string {
 	}
 	if p.ExpandContract {
 		write("expand_contract:true\n")
+	}
+	write("policy:%t,%t,%t,%t,%t\n",
+		p.Policy.AllowTable, p.Policy.AllowColumn, p.Policy.AllowIndex,
+		p.Policy.AllowFK, p.Policy.AllowCheck)
+	if p.NonConcurrentIndexes {
+		write("non_concurrent:true\n")
+	}
+	if p.SchemaSQL != "" {
+		write("schema_sql:%s\n", p.SchemaSQL)
 	}
 
 	for i, s := range p.Steps {
@@ -338,12 +351,15 @@ func stepHazards(s Step) []Hazard {
 		})
 	}
 	if s.IsGeneratedRewrite {
+		// CRITICAL: generated-column rewrites are rendered as DROP COLUMN +
+		// ADD COLUMN (PostgreSQL) or full table rebuild (SQLite), so they are
+		// materially destructive and must be explicitly accepted.
 		hazards = append(hazards, Hazard{
 			Code:        HazardGeneratedRewrite,
-			Level:       HazardLevelWarning,
+			Level:       HazardLevelCritical,
 			Type:        s.Type,
 			Table:       s.Table,
-			Description: fmt.Sprintf("Generated column on table %q expression modified; requires table rewrite", s.Table),
+			Description: fmt.Sprintf("Generated column on table %q expression modified; requires destructive rewrite (drop/recreate column or table rebuild)", s.Table),
 			SQL:         s.SQL,
 		})
 	}

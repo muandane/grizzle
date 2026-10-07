@@ -344,6 +344,12 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig, b
 	primarySchema := cfg.primarySchema()
 	isMulti := len(targetSchemas) > 1
 
+	// Ephemeral per-run shadow prefix: never trust a persisted artifact name.
+	// uniqueShadowName keeps concurrent Sync/PlanDiff callers collision-free
+	// within PostgreSQL's 63-byte identifier limit.
+	userShadow := cmp.Or(cfg.ShadowSchema, "_grizzle_shadow")
+	cfg.ShadowSchema = uniqueShadowName(userShadow)
+
 	if logger != nil {
 		logger.InfoContext(ctx, "grizzle: starting schema synchronization", "target_schemas", targetSchemas)
 	}
@@ -654,20 +660,22 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig, b
 				}
 			}
 
-			// Record history in same transaction before commit where possible
-			if isLastGroup {
-				if err := history.RecordPlan(ctx, tx, "postgres", primarySchema, p, time.Since(start)); err != nil {
-					if logger != nil {
-						logger.ErrorContext(ctx, "grizzle: failed recording history in tx", "error", err)
-					}
-				}
-			}
-
 			if err := tx.Commit(); err != nil {
 				recordFailureHistory(stepIdx, err, false)
 				return committedSteps, fmt.Errorf("grizzle: failed committing step transaction: %w", err)
 			}
 			committedSteps += len(group.Steps)
+			// Model B: history is advisory — recorded after commit on the
+			// dedicated connection so a history failure can never roll back
+			// applied DDL.
+			if isLastGroup {
+				if err := history.RecordPlan(ctx, conn, "postgres", primarySchema, p, time.Since(start)); err != nil {
+					histErr = fmt.Errorf("%w: %w", plan.ErrHistoryRecord, err)
+					if logger != nil {
+						logger.ErrorContext(ctx, "grizzle: failed recording history post-commit", "error", err)
+					}
+				}
+			}
 		}
 	}
 
@@ -748,38 +756,19 @@ func PlanDiffPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 	}
 
 	return &plan.Plan{
-		TargetSchema:   primarySchema,
-		TargetSchemas:  targetSchemas,
-		Steps:          steps,
-		Policy:         cfg.Policy,
-		IncludeTables:  cfg.Filters.Includes,
-		ExcludeTables:  cfg.Filters.Excludes,
-		Renames:        cfg.Filters.Renames,
-		ExpandContract: cfg.Filters.ExpandContract,
-		SchemaSQL:      cfg.SchemaSQL,
-
-		// Persisted execution knobs for direct apply (see Plan doc comment).
-		// A custom shadow schema without the reserved prefix is valid for
-		// this call but must not be persisted: Apply validates shadow names
-		// against the prefix (the artifact is untrusted and the shadow is
-		// dropped CASCADE). Empty means "use the default on apply".
-		LockID:               cfg.LockID,
-		LockNamespace:        cfg.LockNamespace,
+		TargetSchema:         primarySchema,
+		TargetSchemas:        targetSchemas,
+		Steps:                steps,
+		Policy:               cfg.Policy,
+		IncludeTables:        cfg.Filters.Includes,
+		ExcludeTables:        cfg.Filters.Excludes,
+		Renames:              cfg.Filters.Renames,
+		ExpandContract:       cfg.Filters.ExpandContract,
+		SchemaSQL:            cfg.SchemaSQL,
 		LockTimeout:          cfg.LockTimeout,
 		StatementTimeout:     cfg.StatementTimeout,
 		NonConcurrentIndexes: cfg.NonConcurrentIndexes,
-		ShadowSchema:         persistableShadowName(userShadowSchema),
 	}, nil
-}
-
-// persistableShadowName returns the name to persist in a plan artifact:
-// only reserved-prefix shadow names round-trip; anything else is dropped so
-// Apply re-derives the default instead of rejecting the plan.
-func persistableShadowName(userShadowSchema string) string {
-	if strings.HasPrefix(userShadowSchema, plan.ShadowSchemaPrefix) {
-		return userShadowSchema
-	}
-	return ""
 }
 
 // planShadowSuffix is a process-local counter ensuring concurrent PlanDiff
@@ -988,21 +977,18 @@ func SyncSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) error {
 		if len(fkViolations) > 0 {
 			return fmt.Errorf("sqlite: foreign key constraint violation: %s", strings.Join(fkViolations, "; "))
 		}
-
-		// Record history in same transaction
-		if err := history.RecordPlan(ctx, tx, "sqlite", "", p, time.Since(start)); err != nil {
-			// A failed statement does not poison a SQLite transaction, so the
-			// commit can still succeed; surface the missing record as a typed
-			// non-fatal error instead of failing the applied migration.
-			histErr = fmt.Errorf("%w: %w", plan.ErrHistoryRecord, err)
-			if logger != nil {
-				logger.ErrorContext(ctx, "sqlite: failed recording history in tx", "error", err)
-			}
-		}
+		// Model B: do not record history inside the migration transaction.
 		return nil
 	})
 	if err != nil {
 		return err
+	}
+	// Model B: history is advisory — recorded after DDL commit.
+	if err := history.RecordPlan(ctx, db, "sqlite", "", p, time.Since(start)); err != nil {
+		histErr = fmt.Errorf("%w: %w", plan.ErrHistoryRecord, err)
+		if logger != nil {
+			logger.ErrorContext(ctx, "sqlite: failed recording history post-commit", "error", err)
+		}
 	}
 	if histErr != nil {
 		return histErr
@@ -1342,19 +1328,20 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 				}
 			}
 
-			if isLastGroup {
-				if err := history.RecordPlan(ctx, tx, "postgres", primarySchema, p, time.Since(start)); err != nil {
-					if logger != nil {
-						logger.ErrorContext(ctx, "grizzle: failed recording history in tx", "error", err)
-					}
-				}
-			}
-
 			if err := tx.Commit(); err != nil {
 				recordFailureHistory(stepIdx, err, false)
 				return committedSteps, fmt.Errorf("grizzle: failed committing step transaction: %w", err)
 			}
 			committedSteps += len(group.Steps)
+			// Model B: history is advisory — recorded after commit.
+			if isLastGroup {
+				if err := history.RecordPlan(ctx, conn, "postgres", primarySchema, p, time.Since(start)); err != nil {
+					histErr = fmt.Errorf("%w: %w", plan.ErrHistoryRecord, err)
+					if logger != nil {
+						logger.ErrorContext(ctx, "grizzle: failed recording history post-commit", "error", err)
+					}
+				}
+			}
 		}
 	}
 
@@ -1498,21 +1485,18 @@ func ApplySQLite(ctx context.Context, db *sql.DB, p *plan.Plan, cfg SQLiteExecCo
 		if len(fkViolations) > 0 {
 			return fmt.Errorf("sqlite: foreign key constraint violation: %s", strings.Join(fkViolations, "; "))
 		}
-
-		// Record history in same transaction
-		if err := history.RecordPlan(ctx, tx, "sqlite", "", p, time.Since(start)); err != nil {
-			// A failed statement does not poison a SQLite transaction, so the
-			// commit can still succeed; surface the missing record as a typed
-			// non-fatal error instead of failing the applied migration.
-			histErr = fmt.Errorf("%w: %w", plan.ErrHistoryRecord, err)
-			if logger != nil {
-				logger.ErrorContext(ctx, "sqlite: failed recording history in tx", "error", err)
-			}
-		}
+		// Model B: do not record history inside the migration transaction.
 		return nil
 	})
 	if err != nil {
 		return err
+	}
+	// Model B: history is advisory — recorded after DDL commit.
+	if err := history.RecordPlan(ctx, db, "sqlite", "", p, time.Since(start)); err != nil {
+		histErr = fmt.Errorf("%w: %w", plan.ErrHistoryRecord, err)
+		if logger != nil {
+			logger.ErrorContext(ctx, "sqlite: failed recording history post-commit", "error", err)
+		}
 	}
 	if histErr != nil {
 		return histErr
@@ -1589,7 +1573,19 @@ func executeSQLiteStepInner(ctx context.Context, tx *sql.Tx, s plan.Step, cfg SQ
 	copyDataPrefix := fmt.Sprintf("INSERT INTO %q", tempTable)
 	idx := strings.Index(s.SQL, copyDataPrefix)
 
-	needsChunked := threshold > 0 && rowCount > int64(threshold) && idx != -1
+	// WITHOUT ROWID tables have no usable rowid for keyset batching.
+	hasRowID := true
+	var probeDDL string
+	if qErr := tx.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name=?;`, s.Table).Scan(&probeDDL); qErr == nil {
+		if strings.Contains(strings.ToUpper(probeDDL), "WITHOUT ROWID") {
+			hasRowID = false
+			if cfg.Logger != nil {
+				cfg.Logger.DebugContext(ctx, "sqlite: skipping rowid keyset copy for WITHOUT ROWID table", "table", s.Table)
+			}
+		}
+	}
+
+	needsChunked := threshold > 0 && rowCount > int64(threshold) && idx != -1 && hasRowID
 
 	if needsChunked {
 		beforeCopy := strings.TrimSpace(s.SQL[:idx])

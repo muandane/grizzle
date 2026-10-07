@@ -1108,11 +1108,10 @@ func TestHookPanic_LockReleasedAfterBeforeStepPanic(t *testing.T) {
 	_ = testConn.QueryRowContext(context.Background(), "SELECT pg_advisory_unlock($1, $2);", nsKey, schemaKey).Scan(&released)
 }
 
-// TestApply_FallbackRespectsPlanLockID verifies the direct-apply fallback
-// (plan without SchemaSQL) uses the LockID persisted in the plan: while a
-// holder owns that advisory lock, Apply must block, not run under a
-// different (default) lock.
-func TestApply_FallbackRespectsPlanLockID(t *testing.T) {
+// TestApply_FallbackUsesNamespaceLocks verifies the direct-apply fallback
+// (plan without SchemaSQL) acquires namespace-derived locks, not an
+// artifact-supplied LockID (which is never persisted).
+func TestApply_FallbackUsesNamespaceLocks(t *testing.T) {
 	db := testutil.TestDatabase(t)
 
 	schema := fmt.Sprintf("test_fallback_lockid_%d", time.Now().UnixNano())
@@ -1130,60 +1129,56 @@ func TestApply_FallbackRespectsPlanLockID(t *testing.T) {
 		t.Fatalf("initial sync failed: %v", err)
 	}
 
-	customLockID := int64(918273645000) + time.Now().UnixNano()%1000
 	desiredSQL := "CREATE TABLE lockid_items (id BIGINT PRIMARY KEY, name TEXT);"
-
 	p, err := grizzle.PlanDiff(context.Background(), db, grizzle.Options{
 		Dialect:      grizzle.DialectPostgres,
 		TargetSchema: schema,
 		SchemaSQL:    desiredSQL,
-		LockID:       customLockID,
 		LockTimeout:  5 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("PlanDiff failed: %v", err)
-	}
-	if p.LockID != customLockID {
-		t.Fatalf("plan does not persist LockID: got %d, want %d", p.LockID, customLockID)
 	}
 
 	// Strip SchemaSQL to force the direct-apply fallback.
 	p.SchemaSQL = ""
 	approvedHash := p.Hash()
 
+	// Hold the namespace+schema 2-int lock that Apply must use.
+	nsKey := postgres.Hash32("grizzle")
+	schemaKey := postgres.Hash32(schema)
 	holderConn, err := db.Conn(context.Background())
 	if err != nil {
 		t.Fatalf("failed acquiring holder conn: %v", err)
 	}
 	defer func() {
 		var released bool
-		_ = holderConn.QueryRowContext(context.Background(), "SELECT pg_advisory_unlock($1);", customLockID).Scan(&released)
+		_ = holderConn.QueryRowContext(context.Background(), "SELECT pg_advisory_unlock($1, $2);", nsKey, schemaKey).Scan(&released)
 		_ = holderConn.Close()
 	}()
 
 	var dummy int
-	if err := holderConn.QueryRowContext(context.Background(), "SELECT 1 FROM pg_advisory_lock($1);", customLockID).Scan(&dummy); err != nil {
-		t.Fatalf("holder failed acquiring custom lock: %v", err)
+	if err := holderConn.QueryRowContext(context.Background(), "SELECT 1 FROM pg_advisory_lock($1, $2);", nsKey, schemaKey).Scan(&dummy); err != nil {
+		t.Fatalf("holder failed acquiring namespace lock: %v", err)
 	}
 
 	applyDone := make(chan error, 1)
 	go func() {
 		applyDone <- grizzle.Apply(context.Background(), db, p, grizzle.ApplyOpts{
-			ExpectedHash: approvedHash,
+			ExpectedHash:  approvedHash,
+			LockNamespace: "grizzle",
 		})
 	}()
 
-	// While the holder owns the custom lock, Apply must still be blocked.
 	select {
 	case err := <-applyDone:
-		t.Fatalf("Apply bypassed the plan's LockID (returned while holder owns the lock): %v", err)
+		t.Fatalf("Apply bypassed namespace lock (returned while holder owns the lock): %v", err)
 	case <-time.After(1200 * time.Millisecond):
 		// still blocked — expected
 	}
 
-	// Release; Apply must now complete.
 	var released bool
-	if err := holderConn.QueryRowContext(context.Background(), "SELECT pg_advisory_unlock($1);", customLockID).Scan(&released); err != nil {
+	if err := holderConn.QueryRowContext(context.Background(), "SELECT pg_advisory_unlock($1, $2);", nsKey, schemaKey).Scan(&released); err != nil {
 		t.Fatalf("holder unlock failed: %v", err)
 	}
 

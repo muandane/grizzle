@@ -14,57 +14,17 @@ import (
 	"github.com/muandane/grizzle/internal/testutil"
 )
 
-// tamperShadow swaps the persisted shadow schema for a hostile value.
-func tamperShadow(t *testing.T, planJSON []byte, newShadow string) []byte {
-	t.Helper()
-	old := `"shadow_schema": "_grizzle_shadow"`
-	if !strings.Contains(string(planJSON), old) {
-		// Field may be absent (omitted when equal to the recorded value);
-		// fall back to a naive JSON string replacement of the empty value.
-		return planJSON
-	}
-	return []byte(strings.Replace(string(planJSON), old, fmt.Sprintf("\"shadow_schema\": %q", newShadow), 1))
-}
-
-// TestPlan_ParseRejectsTamperedShadowSchema verifies plan loading rejects an
-// artifact whose ShadowSchema points at a user schema: the shadow is dropped
-// with CASCADE before compilation, so this would destroy the target.
-func TestPlan_ParseRejectsTamperedShadowSchema(t *testing.T) {
-	p := &grizzle.Plan{
-		TargetSchema: "public",
-		Steps:        []grizzle.Step{{Type: grizzle.ChangeAddColumn, Table: "users", SQL: `ALTER TABLE "public"."users" ADD COLUMN name TEXT;`}},
-		SchemaSQL:    `CREATE TABLE users (id INT PRIMARY KEY, name TEXT);`,
-		// Persist a shadow name so the field appears in the document and the
-		// tamper below actually swaps it.
-		ShadowSchema: "_grizzle_shadow",
-	}
-	data, err := p.ToJSON()
-	if err != nil {
-		t.Fatalf("serializing plan: %v", err)
-	}
-
-	tampered := tamperShadow(t, data, "public")
-	if _, _, err := grizzle.ParsePlanJSON(tampered); err == nil {
-		t.Fatalf("expected ParsePlanJSON to reject shadow_schema \"public\", got nil")
-	}
-}
-
-// TestApply_RejectsTamperedPlanFields verifies Apply validates operational
-// fields before touching the database.
-func TestApply_RejectsTamperedPlanFields(t *testing.T) {
+// TestApply_RejectsTamperedTimeouts verifies Apply validates operational
+// timeout fields before touching the database.
+func TestApply_RejectsTamperedTimeouts(t *testing.T) {
 	db := testutil.TestDatabase(t)
 
 	cases := []struct {
 		name   string
 		mutate func(p *grizzle.Plan)
 	}{
-		{"shadow=public", func(p *grizzle.Plan) { p.ShadowSchema = "public" }},
-		{"shadow wrong prefix", func(p *grizzle.Plan) { p.ShadowSchema = "evil_shadow" }},
-		{"shadow too long", func(p *grizzle.Plan) { p.ShadowSchema = "_grizzle_shadow_" + strings.Repeat("a", 60) }},
-		{"shadow invalid ident", func(p *grizzle.Plan) { p.ShadowSchema = `_grizzle_shadow"; DROP SCHEMA public;` }},
 		{"negative lock timeout", func(p *grizzle.Plan) { p.LockTimeout = -time.Second }},
 		{"absurd statement timeout", func(p *grizzle.Plan) { p.StatementTimeout = 48 * time.Hour }},
-		{"invalid lock namespace", func(p *grizzle.Plan) { p.LockNamespace = `grizzle"; DROP SCHEMA public;` }},
 	}
 
 	for _, tc := range cases {
@@ -87,11 +47,10 @@ func TestApply_RejectsTamperedPlanFields(t *testing.T) {
 	}
 }
 
-// TestApply_ReplanUsesPersistedLockID verifies the full CLI round trip:
-// plan (with a custom LockID) -> plan.json -> apply. While a holder owns the
-// custom advisory lock, Apply must block; losing the LockID in serialization
-// would let it execute unprotected.
-func TestApply_ReplanUsesPersistedLockID(t *testing.T) {
+// TestApply_ArtifactCannotOverrideLockIdentity verifies that plan.json cannot
+// carry a LockID: after round-trip serialization the apply path uses
+// namespace-derived locks (LockID=0), not an artifact-supplied value.
+func TestApply_ArtifactCannotOverrideLockIdentity(t *testing.T) {
 	db := testutil.TestDatabase(t)
 
 	schema := fmt.Sprintf("test_replan_lock_%d", time.Now().UnixNano())
@@ -100,62 +59,76 @@ func TestApply_ReplanUsesPersistedLockID(t *testing.T) {
 	}
 	defer func() { _, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schema)) }()
 
-	customLockID := int64(918273645111)
 	p, err := grizzle.PlanDiff(context.Background(), db, grizzle.Options{
 		Dialect:      grizzle.DialectPostgres,
 		TargetSchema: schema,
 		SchemaSQL:    "CREATE TABLE roundtrip (id BIGINT PRIMARY KEY);",
-		LockID:       customLockID,
 	})
 	if err != nil {
 		t.Fatalf("PlanDiff failed: %v", err)
 	}
 
-	// Serialize through the document envelope and back, as the CLI does.
 	data, err := p.ToJSON()
 	if err != nil {
 		t.Fatalf("ToJSON failed: %v", err)
 	}
-	parsed, _, err := grizzle.ParsePlanJSON(data)
+	if strings.Contains(string(data), `"lock_id"`) || strings.Contains(string(data), `"shadow_schema"`) {
+		t.Fatalf("artifact must not persist lock_id or shadow_schema: %s", data)
+	}
+	parsed, hash, err := grizzle.ParsePlanJSON(data)
 	if err != nil {
 		t.Fatalf("ParsePlanJSON failed: %v", err)
 	}
-	if parsed.LockID != customLockID {
-		t.Fatalf("envelope dropped LockID: got %d, want %d", parsed.LockID, customLockID)
+	if hash != p.Hash() {
+		t.Fatalf("envelope hash mismatch")
 	}
 
-	// Holder owns the plan's advisory lock. The plan carries a custom LockID,
-	// so Apply acquires the single-key form (pg_try_advisory_lock($1)); the
-	// holder must hold the same lock key.
+	// Holding an arbitrary single-key advisory lock must NOT block Apply,
+	// because Apply no longer trusts artifact LockIDs — it uses
+	// namespace+schema 2-int locks.
 	holderConn, err := db.Conn(context.Background())
 	if err != nil {
 		t.Fatalf("failed acquiring holder conn: %v", err)
 	}
 	defer func() { _ = holderConn.Close() }()
 
+	arbitraryLockID := int64(918273645111)
 	var dummy int
-	if err := holderConn.QueryRowContext(context.Background(), "SELECT 1 FROM pg_advisory_lock($1);", customLockID).Scan(&dummy); err != nil {
+	if err := holderConn.QueryRowContext(context.Background(), "SELECT 1 FROM pg_advisory_lock($1);", arbitraryLockID).Scan(&dummy); err != nil {
 		t.Fatalf("holder failed acquiring lock: %v", err)
 	}
-
-	applyDone := make(chan error, 1)
-	go func() {
-		applyDone <- grizzle.Apply(context.Background(), db, parsed, grizzle.ApplyOpts{})
+	defer func() {
+		var unlocked bool
+		_ = holderConn.QueryRowContext(context.Background(), "SELECT pg_advisory_unlock($1);", arbitraryLockID).Scan(&unlocked)
 	}()
 
-	select {
-	case err := <-applyDone:
-		t.Fatalf("Apply ran while holder owned the plan's lock (LockID lost in replan?): err=%v", err)
-	case <-time.After(500 * time.Millisecond):
-		// Still blocked: correct.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := grizzle.Apply(ctx, db, parsed, grizzle.ApplyOpts{ExpectedHash: hash}); err != nil {
+		t.Fatalf("Apply should succeed with namespace locks despite unrelated LockID holder: %v", err)
 	}
+}
 
-	var unlocked bool
-	if err := holderConn.QueryRowContext(context.Background(), "SELECT pg_advisory_unlock($1);", customLockID).Scan(&unlocked); err != nil || !unlocked {
-		t.Fatalf("holder unlock failed: err=%v unlocked=%v", err, unlocked)
+// TestApply_ExpectedHashRejectsPolicyTamper verifies mutating Policy after
+// approval fails ExpectedHash verification before execution.
+func TestApply_ExpectedHashRejectsPolicyTamper(t *testing.T) {
+	db := testutil.TestDatabase(t)
+
+	p := &grizzle.Plan{
+		TargetSchema: "public",
+		Policy:       grizzle.DropPolicy{},
+		Steps:        []grizzle.Step{{Type: grizzle.ChangeAddColumn, Table: "users", SQL: `ALTER TABLE "public"."users" ADD COLUMN name TEXT;`}},
+		SchemaSQL:    `CREATE TABLE users (id INT PRIMARY KEY, name TEXT);`,
 	}
-	if err := <-applyDone; err != nil {
-		t.Fatalf("Apply failed after holder released: %v", err)
+	approved := p.Hash()
+	p.Policy.AllowTable = true
+
+	err := grizzle.Apply(context.Background(), db, p, grizzle.ApplyOpts{ExpectedHash: approved})
+	if err == nil {
+		t.Fatal("expected ErrPlanDrift for policy tamper")
+	}
+	if !errors.Is(err, grizzle.ErrPlanDrift) {
+		t.Fatalf("expected ErrPlanDrift, got: %v", err)
 	}
 }
 
@@ -191,9 +164,7 @@ func TestSync_ShadowSchemaTooLong_Rejected(t *testing.T) {
 
 // TestSync_HistoryWriteFailure_TypedNonFatal verifies a successful migration
 // whose history INSERT fails surfaces plan.ErrHistoryRecord (non-fatal,
-// errors.Is-detectable) while the schema changes remain applied. Uses a
-// non-tx final group (CREATE INDEX CONCURRENTLY) so the history write runs
-// in autocommit on the dedicated conn.
+// errors.Is-detectable) while the schema changes remain applied.
 func TestSync_HistoryWriteFailure_TypedNonFatal(t *testing.T) {
 	db := testutil.TestDatabase(t)
 
@@ -235,7 +206,6 @@ func TestSync_HistoryWriteFailure_TypedNonFatal(t *testing.T) {
 		t.Errorf("expected ErrHistoryRecord, got: %v", err)
 	}
 
-	// The migration itself must have been applied.
 	var exists bool
 	if err := db.QueryRow(`SELECT EXISTS (
 		SELECT 1 FROM pg_indexes WHERE schemaname = $1 AND indexname = 'idx_widgets_sku'
@@ -244,5 +214,57 @@ func TestSync_HistoryWriteFailure_TypedNonFatal(t *testing.T) {
 	}
 	if !exists {
 		t.Errorf("index was not applied despite non-fatal history error")
+	}
+}
+
+// TestSync_HistoryWriteFailure_TransactionalDDL verifies Model B: when the
+// final group is transactional, history is recorded after commit. A poisoned
+// history table must leave DDL committed and return ErrHistoryRecord.
+func TestSync_HistoryWriteFailure_TransactionalDDL(t *testing.T) {
+	db := testutil.TestDatabase(t)
+
+	schema := fmt.Sprintf("test_hist_tx_%d", time.Now().UnixNano())
+	if _, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema)); err != nil {
+		t.Fatalf("failed creating schema: %v", err)
+	}
+	defer func() { _, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schema)) }()
+
+	histTable := fmt.Sprintf(`CREATE TABLE %s.grizzle_history (
+		id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+		plan_hash VARCHAR(64),
+		status TEXT NOT NULL CHECK (status <> 'applied'),
+		failed_step INT,
+		error TEXT,
+		applied_at TIMESTAMPTZ,
+		duration_ms INT,
+		applied_by TEXT,
+		steps JSONB,
+		seed_hash VARCHAR(64)
+	);`, schema)
+	if _, err := db.Exec(histTable); err != nil {
+		t.Fatalf("failed creating poisoned history table: %v", err)
+	}
+
+	err := grizzle.Sync(context.Background(), db, grizzle.Options{
+		Dialect:              grizzle.DialectPostgres,
+		TargetSchema:         schema,
+		NonConcurrentIndexes: true, // force transactional CREATE INDEX
+		SchemaSQL: `
+			CREATE TABLE widgets (id BIGINT PRIMARY KEY, sku TEXT);
+			CREATE INDEX idx_widgets_sku ON widgets(sku);
+		`,
+	})
+	if !errors.Is(err, grizzle.ErrHistoryRecord) {
+		t.Fatalf("expected ErrHistoryRecord, got: %v", err)
+	}
+
+	var exists bool
+	if err := db.QueryRow(`SELECT EXISTS (
+		SELECT 1 FROM information_schema.tables WHERE table_schema = $1 AND table_name = 'widgets'
+	);`, schema).Scan(&exists); err != nil {
+		t.Fatalf("querying table: %v", err)
+	}
+	if !exists {
+		t.Fatal("transactional DDL must remain committed after history failure")
 	}
 }

@@ -196,18 +196,19 @@ type Plan struct {
     ExpandContract bool
     SchemaSQL      string
 
-    // Operational knobs persisted so direct Apply reproduces the locking and
-    // timeout posture used to generate the plan. Serialized in the document
-    // envelope (durations as nanoseconds); excluded from Hash().
-    LockID               int64
-    LockNamespace        string
-    LockTimeout          time.Duration
-    StatementTimeout     time.Duration
+    // Approval-sensitive: participates in Hash() because it changes generated SQL.
     NonConcurrentIndexes bool
-    ShadowSchema         string
+
+    // Operational timeouts persisted for direct Apply. Bounded by
+    // ValidateExecutionFields; excluded from Hash(). Lock identity and
+    // shadow schema names are never persisted — LockID is derived at apply
+    // from trusted target identity, LockNamespace is an ApplyOpts runtime
+    // option, and shadow schemas are generated ephemerally per run.
+    LockTimeout      time.Duration
+    StatementTimeout time.Duration
 }
 
-func (p *Plan) Hash() string
+func (p *Plan) Hash() string // schema(s), scope, renames, expand, policy, NonConcurrentIndexes, SchemaSQL, ordered steps
 func (p *Plan) ValidateExecutionFields() error
 func (p *Plan) Hazards() []Hazard
 func (p *Plan) Additions() int
@@ -221,26 +222,13 @@ func (p *Plan) String() string
 type HazardLevel string
 
 const (
-    HazardLevelCritical HazardLevel = "CRITICAL" // Data destruction (DROP TABLE, DROP COLUMN, TYPE_NARROW, RENAME_AMBIGUOUS, UNMANAGED_DEPENDENCY)
-    HazardLevelWarning  HazardLevel = "WARNING"  // Execution risk (NOT NULL without DEFAULT, GENERATED_REWRITE, PARTITION_ATTACH_SCAN, PARTITION_PENDING_DETACH)
+    HazardLevelCritical HazardLevel = "CRITICAL" // Data destruction (DROP TABLE/COLUMN, TYPE_NARROW, RENAME_AMBIGUOUS, UNMANAGED_DEPENDENCY, GENERATED_REWRITE)
+    HazardLevelWarning  HazardLevel = "WARNING"  // Execution risk (PARTITION_ATTACH_SCAN, PARTITION_PENDING_DETACH)
     HazardLevelNotice   HazardLevel = "NOTICE"   // Locking or performance impact (INDEX creation/drop, FK drop)
 )
 
-// Operational field validation. Invoked by ParsePlanJSON on load and by
-// Apply before execution; rejects untrusted artifacts with ErrInvalidOptions:
-//
-//   - ShadowSchema, when set, must use the reserved "_grizzle_shadow" prefix,
-//     be <= 63 bytes (PostgreSQL NAMEDATALEN), be a valid SQL identifier, and
-//     must not name a target or included schema (the shadow is dropped with
-//     CASCADE before compilation);
-//   - LockNamespace must be a valid SQL identifier;
-//   - LockTimeout and StatementTimeout must be in [0, 24h].
-//
-// The document envelope serializes the operational fields (lock_id,
-// lock_namespace, lock_timeout_ns, statement_timeout_ns,
-// non_concurrent_indexes, shadow_schema; durations as nanoseconds) and
-// ParsePlanJSON maps them back in both envelope and legacy formats, so the
-// CLI plan -> apply round trip preserves locking and timeout posture.
+// ValidateExecutionFields bounds persisted timeouts to [0, 24h].
+// Lock identity and shadow schema names are not carried in the artifact.
 
 type HazardCode string
 
@@ -331,10 +319,10 @@ If `AllowDrop` is false (the default), Grizzle refuses to execute any plan conta
 PostgreSQL migrations acquire advisory locks (`pg_advisory_xact_lock` or session lock for concurrent indexes). Grizzle recomputes the diff post-lock to avoid TOCTOU races.
 
 ### Invariant 3: Hazard gating
-Critical hazards (`DROP_TABLE`, `DROP_COLUMN`, `TYPE_NARROW`, `RENAME_AMBIGUOUS`, `UNMANAGED_DEPENDENCY`) fail execution unless accepted via `AcceptHazards`. Operational warnings (`GENERATED_REWRITE`) alert callers to full table rewrites.
+Critical hazards (`DROP_TABLE`, `DROP_COLUMN`, `TYPE_NARROW`, `RENAME_AMBIGUOUS`, `UNMANAGED_DEPENDENCY`, `GENERATED_REWRITE`) fail execution unless accepted via `AcceptHazards`.
 
 ### Invariant 4: Plan/Apply approval hash
-`Plan.Hash()` provides a deterministic digest. `Apply` verifies the post-lock hash against `ExpectedHash`, aborting with `ErrPlanDrift` on mismatch.
+`Plan.Hash()` digests approval-sensitive intent (target schemas, scope, renames, expand/contract, policy, NonConcurrentIndexes, SchemaSQL, ordered steps). `Apply` / `DryRunVerifyPlan` verify against `ExpectedHash`, aborting with `ErrPlanDrift` on mismatch. History is advisory (Model B): DDL commits first; a failed history write returns `ErrHistoryRecord` while leaving schema changes applied.
 
 ### Invariant 5: Timeouts and retry
 `LockTimeout` and `StatementTimeout` protect production availability. `LockTimeout` bounds the **total** advisory-lock acquisition wait across all retry attempts (including backoff); preamble work (hooks, schema setup, session timeout statements) and DDL execution do not consume the budget — each attempt's acquisition timer is armed when acquisition begins. PostgreSQL lock-contention and deadlock failures (SQLSTATE `55P03`, `40P01`) are classified via `exec.IsRetryable` and retried with exponential backoff and randomized jitter; retries halt immediately once any DDL step commits.

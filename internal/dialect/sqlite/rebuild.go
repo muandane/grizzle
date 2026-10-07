@@ -26,7 +26,11 @@ func GenerateSQLiteCreateTable(tbl *schema.Table) string {
 	for _, c := range cols {
 		line := fmt.Sprintf("  %q %s", c.Name, c.DataType)
 		if isSinglePK && c.Name == tbl.PrimaryKey.Columns[0] && strings.EqualFold(c.DataType, "INTEGER") {
-			line += " PRIMARY KEY AUTOINCREMENT"
+			if c.Autoincrement {
+				line += " PRIMARY KEY AUTOINCREMENT"
+			} else {
+				line += " PRIMARY KEY"
+			}
 		} else if c.Generated != nil {
 			stored := "STORED"
 			if !c.Generated.Stored {

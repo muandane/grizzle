@@ -172,13 +172,13 @@ func TestGeneratedColumn_PureUnit_ChangeExprEmitsHazard(t *testing.T) {
 	hazards := p.Hazards()
 	var foundRewriteHazard bool
 	for _, h := range hazards {
-		if h.Code == plan.HazardGeneratedRewrite && h.Level == plan.HazardLevelWarning {
+		if h.Code == plan.HazardGeneratedRewrite && h.Level == plan.HazardLevelCritical {
 			foundRewriteHazard = true
 			break
 		}
 	}
 	if !foundRewriteHazard {
-		t.Fatalf("expected HazardGeneratedRewrite with WARNING severity, got hazards: %+v", hazards)
+		t.Fatalf("expected HazardGeneratedRewrite with CRITICAL severity, got hazards: %+v", hazards)
 	}
 }
 

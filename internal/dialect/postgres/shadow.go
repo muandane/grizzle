@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"regexp"
 	"strings"
 
@@ -78,7 +79,11 @@ func DropShadowSchema(ctx context.Context, dbtx dialect.DBTX, shadowSchema strin
 }
 
 // ComputeShadowSchemas returns a mapping from each target schema to its mirroring shadow schema.
-// Single schema "public" defaults to "_grizzle_shadow" for backward compatibility.
+// Names are bounded to PostgreSQL's 63-byte identifier limit. When truncation
+// would collide, a deterministic FNV-1a suffix keyed on the full target name
+// disambiguates. Single schema "public" with the default prefix stays
+// "_grizzle_shadow" for backward compatibility when the prefix is exactly that
+// default (unique per-run prefixes always include the target disambiguator).
 func ComputeShadowSchemas(shadowPrefix string, targetSchemas []string) map[string]string {
 	prefix := shadowPrefix
 	if prefix == "" {
@@ -89,10 +94,44 @@ func ComputeShadowSchemas(shadowPrefix string, targetSchemas []string) map[strin
 		m[targetSchemas[0]] = "_grizzle_shadow"
 		return m
 	}
+	used := make(map[string]string, len(targetSchemas))
 	for _, s := range targetSchemas {
-		m[s] = prefix + "_" + s
+		name := boundShadowName(prefix, s)
+		if other, ok := used[name]; ok && other != s {
+			// Extremely unlikely with FNV suffix; force a second suffix pass.
+			name = boundShadowName(prefix+"_"+fmt.Sprintf("%08x", fnv32a(prefix+s)), s)
+		}
+		used[name] = s
+		m[s] = name
 	}
 	return m
+}
+
+const pgMaxIdentLen = 63
+
+func fnv32a(s string) uint32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(s))
+	return h.Sum32()
+}
+
+// boundShadowName builds prefix_target truncated to 63 bytes with a
+// deterministic hash suffix when truncation is required.
+func boundShadowName(prefix, target string) string {
+	name := prefix + "_" + target
+	if len(name) <= pgMaxIdentLen {
+		return name
+	}
+	suffix := fmt.Sprintf("_%08x", fnv32a(target))
+	baseBudget := pgMaxIdentLen - len(suffix)
+	if baseBudget < 1 {
+		return suffix[1:] // unreachable for normal prefixes; keep identifier-shaped
+	}
+	base := prefix + "_" + target
+	if len(base) > baseBudget {
+		base = base[:baseBudget]
+	}
+	return base + suffix
 }
 
 // SetupShadowSchemas creates clean, isolated temporary shadow schemas for DDL compilation.

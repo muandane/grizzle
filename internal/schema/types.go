@@ -109,6 +109,9 @@ type Column struct {
 	IsIdentity   bool             `json:"is_identity,omitempty"`
 	IdentityType string           `json:"identity_type,omitempty"`
 	Generated    *GeneratedColumn `json:"generated,omitempty"`
+	// Autoincrement is SQLite-specific: true when the column is declared
+	// INTEGER PRIMARY KEY AUTOINCREMENT (distinct from plain INTEGER PRIMARY KEY).
+	Autoincrement bool `json:"autoincrement,omitzero"`
 }
 
 // Index represents a secondary or unique index on a table.

@@ -1,6 +1,7 @@
 package plan_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/muandane/grizzle/internal/plan"
@@ -53,8 +54,84 @@ func TestPlan_Hash_Golden(t *testing.T) {
 		Renames:       map[string]string{"users_accounts": "users"},
 	}
 
-	const want = "821db232a94f4a000c4ab8a0a671a361a9709d4e5ada7bf5af76760b28ec5ab5"
+	const want = "073f1f1bbe91304b0b7f3bc5a40b030f119d9f61568c4818d4ab25c96003500b"
 	if got := p.Hash(); got != want {
 		t.Errorf("golden hash mismatch:\n got  %s\n want %s\nIf this change is intentional (hash format edit), update the golden value.", got, want)
+	}
+}
+
+// TestPlan_Hash_ApprovalSensitiveFields verifies that mutating any
+// approval-sensitive field changes the plan hash (integrity boundary).
+func TestPlan_Hash_ApprovalSensitiveFields(t *testing.T) {
+	base := &plan.Plan{
+		TargetSchema:  "public",
+		TargetSchemas: []string{"public"},
+		Policy:        plan.DropPolicy{AllowIndex: true},
+		IncludeTables: []string{"users"},
+		ExcludeTables: []string{"audit"},
+		Renames:       map[string]string{"a": "b"},
+		SchemaSQL:     "CREATE TABLE users (id INT);",
+		Steps: []plan.Step{
+			{Type: plan.ChangeAddColumn, Table: "users", SQL: `ALTER TABLE "public"."users" ADD COLUMN name TEXT;`},
+		},
+	}
+	baseHash := base.Hash()
+
+	cases := []struct {
+		name   string
+		mutate func(p *plan.Plan)
+	}{
+		{"policy", func(p *plan.Plan) { p.Policy.AllowTable = true }},
+		{"target_schema", func(p *plan.Plan) { p.TargetSchema = "billing" }},
+		{"target_schemas", func(p *plan.Plan) { p.TargetSchemas = []string{"billing", "public"} }},
+		{"include_tables", func(p *plan.Plan) { p.IncludeTables = []string{"users", "posts"} }},
+		{"exclude_tables", func(p *plan.Plan) { p.ExcludeTables = []string{"audit", "log"} }},
+		{"renames", func(p *plan.Plan) { p.Renames = map[string]string{"a": "c"} }},
+		{"expand_contract", func(p *plan.Plan) { p.ExpandContract = true }},
+		{"non_concurrent", func(p *plan.Plan) { p.NonConcurrentIndexes = true }},
+		{"schema_sql", func(p *plan.Plan) { p.SchemaSQL = "CREATE TABLE users (id BIGINT);" }},
+		{"step_sql", func(p *plan.Plan) { p.Steps[0].SQL = `ALTER TABLE "public"."users" ADD COLUMN age INT;` }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clone := *base
+			clone.Policy = base.Policy
+			clone.IncludeTables = append([]string(nil), base.IncludeTables...)
+			clone.ExcludeTables = append([]string(nil), base.ExcludeTables...)
+			clone.TargetSchemas = append([]string(nil), base.TargetSchemas...)
+			clone.Renames = map[string]string{"a": "b"}
+			clone.Steps = append([]plan.Step(nil), base.Steps...)
+			tc.mutate(&clone)
+			if clone.Hash() == baseHash {
+				t.Fatalf("mutating %s did not change hash", tc.name)
+			}
+		})
+	}
+}
+
+// TestPlan_Document_OmitsLockAndShadow verifies the serialized artifact
+// never carries lock identity or shadow schema (generated at apply time).
+func TestPlan_Document_OmitsLockAndShadow(t *testing.T) {
+	p := &plan.Plan{
+		TargetSchema: "public",
+		Steps:        []plan.Step{{Type: plan.ChangeAddColumn, Table: "users", SQL: "ALTER TABLE users ADD COLUMN x INT;"}},
+		SchemaSQL:    "CREATE TABLE users (id INT, x INT);",
+	}
+	data, err := p.ToJSON()
+	if err != nil {
+		t.Fatalf("ToJSON: %v", err)
+	}
+	s := string(data)
+	for _, forbidden := range []string{`"lock_id"`, `"lock_namespace"`, `"shadow_schema"`, `"options_digest"`} {
+		if strings.Contains(s, forbidden) {
+			t.Errorf("document must not contain %s", forbidden)
+		}
+	}
+	parsed, hash, err := plan.ParsePlanJSON(data)
+	if err != nil {
+		t.Fatalf("ParsePlanJSON: %v", err)
+	}
+	if hash != p.Hash() || parsed.Hash() != p.Hash() {
+		t.Fatalf("round-trip hash mismatch: envelope=%s parsed=%s want=%s", hash, parsed.Hash(), p.Hash())
 	}
 }
