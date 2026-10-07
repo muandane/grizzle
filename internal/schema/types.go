@@ -14,6 +14,12 @@ type Schema struct {
 	Routines   map[string]*Routine         `json:"routines,omitempty"`
 	Views      map[string]*View            `json:"views,omitempty"`
 	Unmanaged  map[string]*UnmanagedObject `json:"unmanaged,omitempty"`
+
+	// SourceSQL is the raw desired SchemaSQL the IR was compiled from. It is
+	// deliberately excluded from JSON serialization and plan hashing (the IR
+	// already hashes canonically); it exists so pure statement-scan lint
+	// rules (e.g. L009) can inspect the original input.
+	SourceSQL string `json:"-"`
 }
 
 // Extension represents a PostgreSQL extension (CREATE EXTENSION).

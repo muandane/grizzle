@@ -14,7 +14,12 @@ import (
 // shadow database and returns the desired schema IR without touching any
 // persistent database.
 func CompileSchemaSQLite(ctx context.Context, schemaSQL string) (*schema.Schema, error) {
-	return sqlite.CompileInShadow(ctx, schemaSQL)
+	s, err := sqlite.CompileInShadow(ctx, schemaSQL)
+	if err != nil {
+		return nil, err
+	}
+	s.SourceSQL = schemaSQL
+	return s, nil
 }
 
 // CompileSchemaPostgres compiles schemaSQL in the shadow schema within a
@@ -53,5 +58,6 @@ func CompileSchemaPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConf
 	// best-effort installs roll back with the tx and may have failed on
 	// privileges, but the declared set is what the user wrote.
 	s.Extensions = schema.ParseExtensions(cfg.SchemaSQL)
+	s.SourceSQL = cfg.SchemaSQL
 	return s, nil
 }
