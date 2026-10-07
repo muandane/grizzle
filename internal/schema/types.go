@@ -43,9 +43,10 @@ func RoutineKey(name, identityArgs string) string {
 
 // View represents a managed SQL VIEW or MATERIALIZED VIEW.
 type View struct {
-	Name       string `json:"name"`
-	IsMatView  bool   `json:"is_matview,omitempty"`
-	Definition string `json:"definition"` // canonical pg_get_viewdef
+	Name       string   `json:"name"`
+	IsMatView  bool     `json:"is_matview,omitempty"`
+	Definition string   `json:"definition"` // canonical pg_get_viewdef
+	Columns    []string `json:"columns,omitempty"`
 }
 
 // UnmanagedKind specifies the type of an unmanaged database object.

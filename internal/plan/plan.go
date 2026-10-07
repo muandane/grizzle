@@ -82,6 +82,9 @@ type Step struct {
 	// constraint (as opposed to a foreign key). Used for hazard classification
 	// (CHECK validate runs a full table scan under SHARE UPDATE EXCLUSIVE).
 	ValidatesCheck bool `json:"validates_check,omitzero"`
+
+	// Replace marks a CREATE_VIEW step rendered as CREATE OR REPLACE VIEW.
+	Replace bool `json:"replace,omitzero"`
 }
 
 // DropPolicy defines fine-grained permissions for destructive operations.

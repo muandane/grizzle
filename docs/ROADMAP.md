@@ -116,7 +116,7 @@ Ordered by expected impact; nothing here blocks the first release.
 
 - [ ] **SQLite declarative CHECK constraints** — SQLite CHECK DDL is neither introspected nor preserved through rebuilds (documented gap in SPEC §3).
 - [ ] **Domain CHECK management** — domain constraints (`pg_constraint.conrelid = 0`) are inventory-only.
-- [ ] **Declarative view migrations** — views/triggers/functions remain detected-and-protected; declarative lifecycle evaluated for a future release.
+- [x] **Declarative view migrations** — shipped: views/materialized views now managed (create/replace/drop, `AllowDropView`, `DROP_VIEW` hazard); functions and triggers shipped previously.
 - [ ] **CLI backfill runner** — batched backfill is library-only (`Options.Backfill`); a CLI runner would need a durable batching contract.
 - [ ] **Multi-schema SQLite** — rejected today (`ErrUnsupportedMultiSchema`).
 - [ ] **v1.0.0 API freeze** — remove `Experimental:` markers once rename mapping, staged plans, and backfill batching stabilize.

@@ -384,6 +384,42 @@ func GenerateDropTriggerSQL(targetSchema, tableName, triggerName string) string 
 	return fmt.Sprintf("DROP TRIGGER IF EXISTS %q ON %q.%q;", triggerName, targetSchema, tableName)
 }
 
+// GenerateCreateViewSQL constructs a CREATE [OR REPLACE] [MATERIALIZED] VIEW
+// statement from the canonical pg_get_viewdef definition (schema references
+// already unmapped by the diff stage).
+func GenerateCreateViewSQL(targetSchema string, v *schema.View, replace bool) string {
+	if v == nil {
+		return ""
+	}
+	def := strings.TrimSpace(v.Definition)
+	if def == "" {
+		return ""
+	}
+	if !strings.HasSuffix(def, ";") {
+		def += ";"
+	}
+	if v.IsMatView {
+		return fmt.Sprintf("CREATE MATERIALIZED VIEW %q.%q AS %s", targetSchema, v.Name, def)
+	}
+	if replace {
+		return fmt.Sprintf("CREATE OR REPLACE VIEW %q.%q AS %s", targetSchema, v.Name, def)
+	}
+	return fmt.Sprintf("CREATE VIEW %q.%q AS %s", targetSchema, v.Name, def)
+}
+
+// GenerateDropViewSQL constructs a DROP VIEW or DROP MATERIALIZED VIEW statement.
+func GenerateDropViewSQL(targetSchema, viewName string, isMatView bool) string {
+	if isMatView {
+		return fmt.Sprintf("DROP MATERIALIZED VIEW IF EXISTS %q.%q;", targetSchema, viewName)
+	}
+	return fmt.Sprintf("DROP VIEW IF EXISTS %q.%q;", targetSchema, viewName)
+}
+
+// GenerateRefreshMatViewSQL constructs a REFRESH MATERIALIZED VIEW statement.
+func GenerateRefreshMatViewSQL(targetSchema, viewName string) string {
+	return fmt.Sprintf("REFRESH MATERIALIZED VIEW %q.%q;", targetSchema, viewName)
+}
+
 // RenderOpts configures DDL rendering behavior such as concurrency and server version-specific syntax.
 type RenderOpts struct {
 	NonConcurrentIndexes bool
@@ -461,6 +497,7 @@ func RenderChangeWithOpts(targetSchema string, c diff.Change, opts RenderOpts) p
 		IsRenameCandidate:  c.IsRenameCandidate,
 		IsGeneratedRewrite: c.GeneratedChanged,
 		UnmanagedDeps:      c.UnmanagedDeps,
+		Replace:            c.Replace,
 	}
 	if c.Column != nil {
 		step.Column = c.Column.Name
@@ -494,6 +531,13 @@ func RenderChangeWithOpts(targetSchema string, c diff.Change, opts RenderOpts) p
 			trgName = c.Trigger.Name
 		}
 		step.SQL = GenerateDropTriggerSQL(effectiveSchema, c.Table, trgName)
+	case plan.ChangeCreateView:
+		step.SQL = GenerateCreateViewSQL(effectiveSchema, c.View, c.Replace)
+	case plan.ChangeDropView:
+		isMat := c.View != nil && c.View.IsMatView
+		step.SQL = GenerateDropViewSQL(effectiveSchema, c.Table, isMat)
+	case plan.ChangeRefreshMatView:
+		step.SQL = GenerateRefreshMatViewSQL(effectiveSchema, c.Table)
 	case plan.ChangeCreateEnum:
 		step.SQL = GenerateCreateEnumSQL(effectiveSchema, c.Enum)
 	case plan.ChangeAlterEnum:

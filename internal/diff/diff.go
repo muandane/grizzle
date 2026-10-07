@@ -31,6 +31,7 @@ type Change struct {
 	Routine           *schema.Routine
 	Trigger           *schema.Trigger
 	View              *schema.View
+	Replace           bool
 	Destructive       bool
 	IsRenameCandidate bool
 
@@ -779,7 +780,116 @@ func DiffWithMappings(live, desired *schema.Schema, targetSchema, shadowSchema s
 	// AllowDropFunction.
 	changes = append(changes, diffRoutines(live, desired, targetSchema, normalize)...)
 
+	// 5. Views diff: create missing, CREATE OR REPLACE on append-columns-only
+	// drift, DROP + CREATE otherwise, drop live-only behind AllowDropView.
+	changes = append(changes, diffViews(live, desired, targetSchema, normalize)...)
+
 	return changes, nil
+}
+
+// appendOnlyColumns reports whether desired view columns extend the live
+// column list as a strict in-order prefix — the only drift Postgres accepts
+// via CREATE OR REPLACE VIEW.
+func appendOnlyColumns(liveCols, desiredCols []string) bool {
+	if len(desiredCols) < len(liveCols) {
+		return false
+	}
+	for i, c := range liveCols {
+		if desiredCols[i] != c {
+			return false
+		}
+	}
+	return true
+}
+
+// diffViews emits view changes. Regular views drift via CREATE OR REPLACE
+// when columns are only appended; materialized views and column-shrinking
+// changes require a destructive DROP + CREATE (plus REFRESH for matviews).
+func diffViews(live, desired *schema.Schema, targetSchema string, normalize func(string) string) []Change {
+	var changes []Change
+	for _, dName := range sortedViewNames(desired) {
+		dView := desired.Views[dName]
+		dCopy := *dView
+		dCopy.Definition = normalize(dView.Definition)
+		lView, exists := live.Views[dName]
+		if !exists {
+			changes = append(changes, Change{
+				Type:        plan.ChangeCreateView,
+				Schema:      targetSchema,
+				Table:       dName,
+				View:        &dCopy,
+				Destructive: false,
+			})
+			if dView.IsMatView {
+				changes = append(changes, Change{
+					Type:        plan.ChangeRefreshMatView,
+					Schema:      targetSchema,
+					Table:       dName,
+					View:        &dCopy,
+					Destructive: false,
+				})
+			}
+			continue
+		}
+		lNorm := normalize(lView.Definition)
+		if lNorm == dCopy.Definition && lView.IsMatView == dView.IsMatView {
+			continue
+		}
+		replaceInPlace := !lView.IsMatView && !dView.IsMatView && appendOnlyColumns(lView.Columns, dView.Columns)
+		if !replaceInPlace {
+			lCopy := *lView
+			lCopy.Definition = lNorm
+			changes = append(changes, Change{
+				Type:        plan.ChangeDropView,
+				Schema:      targetSchema,
+				Table:       dName,
+				View:        &lCopy,
+				Destructive: true,
+			})
+		}
+		changes = append(changes, Change{
+			Type:        plan.ChangeCreateView,
+			Schema:      targetSchema,
+			Table:       dName,
+			View:        &dCopy,
+			Replace:     replaceInPlace,
+			Destructive: false,
+		})
+		if dView.IsMatView {
+			changes = append(changes, Change{
+				Type:        plan.ChangeRefreshMatView,
+				Schema:      targetSchema,
+				Table:       dName,
+				View:        &dCopy,
+				Destructive: false,
+			})
+		}
+	}
+	for _, lName := range sortedViewNames(live) {
+		if _, inDesired := desired.Views[lName]; !inDesired {
+			lView := live.Views[lName]
+			lCopy := *lView
+			lCopy.Definition = normalize(lView.Definition)
+			changes = append(changes, Change{
+				Type:        plan.ChangeDropView,
+				Schema:      targetSchema,
+				Table:       lName,
+				View:        &lCopy,
+				Destructive: true,
+			})
+		}
+	}
+	return changes
+}
+
+// sortedViewNames returns a schema's view names in deterministic order.
+func sortedViewNames(s *schema.Schema) []string {
+	if s == nil {
+		return nil
+	}
+	names := slices.Collect(maps.Keys(s.Views))
+	slices.Sort(names)
+	return names
 }
 
 // routineDef returns a shadow-unmapped copy of a desired routine.

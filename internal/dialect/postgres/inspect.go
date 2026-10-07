@@ -27,6 +27,23 @@ func polCmdName(cmd string) string {
 	}
 }
 
+// pinSearchPath pins search_path to pg_catalog for the remainder of the
+// current transaction so pg_get_*def / pg_get_expr emit fully qualified,
+// search-path-independent definitions. It is a no-op when dbtx is not inside
+// a transaction (e.g. direct *sql.DB inspection, where the statement-scoped
+// pin is impossible and the session path is whatever the pool provides).
+// Call unpinSearchPath after the pin-affected queries to restore the
+// transaction path.
+func pinSearchPath(ctx context.Context, dbtx dialect.DBTX) {
+	_, _ = dbtx.ExecContext(ctx, "SAVEPOINT grizzle_inspect_pin; SET LOCAL search_path TO pg_catalog;")
+}
+
+// unpinSearchPath reverts the pinned path (ROLLBACK TO SAVEPOINT undoes the
+// SET LOCAL effect) and discards the savepoint (RELEASE).
+func unpinSearchPath(ctx context.Context, dbtx dialect.DBTX) {
+	_, _ = dbtx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT grizzle_inspect_pin; RELEASE SAVEPOINT grizzle_inspect_pin;")
+}
+
 // Inspect reads the relational state of the specified schema directly from pg_catalog.
 func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema.Schema, error) {
 	s := &schema.Schema{
@@ -361,7 +378,13 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 	}
 	_ = rlsRows.Close()
 
-	// 2e. Inspect row-level security policies
+	// 2e. Inspect row-level security policies. pg_get_expr renders schema
+	// references per the session search_path, so live and shadow inspections
+	// can disagree; pin search_path to pg_catalog for all pg_get_*def-based
+	// queries from here to the end of Inspect (see pinSearchPath).
+	pinSearchPath(ctx, dbtx)
+	defer unpinSearchPath(ctx, dbtx)
+
 	policyQuery := `
 		SELECT
 			c.relname AS table_name,
@@ -675,12 +698,20 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 	}
 	_ = checkRows.Close()
 
-	// 6. Inspect Unmanaged Objects
-	// 6a. Views and Materialized Views
+	// 6. Inspect Views
+	// 6a. Views and Materialized Views (managed surface). pg_get_viewdef is
+	// the canonical definition; schema-qualified references inside it are
+	// unmapped by the diff normalize step for shadow introspection.
 	viewQuery := `
 		SELECT
 			c.relname AS view_name,
-			c.relkind AS view_kind
+			c.relkind AS view_kind,
+			pg_get_viewdef(c.oid) AS definition,
+			COALESCE((
+				SELECT string_agg(a.attname, ',' ORDER BY a.attnum)
+				FROM pg_attribute a
+				WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+			), '') AS columns_csv
 		FROM pg_class c
 		JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE n.nspname = $1
@@ -694,64 +725,31 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 	defer func() { _ = viewRows.Close() }()
 
 	for viewRows.Next() {
-		var viewName, viewKind string
-		if err := viewRows.Scan(&viewName, &viewKind); err != nil {
+		var viewName, viewKind, definition, columnsCSV string
+		if err := viewRows.Scan(&viewName, &viewKind, &definition, &columnsCSV); err != nil {
 			return nil, fmt.Errorf("scanning view in schema %q: %w", schemaName, err)
 		}
-		kind := schema.UnmanagedView
-		if viewKind == "m" {
-			kind = schema.UnmanagedMaterialized
+		if s.Views == nil {
+			s.Views = make(map[string]*schema.View)
 		}
-		s.Unmanaged[viewName] = &schema.UnmanagedObject{
-			Name: viewName,
-			Kind: kind,
+		v := &schema.View{
+			Name:       viewName,
+			IsMatView:  viewKind == "m",
+			Definition: definition,
 		}
+		if columnsCSV != "" {
+			v.Columns = strings.Split(columnsCSV, ",")
+		}
+		s.Views[viewName] = v
 	}
 	if err := viewRows.Err(); err != nil {
 		return nil, err
 	}
 	_ = viewRows.Close()
 
-	// 6b. View Column Dependencies from pg_depend
-	viewDepQuery := `
-		SELECT
-			c.relname AS view_name,
-			dep_c.relname AS referenced_table,
-			COALESCE(a.attname, '') AS referenced_column
-		FROM pg_class c
-		JOIN pg_namespace n ON n.oid = c.relnamespace
-		JOIN pg_rewrite r ON r.ev_class = c.oid
-		JOIN pg_depend d ON d.objid = r.oid AND d.classid = 'pg_rewrite'::regclass AND d.refclassid = 'pg_class'::regclass
-		JOIN pg_class dep_c ON dep_c.oid = d.refobjid
-		LEFT JOIN pg_attribute a ON a.attrelid = dep_c.oid AND a.attnum = d.refobjsubid AND NOT a.attisdropped
-		WHERE n.nspname = $1
-		  AND c.relkind IN ('v', 'm')
-		  AND dep_c.relkind IN ('r', 'p')
-		  AND dep_c.relname != c.relname
-		ORDER BY c.relname, dep_c.relname, a.attname;
-	`
-	depRows, err := dbtx.QueryContext(ctx, viewDepQuery, schemaName)
-	if err != nil {
-		return nil, fmt.Errorf("inspecting view dependencies in schema %q: %w", schemaName, err)
-	}
-	defer func() { _ = depRows.Close() }()
-
-	for depRows.Next() {
-		var viewName, refTable, refCol string
-		if err := depRows.Scan(&viewName, &refTable, &refCol); err != nil {
-			return nil, fmt.Errorf("scanning view dependency: %w", err)
-		}
-		if obj, ok := s.Unmanaged[viewName]; ok {
-			obj.DependsOn = append(obj.DependsOn, schema.DependencyRef{
-				Table:  refTable,
-				Column: refCol,
-			})
-		}
-	}
-	if err := depRows.Err(); err != nil {
-		return nil, err
-	}
-	_ = depRows.Close()
+	// 6b. View column dependencies: managed views are folded into column-drop
+	// protection by diff.findSurvivingViewDeps using the canonical view
+	// definition; no unmanaged registration is needed.
 
 	// 6c. Triggers on managed tables are collected in 2f (Table.Triggers).
 	// Triggers are part of the managed surface as of Phase 1; no unmanaged

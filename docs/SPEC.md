@@ -301,14 +301,14 @@ type Hazard struct {
 
 | Construct | Supported | Policy |
 | :--- | :---: | :--- |
-| `Views` & `Materialized Views` | Protected | Introspected and dependency-graphed; destructive changes blocked via `UNMANAGED_DEPENDENCY` |
+| `Views` & `Materialized Views` | Managed | Introspected (`pg_get_viewdef`); create / replace / drop synced declaratively, drops gated by `AllowDropView` |
 | `Triggers` | Protected | Preserved on managed tables; drop/alter operations on dependencies blocked |
 | `Functions` & `Procedures` | Protected | Introspected with table/column dependencies: `pg_depend` for SQL-standard (`BEGIN ATOMIC`) bodies, conservative source scan for quoted string bodies; destructive alterations on dependents blocked via `UNMANAGED_DEPENDENCY` |
 | `Sequences` (unowned) | Protected | Never dropped or managed |
 | `Domains` | Protected | Introspected and protected |
 
 > [!NOTE]
-> **Roadmap Note**: Declarative view, trigger, and function migrations are intentionally out of scope for automigrations. They are detected and protected from collateral damage, but not altered or dropped. Declarative management of view DDL will be evaluated in future releases.
+> **Roadmap Note**: Declarative views, triggers, functions, RLS policies, and extensions are managed as of this release (see §3). Views and materialized views are created, replaced, and dropped per the desired schema; destructive view steps are gated behind `AllowDropView` and the `DROP_VIEW` hazard.
 
 ## 4. Safety model and invariants
 
