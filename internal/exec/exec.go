@@ -514,7 +514,8 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 				stepStart := time.Now()
 				if err := callBeforeStep(cfg.BeforeStep, HookContext{Context: ctx, DBTX: conn, Step: s, Index: stepIdx, Total: len(steps), IsNonTx: true}); err != nil {
 					hookErr := fmt.Errorf("before_step hook: %w", err)
-					recordFailureHistory(stepIdx, hookErr, true)
+					// No DDL ran yet; status follows committedSteps only (not isNonTx).
+					recordFailureHistory(stepIdx, hookErr, false)
 					return committedSteps, hookErr
 				}
 				if err := execStepWithTracing(ctx, conn, s, true, cfg.Tracer); err != nil {
@@ -1089,7 +1090,8 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 				stepStart := time.Now()
 				if err := callBeforeStep(cfg.BeforeStep, HookContext{Context: ctx, DBTX: conn, Step: s, Index: stepIdx, Total: len(p.Steps), IsNonTx: true}); err != nil {
 					hookErr := fmt.Errorf("before_step hook: %w", err)
-					recordFailureHistory(stepIdx, hookErr, true)
+					// No DDL ran yet; status follows committedSteps only (not isNonTx).
+					recordFailureHistory(stepIdx, hookErr, false)
 					return committedSteps, hookErr
 				}
 				if err := execStepWithTracing(ctx, conn, s, true, cfg.Tracer); err != nil {

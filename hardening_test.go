@@ -55,7 +55,9 @@ func TestHardening_MultiPodFuzzing(t *testing.T) {
 		wg.Go(func() {
 			<-barrier // Synchronized release
 
-			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			// Waiters serialize on the advisory lock; budget must cover the
+			// leader's full sync (incl. CONCURRENTLY indexes) plus retries.
+			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 			defer cancel()
 
 			err := grizzle.Sync(ctx, db, grizzle.Options{
@@ -63,6 +65,8 @@ func TestHardening_MultiPodFuzzing(t *testing.T) {
 				TargetSchema: "public",
 				SchemaSQL:    complexSchema,
 				AllowDrop:    false,
+				LockTimeout:  15 * time.Second,
+				MaxRetries:   10,
 			})
 			if err != nil {
 				errs <- err

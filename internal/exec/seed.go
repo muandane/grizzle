@@ -102,6 +102,9 @@ func SeedPostgres(ctx context.Context, db *sql.DB, cfg SeedExecConfig, seedSQL s
 		}
 	}()
 
+	targetSchemas := cfg.targetSchemasOr(primarySchema)
+	_, _ = conn.ExecContext(ctx, searchPathSQL(targetSchemas))
+
 	seedHash := SeedHash(seedSQL)
 
 	tx, err := conn.BeginTx(ctx, nil)
@@ -109,6 +112,9 @@ func SeedPostgres(ctx context.Context, db *sql.DB, cfg SeedExecConfig, seedSQL s
 		return fmt.Errorf("grizzle: failed to begin seed transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	// Match Sync/Apply: unqualified seed SQL must resolve against TargetSchemas.
+	_, _ = tx.ExecContext(ctx, localSearchPathSQL(targetSchemas))
 
 	if !cfg.Force {
 		if err := history.EnsureTable(ctx, tx, "postgres", primarySchema); err != nil {

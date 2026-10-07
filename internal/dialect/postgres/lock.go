@@ -41,6 +41,11 @@ func AcquireSessionAdvisoryLock(ctx context.Context, dbtx dialect.DBTX, lockID i
 		var acquired bool
 		err := dbtx.QueryRowContext(ctx, "SELECT pg_try_advisory_lock($1);", lockID).Scan(&acquired)
 		if err != nil {
+			// Context expiry while polling must surface as ErrLockTimeout so
+			// Sync/Apply retry logic (IsLockTimeout) can back off and retry.
+			if ctx.Err() != nil {
+				return fmt.Errorf("%w: %w", plan.ErrLockTimeout, err)
+			}
 			return fmt.Errorf("failed checking pg_try_advisory_lock: %w", err)
 		}
 		if acquired {
@@ -81,6 +86,11 @@ func AcquireSessionAdvisoryLock2(ctx context.Context, dbtx dialect.DBTX, key1, k
 		var acquired bool
 		err := dbtx.QueryRowContext(ctx, "SELECT pg_try_advisory_lock($1, $2);", key1, key2).Scan(&acquired)
 		if err != nil {
+			// Context expiry while polling must surface as ErrLockTimeout so
+			// Sync/Apply retry logic (IsLockTimeout) can back off and retry.
+			if ctx.Err() != nil {
+				return fmt.Errorf("%w: %w", plan.ErrLockTimeout, err)
+			}
 			return fmt.Errorf("failed checking pg_try_advisory_lock($1, $2): %w", err)
 		}
 		if acquired {

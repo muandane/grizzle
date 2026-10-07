@@ -29,11 +29,12 @@ func TestSeedPostgres_IdempotencyAndRollback(t *testing.T) {
 	}
 
 	cfg := exec.SeedExecConfig{TargetSchemas: []string{schema}}
-	seedOne := fmt.Sprintf(`
-		CREATE TABLE %s.cities (id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name TEXT NOT NULL);
-		INSERT INTO %s.cities (name) VALUES ('berlin'), ('tokyo');
-	`, schema, schema)
-	seedTwo := fmt.Sprintf(`INSERT INTO %s.cities (name) VALUES ('lima');`, schema)
+	// Unqualified table names: SeedPostgres must set search_path to TargetSchemas.
+	seedOne := `
+		CREATE TABLE cities (id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name TEXT NOT NULL);
+		INSERT INTO cities (name) VALUES ('berlin'), ('tokyo');
+	`
+	seedTwo := `INSERT INTO cities (name) VALUES ('lima');`
 
 	countRows := func() int {
 		t.Helper()
@@ -89,10 +90,10 @@ func TestSeedPostgres_IdempotencyAndRollback(t *testing.T) {
 	}
 
 	// 5. Bad seed: whole transaction rolls back, schema intact.
-	badSeed := fmt.Sprintf(`
-			INSERT INTO %s.cities (name) VALUES ('partial');
-			INSERT INTO %s.missing_table (name) VALUES ('boom');
-		`, schema, schema)
+	badSeed := `
+		INSERT INTO cities (name) VALUES ('partial');
+		INSERT INTO missing_table (name) VALUES ('boom');
+	`
 	err := exec.SeedPostgres(ctx, db, cfg, badSeed)
 	if !errors.Is(err, plan.ErrSeedFailed) {
 		t.Fatalf("expected ErrSeedFailed, got %v", err)
