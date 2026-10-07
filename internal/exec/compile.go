@@ -58,6 +58,13 @@ func CompileSchemaPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConf
 	// best-effort installs roll back with the tx and may have failed on
 	// privileges, but the declared set is what the user wrote.
 	s.Extensions = schema.ParseExtensions(cfg.SchemaSQL)
+
+	// Shadow-installed functions (e.g. extension functions re-created via
+	// WITH SCHEMA rewriting) qualify expressions with the ephemeral shadow
+	// schema name, which is unique per run. Left in place they break rendered
+	// target DDL and cause permanent drift.
+	unmapShadowExprs(s, []string{shadowSchema})
+
 	s.SourceSQL = cfg.SchemaSQL
 	return s, nil
 }

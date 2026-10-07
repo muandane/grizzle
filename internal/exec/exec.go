@@ -146,6 +146,7 @@ func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig
 		// straight from SchemaSQL (authoritative desired set).
 		desired.Extensions = schema.ParseExtensions(cfg.SchemaSQL)
 		maskShadowExtensions(live, []string{shadowSchema})
+		unmapShadowExprs(desired, []string{shadowSchema})
 
 		changes, err := diff.Diff(live, desired, targetSchema, shadowSchema, cfg.Filters)
 		if err != nil {
@@ -182,6 +183,9 @@ func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig
 	for _, live := range liveMap {
 		maskShadowExtensions(live, shadowNames)
 	}
+	for _, desired := range desiredMap {
+		unmapShadowExprs(desired, shadowNames)
+	}
 
 	var allChanges []diff.Change
 	for _, target := range targetSchemas {
@@ -215,6 +219,34 @@ func maskShadowExtensions(live *schema.Schema, shadowSchemas []string) {
 	for name, ext := range live.Extensions {
 		if ext != nil && shadowSet[ext.Schema] {
 			delete(live.Extensions, name)
+		}
+	}
+}
+
+// unmapShadowExprs strips ephemeral shadow-schema qualifications from column
+// default and generated expressions. Functions re-installed into the shadow
+// schema (e.g. extension functions captured via WITH SCHEMA rewriting) leave
+// `_grizzle_shadow_<id>.fn(...)` in pg_get_expr output; the shadow schema is
+// unique per run and never exists in the target, so left in place they break
+// rendered DDL and cause permanent drift. Stripping lets the reference
+// resolve through the apply-time search_path.
+func unmapShadowExprs(s *schema.Schema, shadowSchemas []string) {
+	if s == nil || len(shadowSchemas) == 0 {
+		return
+	}
+	for _, t := range s.Tables {
+		for _, c := range t.Columns {
+			for _, shadow := range shadowSchemas {
+				if shadow == "" {
+					continue
+				}
+				c.DefaultValue = strings.ReplaceAll(c.DefaultValue, shadow+".", "")
+				c.DefaultValue = strings.ReplaceAll(c.DefaultValue, `"`+shadow+`".`, "")
+				if c.Generated != nil {
+					c.Generated.Expr = strings.ReplaceAll(c.Generated.Expr, shadow+".", "")
+					c.Generated.Expr = strings.ReplaceAll(c.Generated.Expr, `"`+shadow+`".`, "")
+				}
+			}
 		}
 	}
 }
