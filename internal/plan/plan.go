@@ -32,6 +32,21 @@ const (
 	ChangeValidateConstraint ChangeType = "VALIDATE_CONSTRAINT"
 	ChangeAttachPartition    ChangeType = "ATTACH_PARTITION"
 	ChangeDetachPartition    ChangeType = "DETACH_PARTITION"
+	ChangeCreateExtension    ChangeType = "CREATE_EXTENSION"
+	ChangeDropExtension      ChangeType = "DROP_EXTENSION"
+	ChangeEnableRLS          ChangeType = "ENABLE_RLS"
+	ChangeDisableRLS         ChangeType = "DISABLE_RLS"
+	ChangeForceRLS           ChangeType = "FORCE_RLS"
+	ChangeNoForceRLS         ChangeType = "NO_FORCE_RLS"
+	ChangeCreatePolicy       ChangeType = "CREATE_POLICY"
+	ChangeDropPolicy         ChangeType = "DROP_POLICY"
+	ChangeCreateFunction     ChangeType = "CREATE_FUNCTION"
+	ChangeDropFunction       ChangeType = "DROP_FUNCTION"
+	ChangeCreateTrigger      ChangeType = "CREATE_TRIGGER"
+	ChangeDropTrigger        ChangeType = "DROP_TRIGGER"
+	ChangeCreateView         ChangeType = "CREATE_VIEW"
+	ChangeDropView           ChangeType = "DROP_VIEW"
+	ChangeRefreshMatView     ChangeType = "REFRESH_MATVIEW"
 )
 
 // Step represents a single atomic DDL migration statement.
@@ -71,11 +86,16 @@ type Step struct {
 
 // DropPolicy defines fine-grained permissions for destructive operations.
 type DropPolicy struct {
-	AllowTable  bool `json:"allow_table"`
-	AllowColumn bool `json:"allow_column"`
-	AllowIndex  bool `json:"allow_index"`
-	AllowFK     bool `json:"allow_fk"`
-	AllowCheck  bool `json:"allow_check"`
+	AllowTable     bool `json:"allow_table"`
+	AllowColumn    bool `json:"allow_column"`
+	AllowIndex     bool `json:"allow_index"`
+	AllowFK        bool `json:"allow_fk"`
+	AllowCheck     bool `json:"allow_check"`
+	AllowExtension bool `json:"allow_extension"`
+	AllowFunction  bool `json:"allow_function"`
+	AllowPolicy    bool `json:"allow_policy"`
+	AllowTrigger   bool `json:"allow_trigger"`
+	AllowView      bool `json:"allow_view"`
 }
 
 // IsAllowed checks if a given migration step is permitted by the policy.
@@ -96,6 +116,16 @@ func (p DropPolicy) IsAllowed(s Step) bool {
 		return p.AllowCheck
 	case ChangeAlterColumn:
 		return p.AllowColumn
+	case ChangeDropExtension:
+		return p.AllowExtension
+	case ChangeDropFunction:
+		return p.AllowFunction
+	case ChangeDropPolicy:
+		return p.AllowPolicy
+	case ChangeDropTrigger:
+		return p.AllowTrigger
+	case ChangeDropView:
+		return p.AllowView
 	default:
 		return false
 	}
@@ -166,9 +196,11 @@ func (p *Plan) Hash() string {
 	if p.ExpandContract {
 		write("expand_contract:true\n")
 	}
-	write("policy:%t,%t,%t,%t,%t\n",
+	write("policy:%t,%t,%t,%t,%t,%t,%t,%t,%t,%t\n",
 		p.Policy.AllowTable, p.Policy.AllowColumn, p.Policy.AllowIndex,
-		p.Policy.AllowFK, p.Policy.AllowCheck)
+		p.Policy.AllowFK, p.Policy.AllowCheck,
+		p.Policy.AllowExtension, p.Policy.AllowFunction, p.Policy.AllowPolicy,
+		p.Policy.AllowTrigger, p.Policy.AllowView)
 	if p.NonConcurrentIndexes {
 		write("non_concurrent:true\n")
 	}
@@ -221,7 +253,9 @@ func (p *Plan) Additions() int {
 	count := 0
 	for _, s := range p.Steps {
 		switch s.Type {
-		case ChangeCreateEnum, ChangeCreateTable, ChangeAddColumn, ChangeCreateIndex, ChangeAddFK, ChangeAddCheck:
+		case ChangeCreateEnum, ChangeCreateTable, ChangeAddColumn, ChangeCreateIndex, ChangeAddFK, ChangeAddCheck,
+			ChangeCreateExtension, ChangeCreatePolicy, ChangeCreateFunction, ChangeCreateTrigger, ChangeCreateView,
+			ChangeEnableRLS, ChangeForceRLS:
 			count++
 		}
 	}
@@ -233,7 +267,8 @@ func (p *Plan) Modifications() int {
 	count := 0
 	for _, s := range p.Steps {
 		switch s.Type {
-		case ChangeAlterColumn, ChangeAlterEnum:
+		case ChangeAlterColumn, ChangeAlterEnum, ChangeRefreshMatView,
+			ChangeDisableRLS, ChangeNoForceRLS:
 			count++
 		}
 	}
@@ -245,7 +280,8 @@ func (p *Plan) Deletions() int {
 	count := 0
 	for _, s := range p.Steps {
 		switch s.Type {
-		case ChangeDropTable, ChangeDropColumn, ChangeDropIndex, ChangeDropFK, ChangeDropCheck:
+		case ChangeDropTable, ChangeDropColumn, ChangeDropIndex, ChangeDropFK, ChangeDropCheck,
+			ChangeDropExtension, ChangeDropPolicy, ChangeDropFunction, ChangeDropTrigger, ChangeDropView:
 			count++
 		}
 	}
@@ -301,6 +337,22 @@ const (
 	HazardPartitionAttachScan HazardCode = "PARTITION_ATTACH_SCAN"
 	// HazardPartitionPendingDetach indicates an interrupted pending-detach state requiring finalization.
 	HazardPartitionPendingDetach HazardCode = "PARTITION_PENDING_DETACH"
+	// HazardExtensionPrivilege indicates CREATE EXTENSION may require elevated privileges.
+	HazardExtensionPrivilege HazardCode = "EXTENSION_PRIVILEGE"
+	// HazardDropExtension indicates dropping a PostgreSQL extension.
+	HazardDropExtension HazardCode = "DROP_EXTENSION"
+	// HazardDropPolicy indicates dropping a row-level security policy.
+	HazardDropPolicy HazardCode = "DROP_POLICY"
+	// HazardRLSEnable indicates enabling RLS may lock out roles without matching policies.
+	HazardRLSEnable HazardCode = "RLS_ENABLE"
+	// HazardDropFunction indicates dropping a function or procedure.
+	HazardDropFunction HazardCode = "DROP_FUNCTION"
+	// HazardSecurityDefiner indicates a SECURITY DEFINER routine without an explicit search_path.
+	HazardSecurityDefiner HazardCode = "SECURITY_DEFINER"
+	// HazardDropTrigger indicates dropping a trigger.
+	HazardDropTrigger HazardCode = "DROP_TRIGGER"
+	// HazardDropView indicates dropping a view or materialized view.
+	HazardDropView HazardCode = "DROP_VIEW"
 )
 
 // HazardLevel indicates the operational or data-loss severity of a migration step.
@@ -495,6 +547,81 @@ func stepHazards(s Step) []Hazard {
 				SQL:         s.SQL,
 			})
 		}
+	case ChangeCreateExtension:
+		hazards = append(hazards, Hazard{
+			Code:        HazardExtensionPrivilege,
+			Level:       HazardLevelWarning,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Creating extension %q may require superuser or CREATE privilege on the database", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeDropExtension:
+		hazards = append(hazards, Hazard{
+			Code:        HazardDropExtension,
+			Level:       HazardLevelCritical,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Extension %q will be dropped along with objects it owns", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeEnableRLS, ChangeForceRLS:
+		hazards = append(hazards, Hazard{
+			Code:        HazardRLSEnable,
+			Level:       HazardLevelWarning,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Enabling RLS on table %q can lock out roles that lack matching policies", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeDropPolicy:
+		hazards = append(hazards, Hazard{
+			Code:        HazardDropPolicy,
+			Level:       HazardLevelCritical,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Row-level security policy on table %q will be dropped", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeDropFunction:
+		hazards = append(hazards, Hazard{
+			Code:        HazardDropFunction,
+			Level:       HazardLevelCritical,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Function/procedure %q will be dropped", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeCreateFunction:
+		if strings.Contains(strings.ToUpper(s.SQL), "SECURITY DEFINER") &&
+			!strings.Contains(strings.ToLower(s.SQL), "search_path") {
+			hazards = append(hazards, Hazard{
+				Code:        HazardSecurityDefiner,
+				Level:       HazardLevelWarning,
+				Type:        s.Type,
+				Table:       s.Table,
+				Description: fmt.Sprintf("SECURITY DEFINER routine %q has no explicit search_path; set search_path to avoid privilege escalation via schema shadowing", s.Table),
+				SQL:         s.SQL,
+			})
+		}
+	case ChangeDropTrigger:
+		hazards = append(hazards, Hazard{
+			Code:        HazardDropTrigger,
+			Level:       HazardLevelCritical,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Trigger on table %q will be dropped", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeDropView:
+		hazards = append(hazards, Hazard{
+			Code:        HazardDropView,
+			Level:       HazardLevelCritical,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("View %q will be dropped", s.Table),
+			SQL:         s.SQL,
+		})
 	}
 	return hazards
 }

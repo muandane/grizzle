@@ -26,6 +26,11 @@ type Change struct {
 	OldEnum           *schema.Enum
 	EnumValue         string
 	TableData         *schema.Table
+	Extension         *schema.Extension
+	Policy            *schema.Policy
+	Routine           *schema.Routine
+	Trigger           *schema.Trigger
+	View              *schema.View
 	Destructive       bool
 	IsRenameCandidate bool
 
@@ -67,6 +72,28 @@ func DiffWithMappings(live, desired *schema.Schema, targetSchema, shadowSchema s
 
 	normalize := func(def string) string {
 		return schema.NormalizeDefinitionWithMappings(def, schemaMappings, targetSchema)
+	}
+
+	// 0. Extensions Diff (desired Extensions are injected from SchemaSQL parse).
+	// Create missing desired extensions only. Live-only extensions are never
+	// auto-dropped: they are database-wide and may be owned by other tools.
+	// DROP_EXTENSION is reserved for an explicit AllowDropExtension path that
+	// requires the extension to have been removed from SchemaSQL while still
+	// appearing in a caller-supplied managed set — not implemented as a
+	// blanket live-minus-desired sweep.
+	dExtNames := slices.Collect(maps.Keys(desired.Extensions))
+	slices.Sort(dExtNames)
+	for _, dName := range dExtNames {
+		dExt := desired.Extensions[dName]
+		if _, exists := live.Extensions[dName]; !exists {
+			changes = append(changes, Change{
+				Type:        plan.ChangeCreateExtension,
+				Schema:      targetSchema,
+				Table:       dName,
+				Extension:   dExt,
+				Destructive: false,
+			})
+		}
 	}
 
 	// 1. Custom ENUM Types Diff

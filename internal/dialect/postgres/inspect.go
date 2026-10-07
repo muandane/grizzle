@@ -14,11 +14,46 @@ import (
 // Inspect reads the relational state of the specified schema directly from pg_catalog.
 func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema.Schema, error) {
 	s := &schema.Schema{
-		Name:      schemaName,
-		Tables:    make(map[string]*schema.Table),
-		Enums:     make(map[string]*schema.Enum),
-		Unmanaged: make(map[string]*schema.UnmanagedObject),
+		Name:       schemaName,
+		Tables:     make(map[string]*schema.Table),
+		Enums:      make(map[string]*schema.Enum),
+		Extensions: make(map[string]*schema.Extension),
+		Routines:   make(map[string]*schema.Routine),
+		Views:      make(map[string]*schema.View),
+		Unmanaged:  make(map[string]*schema.UnmanagedObject),
 	}
+
+	// 0. Inspect Extensions (database-wide; keyed by lowercased name)
+	extQuery := `
+		SELECT
+			e.extname AS ext_name,
+			COALESCE(n.nspname, '') AS ext_schema,
+			COALESCE(e.extversion, '') AS ext_version
+		FROM pg_extension e
+		LEFT JOIN pg_namespace n ON n.oid = e.extnamespace
+		ORDER BY e.extname;
+	`
+	extRows, err := dbtx.QueryContext(ctx, extQuery)
+	if err != nil {
+		return nil, fmt.Errorf("inspecting extensions: %w", err)
+	}
+	defer func() { _ = extRows.Close() }()
+	for extRows.Next() {
+		var name, extSchema, version string
+		if err := extRows.Scan(&name, &extSchema, &version); err != nil {
+			return nil, fmt.Errorf("scanning extension: %w", err)
+		}
+		key := strings.ToLower(name)
+		s.Extensions[key] = &schema.Extension{
+			Name:    key,
+			Schema:  extSchema,
+			Version: version,
+		}
+	}
+	if err := extRows.Err(); err != nil {
+		return nil, err
+	}
+	_ = extRows.Close()
 
 	// 1. Inspect Custom ENUM Types
 	enumQuery := `

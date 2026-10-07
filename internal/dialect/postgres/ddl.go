@@ -267,6 +267,17 @@ func GenerateAttachPartitionSQL(targetSchema, parentTable, childTable, bounds st
 	return fmt.Sprintf("ALTER TABLE %q.%q ATTACH PARTITION %q.%q %s;", targetSchema, parentTable, targetSchema, childTable, b)
 }
 
+// GenerateCreateExtensionSQL constructs a CREATE EXTENSION IF NOT EXISTS statement.
+func GenerateCreateExtensionSQL(ext *schema.Extension) string {
+	if ext == nil || ext.Name == "" {
+		return ""
+	}
+	if ext.Schema != "" {
+		return fmt.Sprintf("CREATE EXTENSION IF NOT EXISTS %q WITH SCHEMA %q;", ext.Name, ext.Schema)
+	}
+	return fmt.Sprintf("CREATE EXTENSION IF NOT EXISTS %q;", ext.Name)
+}
+
 // RenderOpts configures DDL rendering behavior such as concurrency and server version-specific syntax.
 type RenderOpts struct {
 	NonConcurrentIndexes bool
@@ -353,6 +364,8 @@ func RenderChangeWithOpts(targetSchema string, c diff.Change, opts RenderOpts) p
 	}
 
 	switch c.Type {
+	case plan.ChangeCreateExtension:
+		step.SQL = GenerateCreateExtensionSQL(c.Extension)
 	case plan.ChangeCreateEnum:
 		step.SQL = GenerateCreateEnumSQL(effectiveSchema, c.Enum)
 	case plan.ChangeAlterEnum:

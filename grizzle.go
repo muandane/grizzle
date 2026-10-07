@@ -114,6 +114,21 @@ const (
 	ChangeRenameColumn       = plan.ChangeRenameColumn
 	ChangeAttachPartition    = plan.ChangeAttachPartition
 	ChangeDetachPartition    = plan.ChangeDetachPartition
+	ChangeCreateExtension    = plan.ChangeCreateExtension
+	ChangeDropExtension      = plan.ChangeDropExtension
+	ChangeEnableRLS          = plan.ChangeEnableRLS
+	ChangeDisableRLS         = plan.ChangeDisableRLS
+	ChangeForceRLS           = plan.ChangeForceRLS
+	ChangeNoForceRLS         = plan.ChangeNoForceRLS
+	ChangeCreatePolicy       = plan.ChangeCreatePolicy
+	ChangeDropPolicy         = plan.ChangeDropPolicy
+	ChangeCreateFunction     = plan.ChangeCreateFunction
+	ChangeDropFunction       = plan.ChangeDropFunction
+	ChangeCreateTrigger      = plan.ChangeCreateTrigger
+	ChangeDropTrigger        = plan.ChangeDropTrigger
+	ChangeCreateView         = plan.ChangeCreateView
+	ChangeDropView           = plan.ChangeDropView
+	ChangeRefreshMatView     = plan.ChangeRefreshMatView
 )
 
 // HazardCode constants
@@ -132,10 +147,33 @@ const (
 	HazardGeneratedRewrite       = plan.HazardGeneratedRewrite
 	HazardPartitionAttachScan    = plan.HazardPartitionAttachScan
 	HazardPartitionPendingDetach = plan.HazardPartitionPendingDetach
+	HazardExtensionPrivilege     = plan.HazardExtensionPrivilege
+	HazardDropExtension          = plan.HazardDropExtension
+	HazardRLSEnable              = plan.HazardRLSEnable
+	HazardDropPolicy             = plan.HazardDropPolicy
+	HazardDropFunction           = plan.HazardDropFunction
+	HazardSecurityDefiner        = plan.HazardSecurityDefiner
+	HazardDropTrigger            = plan.HazardDropTrigger
+	HazardDropView               = plan.HazardDropView
 )
 
 // UnmanagedObject represents an unmanaged database object detected during introspection.
 type UnmanagedObject = schema.UnmanagedObject
+
+// ExtensionIR represents the intermediate representation of a PostgreSQL extension.
+type ExtensionIR = schema.Extension
+
+// RoutineIR represents the intermediate representation of a function or procedure.
+type RoutineIR = schema.Routine
+
+// ViewIR represents the intermediate representation of a view or materialized view.
+type ViewIR = schema.View
+
+// PolicyIR represents the intermediate representation of a row-level security policy.
+type PolicyIR = schema.Policy
+
+// TriggerIR represents the intermediate representation of a trigger.
+type TriggerIR = schema.Trigger
 
 // UnmanagedKind represents the category of an unmanaged database object.
 type UnmanagedKind = schema.UnmanagedKind
@@ -503,6 +541,11 @@ func optionsFromPlan(p *Plan, opts ApplyOpts) Options {
 		AllowDropIndex:         &p.Policy.AllowIndex,
 		AllowDropFK:            &p.Policy.AllowFK,
 		AllowDropCheck:         &p.Policy.AllowCheck,
+		AllowDropExtension:     &p.Policy.AllowExtension,
+		AllowDropFunction:      &p.Policy.AllowFunction,
+		AllowDropPolicy:        &p.Policy.AllowPolicy,
+		AllowDropTrigger:       &p.Policy.AllowTrigger,
+		AllowDropView:          &p.Policy.AllowView,
 		AcceptHazards:          opts.AcceptHazards,
 		Backfill:               opts.Backfill,
 		BeforeSync:             opts.BeforeSync,
@@ -596,7 +639,13 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 	// the enum name in Table, not a table name, so they are skipped.
 	planFilters := scope.Filters{Includes: p.IncludeTables, Excludes: p.ExcludeTables}
 	for _, s := range p.Steps {
-		if s.Type == plan.ChangeCreateEnum || s.Type == plan.ChangeAlterEnum {
+		// Schema-scoped steps carry non-table names in Table (enum/extension/
+		// function/view names); skip table scope checks for them.
+		switch s.Type {
+		case plan.ChangeCreateEnum, plan.ChangeAlterEnum,
+			plan.ChangeCreateExtension, plan.ChangeDropExtension,
+			plan.ChangeCreateFunction, plan.ChangeDropFunction,
+			plan.ChangeCreateView, plan.ChangeDropView:
 			continue
 		}
 		if !scope.IsTableManaged(s.Table, planFilters) {

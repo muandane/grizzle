@@ -49,11 +49,16 @@ type Options struct {
 	AllowDrop bool
 
 	// Granular drop overrides (nil inherits from AllowDrop):
-	AllowDropTable  *bool
-	AllowDropColumn *bool
-	AllowDropIndex  *bool
-	AllowDropFK     *bool
-	AllowDropCheck  *bool
+	AllowDropTable     *bool
+	AllowDropColumn    *bool
+	AllowDropIndex     *bool
+	AllowDropFK        *bool
+	AllowDropCheck     *bool
+	AllowDropExtension *bool
+	AllowDropFunction  *bool
+	AllowDropPolicy    *bool
+	AllowDropTrigger   *bool
+	AllowDropView      *bool
 
 	// ExcludeTables defines table names or glob patterns (e.g. "spatial_ref_sys", "asynq_*")
 	// that Grizzle will never manage, alter, or drop.
@@ -435,12 +440,42 @@ func resolveDropPolicy(opts Options) plan.DropPolicy {
 		allowCheck = *opts.AllowDropCheck
 	}
 
+	allowExtension := opts.AllowDrop
+	if opts.AllowDropExtension != nil {
+		allowExtension = *opts.AllowDropExtension
+	}
+
+	allowFunction := opts.AllowDrop
+	if opts.AllowDropFunction != nil {
+		allowFunction = *opts.AllowDropFunction
+	}
+
+	allowPolicy := opts.AllowDrop
+	if opts.AllowDropPolicy != nil {
+		allowPolicy = *opts.AllowDropPolicy
+	}
+
+	allowTrigger := opts.AllowDrop
+	if opts.AllowDropTrigger != nil {
+		allowTrigger = *opts.AllowDropTrigger
+	}
+
+	allowView := opts.AllowDrop
+	if opts.AllowDropView != nil {
+		allowView = *opts.AllowDropView
+	}
+
 	return plan.DropPolicy{
-		AllowTable:  allowTable,
-		AllowColumn: allowColumn,
-		AllowIndex:  allowIndex,
-		AllowFK:     allowFK,
-		AllowCheck:  allowCheck,
+		AllowTable:     allowTable,
+		AllowColumn:    allowColumn,
+		AllowIndex:     allowIndex,
+		AllowFK:        allowFK,
+		AllowCheck:     allowCheck,
+		AllowExtension: allowExtension,
+		AllowFunction:  allowFunction,
+		AllowPolicy:    allowPolicy,
+		AllowTrigger:   allowTrigger,
+		AllowView:      allowView,
 	}
 }
 

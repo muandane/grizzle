@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"maps"
 	"os"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -139,6 +141,11 @@ func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig
 		if err != nil {
 			return nil, fmt.Errorf("%w: shadow schema: %w", plan.ErrInspectionFailed, err)
 		}
+		// Desired extensions are declared via CREATE EXTENSION statements,
+		// which do not persist in the rolled-back shadow tx. Parse them
+		// straight from SchemaSQL (authoritative desired set).
+		desired.Extensions = schema.ParseExtensions(cfg.SchemaSQL)
+		maskShadowExtensions(live, []string{shadowSchema})
 
 		changes, err := diff.Diff(live, desired, targetSchema, shadowSchema, cfg.Filters)
 		if err != nil {
@@ -166,6 +173,15 @@ func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig
 	if err != nil {
 		return nil, fmt.Errorf("%w: shadow schemas: %w", plan.ErrInspectionFailed, err)
 	}
+	// Extensions are database-wide: inject the parsed desired set into the
+	// primary schema only so multi-schema diffs do not duplicate steps.
+	if primary := desiredMap[shadowMap[cfg.primarySchema()]]; primary != nil {
+		primary.Extensions = schema.ParseExtensions(cfg.SchemaSQL)
+	}
+	shadowNames := slices.Collect(maps.Values(shadowMap))
+	for _, live := range liveMap {
+		maskShadowExtensions(live, shadowNames)
+	}
 
 	var allChanges []diff.Change
 	for _, target := range targetSchemas {
@@ -181,6 +197,26 @@ func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig
 
 	steps := postgres.RenderChangesWithOpts(targetSchemas[0], allChanges, renderOpts)
 	return steps, nil
+}
+
+// maskShadowExtensions removes shadow-installed extensions from a live
+// schema snapshot. The shadow compile best-effort installs CREATE EXTENSION
+// into the shadow namespace inside the rolled-back compile tx; pg_extension
+// is database-wide, so without masking the diff would treat those ephemeral
+// installs as already-satisfied live state.
+func maskShadowExtensions(live *schema.Schema, shadowSchemas []string) {
+	if live == nil || len(live.Extensions) == 0 || len(shadowSchemas) == 0 {
+		return
+	}
+	shadowSet := make(map[string]bool, len(shadowSchemas))
+	for _, s := range shadowSchemas {
+		shadowSet[s] = true
+	}
+	for name, ext := range live.Extensions {
+		if ext != nil && shadowSet[ext.Schema] {
+			delete(live.Extensions, name)
+		}
+	}
 }
 
 func inspectPostgresSchema(ctx context.Context, dbtx dialect.DBTX, schema string, tracer Tracer) (*schema.Schema, error) {

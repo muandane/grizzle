@@ -49,5 +49,9 @@ func CompileSchemaPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConf
 	for _, t := range s.Tables {
 		t.Schema = primarySchema
 	}
+	// Desired extensions come from statement parsing, not the shadow catalog:
+	// best-effort installs roll back with the tx and may have failed on
+	// privileges, but the declared set is what the user wrote.
+	s.Extensions = schema.ParseExtensions(cfg.SchemaSQL)
 	return s, nil
 }
