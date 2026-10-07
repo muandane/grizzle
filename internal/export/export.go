@@ -163,7 +163,8 @@ func isStepReversible(s plan.Step) bool {
 	switch s.Type {
 	case plan.ChangeCreateTable, plan.ChangeAddColumn, plan.ChangeCreateIndex, plan.ChangeAddFK, plan.ChangeAddCheck, plan.ChangeRenameColumn, plan.ChangeAttachPartition,
 		plan.ChangeCreatePolicy, plan.ChangeEnableRLS, plan.ChangeDisableRLS, plan.ChangeForceRLS, plan.ChangeNoForceRLS,
-		plan.ChangeCreateFunction, plan.ChangeCreateTrigger, plan.ChangeCreateView, plan.ChangeRefreshMatView:
+		plan.ChangeCreateFunction, plan.ChangeCreateTrigger, plan.ChangeCreateView, plan.ChangeRefreshMatView,
+		plan.ChangeCommentTable, plan.ChangeCommentColumn:
 		return true
 	default:
 		// ChangeCreateExtension is intentionally irreversible: uninstalling an
@@ -266,6 +267,14 @@ func reverseStepSQL(s plan.Step) string {
 	case plan.ChangeRefreshMatView:
 		// REFRESH is idempotent; refreshing again on rollback is a no-op.
 		return fmt.Sprintf("-- REFRESH %s is idempotent; no reversal required", s.Table)
+
+	case plan.ChangeCommentTable, plan.ChangeCommentColumn:
+		// Restore the previous comment (IS NULL when there was none).
+		escaped := strings.ReplaceAll(s.OldComment, "'", "''")
+		if s.Column != "" && s.Type == plan.ChangeCommentColumn {
+			return fmt.Sprintf(`COMMENT ON COLUMN "%s"."%s" IS '%s';`, s.Schema, s.Table, escaped)
+		}
+		return fmt.Sprintf(`COMMENT ON TABLE "%s"."%s" IS '%s';`, s.Schema, s.Table, escaped)
 
 	default:
 		return fmt.Sprintf("-- Reversal not supported for %s", s.Type)

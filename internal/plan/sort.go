@@ -50,8 +50,10 @@ func SortSteps(steps []Step) {
 		ChangeForceRLS:           86,
 		ChangeDisableRLS:         86,
 		ChangeNoForceRLS:         86,
-		ChangeCreatePolicy:       87,  // 10b. Policies after RLS enabled
-		ChangeCreateTrigger:      88,  // 10c. Triggers after functions and columns
+		ChangeCreatePolicy:       87, // 10b. Policies after RLS enabled
+		ChangeCreateTrigger:      88, // 10c. Triggers after functions and columns
+		ChangeCommentTable:       89, // 10c'. Comments after all objects exist
+		ChangeCommentColumn:      89,
 		ChangeCreateView:         95,  // 10d. Views after tables/functions
 		ChangeRefreshMatView:     96,  // 10e. Refresh matviews after create
 		ChangeDropColumn:         90,  // 11. Drop columns (if allowed)

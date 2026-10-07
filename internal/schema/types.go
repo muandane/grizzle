@@ -130,6 +130,7 @@ type Table struct {
 	PartitionOf  *PartitionOf                `json:"partition_of,omitempty"`
 	RLSEnabled   bool                        `json:"rls_enabled,omitempty"`
 	RLSForced    bool                        `json:"rls_forced,omitempty"`
+	Comment      string                      `json:"comment,omitempty"`
 }
 
 // Policy represents a PostgreSQL row-level security policy.
@@ -174,6 +175,7 @@ type Column struct {
 	IsIdentity   bool             `json:"is_identity,omitempty"`
 	IdentityType string           `json:"identity_type,omitempty"`
 	Generated    *GeneratedColumn `json:"generated,omitempty"`
+	Comment      string           `json:"comment,omitempty"`
 	// Autoincrement is SQLite-specific: true when the column is declared
 	// INTEGER PRIMARY KEY AUTOINCREMENT (distinct from plain INTEGER PRIMARY KEY).
 	Autoincrement bool `json:"autoincrement,omitzero"`

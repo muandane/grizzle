@@ -420,6 +420,16 @@ func GenerateRefreshMatViewSQL(targetSchema, viewName string) string {
 	return fmt.Sprintf("REFRESH MATERIALIZED VIEW %q.%q;", targetSchema, viewName)
 }
 
+// GenerateCommentSQL renders a COMMENT ON statement for a table or column.
+// An empty comment renders IS NULL (clearing the comment).
+func GenerateCommentSQL(targetSchema, tableName, columnName, comment string) string {
+	escaped := strings.ReplaceAll(comment, "'", "''")
+	if columnName == "" {
+		return fmt.Sprintf("COMMENT ON TABLE %q.%q IS '%s';", targetSchema, tableName, escaped)
+	}
+	return fmt.Sprintf("COMMENT ON COLUMN %q.%q.%q IS '%s';", targetSchema, tableName, columnName, escaped)
+}
+
 // RenderOpts configures DDL rendering behavior such as concurrency and server version-specific syntax.
 type RenderOpts struct {
 	NonConcurrentIndexes bool
@@ -498,6 +508,7 @@ func RenderChangeWithOpts(targetSchema string, c diff.Change, opts RenderOpts) p
 		IsGeneratedRewrite: c.GeneratedChanged,
 		UnmanagedDeps:      c.UnmanagedDeps,
 		Replace:            c.Replace,
+		OldComment:         c.OldComment,
 	}
 	if c.Column != nil {
 		step.Column = c.Column.Name
@@ -538,6 +549,18 @@ func RenderChangeWithOpts(targetSchema string, c diff.Change, opts RenderOpts) p
 		step.SQL = GenerateDropViewSQL(effectiveSchema, c.Table, isMat)
 	case plan.ChangeRefreshMatView:
 		step.SQL = GenerateRefreshMatViewSQL(effectiveSchema, c.Table)
+	case plan.ChangeCommentTable:
+		comment := ""
+		if c.TableData != nil {
+			comment = c.TableData.Comment
+		}
+		step.SQL = GenerateCommentSQL(effectiveSchema, c.Table, "", comment)
+	case plan.ChangeCommentColumn:
+		comment := ""
+		if c.Column != nil {
+			comment = c.Column.Comment
+		}
+		step.SQL = GenerateCommentSQL(effectiveSchema, c.Table, step.Column, comment)
 	case plan.ChangeCreateEnum:
 		step.SQL = GenerateCreateEnumSQL(effectiveSchema, c.Enum)
 	case plan.ChangeAlterEnum:

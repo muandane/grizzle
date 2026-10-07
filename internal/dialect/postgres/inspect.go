@@ -132,7 +132,8 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 			COALESCE(pg_get_expr(d.adbin, d.adrelid), '') AS column_default,
 			a.attnum AS ordinal_position,
 			a.attidentity AS identity_type,
-			a.attgenerated AS generated_type
+			a.attgenerated AS generated_type,
+			COALESCE(col_description(c.oid, a.attnum), '') AS column_comment
 		FROM pg_attribute a
 		JOIN pg_class c ON c.oid = a.attrelid
 		JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -160,9 +161,10 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 			position      int
 			identityType  string
 			generatedType string
+			colComment    string
 		)
 
-		if err := rows.Scan(&tableName, &colName, &rawType, &isNullable, &rawDefault, &position, &identityType, &generatedType); err != nil {
+		if err := rows.Scan(&tableName, &colName, &rawType, &isNullable, &rawDefault, &position, &identityType, &generatedType, &colComment); err != nil {
 			return nil, fmt.Errorf("scanning column data in schema %q: %w", schemaName, err)
 		}
 
@@ -188,6 +190,7 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 			IsNullable:   isNullable,
 			DefaultValue: schema.NormalizeDefault(rawDefault),
 			Position:     position,
+			Comment:      colComment,
 		}
 
 		switch strings.TrimSpace(generatedType) {
@@ -220,6 +223,36 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 		return nil, err
 	}
 	_ = rows.Close()
+
+	// 2a.1 Table comments (obj_description on pg_class).
+	tableCommentQuery := `
+		SELECT c.relname, COALESCE(obj_description(c.oid, 'pg_class'), '')
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1
+		  AND c.relkind IN ('r', 'p')
+		ORDER BY c.relname;
+	`
+	commentRows, err := dbtx.QueryContext(ctx, tableCommentQuery, schemaName)
+	if err != nil {
+		return nil, fmt.Errorf("inspecting table comments in schema %q: %w", schemaName, err)
+	}
+	for commentRows.Next() {
+		var tblName, comment string
+		if err := commentRows.Scan(&tblName, &comment); err != nil {
+			_ = commentRows.Close()
+			return nil, fmt.Errorf("scanning table comment in schema %q: %w", schemaName, err)
+		}
+		tbl, exists := s.Tables[tblName]
+		if !exists {
+			continue
+		}
+		tbl.Comment = comment
+	}
+	if err := commentRows.Err(); err != nil {
+		return nil, err
+	}
+	_ = commentRows.Close()
 
 	// 2b. Inspect Partitioned Tables
 	partQuery := `

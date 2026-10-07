@@ -34,6 +34,7 @@ type Change struct {
 	Replace           bool
 	Destructive       bool
 	IsRenameCandidate bool
+	OldComment        string
 
 	// Structural flags for hazard analysis
 	ColumnNotNull    bool
@@ -229,6 +230,22 @@ func DiffWithMappings(live, desired *schema.Schema, targetSchema, shadowSchema s
 					Trigger:     &trgCopy,
 					Destructive: false,
 				})
+			}
+			// New table: comments are separate statements (COMMENT ON), emitted
+			// after the objects they describe.
+			changes = append(changes, commentChanges(targetSchema, tblName, dTable.Comment, "", nil, nil)...)
+			for _, dColName := range sortedColumnNamesOf(dTable) {
+				dCol := dTable.Columns[dColName]
+				if dCol.Comment != "" {
+					colCopy := *dCol
+					changes = append(changes, Change{
+						Type:        plan.ChangeCommentColumn,
+						Schema:      targetSchema,
+						Table:       tblName,
+						Column:      &colCopy,
+						Destructive: false,
+					})
+				}
 			}
 			continue
 		}
@@ -446,6 +463,22 @@ func DiffWithMappings(live, desired *schema.Schema, targetSchema, shadowSchema s
 						findSurvivingTriggerDeps(lTable, dTable, normalize),
 					),
 				})
+			}
+
+			// Comment drift: table-level plus per-column (existing columns;
+			// added columns with comments emit their own step).
+			changes = append(changes, commentChanges(targetSchema, tblName, dTable.Comment, lTable.Comment, dTable, lTable)...)
+			for _, colName := range addedKeys {
+				if dCol := addedCols[colName]; dCol.Comment != "" {
+					colCopy := *dCol
+					changes = append(changes, Change{
+						Type:        plan.ChangeCommentColumn,
+						Schema:      targetSchema,
+						Table:       tblName,
+						Column:      &colCopy,
+						Destructive: false,
+					})
+				}
 			}
 		}
 
@@ -785,6 +818,51 @@ func DiffWithMappings(live, desired *schema.Schema, targetSchema, shadowSchema s
 	changes = append(changes, diffViews(live, desired, targetSchema, normalize)...)
 
 	return changes, nil
+}
+
+// commentChanges emits COMMENT drift steps: table comment and column
+// comments on columns present in both live and desired. A comment is set
+// when desired is non-empty; it is cleared (IS NULL) when desired is empty
+// but live carries one. OldComment enables reversal in migration exports.
+func commentChanges(targetSchema, tblName, dComment, lComment string, dTable, lTable *schema.Table) []Change {
+	var changes []Change
+	if dComment != lComment {
+		changes = append(changes, Change{
+			Type:        plan.ChangeCommentTable,
+			Schema:      targetSchema,
+			Table:       tblName,
+			TableData:   &schema.Table{Name: tblName, Comment: dComment},
+			OldComment:  lComment,
+			Destructive: false,
+		})
+	}
+	if dTable == nil || lTable == nil {
+		return changes
+	}
+	for _, colName := range sortedColumnNamesOf(dTable) {
+		dCol := dTable.Columns[colName]
+		lCol, exists := lTable.Columns[colName]
+		if !exists || dCol.Comment == (lCol.Comment) {
+			continue
+		}
+		colCopy := *dCol
+		changes = append(changes, Change{
+			Type:        plan.ChangeCommentColumn,
+			Schema:      targetSchema,
+			Table:       tblName,
+			Column:      &colCopy,
+			OldComment:  lCol.Comment,
+			Destructive: false,
+		})
+	}
+	return changes
+}
+
+// sortedColumnNamesOf returns a table's column names in deterministic order.
+func sortedColumnNamesOf(t *schema.Table) []string {
+	names := slices.Collect(maps.Keys(t.Columns))
+	slices.Sort(names)
+	return names
 }
 
 // appendOnlyColumns reports whether desired view columns extend the live

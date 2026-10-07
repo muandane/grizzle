@@ -47,6 +47,8 @@ const (
 	ChangeCreateView         ChangeType = "CREATE_VIEW"
 	ChangeDropView           ChangeType = "DROP_VIEW"
 	ChangeRefreshMatView     ChangeType = "REFRESH_MATVIEW"
+	ChangeCommentTable       ChangeType = "COMMENT_TABLE"
+	ChangeCommentColumn      ChangeType = "COMMENT_COLUMN"
 )
 
 // Step represents a single atomic DDL migration statement.
@@ -85,6 +87,10 @@ type Step struct {
 
 	// Replace marks a CREATE_VIEW step rendered as CREATE OR REPLACE VIEW.
 	Replace bool `json:"replace,omitzero"`
+
+	// OldComment carries the previous COMMENT ON value for comment steps so
+	// migration export can restore it on rollback.
+	OldComment string `json:"old_comment,omitzero"`
 }
 
 // DropPolicy defines fine-grained permissions for destructive operations.
@@ -356,6 +362,8 @@ const (
 	HazardDropTrigger HazardCode = "DROP_TRIGGER"
 	// HazardDropView indicates dropping a view or materialized view.
 	HazardDropView HazardCode = "DROP_VIEW"
+	// HazardCommentClear indicates an existing COMMENT is being replaced or cleared.
+	HazardCommentClear HazardCode = "COMMENT_CLEAR"
 )
 
 // HazardLevel indicates the operational or data-loss severity of a migration step.
@@ -625,6 +633,17 @@ func stepHazards(s Step) []Hazard {
 			Description: fmt.Sprintf("View %q will be dropped", s.Table),
 			SQL:         s.SQL,
 		})
+	case ChangeCommentTable, ChangeCommentColumn:
+		if s.OldComment != "" {
+			hazards = append(hazards, Hazard{
+				Code:        HazardCommentClear,
+				Level:       HazardLevelNotice,
+				Type:        s.Type,
+				Table:       s.Table,
+				Description: fmt.Sprintf("Existing comment on %q will be replaced or cleared", s.Table),
+				SQL:         s.SQL,
+			})
+		}
 	}
 	return hazards
 }
