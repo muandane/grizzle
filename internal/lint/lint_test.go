@@ -17,10 +17,26 @@ func testSchema() *schema.Schema {
 		Columns:     map[string]*schema.Column{},
 		Indexes:     map[string]*schema.Index{},
 		ForeignKeys: map[string]*schema.ForeignKey{},
+		Checks:      map[string]*schema.CheckConstraint{},
 		PrimaryKey:  &schema.PrimaryKey{Name: "users_pkey", Columns: []string{"id"}},
 	}
 	users.Columns["id"] = &schema.Column{Name: "id", DataType: "integer", IsIdentity: true}
 	users.Columns["email"] = &schema.Column{Name: "email", DataType: "text"}
+	users.Checks["users_email_format_check"] = &schema.CheckConstraint{
+		Name: "users_email_format_check", TableName: "users", Definition: "CHECK ((email <> ''))", IsValid: true,
+	}
+	users.Checks["users_email_nonempty"] = &schema.CheckConstraint{
+		Name: "users_email_nonempty", TableName: "users", Definition: "CHECK ((email <> ''))", IsValid: false,
+	}
+	users.Checks["users_email_required"] = &schema.CheckConstraint{
+		Name: "users_email_required", TableName: "users", Definition: "CHECK (email <> '')", IsValid: true,
+	}
+	users.Checks["UsersEmailLen"] = &schema.CheckConstraint{
+		Name: "UsersEmailLen", TableName: "users", Definition: "CHECK (char_length(email) > 3)", IsValid: true,
+	}
+	users.Checks["users_check"] = &schema.CheckConstraint{
+		Name: "users_check", TableName: "users", Definition: "CHECK ((id > 0))", IsValid: true,
+	}
 
 	posts := &schema.Table{
 		Name:        "Posts",
@@ -176,6 +192,84 @@ func TestLint_DeterministicOrder(t *testing.T) {
 		if a[i-1].RuleID > a[i].RuleID || (a[i-1].RuleID == a[i].RuleID && a[i-1].Table > a[i].Table) {
 			t.Errorf("diagnostics not sorted: %+v before %+v", a[i-1], a[i])
 		}
+	}
+}
+
+func TestCheckNamingConvention(t *testing.T) {
+	diags := Lint(testSchema(), CheckNamingConvention{})
+	if len(diags) != 1 {
+		t.Fatalf("expected 1 diagnostic (UsersEmailLen), got %d: %+v", len(diags), diags)
+	}
+	d := diags[0]
+	if d.RuleID != "L005" || d.Severity != SeverityWarning || d.Table != "users" || d.Column != "UsersEmailLen" {
+		t.Errorf("unexpected diagnostic: %+v", d)
+	}
+}
+
+func TestDuplicateCheckConstraint(t *testing.T) {
+	diags := Lint(testSchema(), DuplicateCheckConstraint{})
+	if len(diags) != 2 {
+		t.Fatalf("expected 2 diagnostics (both duplicates of users_email_format_check), got %d: %+v", len(diags), diags)
+	}
+	wantCols := []string{"users_email_nonempty", "users_email_required"}
+	for i, d := range diags {
+		if d.RuleID != "L006" || d.Table != "users" || d.Column != wantCols[i] {
+			t.Errorf("unexpected diagnostic[%d]: %+v", i, d)
+		}
+		if !strings.Contains(d.Message, "users_email_format_check") {
+			t.Errorf("diagnostic[%d] should reference the first constraint, got: %s", i, d.Message)
+		}
+	}
+}
+
+func TestDuplicateCheckConstraint_Normalization(t *testing.T) {
+	cases := []struct {
+		name string
+		a, b string
+		same bool
+	}{
+		{"double parens", "CHECK ((email <> ''))", "CHECK (email<>'')", true},
+		{"case + whitespace", "CHECK ( Char_Length(EMAIL) > 3 )", "CHECK (char_length(email)>3)", true},
+		{"literals preserved", "CHECK (status IN ('a b'))", "CHECK (status IN ('ab'))", false},
+		{"different exprs", "CHECK ((a > 0))", "CHECK ((b > 0))", false},
+		{"multi-group whitespace only", "CHECK ((a > 0) AND (b > 0))", "CHECK ((a>0) AND (b>0))", true},
+		{"multi-group vs flat stays distinct", "CHECK ((a > 0) AND (b > 0))", "CHECK (a > 0 AND b > 0)", false},
+	}
+	for _, tc := range cases {
+		na, nb := normalizeCheckExpr(tc.a), normalizeCheckExpr(tc.b)
+		if same := na == nb; same != tc.same {
+			t.Errorf("%s: normalize(%q)=%q vs normalize(%q)=%q, same=%v want %v", tc.name, tc.a, na, tc.b, nb, same, tc.same)
+		}
+	}
+}
+
+func TestPreferNamedChecks(t *testing.T) {
+	diags := Lint(testSchema(), PreferNamedChecks{})
+	if len(diags) != 1 {
+		t.Fatalf("expected 1 diagnostic (users_check), got %d: %+v", len(diags), diags)
+	}
+	d := diags[0]
+	if d.RuleID != "L007" || d.Severity != SeverityInfo || d.Table != "users" || d.Column != "users_check" {
+		t.Errorf("unexpected diagnostic: %+v", d)
+	}
+	// Explicitly named constraints sharing the _check suffix must not flag:
+	// users_email_format_check has prefix users_email_format, which is neither
+	// the table name nor table_column.
+	for _, d := range diags {
+		if d.Column == "users_email_format_check" {
+			t.Errorf("named constraint %s should not be flagged as auto-generated", d.Column)
+		}
+	}
+}
+
+func TestFormatGitHub_InfoIsNotice(t *testing.T) {
+	var buf bytes.Buffer
+	diags := []Diagnostic{{RuleID: "L007", Severity: SeverityInfo, Table: "users", Column: "users_check", Message: "x"}}
+	if err := FormatGitHub(&buf, diags); err != nil {
+		t.Fatalf("FormatGitHub: %v", err)
+	}
+	if got := buf.String(); !strings.HasPrefix(got, "::notice title=L007::") {
+		t.Errorf("INFO should render as notice annotation, got: %q", got)
 	}
 }
 

@@ -656,6 +656,8 @@ const (
 	LintSeverityError = lint.SeverityError
 	// LintSeverityWarning marks a recommendation that may be ignored deliberately.
 	LintSeverityWarning = lint.SeverityWarning
+	// LintSeverityInfo marks a stylistic suggestion with no correctness impact.
+	LintSeverityInfo = lint.SeverityInfo
 )
 
 // CompileSchema compiles opts.SchemaSQL into the desired SchemaIR without
