@@ -431,7 +431,7 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 		}
 		var roles []string
 		if rolesCSV != "" {
-			for _, r := range strings.Split(rolesCSV, ",") {
+			for r := range strings.SplitSeq(rolesCSV, ",") {
 				if r = strings.TrimSpace(r); r != "" {
 					roles = append(roles, r)
 				}

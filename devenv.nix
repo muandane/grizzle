@@ -10,6 +10,7 @@
   # Go Language Support
   languages.go = {
     enable = true;
+    version = "1.27.1";
   };
 
   # Packages needed for development, linting, and database interaction
