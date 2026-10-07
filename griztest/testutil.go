@@ -61,3 +61,26 @@ func Reset(t testing.TB, db *sql.DB, schemaSQL string, opts ...grizzle.Option) {
 	t.Helper()
 	MustSync(t, db, schemaSQL, opts...)
 }
+
+// MustSyncWithSeed applies the given schemaSQL to db using Grizzle and then
+// executes the idempotent seedSQL (Sync DDL → AfterSync → Seed). The seed is
+// skipped automatically when the same seed was already applied, unless an
+// option sets grizzle.WithSeedForce(true).
+//
+// If synchronization or seeding fails, the test aborts immediately via t.Fatalf.
+func MustSyncWithSeed(t testing.TB, db *sql.DB, schemaSQL, seedSQL string, opts ...grizzle.Option) {
+	t.Helper()
+
+	options := grizzle.Options{
+		SchemaSQL: schemaSQL,
+		SeedSQL:   seedSQL,
+		AllowDrop: true,
+	}
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	if err := grizzle.Sync(context.Background(), db, options); err != nil {
+		t.Fatalf("griztest: sync with seed failed: %v", err)
+	}
+}

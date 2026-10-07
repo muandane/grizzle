@@ -58,6 +58,10 @@ var (
 	// ErrAfterSyncFailed is returned when the AfterSync hook fails after the
 	// migration steps have already committed.
 	ErrAfterSyncFailed = errors.New("grizzle: after_sync hook failed (migration already committed)")
+
+	// ErrSeedFailed is returned when seed SQL execution fails; the seed
+	// transaction is rolled back and the schema is left intact.
+	ErrSeedFailed = errors.New("grizzle: seed execution failed")
 )
 
 // HazardError reports all critical hazards that were not explicitly accepted.

@@ -259,8 +259,9 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error {
 	policy := resolveDropPolicy(opts)
 	filters := toScopeFilters(opts)
 
+	var syncErr error
 	if opts.Dialect == DialectSQLite {
-		return exec.SyncSQLite(ctx, db, exec.SQLiteExecConfig{
+		syncErr = exec.SyncSQLite(ctx, db, exec.SQLiteExecConfig{
 			SchemaSQL:        opts.SchemaSQL,
 			Filters:          filters,
 			Policy:           policy,
@@ -276,32 +277,93 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error {
 			RebuildThreshold: opts.SQLiteRebuildThreshold,
 			RebuildBatchSize: opts.SQLiteRebuildBatchSize,
 		})
+	} else {
+		syncErr = exec.SyncPostgres(ctx, db, exec.PostgresExecConfig{
+			TargetSchema:         opts.TargetSchema,
+			TargetSchemas:        opts.TargetSchemas,
+			ShadowSchema:         opts.ShadowSchema,
+			SchemaSQL:            opts.SchemaSQL,
+			LockNamespace:        opts.LockNamespace,
+			LockID:               opts.LockID,
+			Filters:              filters,
+			Policy:               policy,
+			AcceptHazards:        opts.AcceptHazards,
+			NonConcurrentIndexes: opts.NonConcurrentIndexes,
+			LockTimeout:          opts.LockTimeout,
+			StatementTimeout:     opts.StatementTimeout,
+			MaxRetries:           opts.MaxRetries,
+			RandFloat:            opts.RandFloat,
+			Logger:               opts.Logger,
+			Tracer:               opts.Tracer,
+			DryRun:               opts.DryRun,
+			Backfill:             toExecBackfill(opts.Backfill),
+			BeforeSync:           opts.BeforeSync,
+			AfterSync:            opts.AfterSync,
+			BeforeStep:           opts.BeforeStep,
+			AfterStep:            opts.AfterStep,
+		})
+	}
+	if syncErr != nil {
+		return syncErr
 	}
 
-	return exec.SyncPostgres(ctx, db, exec.PostgresExecConfig{
-		TargetSchema:         opts.TargetSchema,
-		TargetSchemas:        opts.TargetSchemas,
-		ShadowSchema:         opts.ShadowSchema,
-		SchemaSQL:            opts.SchemaSQL,
-		LockNamespace:        opts.LockNamespace,
-		LockID:               opts.LockID,
-		Filters:              filters,
-		Policy:               policy,
-		AcceptHazards:        opts.AcceptHazards,
-		NonConcurrentIndexes: opts.NonConcurrentIndexes,
-		LockTimeout:          opts.LockTimeout,
-		StatementTimeout:     opts.StatementTimeout,
-		MaxRetries:           opts.MaxRetries,
-		RandFloat:            opts.RandFloat,
-		Logger:               opts.Logger,
-		Tracer:               opts.Tracer,
-		DryRun:               opts.DryRun,
-		Backfill:             toExecBackfill(opts.Backfill),
-		BeforeSync:           opts.BeforeSync,
-		AfterSync:            opts.AfterSync,
-		BeforeStep:           opts.BeforeStep,
-		AfterStep:            opts.AfterStep,
-	})
+	// Sync DDL → AfterSync (inside exec) → Seed. Skipped in dry-run mode.
+	if strings.TrimSpace(opts.SeedSQL) != "" && !opts.DryRun {
+		return seedWithOptions(ctx, db, &opts)
+	}
+	return nil
+}
+
+// Seed executes idempotent seed SQL against the database. The seed runs in a
+// single transaction: either the whole script commits with an 'applied'
+// grizzle_history record keyed by the seed's content hash, or nothing
+// persists. If the same seed hash was already applied and force is false,
+// the seed is skipped. Forced re-runs execute the script again, so seed
+// scripts should tolerate re-execution (IF NOT EXISTS, ON CONFLICT...).
+//
+// Dialect and target schema are taken from opts (auto-detected when unset).
+func Seed(ctx context.Context, db *sql.DB, seedSQL string, opts ...Option) error {
+	if strings.TrimSpace(seedSQL) == "" {
+		return fmt.Errorf("grizzle: seed SQL is empty")
+	}
+	o := Options{SeedSQL: seedSQL}
+	for _, opt := range opts {
+		opt(&o)
+	}
+	return seedWithOptions(ctx, db, &o)
+}
+
+// SeedHash returns the deterministic sha256 identity of a seed script.
+// Leading and trailing whitespace is ignored so reformatted-but-identical
+// seeds do not re-run.
+func SeedHash(seedSQL string) string {
+	return exec.SeedHash(seedSQL)
+}
+
+// seedWithOptions dispatches seed execution based on the resolved dialect.
+func seedWithOptions(ctx context.Context, db *sql.DB, opts *Options) error {
+	if opts.Dialect == DialectAuto {
+		d, err := detectDialect(ctx, db)
+		if err != nil {
+			return err
+		}
+		opts.Dialect = d
+	}
+	if opts.Dialect == DialectSQLite {
+		return exec.SeedSQLite(ctx, db, exec.SeedExecConfig{
+			Force:  opts.SeedForce,
+			Logger: opts.Logger,
+		}, opts.SeedSQL)
+	}
+	return exec.SeedPostgres(ctx, db, exec.SeedExecConfig{
+		TargetSchemas:    opts.TargetSchemas,
+		LockID:           opts.LockID,
+		LockNamespace:    opts.LockNamespace,
+		LockTimeout:      opts.LockTimeout,
+		StatementTimeout: opts.StatementTimeout,
+		Force:            opts.SeedForce,
+		Logger:           opts.Logger,
+	}, opts.SeedSQL)
 }
 
 // PlanDiff inspects the live database and computes the planned migration steps without applying them.

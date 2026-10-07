@@ -139,6 +139,16 @@ type Options struct {
 	// external side effects (webhooks, message publishing, etc.).
 	ExecuteHooksInDryRun bool
 
+	// SeedSQL contains idempotent data-seed SQL executed after a successful
+	// sync (Sync DDL → AfterSync → Seed). The seed runs in a single
+	// transaction and is skipped when the same seed (by content hash) was
+	// already applied, unless SeedForce is set.
+	SeedSQL string
+
+	// SeedForce re-runs the seed even when the same seed hash was already
+	// applied.
+	SeedForce bool
+
 	// SQLiteRebuildThreshold defines the row count threshold above which SQLite table rebuilds
 	// chunk data copying by keyset to prevent journal memory exhaustion.
 	// Defaults to 100000. Set to 0 to disable batching.
@@ -425,6 +435,21 @@ func WithDryRunLockTimeout(d time.Duration) Option {
 func WithExecuteHooksInDryRun() Option {
 	return func(o *Options) {
 		o.ExecuteHooksInDryRun = true
+	}
+}
+
+// WithSeedSQL attaches idempotent seed SQL executed after a successful sync.
+func WithSeedSQL(seedSQL string) Option {
+	return func(o *Options) {
+		o.SeedSQL = seedSQL
+	}
+}
+
+// WithSeedForce re-runs the seed even when the same seed hash was already
+// applied.
+func WithSeedForce(force bool) Option {
+	return func(o *Options) {
+		o.SeedForce = force
 	}
 }
 

@@ -92,7 +92,7 @@ var (
 
 func run(args []string) int {
 	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "Usage: grizzle <plan|apply|check|lint|export|init|version> [flags]")
+		fmt.Fprintln(os.Stderr, "Usage: grizzle <plan|apply|check|lint|export|seed|init|version> [flags]")
 		return 1
 	}
 
@@ -121,6 +121,7 @@ func run(args []string) int {
 		forceFlag    = fs.Bool("force", false, "Overwrite existing files during init")
 		failOnWarn   = fs.Bool("fail-on-warning", false, "Fail lint when warnings are reported")
 		dryRunFlag   = fs.Bool("dry-run", false, "Verify planned DDL against live data without persisting changes (apply)")
+		seedFile     = fs.String("seed", "", "Path to seed SQL file (seed)")
 	)
 
 	var hazards hazardFlags
@@ -154,9 +155,11 @@ func run(args []string) int {
 		return runLint(ctx, dsn, *schemaFile, lintFormat, *failOnWarn)
 	case "export":
 		return runExport(ctx, dsn, *planFile, *schemaFile, *formatFlag, *versionFlag, *outFile, *allowDrop)
+	case "seed":
+		return runSeed(ctx, dsn, *seedFile, *forceFlag)
 	default:
 		slog.Error("unknown command", "command", command)
-		fmt.Fprintf(os.Stderr, "Unknown command: %q. Expected plan, apply, check, lint, export, or init.\n", command)
+		fmt.Fprintf(os.Stderr, "Unknown command: %q. Expected plan, apply, check, lint, export, seed, or init.\n", command)
 		return 1
 	}
 }

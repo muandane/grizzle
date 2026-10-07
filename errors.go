@@ -54,6 +54,10 @@ var (
 
 	// ErrAfterSyncFailed is returned when the AfterSync hook fails after the migration steps have already committed.
 	ErrAfterSyncFailed = plan.ErrAfterSyncFailed
+
+	// ErrSeedFailed is returned when seed SQL execution fails; the seed
+	// transaction is rolled back and the schema is left intact.
+	ErrSeedFailed = plan.ErrSeedFailed
 )
 
 // HazardError reports all critical hazards that were not explicitly accepted.
