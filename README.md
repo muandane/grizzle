@@ -160,7 +160,7 @@ func main() {
 
 | Engine | Versions | Drivers | Capabilities |
 | :--- | :--- | :--- | :--- |
-| **PostgreSQL** | 13, 14, 15, 16, 17, 18 | `pgx/v5`, `lib/pq`, `database/sql` | Session advisory locks, `CREATE INDEX CONCURRENTLY`, `ADD CONSTRAINT ... NOT VALID` + separate `VALIDATE CONSTRAINT`, invalid index repair, unmanaged object dependency tracking (`UNMANAGED_DEPENDENCY`). |
+| **PostgreSQL** | 14, 15, 16, 17, 18 (tested in CI) | `pgx/v5`, `lib/pq`, `database/sql` | Session advisory locks, `CREATE INDEX CONCURRENTLY`, `ADD CONSTRAINT ... NOT VALID` + separate `VALIDATE CONSTRAINT`, invalid index repair, unmanaged object dependency tracking (`UNMANAGED_DEPENDENCY`). |
 | **SQLite** | 3.35+ | `modernc.org/sqlite` (pure Go), `mattn/go-sqlite3` | 12-step table rebuild with trigger/view preservation, keyset batch copying, savepoint isolation, generated columns (`VIRTUAL` / `STORED`), native column renames, `PRAGMA foreign_key_check`. |
 
 CI runs the PostgreSQL integration matrix on 14–18 (16 on pull requests).

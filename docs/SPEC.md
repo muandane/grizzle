@@ -6,7 +6,7 @@ This document defines the technical specification, API contract, and safety mode
 
 * **Language**: Go 1.27+
 * **Engines supported**:
-  * PostgreSQL 13, 14, 15, 16, 17, 18
+  * PostgreSQL 14, 15, 16, 17, 18 (tested in CI; 13 claim removed — untested)
   * SQLite 3.35+ (via pure-Go `modernc.org/sqlite`, zero Cgo)
 * **Database drivers supported**:
   * PostgreSQL: `github.com/jackc/pgx/v5/stdlib`, `github.com/lib/pq`
@@ -67,6 +67,7 @@ type Options struct {
     AllowDropColumn *bool
     AllowDropIndex  *bool
     AllowDropFK     *bool
+    AllowDropCheck  *bool
 
     // ExcludeTables defines table names or glob patterns (e.g. "spatial_ref_sys", "asynq_*")
     // that Grizzle will never alter, diff, or drop.
@@ -117,8 +118,32 @@ type Options struct {
     // Experimental: library-only; no CLI equivalent.
     Backfill BackfillFunc
 
+    // BeforeSync runs once before any migration steps or locks execute; a
+    // non-nil error aborts the migration before any DDL runs.
+    BeforeSync SyncHook
+
+    // AfterSync runs once after all migration steps and history recording succeed.
+    AfterSync SyncHook
+
+    // BeforeStep executes immediately prior to each plan step.
+    BeforeStep StepHook
+
+    // AfterStep executes immediately after each successful plan step.
+    AfterStep StepHook
+
     // DryRun outputs planned statements without executing them.
     DryRun bool
+
+    // DryRunLockTimeout bounds lock waits for live dry-run verification.
+    DryRunLockTimeout time.Duration
+
+    // SeedSQL contains idempotent data-seed SQL executed after a successful
+    // sync (DDL -> AfterSync -> Seed); already-applied seeds are skipped
+    // unless SeedForce is set.
+    SeedSQL string
+
+    // SeedForce re-runs the seed even when the same seed hash was already applied.
+    SeedForce bool
 
     // SQLiteRebuildThreshold defines row count threshold above which SQLite table rebuilds chunk data copying by keyset.
     SQLiteRebuildThreshold int
@@ -128,6 +153,9 @@ type Options struct {
 
     // Logger accepts a structured logger (*slog.Logger) for migration events.
     Logger *slog.Logger
+
+    // Tracer receives lifecycle spans (sync start/end, step execution, lock wait).
+    Tracer Tracer
 }
 
 type ApplyOpts struct {

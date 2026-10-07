@@ -111,3 +111,23 @@ Examples: `feat(schema): support generated columns`, `fix(retry): halt retry aft
 3. Layering / import rules are respected.
 4. No secrets or connection strings are logged or committed.
 5. Public API changes are reflected in `docs/SPEC.md` and `CHANGELOG.md`.
+
+---
+
+## Release process
+
+Releases are tag-driven: pushing a `v*` tag triggers `.github/workflows/release.yml` (quality-gate validation → GoReleaser).
+
+**First release is `v0.1.0`** — there is no 0.2.0; everything currently shipping folds into `0.1.0`.
+
+1. **Preconditions (gate, not a step):**
+   - `main` CI is green on the full PG matrix (14–18) — for docs-only changes that skip CI path filters, run `devenv up && ci` (or a manual workflow dispatch) explicitly before tagging.
+   - `CHANGELOG.md`, `docs/ENGINE_FEATURES.md`, `docs/SPEC.md`, and `docs/SAFETY.md` claims agree with the code on `main`.
+2. **Tag the release candidate from green `main`:**
+   ```bash
+   git tag -a v0.1.0-rc.1 -m "First release candidate"
+   git push origin v0.1.0-rc.1
+   ```
+3. **Verify the `release.yml` run:** validation job green; GoReleaser publishes the GitHub release with the CLI binary. The repository stays private — no visibility change happens with the tag.
+4. **Changelog PR:** `update-changelog.yml` opens a changelog adjustment PR if needed; merge it into `main`.
+5. **Final release:** after any rc fixes, tag `v0.1.0` the same way. `v0.1.x` is the supported line until the post-0.1 backlog (see [ROADMAP](ROADMAP.md)) lands behind an API freeze.

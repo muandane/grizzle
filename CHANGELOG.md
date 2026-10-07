@@ -48,8 +48,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Skips direct column alterations on child partitions to ensure schema alterations route cleanly through parent partitioned tables.
 - **Unmanaged Object Detection & Protection**:
   - PostgreSQL introspection catalogs unmanaged database entities including views, materialized views, triggers, functions, procedures, external sequences, and unmanaged domains.
-  - Structural dependency graph resolved via `pg_depend` and `pg_rewrite`.
-  - Emits `UNMANAGED_DEPENDENCY` (`CRITICAL`) hazard whenever a planned drop or type alteration impacts an unmanaged object, blocking execution unless explicitly accepted.
+  - Structural dependency graph resolved via `pg_depend` and `pg_rewrite`; function and procedure table/column dependencies resolved from `pg_depend` for SQL-standard (`BEGIN ATOMIC`) bodies and via a conservative source scan for quoted string bodies (`LANGUAGE sql AS '...'`, PL/pgSQL).
+  - Emits `UNMANAGED_DEPENDENCY` (`CRITICAL`) hazard whenever a planned drop or type alteration impacts an unmanaged object, blocking execution unless explicitly accepted; the hazard description and interactive summary include the affected objects and the remediation path.
 - **Generated Column Support**:
   - Full support for generated columns on PostgreSQL (`GENERATED ALWAYS AS (...) STORED`) and SQLite (`VIRTUAL` and `STORED` via `table_xinfo`).
   - Expression normalization (`NormalizeGeneratedExpr`) eliminates false schema diffs across database versions.
@@ -80,6 +80,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Automated Invalid Index Recovery**:
   - PostgreSQL schema inspection checks `pg_index.indisvalid`.
   - Broken indexes left by failed `CREATE INDEX CONCURRENTLY` executions are automatically detected and repaired via `DROP INDEX CONCURRENTLY` and clean recreation.
+- **Schema Linting (L001–L007)**:
+  - Pure, database-free static analysis of the desired schema IR: `L001` missing primary key (ERROR), `L002` unindexed foreign key columns, `L003` non-snake_case identifiers, `L004` legacy SERIAL/nextval defaults (all WARNING), `L005` non-snake_case CHECK constraint names and `L006` duplicate CHECK expressions (WARNING), `L007` auto-generated CHECK names (INFO).
+  - Severity levels `ERROR` / `WARNING` / `INFO`; INFO findings render as GitHub `::notice` annotations.
+  - Formatters for human text with severity counts, stable JSON, and GitHub Actions workflow annotations; custom rules implement `LintRule` and mix with `DefaultLintRules`.
+  - CLI `grizzle lint --schema schema.sql` with `--format text|json|github` and `--fail-on-warning` (fails on WARNING severity, not INFO).
+- **Dry-Run Verification**:
+  - `Options.DryRun` plans and executes the migration against live data inside a rolled-back sandbox, catching data-dependent failures (constraint violations, invalid data casts) before any DDL persists.
+  - CLI `grizzle apply --dry-run`; bounded lock waits via `Options.DryRunLockTimeout`.
+- **Lifecycle Hooks**:
+  - `Options.BeforeSync` / `Options.AfterSync` run once around the whole migration; `Options.BeforeStep` / `Options.AfterStep` wrap each plan step with bound `HookContext` database access.
+  - Hook failures abort before/after the corresponding operation with typed errors; `Options.ExecuteHooksInDryRun` controls hook execution inside dry-run sandboxes.
+- **Idempotent Seeding**:
+  - `Options.SeedSQL` executes idempotent data-seed SQL after a successful sync (DDL → `AfterSync` → seed); records history and skips already-applied seeds unless `SeedForce` is set.
+  - CLI `grizzle seed --seed seed.sql [--force]`.
+- **Lock Acquisition Retry**:
+  - `Options.MaxRetries` (default 3) with exponential backoff and deterministic jitter (`Options.RandFloat` injection point for tests); retries halt immediately once any DDL step commits.
 - **Declarative CHECK Constraints (PostgreSQL)**:
   - Named and inline `CHECK` table constraints introspected (`pg_constraint.contype = 'c'`, local constraints only), diffed, and managed end-to-end.
   - Staged safely like foreign keys: `ADD CONSTRAINT ... NOT VALID` in one transaction group, then `VALIDATE CONSTRAINT` in a separate group to keep `SHARE UPDATE EXCLUSIVE` scans off the exclusive lock window (`CHECK_VALIDATE_SCAN` notice).
@@ -91,6 +107,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Plan 1 adds new columns as nullable alongside existing columns.
   - Plan 2 (contract phase) is emitted separately with its own deterministic approval hash to drop legacy columns.
   - Added `BackfillFunc` hook (`Options.Backfill` / `ApplyOpts.Backfill`) executed in batches outside the DDL lock window.
+  - CLI support: repeatable `--rename old=new` (table-qualified `table.old=new` supported) and `--expand-contract` on `plan` / `apply` / `check` / `--dry-run`; backfill remains library-only.
+  - Runnable end-to-end example in `examples/expand-contract`.
 - **Audit History**:
   - `grizzle_history` tracks execution lifecycle: `status` (`applied`, `partial`, `failed`), `failed_step`, `error`, and `plan_hash`.
   - Failure records are guaranteed via dedicated connections and detached contexts even if DDL transactions abort.

@@ -268,7 +268,7 @@ SQLite does not support altering column types, renaming foreign keys, or droppin
 The following operational characteristics cannot be fully automated in continuous integration runners and require periodic manual verification:
 
 1. **Mechanical-disk & NAS storage performance:** Keyset batch copy I/O throughput and fsync latency on rotational mechanical disks (5400/7200 RPM) or high-latency network mounts (NFS v4, SMB).
-2. **Multi-version live PostgreSQL matrix:** The multi-version matrix (PostgreSQL 14, 15, 16, 17) runs automatically in continuous integration (`.github/workflows/ci.yml`) and via `scripts/run-pg-matrix.sh`; periodic manual verification focuses on production-equivalent replication and connection-pooler topologies (e.g., PgBouncer transaction-mode pooling, high-availability failover).
+2. **Multi-version live PostgreSQL matrix:** The multi-version matrix (PostgreSQL 14, 15, 16, 17, 18) runs automatically in continuous integration (`.github/workflows/ci.yml`) and via `scripts/run-pg-matrix.sh`; periodic manual verification focuses on production-equivalent replication and connection-pooler topologies (e.g., PgBouncer transaction-mode pooling, high-availability failover).
 3. **Human interactive terminal emulators:** Manual validation of interactive terminal prompts (`grizzle apply` with `[y/N/details]`) across standard human terminals (macOS Terminal, iTerm2, tmux, Windows Terminal) beyond automated `pty.Open()` pseudo-terminals.
 
 ---
