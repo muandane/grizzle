@@ -229,14 +229,33 @@ func GenerateAddFKSQL(targetSchema, tableName, fkName, normalizedFKDef string) s
 	return fmt.Sprintf("ALTER TABLE %q.%q ADD CONSTRAINT %q %s NOT VALID;", targetSchema, tableName, fkName, normalizedFKDef)
 }
 
+// GenerateValidateConstraintSQL constructs an ALTER TABLE ... VALIDATE CONSTRAINT statement.
+// It is shared by foreign key and CHECK constraint validation steps.
+func GenerateValidateConstraintSQL(targetSchema, tableName, constraintName string) string {
+	return fmt.Sprintf("ALTER TABLE %q.%q VALIDATE CONSTRAINT %q;", targetSchema, tableName, constraintName)
+}
+
 // GenerateValidateFKSQL constructs an ALTER TABLE ... VALIDATE CONSTRAINT statement.
+//
+// Deprecated: use GenerateValidateConstraintSQL, which is constraint-kind agnostic.
 func GenerateValidateFKSQL(targetSchema, tableName, fkName string) string {
-	return fmt.Sprintf("ALTER TABLE %q.%q VALIDATE CONSTRAINT %q;", targetSchema, tableName, fkName)
+	return GenerateValidateConstraintSQL(targetSchema, tableName, fkName)
 }
 
 // GenerateDropFKSQL constructs an ALTER TABLE ... DROP CONSTRAINT statement.
 func GenerateDropFKSQL(targetSchema, tableName, fkName string) string {
 	return fmt.Sprintf("ALTER TABLE %q.%q DROP CONSTRAINT IF EXISTS %q;", targetSchema, tableName, fkName)
+}
+
+// GenerateAddCheckSQL constructs an ALTER TABLE ... ADD CONSTRAINT ... CHECK statement with
+// NOT VALID for safe zero-lock addition.
+func GenerateAddCheckSQL(targetSchema, tableName, checkName, normalizedCheckDef string) string {
+	return fmt.Sprintf("ALTER TABLE %q.%q ADD CONSTRAINT %q %s NOT VALID;", targetSchema, tableName, checkName, normalizedCheckDef)
+}
+
+// GenerateDropCheckSQL constructs an ALTER TABLE ... DROP CONSTRAINT statement for a CHECK constraint.
+func GenerateDropCheckSQL(targetSchema, tableName, checkName string) string {
+	return fmt.Sprintf("ALTER TABLE %q.%q DROP CONSTRAINT IF EXISTS %q;", targetSchema, tableName, checkName)
 }
 
 // GenerateAttachPartitionSQL constructs an ALTER TABLE ... ATTACH PARTITION statement.
@@ -390,12 +409,24 @@ func RenderChangeWithOpts(targetSchema string, c diff.Change, opts RenderOpts) p
 	case plan.ChangeAddFK:
 		step.SQL = GenerateAddFKSQL(effectiveSchema, c.Table, c.ForeignKey.Name, c.ForeignKey.Definition)
 		step.RefTable = foreignKeyRefTable(c.ForeignKey, effectiveSchema)
+	case plan.ChangeAddCheck:
+		step.SQL = GenerateAddCheckSQL(effectiveSchema, c.Table, c.Check.Name, c.Check.Definition)
 	case plan.ChangeValidateConstraint:
-		step.SQL = GenerateValidateFKSQL(effectiveSchema, c.Table, c.ForeignKey.Name)
-		step.RefTable = foreignKeyRefTable(c.ForeignKey, effectiveSchema)
+		switch {
+		case c.ForeignKey != nil:
+			step.SQL = GenerateValidateConstraintSQL(effectiveSchema, c.Table, c.ForeignKey.Name)
+			step.RefTable = foreignKeyRefTable(c.ForeignKey, effectiveSchema)
+		case c.Check != nil:
+			step.SQL = GenerateValidateConstraintSQL(effectiveSchema, c.Table, c.Check.Name)
+			step.ValidatesCheck = true
+		default:
+			panic(fmt.Sprintf("grizzle: VALIDATE_CONSTRAINT change on table %q has no constraint payload", c.Table))
+		}
 	case plan.ChangeDropFK:
 		step.SQL = GenerateDropFKSQL(effectiveSchema, c.Table, c.ForeignKey.Name)
 		step.RefTable = foreignKeyRefTable(c.ForeignKey, effectiveSchema)
+	case plan.ChangeDropCheck:
+		step.SQL = GenerateDropCheckSQL(effectiveSchema, c.Table, c.Check.Name)
 	case plan.ChangeDropTable:
 		step.SQL = fmt.Sprintf("DROP TABLE %q.%q CASCADE;", effectiveSchema, c.Table)
 		if c.TableData != nil {
@@ -434,8 +465,19 @@ func RenderChangesWithOpts(targetSchema string, changes []diff.Change, opts Rend
 				Type:     plan.ChangeValidateConstraint,
 				Schema:   c.Schema,
 				Table:    c.Table,
-				SQL:      GenerateValidateFKSQL(effectiveSchema, c.Table, c.ForeignKey.Name),
+				SQL:      GenerateValidateConstraintSQL(effectiveSchema, c.Table, c.ForeignKey.Name),
 				RefTable: step.RefTable,
+			}
+			steps = append(steps, validateStep)
+		}
+		if c.Type == plan.ChangeAddCheck {
+			effectiveSchema := cmp.Or(c.Schema, targetSchema)
+			validateStep := plan.Step{
+				Type:           plan.ChangeValidateConstraint,
+				Schema:         c.Schema,
+				Table:          c.Table,
+				SQL:            GenerateValidateConstraintSQL(effectiveSchema, c.Table, c.Check.Name),
+				ValidatesCheck: true,
 			}
 			steps = append(steps, validateStep)
 		}

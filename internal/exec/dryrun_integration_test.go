@@ -174,6 +174,64 @@ func TestDryRunVerify_Postgres_NotNullViolation(t *testing.T) {
 	}
 }
 
+func TestDryRunVerify_Postgres_CheckViolation(t *testing.T) {
+	db := testutil.TestDatabase(t)
+	ctx := context.Background()
+	schema := fmt.Sprintf("test_dryrun_check_%d", time.Now().UnixNano())
+	defer dropSchema(t, db, schema)
+
+	if _, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema)); err != nil {
+		t.Fatalf("creating test schema: %v", err)
+	}
+	if _, err := db.Exec(fmt.Sprintf(`
+		CREATE TABLE %s.products (id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, price_cents INT NOT NULL);
+		INSERT INTO %s.products (price_cents) VALUES (-500), (1200);
+	`, schema, schema)); err != nil {
+		t.Fatalf("seeding live schema: %v", err)
+	}
+
+	before, err := postgres.Inspect(ctx, db, schema)
+	if err != nil {
+		t.Fatalf("inspecting before: %v", err)
+	}
+
+	// Negative plan: the CHECK constraint is staged NOT VALID (succeeds), then
+	// VALIDATE CONSTRAINT scans the real rows and must fail on price_cents = -500.
+	_, err = exec.DryRunVerifyPostgres(ctx, db, exec.PostgresExecConfig{
+		TargetSchema: schema,
+		SchemaSQL: `
+			CREATE TABLE products (
+				id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+				price_cents INT NOT NULL,
+				CONSTRAINT check_positive_price CHECK (price_cents > 0)
+			);
+		`,
+	})
+	if err == nil {
+		t.Fatal("expected dry-run to fail on CHECK constraint violation of live data")
+	}
+	if !strings.Contains(err.Error(), "dry-run verification failed at step") {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	after, err := postgres.Inspect(ctx, db, schema)
+	if err != nil {
+		t.Fatalf("inspecting after: %v", err)
+	}
+	if !reflect.DeepEqual(before, after) {
+		t.Error("schema catalog changed after failed dry-run")
+	}
+
+	// Data rows untouched.
+	var productCount int
+	if err := db.QueryRow(fmt.Sprintf(`SELECT count(*) FROM %s.products`, schema)).Scan(&productCount); err != nil {
+		t.Fatalf("counting products: %v", err)
+	}
+	if productCount != 2 {
+		t.Errorf("product rows = %d, want 2", productCount)
+	}
+}
+
 func TestDryRunVerify_Postgres_LockTimeout(t *testing.T) {
 	db := testutil.TestDatabase(t)
 	ctx := context.Background()

@@ -104,6 +104,7 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 				Columns:     make(map[string]*schema.Column),
 				Indexes:     make(map[string]*schema.Index),
 				ForeignKeys: make(map[string]*schema.ForeignKey),
+				Checks:      make(map[string]*schema.CheckConstraint),
 			}
 			s.Tables[tableName] = tbl
 		}
@@ -185,6 +186,7 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 				Columns:     make(map[string]*schema.Column),
 				Indexes:     make(map[string]*schema.Index),
 				ForeignKeys: make(map[string]*schema.ForeignKey),
+				Checks:      make(map[string]*schema.CheckConstraint),
 			}
 			s.Tables[tableName] = tbl
 		}
@@ -258,6 +260,7 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 				Columns:     make(map[string]*schema.Column),
 				Indexes:     make(map[string]*schema.Index),
 				ForeignKeys: make(map[string]*schema.ForeignKey),
+				Checks:      make(map[string]*schema.CheckConstraint),
 			}
 			s.Tables[childTable] = tbl
 		}
@@ -427,6 +430,54 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 		return nil, err
 	}
 	_ = fkRows.Close()
+
+	// 5b. Inspect Check Constraints (table constraints only; domain checks are
+	// out of scope and inherited constraints are managed via their parent table)
+	checkQuery := `
+		SELECT
+			c.relname AS table_name,
+			con.conname AS constraint_name,
+			pg_get_constraintdef(con.oid) AS constraint_def,
+			con.convalidated AS is_valid
+		FROM pg_constraint con
+		JOIN pg_class c ON c.oid = con.conrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1
+		  AND con.contype = 'c'
+		  AND con.conislocal
+		  AND c.relkind IN ('r', 'p')
+		ORDER BY c.relname, con.conname;
+	`
+	checkRows, err := dbtx.QueryContext(ctx, checkQuery, schemaName)
+	if err != nil {
+		return nil, fmt.Errorf("inspecting check constraints in schema %q: %w", schemaName, err)
+	}
+	defer func() { _ = checkRows.Close() }()
+
+	for checkRows.Next() {
+		var (
+			tableName string
+			checkName string
+			checkDef  string
+			isValid   bool
+		)
+		if err := checkRows.Scan(&tableName, &checkName, &checkDef, &isValid); err != nil {
+			return nil, fmt.Errorf("scanning check constraint in schema %q: %w", schemaName, err)
+		}
+
+		if tbl, exists := s.Tables[tableName]; exists {
+			tbl.Checks[checkName] = &schema.CheckConstraint{
+				Name:       checkName,
+				TableName:  tableName,
+				Definition: checkDef,
+				IsValid:    isValid,
+			}
+		}
+	}
+	if err := checkRows.Err(); err != nil {
+		return nil, err
+	}
+	_ = checkRows.Close()
 
 	// 6. Inspect Unmanaged Objects
 	// 6a. Views and Materialized Views

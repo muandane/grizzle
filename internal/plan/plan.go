@@ -26,6 +26,8 @@ const (
 	ChangeDropIndex          ChangeType = "DROP_INDEX"
 	ChangeAddFK              ChangeType = "ADD_FK"
 	ChangeDropFK             ChangeType = "DROP_FK"
+	ChangeAddCheck           ChangeType = "ADD_CHECK"
+	ChangeDropCheck          ChangeType = "DROP_CHECK"
 	ChangeValidateConstraint ChangeType = "VALIDATE_CONSTRAINT"
 	ChangeAttachPartition    ChangeType = "ATTACH_PARTITION"
 	ChangeDetachPartition    ChangeType = "DETACH_PARTITION"
@@ -59,6 +61,11 @@ type Step struct {
 	Schema    string   `json:"schema,omitzero"`
 	DependsOn []string `json:"depends_on,omitzero"`
 	RefTable  string   `json:"ref_table,omitzero"`
+
+	// ValidatesCheck marks a VALIDATE_CONSTRAINT step that validates a CHECK
+	// constraint (as opposed to a foreign key). Used for hazard classification
+	// (CHECK validate runs a full table scan under SHARE UPDATE EXCLUSIVE).
+	ValidatesCheck bool `json:"validates_check,omitzero"`
 }
 
 // DropPolicy defines fine-grained permissions for destructive operations.
@@ -67,6 +74,7 @@ type DropPolicy struct {
 	AllowColumn bool `json:"allow_column"`
 	AllowIndex  bool `json:"allow_index"`
 	AllowFK     bool `json:"allow_fk"`
+	AllowCheck  bool `json:"allow_check"`
 }
 
 // IsAllowed checks if a given migration step is permitted by the policy.
@@ -83,6 +91,8 @@ func (p DropPolicy) IsAllowed(s Step) bool {
 		return p.AllowIndex
 	case ChangeDropFK:
 		return p.AllowFK
+	case ChangeDropCheck:
+		return p.AllowCheck
 	case ChangeAlterColumn:
 		return p.AllowColumn
 	default:
@@ -186,7 +196,7 @@ func (p *Plan) Additions() int {
 	count := 0
 	for _, s := range p.Steps {
 		switch s.Type {
-		case ChangeCreateEnum, ChangeCreateTable, ChangeAddColumn, ChangeCreateIndex, ChangeAddFK:
+		case ChangeCreateEnum, ChangeCreateTable, ChangeAddColumn, ChangeCreateIndex, ChangeAddFK, ChangeAddCheck:
 			count++
 		}
 	}
@@ -210,7 +220,7 @@ func (p *Plan) Deletions() int {
 	count := 0
 	for _, s := range p.Steps {
 		switch s.Type {
-		case ChangeDropTable, ChangeDropColumn, ChangeDropIndex, ChangeDropFK:
+		case ChangeDropTable, ChangeDropColumn, ChangeDropIndex, ChangeDropFK, ChangeDropCheck:
 			count++
 		}
 	}
@@ -251,6 +261,11 @@ const (
 	HazardDropIndex HazardCode = "DROP_INDEX"
 	// HazardDropFK indicates removing referential integrity enforcement.
 	HazardDropFK HazardCode = "DROP_FK"
+	// HazardDropCheck indicates removing row-validation enforcement from a table.
+	HazardDropCheck HazardCode = "DROP_CHECK"
+	// HazardCheckValidateScan indicates a VALIDATE CONSTRAINT table scan under
+	// SHARE UPDATE EXCLUSIVE lock for a newly staged CHECK constraint.
+	HazardCheckValidateScan HazardCode = "CHECK_VALIDATE_SCAN"
 	// HazardRenameAmbiguous indicates an ambiguous column rename candidate (same type dropped and added).
 	HazardRenameAmbiguous HazardCode = "RENAME_AMBIGUOUS"
 	// HazardUnmanagedDependency indicates a drop or type change touches a column/table that an unmanaged object depends on.
@@ -429,6 +444,26 @@ func stepHazards(s Step) []Hazard {
 			Description: fmt.Sprintf("Dropping foreign key constraint on table %q removes referential integrity enforcement", s.Table),
 			SQL:         s.SQL,
 		})
+	case ChangeDropCheck:
+		hazards = append(hazards, Hazard{
+			Code:        HazardDropCheck,
+			Level:       HazardLevelNotice,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Dropping check constraint on table %q removes row-validation enforcement", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeValidateConstraint:
+		if s.ValidatesCheck {
+			hazards = append(hazards, Hazard{
+				Code:        HazardCheckValidateScan,
+				Level:       HazardLevelNotice,
+				Type:        s.Type,
+				Table:       s.Table,
+				Description: fmt.Sprintf("Validating check constraint on table %q runs a full table scan under SHARE UPDATE EXCLUSIVE lock", s.Table),
+				SQL:         s.SQL,
+			})
+		}
 	}
 	return hazards
 }

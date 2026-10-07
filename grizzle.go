@@ -60,6 +60,9 @@ type IndexIR = schema.Index
 // ForeignKeyIR represents the intermediate representation of a foreign key relationship.
 type ForeignKeyIR = schema.ForeignKey
 
+// CheckConstraintIR represents the intermediate representation of a CHECK constraint.
+type CheckConstraintIR = schema.CheckConstraint
+
 // PrimaryKeyIR represents the intermediate representation of a table primary key.
 type PrimaryKeyIR = schema.PrimaryKey
 
@@ -101,6 +104,8 @@ const (
 	ChangeDropIndex          = plan.ChangeDropIndex
 	ChangeAddFK              = plan.ChangeAddFK
 	ChangeDropFK             = plan.ChangeDropFK
+	ChangeAddCheck           = plan.ChangeAddCheck
+	ChangeDropCheck          = plan.ChangeDropCheck
 	ChangeValidateConstraint = plan.ChangeValidateConstraint
 	ChangeRenameColumn       = plan.ChangeRenameColumn
 	ChangeAttachPartition    = plan.ChangeAttachPartition
@@ -116,6 +121,8 @@ const (
 	HazardIndexBuild             = plan.HazardIndexBuild
 	HazardDropIndex              = plan.HazardDropIndex
 	HazardDropFK                 = plan.HazardDropFK
+	HazardDropCheck              = plan.HazardDropCheck
+	HazardCheckValidateScan      = plan.HazardCheckValidateScan
 	HazardRenameAmbiguous        = plan.HazardRenameAmbiguous
 	HazardUnmanagedDependency    = plan.HazardUnmanagedDependency
 	HazardGeneratedRewrite       = plan.HazardGeneratedRewrite
@@ -472,6 +479,7 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 			AllowDropColumn:        &p.Policy.AllowColumn,
 			AllowDropIndex:         &p.Policy.AllowIndex,
 			AllowDropFK:            &p.Policy.AllowFK,
+			AllowDropCheck:         &p.Policy.AllowCheck,
 			AcceptHazards:          opts.AcceptHazards,
 			Backfill:               opts.Backfill,
 			BeforeSync:             opts.BeforeSync,

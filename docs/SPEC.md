@@ -190,6 +190,8 @@ const (
     HazardIndexBuild             HazardCode = "INDEX_BUILD"
     HazardDropIndex              HazardCode = "DROP_INDEX"
     HazardDropFK                 HazardCode = "DROP_FK"
+    HazardDropCheck              HazardCode = "DROP_CHECK"
+    HazardCheckValidateScan      HazardCode = "CHECK_VALIDATE_SCAN"
     HazardRenameAmbiguous        HazardCode = "RENAME_AMBIGUOUS"
     HazardUnmanagedDependency    HazardCode = "UNMANAGED_DEPENDENCY"
     HazardGeneratedRewrite       HazardCode = "GENERATED_REWRITE"
@@ -224,6 +226,7 @@ type Hazard struct {
 | `CREATE INDEX` | Yes | Emitted as `CONCURRENTLY` by default; B-tree, GIN, GiST, BRIN, unique, partial |
 | `DROP INDEX` | Yes | Guarded by `AllowDropIndex` and `HazardDropIndex` |
 | `FOREIGN KEY` | Yes | Split into `ADD CONSTRAINT ... NOT VALID` and `VALIDATE CONSTRAINT` |
+| `CHECK Constraint` | Yes | Named and inline `CHECK`; staged `ADD ... NOT VALID` then `VALIDATE CONSTRAINT`; drops guarded by `AllowDropCheck` |
 | `ENUM Types` | Yes | `CREATE TYPE ... AS ENUM`, `ALTER TYPE ... ADD VALUE` |
 | `Generated Columns` | Yes | `GENERATED ALWAYS AS (...) STORED`; expression rewrite triggers `GENERATED_REWRITE` hazard |
 | `Native Types` | Yes | UUID, JSONB, Arrays, Timestamps, Numerics |
@@ -241,6 +244,7 @@ type Hazard struct {
 | `CREATE INDEX` | Yes | Direct `CREATE INDEX` and `CREATE UNIQUE INDEX` |
 | `DROP INDEX` | Yes | Guarded by `AllowDropIndex` |
 | `FOREIGN KEY` | Yes | Validated with `PRAGMA foreign_key_check` |
+| `CHECK Constraint` | No | SQLite CHECK constraints are not introspected or diffed; a table rebuild rewrites the table from the managed IR and does not preserve inline CHECK DDL — declare CHECK-managed tables as Postgres-only or avoid rebuild-triggering changes |
 | `Generated Columns` | Yes | `STORED` and `VIRTUAL` supported; rebuild preserves generated definitions |
 
 ### Unmanaged database objects (Detected, Protected, Not Managed)
