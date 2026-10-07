@@ -54,6 +54,10 @@ type PostgresExecConfig struct {
 	Tracer               Tracer
 	DryRun               bool
 	Backfill             BackfillFunc
+	BeforeSync           SyncHook
+	AfterSync            SyncHook
+	BeforeStep           StepHook
+	AfterStep            StepHook
 }
 
 func (cfg PostgresExecConfig) targetSchemas() []string {
@@ -291,6 +295,11 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 	}
 	defer func() { _ = conn.Close() }()
 
+	// BeforeSync runs once before any migration steps or locks are executed.
+	if err := callBeforeSync(cfg.BeforeSync, ctx, conn); err != nil {
+		return 0, fmt.Errorf("grizzle: before_sync hook: %w", err)
+	}
+
 	for _, s := range targetSchemas {
 		if err := postgres.ValidateIdentifier(s); err == nil && s != "public" {
 			_, _ = conn.ExecContext(ctx, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %q;", s))
@@ -497,6 +506,11 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 			for _, s := range group.Steps {
 				stepIdx++
 				stepStart := time.Now()
+				if err := callBeforeStep(cfg.BeforeStep, HookContext{Context: ctx, DBTX: conn, Step: s, Index: stepIdx, Total: len(steps), IsNonTx: true}); err != nil {
+					hookErr := fmt.Errorf("before_step hook: %w", err)
+					recordFailureHistory(stepIdx, hookErr, true)
+					return committedSteps, hookErr
+				}
 				if err := execStepWithTracing(ctx, conn, s, true, cfg.Tracer); err != nil {
 					if logger != nil {
 						logger.ErrorContext(ctx, "grizzle: failed executing non-tx step", "step_index", stepIdx, "sql", s.SQL, "error", err)
@@ -505,6 +519,11 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 					return committedSteps + 1, wrapStepExecError(s, err, true)
 				}
 				committedSteps++
+				if err := callAfterStep(cfg.AfterStep, HookContext{Context: ctx, DBTX: conn, Step: s, Index: stepIdx, Total: len(steps), IsNonTx: true}); err != nil {
+					hookErr := fmt.Errorf("after_step hook: %w", err)
+					recordFailureHistory(stepIdx, hookErr, true)
+					return committedSteps, hookErr
+				}
 				if logger != nil {
 					logger.DebugContext(ctx, "grizzle: executed non-tx step", "step_index", stepIdx, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
 				}
@@ -528,6 +547,12 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 			for _, s := range group.Steps {
 				stepIdx++
 				stepStart := time.Now()
+				if err := callBeforeStep(cfg.BeforeStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: stepIdx, Total: len(steps), IsNonTx: false}); err != nil {
+					_ = tx.Rollback()
+					hookErr := fmt.Errorf("before_step hook: %w", err)
+					recordFailureHistory(stepIdx, hookErr, false)
+					return committedSteps, hookErr
+				}
 				if err := execStepWithTracing(ctx, tx, s, false, cfg.Tracer); err != nil {
 					_ = tx.Rollback()
 					if logger != nil {
@@ -535,6 +560,12 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 					}
 					recordFailureHistory(stepIdx, err, false)
 					return committedSteps, wrapStepExecError(s, err, false)
+				}
+				if err := callAfterStep(cfg.AfterStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: stepIdx, Total: len(steps), IsNonTx: false}); err != nil {
+					_ = tx.Rollback()
+					hookErr := fmt.Errorf("after_step hook: %w", err)
+					recordFailureHistory(stepIdx, hookErr, false)
+					return committedSteps, hookErr
 				}
 				if logger != nil {
 					logger.DebugContext(ctx, "grizzle: executed step in tx", "step_index", stepIdx, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
@@ -556,6 +587,10 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 			}
 			committedSteps += len(group.Steps)
 		}
+	}
+
+	if err := callAfterSync(cfg.AfterSync, ctx, conn); err != nil {
+		return committedSteps, fmt.Errorf("%w: %w", plan.ErrAfterSyncFailed, err)
 	}
 
 	if logger != nil {
@@ -640,6 +675,10 @@ type SQLiteExecConfig struct {
 	Tracer        Tracer
 	DryRun        bool
 	Backfill      BackfillFunc
+	BeforeSync    SyncHook
+	AfterSync     SyncHook
+	BeforeStep    StepHook
+	AfterStep     StepHook
 
 	RebuildThreshold int
 	RebuildBatchSize int
@@ -725,6 +764,12 @@ func SyncSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) error {
 		return nil
 	}
 
+	// BeforeSync runs once before any migration steps are executed.
+	// SQLite passes the *sql.DB handle because the entire sync is a single transaction.
+	if err := callBeforeSync(cfg.BeforeSync, ctx, db); err != nil {
+		return fmt.Errorf("sqlite: before_sync hook: %w", err)
+	}
+
 	// 5. Execute in transaction
 	_, _ = db.ExecContext(ctx, "PRAGMA foreign_keys = OFF;")
 	defer func() {
@@ -747,6 +792,14 @@ func SyncSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) error {
 		if sqlToExec == "" {
 			continue
 		}
+		if err := callBeforeStep(cfg.BeforeStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: i + 1, Total: len(steps), IsNonTx: false}); err != nil {
+			_ = tx.Rollback()
+			hookErr := fmt.Errorf("before_step hook: %w", err)
+			histCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = history.RecordProgress(histCtx, db, "sqlite", "", p, "failed", i+1, hookErr, time.Since(start))
+			return hookErr
+		}
 		if err := executeSQLiteStep(ctx, tx, s, cfg); err != nil {
 			_ = tx.Rollback()
 			if logger != nil {
@@ -756,6 +809,14 @@ func SyncSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) error {
 			defer cancel()
 			_ = history.RecordProgress(histCtx, db, "sqlite", "", p, "failed", i+1, err, time.Since(start))
 			return fmt.Errorf("%w: failed executing [%s]: %w", plan.ErrExecutionFailed, sqlToExec, err)
+		}
+		if err := callAfterStep(cfg.AfterStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: i + 1, Total: len(steps), IsNonTx: false}); err != nil {
+			_ = tx.Rollback()
+			hookErr := fmt.Errorf("after_step hook: %w", err)
+			histCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = history.RecordProgress(histCtx, db, "sqlite", "", p, "failed", i+1, hookErr, time.Since(start))
+			return hookErr
 		}
 		if logger != nil {
 			logger.DebugContext(ctx, "sqlite: executed step", "step_index", i+1, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
@@ -798,6 +859,10 @@ func SyncSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) error {
 		if err := RunBackfill(ctx, db, "main", cfg.Filters.Renames, steps, cfg.Backfill, cfg.Logger); err != nil {
 			return err
 		}
+	}
+
+	if err := callAfterSync(cfg.AfterSync, ctx, db); err != nil {
+		return fmt.Errorf("%w: %w", plan.ErrAfterSyncFailed, err)
 	}
 
 	if logger != nil {
@@ -918,6 +983,11 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 	}
 	defer func() { _ = conn.Close() }()
 
+	// BeforeSync runs once before any migration steps or locks are executed.
+	if err := callBeforeSync(cfg.BeforeSync, ctx, conn); err != nil {
+		return 0, fmt.Errorf("grizzle: before_sync hook: %w", err)
+	}
+
 	for _, s := range targetSchemas {
 		if err := postgres.ValidateIdentifier(s); err == nil && s != "public" {
 			_, _ = conn.ExecContext(ctx, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %q;", s))
@@ -1009,6 +1079,11 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 			for _, s := range group.Steps {
 				stepIdx++
 				stepStart := time.Now()
+				if err := callBeforeStep(cfg.BeforeStep, HookContext{Context: ctx, DBTX: conn, Step: s, Index: stepIdx, Total: len(p.Steps), IsNonTx: true}); err != nil {
+					hookErr := fmt.Errorf("before_step hook: %w", err)
+					recordFailureHistory(stepIdx, hookErr, true)
+					return committedSteps, hookErr
+				}
 				if err := execStepWithTracing(ctx, conn, s, true, cfg.Tracer); err != nil {
 					if logger != nil {
 						logger.ErrorContext(ctx, "grizzle: failed executing non-tx step", "step_index", stepIdx, "sql", s.SQL, "error", err)
@@ -1017,6 +1092,11 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 					return committedSteps + 1, wrapStepExecError(s, err, true)
 				}
 				committedSteps++
+				if err := callAfterStep(cfg.AfterStep, HookContext{Context: ctx, DBTX: conn, Step: s, Index: stepIdx, Total: len(p.Steps), IsNonTx: true}); err != nil {
+					hookErr := fmt.Errorf("after_step hook: %w", err)
+					recordFailureHistory(stepIdx, hookErr, true)
+					return committedSteps, hookErr
+				}
 				if logger != nil {
 					logger.DebugContext(ctx, "grizzle: executed non-tx step", "step_index", stepIdx, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
 				}
@@ -1039,6 +1119,12 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 			for _, s := range group.Steps {
 				stepIdx++
 				stepStart := time.Now()
+				if err := callBeforeStep(cfg.BeforeStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: stepIdx, Total: len(p.Steps), IsNonTx: false}); err != nil {
+					_ = tx.Rollback()
+					hookErr := fmt.Errorf("before_step hook: %w", err)
+					recordFailureHistory(stepIdx, hookErr, false)
+					return committedSteps, hookErr
+				}
 				if err := execStepWithTracing(ctx, tx, s, false, cfg.Tracer); err != nil {
 					_ = tx.Rollback()
 					if logger != nil {
@@ -1046,6 +1132,12 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 					}
 					recordFailureHistory(stepIdx, err, false)
 					return committedSteps, wrapStepExecError(s, err, false)
+				}
+				if err := callAfterStep(cfg.AfterStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: stepIdx, Total: len(p.Steps), IsNonTx: false}); err != nil {
+					_ = tx.Rollback()
+					hookErr := fmt.Errorf("after_step hook: %w", err)
+					recordFailureHistory(stepIdx, hookErr, false)
+					return committedSteps, hookErr
 				}
 				if logger != nil {
 					logger.DebugContext(ctx, "grizzle: executed step in tx", "step_index", stepIdx, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
@@ -1066,6 +1158,10 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 			}
 			committedSteps += len(group.Steps)
 		}
+	}
+
+	if err := callAfterSync(cfg.AfterSync, ctx, conn); err != nil {
+		return committedSteps, fmt.Errorf("%w: %w", plan.ErrAfterSyncFailed, err)
 	}
 
 	if logger != nil {
@@ -1109,6 +1205,11 @@ func ApplySQLite(ctx context.Context, db *sql.DB, p *plan.Plan, cfg SQLiteExecCo
 		logger.InfoContext(ctx, "sqlite: starting SQLite plan application")
 	}
 
+	// BeforeSync runs once before any migration steps are executed.
+	if err := callBeforeSync(cfg.BeforeSync, ctx, db); err != nil {
+		return fmt.Errorf("sqlite: before_sync hook: %w", err)
+	}
+
 	_, _ = db.ExecContext(ctx, "PRAGMA foreign_keys = OFF;")
 	defer func() {
 		_, _ = db.ExecContext(ctx, "PRAGMA foreign_keys = ON;")
@@ -1138,6 +1239,14 @@ func ApplySQLite(ctx context.Context, db *sql.DB, p *plan.Plan, cfg SQLiteExecCo
 		if sqlToExec == "" {
 			continue
 		}
+		if err := callBeforeStep(cfg.BeforeStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: i + 1, Total: len(p.Steps), IsNonTx: false}); err != nil {
+			_ = tx.Rollback()
+			hookErr := fmt.Errorf("before_step hook: %w", err)
+			histCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = history.RecordProgress(histCtx, db, "sqlite", "", p, "failed", i+1, hookErr, time.Since(start))
+			return hookErr
+		}
 		if err := executeSQLiteStep(ctx, tx, s, cfg); err != nil {
 			_ = tx.Rollback()
 			if logger != nil {
@@ -1147,6 +1256,14 @@ func ApplySQLite(ctx context.Context, db *sql.DB, p *plan.Plan, cfg SQLiteExecCo
 			defer cancel()
 			_ = history.RecordProgress(histCtx, db, "sqlite", "", p, "failed", i+1, err, time.Since(start))
 			return fmt.Errorf("%w: failed executing [%s]: %w", plan.ErrExecutionFailed, sqlToExec, err)
+		}
+		if err := callAfterStep(cfg.AfterStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: i + 1, Total: len(p.Steps), IsNonTx: false}); err != nil {
+			_ = tx.Rollback()
+			hookErr := fmt.Errorf("after_step hook: %w", err)
+			histCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = history.RecordProgress(histCtx, db, "sqlite", "", p, "failed", i+1, hookErr, time.Since(start))
+			return hookErr
 		}
 		if logger != nil {
 			logger.DebugContext(ctx, "sqlite: executed step", "step_index", i+1, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
@@ -1188,6 +1305,10 @@ func ApplySQLite(ctx context.Context, db *sql.DB, p *plan.Plan, cfg SQLiteExecCo
 		if err := RunBackfill(ctx, db, "main", p.Renames, p.Steps, cfg.Backfill, cfg.Logger); err != nil {
 			return err
 		}
+	}
+
+	if err := callAfterSync(cfg.AfterSync, ctx, db); err != nil {
+		return fmt.Errorf("%w: %w", plan.ErrAfterSyncFailed, err)
 	}
 
 	if logger != nil {

@@ -51,6 +51,9 @@ var (
 
 	// ErrPartitionKeyNotInUnique is returned when a primary key or unique constraint on a partitioned table does not include all partition key columns.
 	ErrPartitionKeyNotInUnique = plan.ErrPartitionKeyNotInUnique
+
+	// ErrAfterSyncFailed is returned when the AfterSync hook fails after the migration steps have already committed.
+	ErrAfterSyncFailed = plan.ErrAfterSyncFailed
 )
 
 // HazardError reports all critical hazards that were not explicitly accepted.

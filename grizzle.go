@@ -269,6 +269,10 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error {
 			Tracer:           opts.Tracer,
 			DryRun:           opts.DryRun,
 			Backfill:         toExecBackfill(opts.Backfill),
+			BeforeSync:       opts.BeforeSync,
+			AfterSync:        opts.AfterSync,
+			BeforeStep:       opts.BeforeStep,
+			AfterStep:        opts.AfterStep,
 			RebuildThreshold: opts.SQLiteRebuildThreshold,
 			RebuildBatchSize: opts.SQLiteRebuildBatchSize,
 		})
@@ -293,6 +297,10 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error {
 		Tracer:               opts.Tracer,
 		DryRun:               opts.DryRun,
 		Backfill:             toExecBackfill(opts.Backfill),
+		BeforeSync:           opts.BeforeSync,
+		AfterSync:            opts.AfterSync,
+		BeforeStep:           opts.BeforeStep,
+		AfterStep:            opts.AfterStep,
 	})
 }
 
@@ -349,6 +357,18 @@ type ApplyOpts struct {
 	// Backfill hook function run outside the DDL lock window in batches during staged expand migration.
 	Backfill BackfillFunc
 
+	// BeforeSync runs once before any migration steps or locks are executed.
+	BeforeSync SyncHook
+
+	// AfterSync runs once after all migration steps and history recording succeed.
+	AfterSync SyncHook
+
+	// BeforeStep executes immediately prior to executing each plan step.
+	BeforeStep StepHook
+
+	// AfterStep executes immediately following the successful execution of each plan step.
+	AfterStep StepHook
+
 	// SQLiteRebuildThreshold defines the row count threshold above which SQLite table rebuilds
 	// chunk data copying by keyset. Defaults to 100000.
 	SQLiteRebuildThreshold int
@@ -392,6 +412,10 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 			AllowDropFK:            &p.Policy.AllowFK,
 			AcceptHazards:          opts.AcceptHazards,
 			Backfill:               opts.Backfill,
+			BeforeSync:             opts.BeforeSync,
+			AfterSync:              opts.AfterSync,
+			BeforeStep:             opts.BeforeStep,
+			AfterStep:              opts.AfterStep,
 			SQLiteRebuildThreshold: opts.SQLiteRebuildThreshold,
 			SQLiteRebuildBatchSize: opts.SQLiteRebuildBatchSize,
 			LockNamespace:          opts.LockNamespace,
@@ -414,6 +438,10 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 				Tracer:           syncOpts.Tracer,
 				DryRun:           syncOpts.DryRun,
 				Backfill:         toExecBackfill(opts.Backfill),
+				BeforeSync:       opts.BeforeSync,
+				AfterSync:        opts.AfterSync,
+				BeforeStep:       opts.BeforeStep,
+				AfterStep:        opts.AfterStep,
 				RebuildThreshold: syncOpts.SQLiteRebuildThreshold,
 				RebuildBatchSize: syncOpts.SQLiteRebuildBatchSize,
 			})
@@ -456,6 +484,10 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 			ExpectedHash:     opts.ExpectedHash,
 			Tracer:           opts.Tracer,
 			Backfill:         toExecBackfill(opts.Backfill),
+			BeforeSync:       opts.BeforeSync,
+			AfterSync:        opts.AfterSync,
+			BeforeStep:       opts.BeforeStep,
+			AfterStep:        opts.AfterStep,
 			RebuildThreshold: opts.SQLiteRebuildThreshold,
 			RebuildBatchSize: opts.SQLiteRebuildBatchSize,
 		})
@@ -478,6 +510,10 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 			StatementTimeout: exec.DefaultStatementTimeout,
 			MaxRetries:       exec.DefaultMaxRetries,
 			Backfill:         toExecBackfill(opts.Backfill),
+			BeforeSync:       opts.BeforeSync,
+			AfterSync:        opts.AfterSync,
+			BeforeStep:       opts.BeforeStep,
+			AfterStep:        opts.AfterStep,
 		})
 	default:
 		return fmt.Errorf("grizzle: unsupported dialect %q", dialect)
