@@ -108,7 +108,7 @@ func main() {
 		TargetSchema:    targetSchema,
 		SchemaSQL:       schemaSQL,
 		Renames:         renames,
-		AllowDropColumn: ptr(true),
+		AllowDropColumn: new(true),
 		AcceptHazards:   []grizzle.HazardCode{grizzle.HazardDropColumn},
 	})
 	if err != nil {
@@ -138,5 +138,3 @@ func bootstrap(ctx context.Context, db *sql.DB, targetSchema string) error {
 	}
 	return exec(bootstrapSQL)
 }
-
-func ptr[T any](v T) *T { return &v }
