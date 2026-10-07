@@ -114,9 +114,28 @@ This document outlines the step-by-step execution plan to build, test, and ship 
 
 Ordered by expected impact; nothing here blocks the first release.
 
+- [x] **Declarative management surface expansion** — shipped (see "Managed surface expansion" below): extensions, RLS + policies, functions, triggers, and views/matviews are now first-class managed constructs.
 - [ ] **SQLite declarative CHECK constraints** — SQLite CHECK DDL is neither introspected nor preserved through rebuilds (documented gap in SPEC §3).
 - [ ] **Domain CHECK management** — domain constraints (`pg_constraint.conrelid = 0`) are inventory-only.
-- [x] **Declarative view migrations** — shipped: views/materialized views now managed (create/replace/drop, `AllowDropView`, `DROP_VIEW` hazard); functions and triggers shipped previously.
 - [ ] **CLI backfill runner** — batched backfill is library-only (`Options.Backfill`); a CLI runner would need a durable batching contract.
 - [ ] **Multi-schema SQLite** — rejected today (`ErrUnsupportedMultiSchema`).
 - [ ] **v1.0.0 API freeze** — remove `Experimental:` markers once rename mapping, staged plans, and backfill batching stabilize.
+
+## Managed surface expansion (shipped)
+
+Declarative lifecycle for objects previously detected-and-protected. Each construct follows the same pipeline: shadow-compile the desired DDL, introspect both live and shadow catalogs, diff canonically (`pg_get_*def` outputs), render steps, gate destructive steps.
+
+- **Extensions** — statement-scanned (they roll back with the shadow tx, so they are captured before shadow compilation and re-installed best-effort for type availability). `EXTENSION_PRIVILEGE` warning; `AllowDropExtension` gate; intentionally irreversible in migration exports.
+- **RLS + policies** — table flags via `pg_class`, policies via `pg_policy` with expression normalization. Replace is DROP+CREATE (PostgreSQL has no `CREATE OR REPLACE POLICY`). `RLS_ENABLE` warning, `DROP_POLICY` critical + `AllowDropPolicy`. Lint L008 flags RLS-enabled tables with zero policies.
+- **Functions** — canonical `pg_get_functiondef` comparison with search-path-independent inspection; body drift replaces in place, signature drift is DROP+CREATE. `DROP_FUNCTION` critical + `AllowDropFunction`; `SECURITY_DEFINER` warning. Procedures/aggregates remain protected (no clean `CREATE OR REPLACE` diff semantics for identity-args changes across kinds).
+- **Triggers** — `pg_get_triggerdef` canonical; surviving managed triggers fold into `UNMANAGED_DEPENDENCY` so dependent column drops stay blocked until the hazard is accepted. `DROP_TRIGGER` critical + `AllowDropTrigger`.
+- **Views / materialized views** — `pg_get_viewdef` canonical; append-only column growth replaces in place, everything else is DROP+CREATE; matviews additionally emit `REFRESH MATERIALIZED VIEW`. `DROP_VIEW` critical + `AllowDropView`.
+- **Lint L009** — rejects DML in `SchemaSQL` (silently ignored today; seeds belong in `SeedSQL`).
+- **Export** — reversal (`Down`) SQL for policy/RLS/function/trigger/view creation; extension creation deliberately irreversible.
+
+### Deferred (rationale)
+
+- **Grants / roles / privileges** — environment-specific by nature (`GRANT` targets differ per deployment); a declarative diff would either fight operators or require per-env policy files. Re-evaluate with a roles-file contract.
+- **`COMMENT ON`** — comments on tables/columns are Phase 2 parity nicety; diff is trivial but not yet wired into the plan hash contract.
+- **Publications / event triggers** — cluster-wide, schema-less objects with no shadow-compile story (the shadow schema is transactional; publications and event triggers are database-level).
+- **Procedures & aggregates** — deferred with functions shipped: `CREATE OR REPLACE PROCEDURE` exists, but identity-args drift cannot be replaced (DROP+CREATE only) and aggregate signatures are carrier-verbose; protection remains active.

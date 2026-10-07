@@ -65,11 +65,16 @@ type Options struct {
     AllowDrop bool
 
     // Granular drop overrides (nil inherits from AllowDrop):
-    AllowDropTable  *bool
-    AllowDropColumn *bool
-    AllowDropIndex  *bool
-    AllowDropFK     *bool
-    AllowDropCheck  *bool
+    AllowDropTable     *bool
+    AllowDropColumn    *bool
+    AllowDropIndex     *bool
+    AllowDropFK        *bool
+    AllowDropCheck     *bool
+    AllowDropExtension *bool
+    AllowDropFunction  *bool
+    AllowDropPolicy    *bool
+    AllowDropTrigger   *bool
+    AllowDropView      *bool
 
     // ExcludeTables defines table names or glob patterns (e.g. "spatial_ref_sys", "asynq_*")
     // that Grizzle will never alter, diff, or drop.
@@ -222,8 +227,8 @@ func (p *Plan) String() string
 type HazardLevel string
 
 const (
-    HazardLevelCritical HazardLevel = "CRITICAL" // Data destruction (DROP TABLE/COLUMN, TYPE_NARROW, RENAME_AMBIGUOUS, UNMANAGED_DEPENDENCY, GENERATED_REWRITE)
-    HazardLevelWarning  HazardLevel = "WARNING"  // Execution risk (PARTITION_ATTACH_SCAN, PARTITION_PENDING_DETACH)
+    HazardLevelCritical HazardLevel = "CRITICAL" // Data destruction (DROP TABLE/COLUMN, DROP_EXTENSION, DROP_POLICY, DROP_FUNCTION, DROP_TRIGGER, DROP_VIEW, TYPE_NARROW, RENAME_AMBIGUOUS, UNMANAGED_DEPENDENCY, GENERATED_REWRITE)
+    HazardLevelWarning  HazardLevel = "WARNING"  // Execution or lockout risk (EXTENSION_PRIVILEGE, RLS_ENABLE, SECURITY_DEFINER, PARTITION_ATTACH_SCAN, PARTITION_PENDING_DETACH)
     HazardLevelNotice   HazardLevel = "NOTICE"   // Locking or performance impact (INDEX creation/drop, FK drop)
 )
 
@@ -247,6 +252,14 @@ const (
     HazardGeneratedRewrite       HazardCode = "GENERATED_REWRITE"
     HazardPartitionAttachScan    HazardCode = "PARTITION_ATTACH_SCAN"
     HazardPartitionPendingDetach HazardCode = "PARTITION_PENDING_DETACH"
+    HazardExtensionPrivilege     HazardCode = "EXTENSION_PRIVILEGE"
+    HazardDropExtension          HazardCode = "DROP_EXTENSION"
+    HazardDropPolicy             HazardCode = "DROP_POLICY"
+    HazardRLSEnable              HazardCode = "RLS_ENABLE"
+    HazardDropFunction           HazardCode = "DROP_FUNCTION"
+    HazardSecurityDefiner        HazardCode = "SECURITY_DEFINER"
+    HazardDropTrigger            HazardCode = "DROP_TRIGGER"
+    HazardDropView               HazardCode = "DROP_VIEW"
 )
 
 type Hazard struct {
@@ -280,6 +293,12 @@ type Hazard struct {
 | `ENUM Types` | Yes | `CREATE TYPE ... AS ENUM`, `ALTER TYPE ... ADD VALUE` |
 | `Generated Columns` | Yes | `GENERATED ALWAYS AS (...) STORED`; expression rewrite triggers `GENERATED_REWRITE` hazard |
 | `Native Types` | Yes | UUID, JSONB, Arrays, Timestamps, Numerics |
+| `Extensions` | Yes | Declarative `CREATE EXTENSION` (desired captured by statement scan; installs best-effort in the shadow tx so extension-provided types compile). Creates are never dropped by default (`AllowDropExtension`) and marked irreversible in exports. `EXTENSION_PRIVILEGE` (WARNING) on create |
+| `Row-Level Security` | Yes | `ENABLE/DISABLE/FORCE ROW LEVEL SECURITY` flags diffed per table (`pg_class`); `RLS_ENABLE` (WARNING) because applying can lock out the app role |
+| `RLS Policies` | Yes | Full lifecycle via `pg_policy` (`CREATE POLICY` / DROP+CREATE replace); drops gated by `AllowDropPolicy` + `DROP_POLICY` (CRITICAL) |
+| `Functions` | Yes | Managed routines diffed on canonical `pg_get_functiondef` output; body drift → `CREATE OR REPLACE FUNCTION`, signature drift → DROP+CREATE; drops gated by `AllowDropFunction` + `DROP_FUNCTION` (CRITICAL); `SECURITY_DEFINER` (WARNING) without explicit `search_path`. Procedures and aggregates are detected-and-protected, not managed |
+| `Triggers` | Yes | `pg_trigger` + canonical `pg_get_triggerdef`; drift → DROP+CREATE; drops gated by `AllowDropTrigger` + `DROP_TRIGGER` (CRITICAL); surviving managed triggers block dependent column drops via `UNMANAGED_DEPENDENCY` |
+| `Views` & `Materialized Views` | Yes | Canonical `pg_get_viewdef`; append-only column changes replace in place (`CREATE OR REPLACE VIEW`), otherwise DROP+CREATE; matviews always DROP+CREATE plus `REFRESH MATERIALIZED VIEW`; drops gated by `AllowDropView` + `DROP_VIEW` (CRITICAL) |
 
 ### SQLite
 
@@ -301,14 +320,11 @@ type Hazard struct {
 
 | Construct | Supported | Policy |
 | :--- | :---: | :--- |
-| `Views` & `Materialized Views` | Managed | Introspected (`pg_get_viewdef`); create / replace / drop synced declaratively, drops gated by `AllowDropView` |
-| `Triggers` | Protected | Preserved on managed tables; drop/alter operations on dependencies blocked |
-| `Functions` & `Procedures` | Protected | Introspected with table/column dependencies: `pg_depend` for SQL-standard (`BEGIN ATOMIC`) bodies, conservative source scan for quoted string bodies; destructive alterations on dependents blocked via `UNMANAGED_DEPENDENCY` |
+| `Procedures` & `Aggregates` | Protected | Introspected and dependency-graphed (`pg_depend` for SQL-standard `BEGIN ATOMIC` bodies, conservative source scan for quoted string bodies); never created, altered, or dropped — only managed `FUNCTION`s are synced |
 | `Sequences` (unowned) | Protected | Never dropped or managed |
 | `Domains` | Protected | Introspected and protected |
 
-> [!NOTE]
-> **Roadmap Note**: Declarative views, triggers, functions, RLS policies, and extensions are managed as of this release (see §3). Views and materialized views are created, replaced, and dropped per the desired schema; destructive view steps are gated behind `AllowDropView` and the `DROP_VIEW` hazard.
+Everything outside the tables above that Grizzle cannot fully diff is left untouched. Extension-owned objects (e.g. types installed by `citext`) are excluded from routine management (`pg_proc.deptype = 'e'`).
 
 ## 4. Safety model and invariants
 
@@ -391,6 +407,8 @@ type DestructiveViolationError struct {
 | `L005` | `WARNING` | CHECK constraint name is not lowercase snake_case |
 | `L006` | `WARNING` | Table declares multiple CHECK constraints with the same normalized expression |
 | `L007` | `INFO` | CHECK constraint uses PostgreSQL's auto-generated name (`table[_column]_check[n]`); prefer an explicit `CONSTRAINT name CHECK` |
+| `L008` | `WARNING` | Table has `ENABLE ROW LEVEL SECURITY` but declares zero policies — every role is locked out |
+| `L009` | `ERROR` | DML statement (`INSERT`/`UPDATE`/`DELETE`/`TRUNCATE`) declared in `SchemaSQL` — it is silently ignored by automigrations; move seed data to `SeedSQL` |
 
 Severity semantics:
 
