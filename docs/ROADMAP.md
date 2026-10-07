@@ -127,15 +127,16 @@ Declarative lifecycle for objects previously detected-and-protected. Each constr
 
 - **Extensions** — statement-scanned (they roll back with the shadow tx, so they are captured before shadow compilation and re-installed best-effort for type availability). `EXTENSION_PRIVILEGE` warning; `AllowDropExtension` gate; intentionally irreversible in migration exports.
 - **RLS + policies** — table flags via `pg_class`, policies via `pg_policy` with expression normalization. Replace is DROP+CREATE (PostgreSQL has no `CREATE OR REPLACE POLICY`). `RLS_ENABLE` warning, `DROP_POLICY` critical + `AllowDropPolicy`. Lint L008 flags RLS-enabled tables with zero policies.
-- **Functions** — canonical `pg_get_functiondef` comparison with search-path-independent inspection; body drift replaces in place, signature drift is DROP+CREATE. `DROP_FUNCTION` critical + `AllowDropFunction`; `SECURITY_DEFINER` warning. Procedures/aggregates remain protected (no clean `CREATE OR REPLACE` diff semantics for identity-args changes across kinds).
+- **COMMENT ON** — table/column comments diffed from `obj_description` / `col_description`; set/clear is non-destructive with a `COMMENT_CLEAR` notice when overwriting an existing comment; reversible in exports.
+- **Functions** — canonical `pg_get_functiondef` comparison with search-path-independent inspection; body drift replaces in place, signature drift is DROP+CREATE. `DROP_FUNCTION` critical + `AllowDropFunction`; `SECURITY_DEFINER` warning.
+- **Procedures** — managed like functions (`pg_get_functiondef` covers both); body drift → `CREATE OR REPLACE PROCEDURE`, signature drift DROP+CREATE, drops share the `AllowDropFunction` gate. Window functions (prokind `w`) remain protected.
+- **Aggregates** — canonical definition reconstructed from `pg_aggregate` catalog fields (`pg_get_functiondef` does not support aggregates); any drift is DROP+CREATE (Postgres has no `CREATE OR REPLACE AGGREGATE`); created after and dropped before their support functions via dedicated `CREATE_AGGREGATE`/`DROP_AGGREGATE` plan steps sharing the function gate. Ordered-set/hypothetical aggregates remain protected.
 - **Triggers** — `pg_get_triggerdef` canonical; surviving managed triggers fold into `UNMANAGED_DEPENDENCY` so dependent column drops stay blocked until the hazard is accepted. `DROP_TRIGGER` critical + `AllowDropTrigger`.
 - **Views / materialized views** — `pg_get_viewdef` canonical; append-only column growth replaces in place, everything else is DROP+CREATE; matviews additionally emit `REFRESH MATERIALIZED VIEW`. `DROP_VIEW` critical + `AllowDropView`.
 - **Lint L009** — rejects DML in `SchemaSQL` (silently ignored today; seeds belong in `SeedSQL`).
-- **Export** — reversal (`Down`) SQL for policy/RLS/function/trigger/view creation; extension creation deliberately irreversible.
+- **Export** — reversal (`Down`) SQL for policy/RLS/function/trigger/view/comment creation (comments restore the previous text; aggregates reverse to `DROP AGGREGATE`); extension creation deliberately irreversible.
 
 ### Deferred (rationale)
 
 - **Grants / roles / privileges** — environment-specific by nature (`GRANT` targets differ per deployment); a declarative diff would either fight operators or require per-env policy files. Re-evaluate with a roles-file contract.
-- **`COMMENT ON`** — comments on tables/columns are Phase 2 parity nicety; diff is trivial but not yet wired into the plan hash contract.
 - **Publications / event triggers** — cluster-wide, schema-less objects with no shadow-compile story (the shadow schema is transactional; publications and event triggers are database-level).
-- **Procedures & aggregates** — deferred with functions shipped: `CREATE OR REPLACE PROCEDURE` exists, but identity-args drift cannot be replaced (DROP+CREATE only) and aggregate signatures are carrier-verbose; protection remains active.

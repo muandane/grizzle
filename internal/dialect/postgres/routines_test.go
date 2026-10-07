@@ -42,7 +42,21 @@ func TestGenerateDropFunctionSQL(t *testing.T) {
 	if got := postgres.GenerateDropFunctionSQL("public", &schema.Routine{Name: "do_stuff", Kind: "PROCEDURE", IdentityArgs: "integer"}); got != `DROP PROCEDURE IF EXISTS "public"."do_stuff"(integer);` {
 		t.Fatalf("unexpected procedure kind: %q", got)
 	}
+	if got := postgres.GenerateDropFunctionSQL("public", &schema.Routine{Name: "sum2", Kind: "AGGREGATE", IdentityArgs: "v integer"}); got != `DROP AGGREGATE IF EXISTS "public"."sum2"(v integer);` {
+		t.Fatalf("unexpected aggregate kind: %q", got)
+	}
 	if got := postgres.GenerateDropFunctionSQL("public", nil); got != "" {
 		t.Fatalf("nil routine must render empty, got %q", got)
+	}
+}
+
+func TestGenerateCreateFunctionSQL_AggregatePassthrough(t *testing.T) {
+	def := "CREATE AGGREGATE public.sum2(v integer) (\n    SFUNC = int4pl,\n    STYPE = integer\n);"
+	if got := postgres.GenerateCreateFunctionSQL(&schema.Routine{Name: "sum2", Kind: "AGGREGATE", IdentityArgs: "v integer", Definition: def}); got != def {
+		t.Fatalf("aggregate definition must pass through with terminator, got %q", got)
+	}
+	unterminated := "CREATE AGGREGATE public.sum2(v integer) (\n    SFUNC = int4pl,\n    STYPE = integer\n)"
+	if got := postgres.GenerateCreateFunctionSQL(&schema.Routine{Name: "sum2", Kind: "AGGREGATE", IdentityArgs: "v integer", Definition: unterminated}); got != unterminated+";" {
+		t.Fatalf("unterminated aggregate definition must gain terminator, got %q", got)
 	}
 }

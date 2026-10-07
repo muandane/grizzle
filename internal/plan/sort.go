@@ -30,6 +30,7 @@ func SortSteps(steps []Step) {
 		ChangeDetachPartition:    25, // 2b. Detach partitions before modifying or dropping them
 		ChangeDropPolicy:         26, // 2c. Drop policies before recreating
 		ChangeDropTrigger:        27, // 2d. Drop triggers before column/table drops or function replaces
+		ChangeDropAggregate:      28, // 2e'. Drop aggregates before their support functions (pg_depend)
 		ChangeDropView:           28, // 2e. Drop views before underlying table drops
 		ChangeDropFunction:       29, // 2f. Drop functions after dependents
 		ChangeDropExtension:      29, // 2g. Drop extensions last among early drops
@@ -40,6 +41,7 @@ func SortSteps(steps []Step) {
 		ChangeAttachPartition:    42, // 5a. Attach existing tables to partitioned tables
 		ChangeRenameColumn:       45, // 5b. Rename columns before adding or altering other columns
 		ChangeCreateFunction:     48, // 5c. Functions before triggers/views that call them
+		ChangeCreateAggregate:    49, // 5c'. Aggregates after their support functions (pg_depend)
 		ChangeAddColumn:          50, // 6. Add new columns
 		ChangeAlterColumn:        60, // 7. Modify column types, nullability, defaults
 		ChangeCreateIndex:        70, // 8. Build new indexes

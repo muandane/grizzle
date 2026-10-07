@@ -296,7 +296,10 @@ type Hazard struct {
 | `Extensions` | Yes | Declarative `CREATE EXTENSION` (desired captured by statement scan; installs best-effort in the shadow tx so extension-provided types compile). Creates are never dropped by default (`AllowDropExtension`) and marked irreversible in exports. `EXTENSION_PRIVILEGE` (WARNING) on create |
 | `Row-Level Security` | Yes | `ENABLE/DISABLE/FORCE ROW LEVEL SECURITY` flags diffed per table (`pg_class`); `RLS_ENABLE` (WARNING) because applying can lock out the app role |
 | `RLS Policies` | Yes | Full lifecycle via `pg_policy` (`CREATE POLICY` / DROP+CREATE replace); drops gated by `AllowDropPolicy` + `DROP_POLICY` (CRITICAL) |
-| `Functions` | Yes | Managed routines diffed on canonical `pg_get_functiondef` output; body drift → `CREATE OR REPLACE FUNCTION`, signature drift → DROP+CREATE; drops gated by `AllowDropFunction` + `DROP_FUNCTION` (CRITICAL); `SECURITY_DEFINER` (WARNING) without explicit `search_path`. Procedures and aggregates are detected-and-protected, not managed |
+| `COMMENT ON` | Yes | Table/column comments diffed from `obj_description` / `col_description`; set/clear (`IS '…'` / `IS NULL`) is non-destructive; clearing a non-empty live comment emits `COMMENT_CLEAR` (NOTICE); SQLite ignores comments (no catalog support) |
+| `Functions` | Yes | Managed routines diffed on canonical `pg_get_functiondef` output; body drift → `CREATE OR REPLACE FUNCTION`, signature drift → DROP+CREATE; drops gated by `AllowDropFunction` + `DROP_FUNCTION` (CRITICAL); `SECURITY_DEFINER` (WARNING) without explicit `search_path` |
+| `Procedures` | Yes | Managed like functions (`pg_get_functiondef` is canonical for both); body drift → `CREATE OR REPLACE PROCEDURE`; signature drift → DROP+CREATE; drops share the `AllowDropFunction` gate |
+| `Aggregates` | Yes | Reconstructed canonical `CREATE AGGREGATE` from `pg_aggregate` (`SFUNC`/`STYPE`/`FINALFUNC`/`INITCOND`/`PARALLEL`); any drift is DROP+CREATE (no `CREATE OR REPLACE`); ordered-set/hypothetical aggregates (non-default `aggkind`) remain protected |
 | `Triggers` | Yes | `pg_trigger` + canonical `pg_get_triggerdef`; drift → DROP+CREATE; drops gated by `AllowDropTrigger` + `DROP_TRIGGER` (CRITICAL); surviving managed triggers block dependent column drops via `UNMANAGED_DEPENDENCY` |
 | `Views` & `Materialized Views` | Yes | Canonical `pg_get_viewdef`; append-only column changes replace in place (`CREATE OR REPLACE VIEW`), otherwise DROP+CREATE; matviews always DROP+CREATE plus `REFRESH MATERIALIZED VIEW`; drops gated by `AllowDropView` + `DROP_VIEW` (CRITICAL) |
 
@@ -320,9 +323,10 @@ type Hazard struct {
 
 | Construct | Supported | Policy |
 | :--- | :---: | :--- |
-| `Procedures` & `Aggregates` | Protected | Introspected and dependency-graphed (`pg_depend` for SQL-standard `BEGIN ATOMIC` bodies, conservative source scan for quoted string bodies); never created, altered, or dropped — only managed `FUNCTION`s are synced |
 | `Sequences` (unowned) | Protected | Never dropped or managed |
 | `Domains` | Protected | Introspected and protected |
+| `Window functions` (prokind `w`) | Protected | Never managed; dependency-graphed so drops referencing them stay blocked |
+| Ordered-set / hypothetical aggregates (non-default `aggkind`) | Protected | Outside the reconstructed `CREATE AGGREGATE` surface; never managed |
 
 Everything outside the tables above that Grizzle cannot fully diff is left untouched. Extension-owned objects (e.g. types installed by `citext`) are excluded from routine management (`pg_proc.deptype = 'e'`).
 

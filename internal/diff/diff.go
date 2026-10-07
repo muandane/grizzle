@@ -980,9 +980,11 @@ func routineDef(r *schema.Routine, normalize func(string) string) *schema.Routin
 }
 
 // diffRoutines emits routine changes. pg_get_functiondef always renders
-// CREATE OR REPLACE, so body/volatility/security drift replaces in place;
-// identity-args, return-type, kind, or language drift cannot be replaced
-// (Postgres restriction) and requires a destructive DROP + CREATE.
+// CREATE OR REPLACE, so function/procedure body/volatility/security drift
+// replaces in place; identity-args, return-type, kind, or language drift
+// cannot be replaced (Postgres restriction) and requires a destructive
+// DROP + CREATE. Aggregates (reconstructed CREATE AGGREGATE) have no
+// CREATE OR REPLACE, so any body drift is DROP + CREATE.
 func diffRoutines(live, desired *schema.Schema, targetSchema string, normalize func(string) string) []Change {
 	var changes []Change
 	for _, dR := range sortedRoutines(desired) {
@@ -990,7 +992,7 @@ func diffRoutines(live, desired *schema.Schema, targetSchema string, normalize f
 		lR, exists := live.Routines[schema.RoutineKey(dR.Name, dR.IdentityArgs)]
 		if !exists {
 			changes = append(changes, Change{
-				Type:        plan.ChangeCreateFunction,
+				Type:        routineCreateType(dR.Kind),
 				Schema:      targetSchema,
 				Table:       dR.Name,
 				Routine:     dCopy,
@@ -1004,14 +1006,14 @@ func diffRoutines(live, desired *schema.Schema, targetSchema string, normalize f
 			lCopy := *lR
 			lCopy.IdentityArgs = normalize(lR.IdentityArgs)
 			changes = append(changes, Change{
-				Type:        plan.ChangeDropFunction,
+				Type:        routineDropType(lR.Kind),
 				Schema:      targetSchema,
 				Table:       lR.Name,
 				Routine:     &lCopy,
 				Destructive: true,
 			})
 			changes = append(changes, Change{
-				Type:        plan.ChangeCreateFunction,
+				Type:        routineCreateType(dR.Kind),
 				Schema:      targetSchema,
 				Table:       dR.Name,
 				Routine:     dCopy,
@@ -1020,8 +1022,20 @@ func diffRoutines(live, desired *schema.Schema, targetSchema string, normalize f
 			continue
 		}
 		if normalize(lR.Definition) != dCopy.Definition {
+			if dR.Kind == "AGGREGATE" {
+				// Aggregates have no CREATE OR REPLACE: any drift is DROP + CREATE.
+				lCopy := *lR
+				lCopy.IdentityArgs = normalize(lR.IdentityArgs)
+				changes = append(changes, Change{
+					Type:        routineDropType(lR.Kind),
+					Schema:      targetSchema,
+					Table:       lR.Name,
+					Routine:     &lCopy,
+					Destructive: true,
+				})
+			}
 			changes = append(changes, Change{
-				Type:        plan.ChangeCreateFunction,
+				Type:        routineCreateType(dR.Kind),
 				Schema:      targetSchema,
 				Table:       dR.Name,
 				Routine:     dCopy,
@@ -1034,7 +1048,7 @@ func diffRoutines(live, desired *schema.Schema, targetSchema string, normalize f
 			lCopy := *lR
 			lCopy.IdentityArgs = normalize(lR.IdentityArgs)
 			changes = append(changes, Change{
-				Type:        plan.ChangeDropFunction,
+				Type:        routineDropType(lR.Kind),
 				Schema:      targetSchema,
 				Table:       lR.Name,
 				Routine:     &lCopy,
@@ -1043,6 +1057,24 @@ func diffRoutines(live, desired *schema.Schema, targetSchema string, normalize f
 		}
 	}
 	return changes
+}
+
+// routineCreateType / routineDropType route aggregates to their dedicated
+// change types so plan sorting places aggregate creation after support
+// functions and aggregate drops before support functions. Functions and
+// procedures share the base types.
+func routineCreateType(kind string) plan.ChangeType {
+	if kind == "AGGREGATE" {
+		return plan.ChangeCreateAggregate
+	}
+	return plan.ChangeCreateFunction
+}
+
+func routineDropType(kind string) plan.ChangeType {
+	if kind == "AGGREGATE" {
+		return plan.ChangeDropAggregate
+	}
+	return plan.ChangeDropFunction
 }
 
 // sortedRoutines returns a schema's routines in deterministic key order.

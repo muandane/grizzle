@@ -163,7 +163,7 @@ func isStepReversible(s plan.Step) bool {
 	switch s.Type {
 	case plan.ChangeCreateTable, plan.ChangeAddColumn, plan.ChangeCreateIndex, plan.ChangeAddFK, plan.ChangeAddCheck, plan.ChangeRenameColumn, plan.ChangeAttachPartition,
 		plan.ChangeCreatePolicy, plan.ChangeEnableRLS, plan.ChangeDisableRLS, plan.ChangeForceRLS, plan.ChangeNoForceRLS,
-		plan.ChangeCreateFunction, plan.ChangeCreateTrigger, plan.ChangeCreateView, plan.ChangeRefreshMatView,
+		plan.ChangeCreateFunction, plan.ChangeCreateAggregate, plan.ChangeCreateTrigger, plan.ChangeCreateView, plan.ChangeRefreshMatView,
 		plan.ChangeCommentTable, plan.ChangeCommentColumn:
 		return true
 	default:
@@ -249,6 +249,12 @@ func reverseStepSQL(s plan.Step) string {
 		}
 		return fmt.Sprintf("-- Reversal not derivable for %s", s.Type)
 
+	case plan.ChangeCreateAggregate:
+		if name, args, ok := aggregateSignature(s.SQL); ok {
+			return fmt.Sprintf("DROP AGGREGATE IF EXISTS %s(%s);", name, args)
+		}
+		return fmt.Sprintf("-- Reversal not derivable for %s", s.Type)
+
 	case plan.ChangeCreateTrigger:
 		trgName := ""
 		if m := triggerNameRegex.FindStringSubmatch(s.SQL); len(m) == 2 {
@@ -310,6 +316,40 @@ func functionSignature(sql string) (name, args string, ok bool) {
 		return "", "", false
 	}
 	// Balanced-paren scan for the identity argument list.
+	depth := 0
+	for i := open; i < len(rest); i++ {
+		switch rest[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return name, strings.TrimSpace(rest[open+1 : i]), true
+			}
+		}
+	}
+	return "", "", false
+}
+
+// aggregateSignature extracts the name and identity argument list from a
+// rendered CREATE AGGREGATE statement, e.g. `CREATE AGGREGATE sum2(v bigint)`.
+// The signature ends at the first balanced parenthesis pair (before the
+// definition body); it returns ok=false for statements it cannot parse.
+func aggregateSignature(sql string) (name, args string, ok bool) {
+	const kw = "AGGREGATE"
+	idx := strings.Index(strings.ToUpper(sql), kw)
+	if idx < 0 {
+		return "", "", false
+	}
+	rest := sql[idx+len(kw):]
+	open := strings.IndexByte(rest, '(')
+	if open < 0 {
+		return "", "", false
+	}
+	name = strings.TrimSpace(rest[:open])
+	if name == "" {
+		return "", "", false
+	}
 	depth := 0
 	for i := open; i < len(rest); i++ {
 		switch rest[i] {

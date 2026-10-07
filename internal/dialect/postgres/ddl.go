@@ -348,16 +348,19 @@ func GenerateCreateFunctionSQL(r *schema.Routine) string {
 	return def
 }
 
-// GenerateDropFunctionSQL constructs a DROP FUNCTION statement using the
-// routine's identity arguments, which uniquely identify it (including
-// overloads) without default values.
+// GenerateDropFunctionSQL constructs a DROP FUNCTION/PROCEDURE/AGGREGATE
+// statement using the routine's identity arguments, which uniquely identify it
+// (including overloads) without default values.
 func GenerateDropFunctionSQL(targetSchema string, r *schema.Routine) string {
 	if r == nil {
 		return ""
 	}
 	kind := "FUNCTION"
-	if strings.EqualFold(r.Kind, "PROCEDURE") {
+	switch {
+	case strings.EqualFold(r.Kind, "PROCEDURE"):
 		kind = "PROCEDURE"
+	case strings.EqualFold(r.Kind, "AGGREGATE"):
+		kind = "AGGREGATE"
 	}
 	return fmt.Sprintf("DROP %s IF EXISTS %q.%q(%s);", kind, targetSchema, r.Name, r.IdentityArgs)
 }
@@ -530,9 +533,9 @@ func RenderChangeWithOpts(targetSchema string, c diff.Change, opts RenderOpts) p
 			polName = c.Policy.Name
 		}
 		step.SQL = GenerateDropPolicySQL(effectiveSchema, c.Table, polName)
-	case plan.ChangeCreateFunction:
+	case plan.ChangeCreateFunction, plan.ChangeCreateAggregate:
 		step.SQL = GenerateCreateFunctionSQL(c.Routine)
-	case plan.ChangeDropFunction:
+	case plan.ChangeDropFunction, plan.ChangeDropAggregate:
 		step.SQL = GenerateDropFunctionSQL(effectiveSchema, c.Routine)
 	case plan.ChangeCreateTrigger:
 		step.SQL = GenerateCreateTriggerSQL(c.Trigger)

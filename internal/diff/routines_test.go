@@ -152,3 +152,82 @@ func TestDiff_Routines_NoOpWhenNormalizedEqual(t *testing.T) {
 		t.Fatalf("expected no changes, got %+v", changes)
 	}
 }
+
+func aggregate(name, identityArgs, definition string) *schema.Routine {
+	return &schema.Routine{
+		Name:         name,
+		Kind:         "AGGREGATE",
+		IdentityArgs: identityArgs,
+		Definition:   definition,
+	}
+}
+
+func TestDiff_Routines_AggregateCreateMissing(t *testing.T) {
+	live := &schema.Schema{Name: "public"}
+	desired := &schema.Schema{Name: "public", Routines: map[string]*schema.Routine{
+		schema.RoutineKey("sum2", "v integer"): aggregate("sum2", "v integer",
+			"CREATE AGGREGATE public.sum2(v integer) (\n    SFUNC = int4pl,\n    STYPE = integer\n);"),
+	}}
+
+	changes, err := diff.Diff(live, desired, "public", "", scope.Filters{})
+	if err != nil {
+		t.Fatalf("diff: %v", err)
+	}
+	types := countTypes(changes)
+	if types[plan.ChangeCreateAggregate] != 1 || types[plan.ChangeDropAggregate] != 0 {
+		t.Fatalf("expected single CREATE_AGGREGATE, got %v", types)
+	}
+	for _, c := range changes {
+		if c.Destructive {
+			t.Fatalf("create must not be destructive: %+v", c)
+		}
+	}
+}
+
+func TestDiff_Routines_AggregateBodyDriftDropsAndCreates(t *testing.T) {
+	liveDef := "CREATE AGGREGATE public.sum2(v integer) (\n    SFUNC = int4pl,\n    STYPE = integer\n);"
+	driftDef := "CREATE AGGREGATE public.sum2(v integer) (\n    SFUNC = int8pl,\n    STYPE = bigint\n);"
+	sch := func(def string) *schema.Schema {
+		return &schema.Schema{Name: "public", Routines: map[string]*schema.Routine{
+			schema.RoutineKey("sum2", "v integer"): aggregate("sum2", "v integer", def),
+		}}
+	}
+
+	changes, err := diff.Diff(sch(liveDef), sch(driftDef), "public", "", scope.Filters{})
+	if err != nil {
+		t.Fatalf("diff: %v", err)
+	}
+	// Aggregates have no CREATE OR REPLACE: body drift must be DROP + CREATE.
+	if len(changes) != 2 {
+		t.Fatalf("expected DROP+CREATE for aggregate drift, got %+v", changes)
+	}
+	types := countTypes(changes)
+	if types[plan.ChangeDropAggregate] != 1 || types[plan.ChangeCreateAggregate] != 1 {
+		t.Fatalf("aggregate drift must DROP_AGGREGATE+CREATE_AGGREGATE, got %v", types)
+	}
+	for _, c := range changes {
+		if c.Type == plan.ChangeDropAggregate && !c.Destructive {
+			t.Fatalf("aggregate drop must be destructive: %+v", c)
+		}
+	}
+	if changes[0].Type != plan.ChangeDropAggregate {
+		t.Fatalf("drop must precede create, got %+v", changes)
+	}
+}
+
+func TestDiff_Routines_AggregateNoOpWhenEqual(t *testing.T) {
+	sch := func() *schema.Schema {
+		return &schema.Schema{Name: "public", Routines: map[string]*schema.Routine{
+			schema.RoutineKey("sum2", "v integer"): aggregate("sum2", "v integer",
+				"CREATE AGGREGATE public.sum2(v integer) (\n    SFUNC = int4pl,\n    STYPE = integer\n);"),
+		}}
+	}
+
+	changes, err := diff.Diff(sch(), sch(), "public", "", scope.Filters{})
+	if err != nil {
+		t.Fatalf("diff: %v", err)
+	}
+	if len(changes) != 0 {
+		t.Fatalf("expected no changes, got %+v", changes)
+	}
+}

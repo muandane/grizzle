@@ -42,13 +42,19 @@ const (
 	ChangeDropPolicy         ChangeType = "DROP_POLICY"
 	ChangeCreateFunction     ChangeType = "CREATE_FUNCTION"
 	ChangeDropFunction       ChangeType = "DROP_FUNCTION"
-	ChangeCreateTrigger      ChangeType = "CREATE_TRIGGER"
-	ChangeDropTrigger        ChangeType = "DROP_TRIGGER"
-	ChangeCreateView         ChangeType = "CREATE_VIEW"
-	ChangeDropView           ChangeType = "DROP_VIEW"
-	ChangeRefreshMatView     ChangeType = "REFRESH_MATVIEW"
-	ChangeCommentTable       ChangeType = "COMMENT_TABLE"
-	ChangeCommentColumn      ChangeType = "COMMENT_COLUMN"
+	// ChangeCreateAggregate / ChangeDropAggregate exist only for plan sort
+	// ordering: aggregates must be created after and dropped before their
+	// support functions (pg_depend makes the reverse order fail). Gates and
+	// hazards remain shared with functions (AllowFunction / DROP_FUNCTION).
+	ChangeCreateAggregate ChangeType = "CREATE_AGGREGATE"
+	ChangeDropAggregate   ChangeType = "DROP_AGGREGATE"
+	ChangeCreateTrigger   ChangeType = "CREATE_TRIGGER"
+	ChangeDropTrigger     ChangeType = "DROP_TRIGGER"
+	ChangeCreateView      ChangeType = "CREATE_VIEW"
+	ChangeDropView        ChangeType = "DROP_VIEW"
+	ChangeRefreshMatView  ChangeType = "REFRESH_MATVIEW"
+	ChangeCommentTable    ChangeType = "COMMENT_TABLE"
+	ChangeCommentColumn   ChangeType = "COMMENT_COLUMN"
 )
 
 // Step represents a single atomic DDL migration statement.
@@ -127,7 +133,9 @@ func (p DropPolicy) IsAllowed(s Step) bool {
 		return p.AllowColumn
 	case ChangeDropExtension:
 		return p.AllowExtension
-	case ChangeDropFunction:
+	case ChangeDropFunction, ChangeDropAggregate:
+		// Aggregates share the function drop gate: both are managed routines
+		// with the same replacement semantics (no CREATE OR REPLACE).
 		return p.AllowFunction
 	case ChangeDropPolicy:
 		return p.AllowPolicy
@@ -263,7 +271,7 @@ func (p *Plan) Additions() int {
 	for _, s := range p.Steps {
 		switch s.Type {
 		case ChangeCreateEnum, ChangeCreateTable, ChangeAddColumn, ChangeCreateIndex, ChangeAddFK, ChangeAddCheck,
-			ChangeCreateExtension, ChangeCreatePolicy, ChangeCreateFunction, ChangeCreateTrigger, ChangeCreateView,
+			ChangeCreateExtension, ChangeCreatePolicy, ChangeCreateFunction, ChangeCreateAggregate, ChangeCreateTrigger, ChangeCreateView,
 			ChangeEnableRLS, ChangeForceRLS:
 			count++
 		}
@@ -290,7 +298,7 @@ func (p *Plan) Deletions() int {
 	for _, s := range p.Steps {
 		switch s.Type {
 		case ChangeDropTable, ChangeDropColumn, ChangeDropIndex, ChangeDropFK, ChangeDropCheck,
-			ChangeDropExtension, ChangeDropPolicy, ChangeDropFunction, ChangeDropTrigger, ChangeDropView:
+			ChangeDropExtension, ChangeDropPolicy, ChangeDropFunction, ChangeDropAggregate, ChangeDropTrigger, ChangeDropView:
 			count++
 		}
 	}
@@ -594,16 +602,16 @@ func stepHazards(s Step) []Hazard {
 			Description: fmt.Sprintf("Row-level security policy on table %q will be dropped", s.Table),
 			SQL:         s.SQL,
 		})
-	case ChangeDropFunction:
+	case ChangeDropFunction, ChangeDropAggregate:
 		hazards = append(hazards, Hazard{
 			Code:        HazardDropFunction,
 			Level:       HazardLevelCritical,
 			Type:        s.Type,
 			Table:       s.Table,
-			Description: fmt.Sprintf("Function/procedure %q will be dropped", s.Table),
+			Description: fmt.Sprintf("Function/procedure/aggregate %q will be dropped", s.Table),
 			SQL:         s.SQL,
 		})
-	case ChangeCreateFunction:
+	case ChangeCreateFunction, ChangeCreateAggregate:
 		if strings.Contains(strings.ToUpper(s.SQL), "SECURITY DEFINER") &&
 			!strings.Contains(strings.ToLower(s.SQL), "search_path") {
 			hazards = append(hazards, Hazard{

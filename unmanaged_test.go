@@ -359,26 +359,28 @@ func TestUnmanaged_FunctionDependency_PostgresIntegration(t *testing.T) {
 		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schemaPrefix))
 	}()
 
-	// 1. Setup: managed table + two unmanaged procedures referencing it.
-	//    Functions are managed as of Phase 1 (Schema.Routines), so procedures
-	//    exercise the unmanaged-dependency protection. p_atomic_ref uses a
-	//    SQL-standard body (BEGIN ATOMIC, PG14+): PostgreSQL records exact
-	//    table AND column dependencies in pg_depend. p_string_ref uses a
-	//    quoted plpgsql body: no pg_depend entries exist, so Grizzle must
-	//    discover the dependency by scanning the source text.
+	// 1. Setup: managed table + two unmanaged window functions referencing it.
+	//    Functions, procedures, and aggregates are managed as of A2
+	//    (Schema.Routines), so window functions (prokind 'w') exercise the
+	//    unmanaged-dependency protection. w_atomic_ref uses a SQL-standard
+	//    body (BEGIN ATOMIC, PG14+): PostgreSQL records exact table AND
+	//    column dependencies in pg_depend. w_string_ref uses a quoted plpgsql
+	//    body: no pg_depend entries exist, so Grizzle must discover the
+	//    dependency by scanning the source text.
 	//nolint:gosec // G201: test constructs setup DDL with randomized schema prefix
 	setupSQL := fmt.Sprintf(`
 		SET search_path TO %q;
 		CREATE TABLE orders (id INT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'new');
-		CREATE PROCEDURE p_atomic_ref() LANGUAGE SQL BEGIN ATOMIC
+		CREATE FUNCTION w_atomic_ref() RETURNS text LANGUAGE SQL WINDOW BEGIN ATOMIC
 			SELECT status FROM orders WHERE id = 1;
 		END;
-		CREATE PROCEDURE p_string_ref() LANGUAGE plpgsql AS $$
+		CREATE FUNCTION w_string_ref() RETURNS text LANGUAGE plpgsql WINDOW AS $$
 		DECLARE
 			res TEXT;
 		BEGIN
 			SELECT status INTO res FROM orders WHERE id = 2;
 			RAISE NOTICE '%%', res;
+			RETURN res;
 		END;
 		$$;
 	`, schemaPrefix)
@@ -409,7 +411,7 @@ func TestUnmanaged_FunctionDependency_PostgresIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Inspect failed: %v", err)
 	}
-	for _, fnName := range []string{"p_atomic_ref", "p_string_ref"} {
+	for _, fnName := range []string{"w_atomic_ref", "w_string_ref"} {
 		obj, ok := ir.Unmanaged["function:"+fnName]
 		if !ok {
 			t.Fatalf("expected unmanaged function %s to be introspected, got: %v", fnName, ir.Unmanaged)

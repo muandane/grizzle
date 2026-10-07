@@ -42,6 +42,11 @@ func TestExport_Reversals_NewStepTypes(t *testing.T) {
 			wantRev: `DROP FUNCTION IF EXISTS "public"."add"(a integer, b integer);`,
 		},
 		{
+			name:    "aggregate create drops aggregate with args",
+			step:    plan.Step{Type: plan.ChangeCreateAggregate, Table: "sum2", SQL: "CREATE AGGREGATE sum2(v bigint) (\n    SFUNC = sum2_s,\n    STYPE = bigint\n);"},
+			wantRev: "DROP AGGREGATE IF EXISTS sum2(v bigint);",
+		},
+		{
 			name:    "trigger create drops trigger on table",
 			step:    plan.Step{Type: plan.ChangeCreateTrigger, Table: "docs", SQL: `CREATE TRIGGER trg_after AFTER INSERT ON "public"."docs" FOR EACH ROW EXECUTE FUNCTION "public"."notify_fn"();`},
 			wantRev: "DROP TRIGGER IF EXISTS trg_after ON docs;",

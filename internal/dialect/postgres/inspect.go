@@ -788,25 +788,81 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 	// Triggers are part of the managed surface as of Phase 1; no unmanaged
 	// trigger registration is needed here.
 
-	// 6d. Managed routines. Plain SQL/plpgsql functions become part of the
-	// managed surface: desired side comes from the shadow compile, keyed by
-	// name + identity args (pg_get_functiondef is the canonical definition).
-	// Procedures and aggregates stay unmanaged (pg_get_functiondef does not
-	// support them) and are handled by 6d.1 below.
+	// 6d.0 Managed aggregates (prokind = 'a'). pg_get_functiondef does not
+	// support aggregates, so the definition is reconstructed from
+	// pg_aggregate catalog fields into a canonical CREATE AGGREGATE
+	// statement. regprocedure::text references honor the pinned search_path,
+	// keeping output deterministic across live and shadow introspection; the
+	// diff normalize step unmaps shadow-schema qualifications.
+	aggregateQuery := `
+		SELECT
+			p.proname AS agg_name,
+			pg_get_function_identity_arguments(p.oid) AS identity_args,
+			format_type(a.aggtranstype, NULL) AS state_type,
+			a.aggtransfn::regprocedure::text AS sfunc,
+			COALESCE(NULLIF(a.aggfinalfn::regprocedure::text, '-'), '') AS finalfunc,
+			COALESCE(NULLIF(a.aggcombinefn::regprocedure::text, '-'), '') AS combinefunc,
+			COALESCE(NULLIF(a.aggserialfn::regprocedure::text, '-'), '') AS serialfunc,
+			COALESCE(NULLIF(a.aggdeserialfn::regprocedure::text, '-'), '') AS deserialfunc,
+			COALESCE(a.agginitval, '') AS initcond,
+			CASE p.proparallel WHEN 's' THEN 'SAFE' WHEN 'r' THEN 'RESTRICTED' ELSE 'UNSAFE' END AS parallel
+		FROM pg_proc p
+		JOIN pg_aggregate a ON a.aggfnoid = p.oid
+		JOIN pg_namespace n ON n.oid = p.pronamespace
+		WHERE n.nspname = $1
+		  AND p.prokind = 'a'
+		  AND a.aggkind = 'n'
+		  AND NOT EXISTS (
+		      SELECT 1 FROM pg_depend d
+		      WHERE d.objid = p.oid AND d.deptype = 'e'
+		  )
+		ORDER BY p.proname, identity_args;
+	`
+	aggRows, err := dbtx.QueryContext(ctx, aggregateQuery, schemaName)
+	if err != nil {
+		return nil, fmt.Errorf("inspecting aggregates in schema %q: %w", schemaName, err)
+	}
+	for aggRows.Next() {
+		var name, identityArgs, stype, sfunc, parallel string
+		var finalfunc, combinefunc, serialfunc, deserialfunc, initcond string
+		if err := aggRows.Scan(&name, &identityArgs, &stype, &sfunc, &finalfunc, &combinefunc, &serialfunc, &deserialfunc, &initcond, &parallel); err != nil {
+			_ = aggRows.Close()
+			return nil, fmt.Errorf("scanning aggregate in schema %q: %w", schemaName, err)
+		}
+		if s.Routines == nil {
+			s.Routines = make(map[string]*schema.Routine)
+		}
+		s.Routines[schema.RoutineKey(name, identityArgs)] = &schema.Routine{
+			Name:         name,
+			Kind:         "AGGREGATE",
+			IdentityArgs: identityArgs,
+			Definition:   reconstructAggregateDefinition(name, identityArgs, stype, sfunc, finalfunc, combinefunc, serialfunc, deserialfunc, initcond, parallel),
+		}
+	}
+	if err := aggRows.Err(); err != nil {
+		return nil, err
+	}
+	_ = aggRows.Close()
+
+	// 6d. Managed routines. Functions AND procedures are managed: desired
+	// side comes from the shadow compile, keyed by name + identity args
+	// (pg_get_functiondef is the canonical definition for both). Aggregates
+	// are managed separately in 6d.0 via pg_aggregate reconstruction.
 	routineQuery := `
 		SELECT
 			p.proname AS routine_name,
 			pg_get_function_identity_arguments(p.oid) AS identity_args,
-			pg_get_function_result(p.oid) AS return_type,
+			COALESCE(pg_get_function_result(p.oid), '') AS return_type,
 			l.lanname AS language,
 			CASE p.provolatile WHEN 'i' THEN 'IMMUTABLE' WHEN 's' THEN 'STABLE' ELSE 'VOLATILE' END AS volatility,
 			p.prosecdef AS security_definer,
-			pg_get_functiondef(p.oid) AS definition
+			pg_get_functiondef(p.oid) AS definition,
+			p.prokind AS routine_kind
 		FROM pg_proc p
 		JOIN pg_namespace n ON n.oid = p.pronamespace
 		JOIN pg_language l ON l.oid = p.prolang
 		WHERE n.nspname = $1
-		  AND p.prokind = 'f'
+		  AND p.prokind IN ('f', 'p')
 		  AND NOT EXISTS (
 		      SELECT 1 FROM pg_depend d
 		      WHERE d.objid = p.oid AND d.deptype = 'e'
@@ -818,18 +874,22 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 		return nil, fmt.Errorf("inspecting routines in schema %q: %w", schemaName, err)
 	}
 	for routineRows.Next() {
-		var name, identityArgs, returnType, lang, volatility, definition string
+		var name, identityArgs, returnType, lang, volatility, definition, routineKind string
 		var securityDefiner bool
-		if err := routineRows.Scan(&name, &identityArgs, &returnType, &lang, &volatility, &securityDefiner, &definition); err != nil {
+		if err := routineRows.Scan(&name, &identityArgs, &returnType, &lang, &volatility, &securityDefiner, &definition, &routineKind); err != nil {
 			_ = routineRows.Close()
 			return nil, fmt.Errorf("scanning routine in schema %q: %w", schemaName, err)
+		}
+		kind := "FUNCTION"
+		if routineKind == "p" {
+			kind = "PROCEDURE"
 		}
 		if s.Routines == nil {
 			s.Routines = make(map[string]*schema.Routine)
 		}
 		s.Routines[schema.RoutineKey(name, identityArgs)] = &schema.Routine{
 			Name:            name,
-			Kind:            "FUNCTION",
+			Kind:            kind,
 			IdentityArgs:    identityArgs,
 			ReturnType:      returnType,
 			Language:        lang,
@@ -844,22 +904,31 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 	}
 	_ = routineRows.Close()
 
-	// 6d.1 Unmanaged procedures and aggregates (functions are managed above).
-	procQuery := `
+	// 6d.1 Unmanaged window functions (functions, procedures, and aggregates
+	// are managed above; prokind 'w' is user-defined window functions).
+	// Ordered-set / hypothetical aggregates (aggkind <> 'n') are excluded in
+	// 6d.0 and would also remain protected — register them here too.
+	unmanagedProcQuery := `
 		SELECT
 			p.proname AS proc_name,
 			COALESCE(p.prosrc, '') AS source
 		FROM pg_proc p
 		JOIN pg_namespace n ON n.oid = p.pronamespace
 		WHERE n.nspname = $1
-		  AND p.prokind <> 'f'
+		  AND (
+		      p.prokind = 'w'
+		      OR (p.prokind = 'a' AND EXISTS (
+		          SELECT 1 FROM pg_aggregate a
+		          WHERE a.aggfnoid = p.oid AND a.aggkind <> 'n'
+		      ))
+		  )
 		  AND NOT EXISTS (
 		      SELECT 1 FROM pg_depend d
 		      WHERE d.objid = p.oid AND d.deptype = 'e'
 		  )
 		ORDER BY p.proname;
 	`
-	procRows, err := dbtx.QueryContext(ctx, procQuery, schemaName)
+	procRows, err := dbtx.QueryContext(ctx, unmanagedProcQuery, schemaName)
 	if err != nil {
 		return nil, fmt.Errorf("inspecting procedures in schema %q: %w", schemaName, err)
 	}
@@ -1040,6 +1109,39 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 	}
 
 	return s, nil
+}
+
+// reconstructAggregateDefinition rebuilds a canonical CREATE AGGREGATE
+// statement from pg_aggregate catalog fields. regprocedure arguments are
+// already rendered as "schema.func(argtypes)" (or unqualified when the
+// function resolves through the pinned search_path). regtype state types are
+// rendered similarly. Empty optional fields are omitted.
+func reconstructAggregateDefinition(name, identityArgs, stype, sfunc, finalfunc, combinefunc, serialfunc, deserialfunc, initcond, parallel string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "CREATE AGGREGATE %s(%s) (\n", name, identityArgs)
+	parts := []string{
+		fmt.Sprintf("    SFUNC = %s", sfunc),
+		fmt.Sprintf("    STYPE = %s", stype),
+	}
+	if finalfunc != "" {
+		parts = append(parts, fmt.Sprintf("    FINALFUNC = %s", finalfunc))
+	}
+	if combinefunc != "" {
+		parts = append(parts, fmt.Sprintf("    COMBINEFUNC = %s", combinefunc))
+	}
+	if serialfunc != "" {
+		parts = append(parts, fmt.Sprintf("    SERIALFUNC = %s", serialfunc))
+	}
+	if deserialfunc != "" {
+		parts = append(parts, fmt.Sprintf("    DESERIALFUNC = %s", deserialfunc))
+	}
+	if initcond != "" {
+		parts = append(parts, fmt.Sprintf("    INITCOND = '%s'", initcond))
+	}
+	parts = append(parts, fmt.Sprintf("    PARALLEL = %s", parallel))
+	b.WriteString(strings.Join(parts, ",\n"))
+	b.WriteString("\n);")
+	return b.String()
 }
 
 // InspectSchemas reads the relational states across all specified schema names.
