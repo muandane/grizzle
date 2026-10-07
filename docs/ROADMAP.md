@@ -22,10 +22,10 @@ This document outlines the step-by-step execution plan to build, test, and ship 
   - Implement basic topological sorting to ensure tables are created before columns are referenced.
 - [x] **1.5 Advisory Locking**
   - Implement deterministic FNV-1a hash lock generation.
-  - Add `pg_advisory_xact_lock` integration.
+  - Session-level advisory locking (`pg_advisory_lock` / `pg_try_advisory_lock`) held across the full sync; superseded the original transaction-scoped `pg_advisory_xact_lock` design so locks survive non-transactional groups (e.g. `CREATE INDEX CONCURRENTLY`).
 - [x] **1.6 Integration Testing**
   - Setup integration tests against live PostgreSQL using `testcontainers-go` or local docker-compose.
-  - Verify clean boot with zero diffs takes `< 50ms`.
+  - Verify clean boot with zero diffs stays within the 100ms CI test budget.
 
 ---
 
@@ -104,5 +104,19 @@ This document outlines the step-by-step execution plan to build, test, and ship 
     - Pure Go + standard `database/sql` (`examples/postgres-stdlib`)
     - Embedded pure-Go SQLite (`examples/sqlite-embedded`)
     - Go + `sqlc` (`examples/sqlc-workflow`)
-- [x] **5.4 Version 1.0.0 Ready**
+    - Zero-downtime expand/contract rename (`examples/expand-contract`)
+- [x] **5.4 First release (v0.1.0)**
   - All test suites passing with race detector, zero static analysis issues.
+  - Tag `v0.1.0-rc.1` from a green `main`; docs and code claims reconciled (see CONTRIBUTING release steps).
+  - Not yet v1.0.0: the API carries `Experimental:` surfaces (renames, expand/contract, backfill) that may still change.
+
+## Post-0.1 backlog
+
+Ordered by expected impact; nothing here blocks the first release.
+
+- [ ] **SQLite declarative CHECK constraints** — SQLite CHECK DDL is neither introspected nor preserved through rebuilds (documented gap in SPEC §3).
+- [ ] **Domain CHECK management** — domain constraints (`pg_constraint.conrelid = 0`) are inventory-only.
+- [ ] **Declarative view migrations** — views/triggers/functions remain detected-and-protected; declarative lifecycle evaluated for a future release.
+- [ ] **CLI backfill runner** — batched backfill is library-only (`Options.Backfill`); a CLI runner would need a durable batching contract.
+- [ ] **Multi-schema SQLite** — rejected today (`ErrUnsupportedMultiSchema`).
+- [ ] **v1.0.0 API freeze** — remove `Experimental:` markers once rename mapping, staged plans, and backfill batching stabilize.
