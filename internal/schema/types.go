@@ -1,6 +1,9 @@
 package schema
 
-import "regexp"
+import (
+	"regexp"
+	"strings"
+)
 
 // Schema represents the parsed relational structure of a database schema.
 type Schema struct {
@@ -30,6 +33,12 @@ type Routine struct {
 	Volatility      string `json:"volatility,omitempty"`
 	SecurityDefiner bool   `json:"security_definer,omitempty"`
 	Definition      string `json:"definition"` // canonical pg_get_functiondef
+}
+
+// RoutineKey returns the map key identifying a routine: its name plus the
+// identity arguments that disambiguate overloads.
+func RoutineKey(name, identityArgs string) string {
+	return name + "(" + strings.TrimSpace(identityArgs) + ")"
 }
 
 // View represents a managed SQL VIEW or MATERIALIZED VIEW.

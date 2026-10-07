@@ -708,7 +708,101 @@ func DiffWithMappings(live, desired *schema.Schema, targetSchema, shadowSchema s
 		}
 	}
 
+	// 4. Routine (function) diff: create missing, CREATE OR REPLACE on body
+	// drift, DROP + CREATE on signature change, drop live-only behind
+	// AllowDropFunction.
+	changes = append(changes, diffRoutines(live, desired, targetSchema, normalize)...)
+
 	return changes, nil
+}
+
+// routineDef returns a shadow-unmapped copy of a desired routine.
+func routineDef(r *schema.Routine, normalize func(string) string) *schema.Routine {
+	copied := *r
+	copied.IdentityArgs = normalize(r.IdentityArgs)
+	copied.ReturnType = normalize(r.ReturnType)
+	copied.Definition = normalize(r.Definition)
+	return &copied
+}
+
+// diffRoutines emits routine changes. pg_get_functiondef always renders
+// CREATE OR REPLACE, so body/volatility/security drift replaces in place;
+// identity-args, return-type, kind, or language drift cannot be replaced
+// (Postgres restriction) and requires a destructive DROP + CREATE.
+func diffRoutines(live, desired *schema.Schema, targetSchema string, normalize func(string) string) []Change {
+	var changes []Change
+	for _, dR := range sortedRoutines(desired) {
+		dCopy := routineDef(dR, normalize)
+		lR, exists := live.Routines[schema.RoutineKey(dR.Name, dR.IdentityArgs)]
+		if !exists {
+			changes = append(changes, Change{
+				Type:        plan.ChangeCreateFunction,
+				Schema:      targetSchema,
+				Table:       dR.Name,
+				Routine:     dCopy,
+				Destructive: false,
+			})
+			continue
+		}
+		if lR.IdentityArgs != dCopy.IdentityArgs ||
+			lR.ReturnType != dCopy.ReturnType ||
+			lR.Kind != dR.Kind || lR.Language != dR.Language {
+			lCopy := *lR
+			lCopy.IdentityArgs = normalize(lR.IdentityArgs)
+			changes = append(changes, Change{
+				Type:        plan.ChangeDropFunction,
+				Schema:      targetSchema,
+				Table:       lR.Name,
+				Routine:     &lCopy,
+				Destructive: true,
+			})
+			changes = append(changes, Change{
+				Type:        plan.ChangeCreateFunction,
+				Schema:      targetSchema,
+				Table:       dR.Name,
+				Routine:     dCopy,
+				Destructive: false,
+			})
+			continue
+		}
+		if normalize(lR.Definition) != dCopy.Definition {
+			changes = append(changes, Change{
+				Type:        plan.ChangeCreateFunction,
+				Schema:      targetSchema,
+				Table:       dR.Name,
+				Routine:     dCopy,
+				Destructive: false,
+			})
+		}
+	}
+	for _, lR := range sortedRoutines(live) {
+		if _, inDesired := desired.Routines[schema.RoutineKey(lR.Name, lR.IdentityArgs)]; !inDesired {
+			lCopy := *lR
+			lCopy.IdentityArgs = normalize(lR.IdentityArgs)
+			changes = append(changes, Change{
+				Type:        plan.ChangeDropFunction,
+				Schema:      targetSchema,
+				Table:       lR.Name,
+				Routine:     &lCopy,
+				Destructive: true,
+			})
+		}
+	}
+	return changes
+}
+
+// sortedRoutines returns a schema's routines in deterministic key order.
+func sortedRoutines(s *schema.Schema) []*schema.Routine {
+	if s == nil || len(s.Routines) == 0 {
+		return nil
+	}
+	keys := slices.Collect(maps.Keys(s.Routines))
+	slices.Sort(keys)
+	out := make([]*schema.Routine, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, s.Routines[k])
+	}
+	return out
 }
 
 // sortedPolicies returns a table's desired policies in deterministic order.

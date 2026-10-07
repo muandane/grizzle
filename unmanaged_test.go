@@ -271,12 +271,19 @@ func TestUnmanaged_PostgresIntegration(t *testing.T) {
 		t.Fatalf("setup failed: %v", err)
 	}
 
-	// 2. Desired schema drops email
+	// 2. Desired schema drops email. The trigger function is declared so it
+	// stays managed and matches live; the unmanaged trigger on accounts
+	// still carries the dependency hazard.
 	desiredSQL := `
 		CREATE TABLE accounts (
 			id INT PRIMARY KEY,
 			balance NUMERIC
 		);
+		CREATE FUNCTION trg_noop_fn() RETURNS trigger AS $$
+		BEGIN
+			RETURN NEW;
+		END;
+		$$ LANGUAGE plpgsql;
 	`
 
 	opts := grizzle.Options{
@@ -348,23 +355,28 @@ func TestUnmanaged_FunctionDependency_PostgresIntegration(t *testing.T) {
 		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schemaPrefix))
 	}()
 
-	// 1. Setup: managed table + two unmanaged functions referencing it.
-	//    f_atomic uses a SQL-standard body (BEGIN ATOMIC, PG14+): PostgreSQL
-	//    records exact table AND column dependencies in pg_depend.
-	//    f_string uses a quoted plpgsql body: no pg_depend entries exist, so
-	//    Grizzle must discover the dependency by scanning the source text.
+	// 1. Setup: managed table + two unmanaged procedures referencing it.
+	//    Functions are managed as of Phase 1 (Schema.Routines), so procedures
+	//    exercise the unmanaged-dependency protection. p_atomic_ref uses a
+	//    SQL-standard body (BEGIN ATOMIC, PG14+): PostgreSQL records exact
+	//    table AND column dependencies in pg_depend. p_string_ref uses a
+	//    quoted plpgsql body: no pg_depend entries exist, so Grizzle must
+	//    discover the dependency by scanning the source text.
 	//nolint:gosec // G201: test constructs setup DDL with randomized schema prefix
 	setupSQL := fmt.Sprintf(`
 		SET search_path TO %q;
 		CREATE TABLE orders (id INT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'new');
-		CREATE FUNCTION f_atomic_ref() RETURNS text LANGUAGE SQL BEGIN ATOMIC
+		CREATE PROCEDURE p_atomic_ref() LANGUAGE SQL BEGIN ATOMIC
 			SELECT status FROM orders WHERE id = 1;
 		END;
-		CREATE FUNCTION f_string_ref() RETURNS text AS $$
+		CREATE PROCEDURE p_string_ref() LANGUAGE plpgsql AS $$
+		DECLARE
+			res TEXT;
 		BEGIN
-			RETURN (SELECT status FROM orders WHERE id = 2);
+			SELECT status INTO res FROM orders WHERE id = 2;
+			RAISE NOTICE '%%', res;
 		END;
-		$$ LANGUAGE plpgsql;
+		$$;
 	`, schemaPrefix)
 	if _, err := db.Exec(setupSQL); err != nil {
 		t.Fatalf("setup failed: %v", err)
@@ -393,7 +405,7 @@ func TestUnmanaged_FunctionDependency_PostgresIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Inspect failed: %v", err)
 	}
-	for _, fnName := range []string{"f_atomic_ref", "f_string_ref"} {
+	for _, fnName := range []string{"p_atomic_ref", "p_string_ref"} {
 		obj, ok := ir.Unmanaged["function:"+fnName]
 		if !ok {
 			t.Fatalf("expected unmanaged function %s to be introspected, got: %v", fnName, ir.Unmanaged)

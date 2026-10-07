@@ -748,7 +748,63 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 	}
 	_ = trgRows.Close()
 
-	// 6d. Stored Functions and Procedures
+	// 6d. Managed routines. Plain SQL/plpgsql functions become part of the
+	// managed surface: desired side comes from the shadow compile, keyed by
+	// name + identity args (pg_get_functiondef is the canonical definition).
+	// Procedures and aggregates stay unmanaged (pg_get_functiondef does not
+	// support them) and are handled by 6d.1 below.
+	routineQuery := `
+		SELECT
+			p.proname AS routine_name,
+			pg_get_function_identity_arguments(p.oid) AS identity_args,
+			pg_get_function_result(p.oid) AS return_type,
+			l.lanname AS language,
+			CASE p.provolatile WHEN 'i' THEN 'IMMUTABLE' WHEN 's' THEN 'STABLE' ELSE 'VOLATILE' END AS volatility,
+			p.prosecdef AS security_definer,
+			pg_get_functiondef(p.oid) AS definition
+		FROM pg_proc p
+		JOIN pg_namespace n ON n.oid = p.pronamespace
+		JOIN pg_language l ON l.oid = p.prolang
+		WHERE n.nspname = $1
+		  AND p.prokind = 'f'
+		  AND NOT EXISTS (
+		      SELECT 1 FROM pg_depend d
+		      WHERE d.objid = p.oid AND d.deptype = 'e'
+		  )
+		ORDER BY p.proname, identity_args;
+	`
+	routineRows, err := dbtx.QueryContext(ctx, routineQuery, schemaName)
+	if err != nil {
+		return nil, fmt.Errorf("inspecting routines in schema %q: %w", schemaName, err)
+	}
+	for routineRows.Next() {
+		var name, identityArgs, returnType, lang, volatility, definition string
+		var securityDefiner bool
+		if err := routineRows.Scan(&name, &identityArgs, &returnType, &lang, &volatility, &securityDefiner, &definition); err != nil {
+			_ = routineRows.Close()
+			return nil, fmt.Errorf("scanning routine in schema %q: %w", schemaName, err)
+		}
+		if s.Routines == nil {
+			s.Routines = make(map[string]*schema.Routine)
+		}
+		s.Routines[schema.RoutineKey(name, identityArgs)] = &schema.Routine{
+			Name:            name,
+			Kind:            "FUNCTION",
+			IdentityArgs:    identityArgs,
+			ReturnType:      returnType,
+			Language:        lang,
+			Volatility:      volatility,
+			SecurityDefiner: securityDefiner,
+			Definition:      definition,
+		}
+	}
+	if err := routineRows.Err(); err != nil {
+		_ = routineRows.Close()
+		return nil, err
+	}
+	_ = routineRows.Close()
+
+	// 6d.1 Unmanaged procedures and aggregates (functions are managed above).
 	procQuery := `
 		SELECT
 			p.proname AS proc_name,
@@ -756,6 +812,7 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 		FROM pg_proc p
 		JOIN pg_namespace n ON n.oid = p.pronamespace
 		WHERE n.nspname = $1
+		  AND p.prokind <> 'f'
 		  AND NOT EXISTS (
 		      SELECT 1 FROM pg_depend d
 		      WHERE d.objid = p.oid AND d.deptype = 'e'
