@@ -324,7 +324,7 @@ flowchart LR
 
 ---
 
-## Stability (v0.2.0)
+## Stability (v0.1.0-rc2)
 
 - **Stable enough for production use**: `Sync`, `PlanDiff`, `Apply`, `Check`, `Export`, both dialects, advisory locking, invalid index recovery, unmanaged object protection, and hazard gates are covered by unit and integration tests.
 - **Managed surface**: extensions, domains, COMMENT ON, functions, procedures, aggregates, triggers, views/matviews, RLS + policies, and SQLite CHECK constraints are declaratively managed with gated destructive operations.
