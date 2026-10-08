@@ -59,3 +59,28 @@ func TestGenerateGrantSQL_NormalizesUnquotedIdentifierCase(t *testing.T) {
 		t.Fatalf("unquoted identifiers must follow PostgreSQL lower-case semantics: %s", sql)
 	}
 }
+
+func TestRoleManagedCommentRequiresExactMarker(t *testing.T) {
+	if !roleManagedComment(schema.RoleManagedComment) {
+		t.Fatal("exact managed marker must be recognized")
+	}
+	if roleManagedComment(schema.RoleManagedComment + "-extra") {
+		t.Fatal("marker suffixes must not be treated as managed")
+	}
+}
+
+func TestGenerateRoleSQL_DoublesMaliciousQuotes(t *testing.T) {
+	roleName := `role"; DROP ROLE admin; --`
+	if got, want := GenerateCreateRoleSQL(roleName), `CREATE ROLE "role""; DROP ROLE admin; --" NOLOGIN;`; got != want {
+		t.Fatalf("malicious role name rendering = %q, want %q", got, want)
+	}
+	grantSQL := GenerateGrantSQL(&schema.Grant{
+		Grantee:    `"app""role"`,
+		ObjectKind: "TABLE",
+		ObjectName: `"schema""name"."table""name"`,
+		Privileges: []string{"SELECT"},
+	})
+	if want := `GRANT SELECT ON TABLE "schema""name"."table""name" TO "app""role";`; grantSQL != want {
+		t.Fatalf("malicious grant rendering = %q, want %q", grantSQL, want)
+	}
+}

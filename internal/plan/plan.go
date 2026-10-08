@@ -189,6 +189,11 @@ func (p DropPolicy) IsAllowed(s Step) bool {
 		return p.AllowDropRole
 	case ChangeDropPublication:
 		return p.AllowDropPublication
+	case ChangeAlterPublication:
+		// Membership removals and publish-flag reductions are destructive
+		// replication-surface changes even though PostgreSQL renders them as
+		// ALTER PUBLICATION.
+		return p.AllowDropPublication
 	case ChangeDropEventTrigger:
 		return p.AllowDropEventTrigger
 	default:
@@ -803,6 +808,27 @@ func stepHazards(s Step) []Hazard {
 			Description: fmt.Sprintf("Event trigger %q will be dropped; its DDL auditing/enforcement stops firing", s.Table),
 			SQL:         s.SQL,
 		})
+	case ChangeAlterPublication:
+		if s.Destructive {
+			hazards = append(hazards, Hazard{
+				Code:        HazardDropPublication,
+				Level:       HazardLevelCritical,
+				Type:        s.Type,
+				Table:       s.Table,
+				Description: fmt.Sprintf("Publication %q will be narrowed; subscribers may stop receiving the removed replication surface", s.Table),
+				SQL:         s.SQL,
+			})
+		}
+		if strings.Contains(strings.ToUpper(s.SQL), "SET ALL TABLES") || strings.Contains(strings.ToUpper(s.SQL), "FOR ALL TABLES") {
+			hazards = append(hazards, Hazard{
+				Code:        HazardPublicationAllTables,
+				Level:       HazardLevelNotice,
+				Type:        s.Type,
+				Table:       s.Table,
+				Description: fmt.Sprintf("Publication %q publishes ALL tables, including future ones", s.Table),
+				SQL:         s.SQL,
+			})
+		}
 	case ChangeCreateEventTrigger, ChangeAlterEventTrigger:
 		hazards = append(hazards, Hazard{
 			Code:        HazardEventTriggerSuperuser,
@@ -812,7 +838,7 @@ func stepHazards(s Step) []Hazard {
 			Description: fmt.Sprintf("Event trigger %q DDL may require superuser or elevated privileges", s.Table),
 			SQL:         s.SQL,
 		})
-	case ChangeCreatePublication, ChangeAlterPublication:
+	case ChangeCreatePublication:
 		if strings.Contains(strings.ToUpper(s.SQL), "SET ALL TABLES") || strings.Contains(strings.ToUpper(s.SQL), "FOR ALL TABLES") {
 			hazards = append(hazards, Hazard{
 				Code:        HazardPublicationAllTables,

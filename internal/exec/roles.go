@@ -18,7 +18,7 @@ import (
 // the live state is inspected from pg_roles/pg_authid and object ACLs, and
 // the diff renders GRANT/REVOKE/CREATE ROLE/DROP ROLE steps that sort after
 // all schema DDL.
-func diffRolesSteps(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig) ([]plan.Step, error) {
+func diffRolesSteps(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig, serverVersion int) ([]plan.Step, error) {
 	desired, err := desiredRolesSpec(cfg)
 	if err != nil {
 		return nil, err
@@ -26,6 +26,7 @@ func diffRolesSteps(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConf
 	if desired == nil {
 		return nil, nil
 	}
+	desired = schema.FilterRolePrivilegesForServer(desired, serverVersion)
 
 	live, err := postgres.InspectLiveRoles(ctx, dbtx, cfg.targetSchemas())
 	if err != nil {

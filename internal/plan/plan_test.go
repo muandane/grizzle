@@ -62,6 +62,28 @@ func TestPlan_Hazards(t *testing.T) {
 	}
 }
 
+func TestPlan_PublicationNarrowingRequiresDropPolicyAndHazard(t *testing.T) {
+	p := &plan.Plan{Steps: []plan.Step{{
+		Type:        plan.ChangeAlterPublication,
+		Table:       "docs_pub",
+		SQL:         `ALTER PUBLICATION "docs_pub" DROP TABLE "public"."archive";`,
+		Destructive: true,
+	}}}
+	if p.Policy.IsAllowed(p.Steps[0]) {
+		t.Fatal("destructive ALTER_PUBLICATION must require AllowDropPublication")
+	}
+	p.Policy.AllowDropPublication = true
+	if !p.Policy.IsAllowed(p.Steps[0]) {
+		t.Fatal("AllowDropPublication should permit destructive publication ALTER")
+	}
+	if err := p.ValidateHazards(nil); err == nil {
+		t.Fatal("publication narrowing must require DROP_PUBLICATION hazard acceptance")
+	}
+	if err := p.ValidateHazards([]plan.HazardCode{plan.HazardDropPublication}); err != nil {
+		t.Fatalf("accepted DROP_PUBLICATION hazard should pass: %v", err)
+	}
+}
+
 func TestPlan_Format(t *testing.T) {
 	p := &plan.Plan{
 		TargetSchema: "public",

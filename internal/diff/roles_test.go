@@ -124,7 +124,7 @@ func TestRolesDiff_GrantOptionDrift(t *testing.T) {
 	}
 }
 
-func TestRolesDiff_DropRoleBehindGateSkipsItsGrants(t *testing.T) {
+func TestRolesDiff_DropRoleRevokesItsGrantsBeforeDrop(t *testing.T) {
 	desired := roleSpec(t, ``)
 	live := &diff.RoleState{
 		RoleNames:    map[string]string{"app_read": "app_read"},
@@ -136,11 +136,26 @@ func TestRolesDiff_DropRoleBehindGateSkipsItsGrants(t *testing.T) {
 
 	changes := diff.RolesDiff(desired, live, "public")
 	types := countTypes(changes)
-	if types[plan.ChangeDropRole] != 1 || types[plan.ChangeRevoke] != 0 {
-		t.Fatalf("managed marker + absent desired must DROP_ROLE without REVOKE noise, got %v", types)
+	if types[plan.ChangeDropRole] != 1 || types[plan.ChangeRevoke] != 1 {
+		t.Fatalf("managed marker + absent desired must REVOKE ACLs before DROP_ROLE, got %v", types)
 	}
-	if !changes[0].Destructive {
-		t.Fatalf("drop role must be destructive: %+v", changes[0])
+	var sawRevoke, sawDrop bool
+	for _, change := range changes {
+		switch change.Type {
+		case plan.ChangeRevoke:
+			sawRevoke = true
+			if !change.Destructive || change.Grant == nil || len(change.Grant.Privileges) != 1 {
+				t.Fatalf("role ACL revoke must be destructive and precise: %+v", change)
+			}
+		case plan.ChangeDropRole:
+			sawDrop = true
+			if !change.Destructive {
+				t.Fatalf("drop role must be destructive: %+v", change)
+			}
+		}
+	}
+	if !sawRevoke || !sawDrop {
+		t.Fatalf("expected both revoke and drop changes: %+v", changes)
 	}
 }
 

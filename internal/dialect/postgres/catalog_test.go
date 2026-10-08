@@ -43,6 +43,26 @@ func TestGenerateCatalogSQL_EscapesQuotedIdentifiersAndTags(t *testing.T) {
 	}
 }
 
+func TestGenerateCatalogSQL_DoublesMaliciousIdentifierQuotes(t *testing.T) {
+	publicationSQL := GenerateCreatePublicationSQL(&schema.Publication{
+		Name:   `pub"; DROP PUBLICATION other; --`,
+		Tables: []string{`"schema""name"."table""name"`},
+	})
+	if !strings.Contains(publicationSQL, `CREATE PUBLICATION "pub""; DROP PUBLICATION other; --"`) ||
+		!strings.Contains(publicationSQL, `"schema""name"."table""name"`) {
+		t.Fatalf("malicious publication identifiers must remain quoted: %s", publicationSQL)
+	}
+	triggerSQL := GenerateCreateEventTriggerSQL(&schema.EventTrigger{
+		Name:     `trigger"; DROP EVENT TRIGGER other; --`,
+		Event:    "ddl_command_end",
+		Function: `"schema""name"."fn""name"`,
+	})
+	if !strings.Contains(triggerSQL, `CREATE EVENT TRIGGER "trigger""; DROP EVENT TRIGGER other; --"`) ||
+		!strings.Contains(triggerSQL, `EXECUTE FUNCTION "schema""name"."fn""name"()`) {
+		t.Fatalf("malicious event-trigger identifiers must remain quoted: %s", triggerSQL)
+	}
+}
+
 func TestGenerateEventTriggerSQL_PreservesQualifiedQuotedFunction(t *testing.T) {
 	sql := GenerateCreateEventTriggerSQL(&schema.EventTrigger{
 		Name:     "audit",
@@ -166,5 +186,15 @@ func TestEventTriggerEnabledStatus(t *testing.T) {
 				t.Fatalf("eventTriggerEnabled(%q) = %v, want %v", test.status, got, test.enabled)
 			}
 		})
+	}
+}
+
+func TestMapQualifiedFunctionSchema(t *testing.T) {
+	shadowMap := map[string]string{"billing": `_grizzle_shadow_billing`}
+	if got, want := mapQualifiedFunctionSchema(`"billing"."AuditFn"`, shadowMap), `"_grizzle_shadow_billing"."AuditFn"`; got != want {
+		t.Fatalf("mapped qualified function = %q, want %q", got, want)
+	}
+	if got := mapQualifiedFunctionSchema(`"other"."AuditFn"`, shadowMap); got != `"other"."AuditFn"` {
+		t.Fatalf("unmapped qualified function changed: %q", got)
 	}
 }

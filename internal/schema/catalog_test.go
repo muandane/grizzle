@@ -433,6 +433,28 @@ func TestMergeCatalogSpecs_SideDropCannotBeResurrected(t *testing.T) {
 	}
 }
 
+func TestMergeCatalogSpecs_PreservesSideCreateDropCreateOrder(t *testing.T) {
+	sideSpec := ParseCatalogSQL(`
+		DROP PUBLICATION p;
+		CREATE PUBLICATION p FOR TABLE recreated;
+	`)
+	if err := ValidateCatalogSpecMerge(nil, sideSpec); err != nil {
+		t.Fatalf("DROP followed by CREATE should validate: %v", err)
+	}
+	merged := MergeCatalogSpecs(nil, sideSpec)
+	if len(merged.Publications) != 1 || len(merged.Publications[0].Tables) != 1 ||
+		merged.Publications[0].Tables[0] != "recreated" {
+		t.Fatalf("side-channel operation order must be preserved: %+v", merged.Publications)
+	}
+}
+
+func TestValidateCatalogSQL_RejectsOverlengthIdentifiers(t *testing.T) {
+	longName := strings.Repeat("p", 64)
+	if err := ValidateCatalogSQL(`CREATE PUBLICATION "` + longName + `";`); err == nil {
+		t.Fatal("publication identifiers over PostgreSQL's 63-byte limit must be rejected")
+	}
+}
+
 func TestParseCatalogSQL_QualifiedEventFunctionIdentity(t *testing.T) {
 	spec := ParseCatalogSQL(`CREATE EVENT TRIGGER t ON ddl_command_end EXECUTE FUNCTION "audit.schema"."Fn"();`)
 	if len(spec.EventTriggers) != 1 {

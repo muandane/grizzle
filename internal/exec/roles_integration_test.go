@@ -148,14 +148,29 @@ func TestRoles_Lifecycle(t *testing.T) {
 		t.Fatalf("grants must be revoked, count = %d", grants)
 	}
 
-	// 4. Live-only managed role drop: gated by AllowDropRole + DROP_ROLE.
+	// Reintroduce an ACL dependency so DROP ROLE must revoke it first.
+	if _, err := db.Exec(fmt.Sprintf(`GRANT UPDATE ON TABLE "%s"."docs" TO "app_read";`, schema)); err != nil {
+		t.Fatalf("regrant role ACL before drop: %v", err)
+	}
+
+	// 4. Live-only managed role drop: gated by AllowDropRole + DROP_ROLE,
+	// with AllowRevoke + REVOKE_PRIVILEGE for its remaining ACLs.
 	emptyRoles := newCfg("-- empty desired roles state\n")
 	p3, err := exec.PlanDiffPostgres(ctx, db, emptyRoles)
 	if err != nil {
 		t.Fatalf("live-only role plan: %v", err)
 	}
-	if len(p3.Steps) != 1 || p3.Steps[0].Type != plan.ChangeDropRole || !p3.Steps[0].Destructive {
-		t.Fatalf("expected single destructive DROP_ROLE, got %+v", p3.Steps)
+	var sawDropRole, sawDropRevoke bool
+	for _, step := range p3.Steps {
+		switch step.Type {
+		case plan.ChangeDropRole:
+			sawDropRole = step.Destructive
+		case plan.ChangeRevoke:
+			sawDropRevoke = step.Destructive
+		}
+	}
+	if !sawDropRole || !sawDropRevoke {
+		t.Fatalf("expected destructive ACL revoke before DROP_ROLE, got %+v", p3.Steps)
 	}
 	if err := exec.SyncPostgres(ctx, db, newCfg("-- empty desired roles state\n")); err == nil {
 		t.Fatalf("role drop must fail with default policy (AllowDropRole=false)")
@@ -173,8 +188,8 @@ func TestRoles_Lifecycle(t *testing.T) {
 	}
 	defer func() { _, _ = db.Exec(`DROP ROLE IF EXISTS operator_role;`) }()
 	allowDropCfg := newCfg("-- empty desired roles state\n")
-	allowDropCfg.Policy = plan.DropPolicy{AllowDropRole: true}
-	allowDropCfg.AcceptHazards = []plan.HazardCode{plan.HazardDropRole}
+	allowDropCfg.Policy = plan.DropPolicy{AllowDropRole: true, AllowRevoke: true}
+	allowDropCfg.AcceptHazards = []plan.HazardCode{plan.HazardDropRole, plan.HazardRevokePrivilege}
 	if err := exec.SyncPostgres(ctx, db, allowDropCfg); err != nil {
 		t.Fatalf("allowed drop sync: %v", err)
 	}

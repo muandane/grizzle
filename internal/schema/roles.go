@@ -56,7 +56,7 @@ var (
 // Privilege sets used to expand ALL per object kind. They mirror the
 // PostgreSQL defaults so aclexplode output compares 1:1 with desired state.
 var (
-	tablePrivileges     = []string{"SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"}
+	tablePrivileges     = []string{"SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN"}
 	sequencePrivileges  = []string{"USAGE", "SELECT", "UPDATE"}
 	databasePrivileges  = []string{"CONNECT", "CREATE", "TEMPORARY"}
 	schemaPrivileges    = []string{"USAGE", "CREATE"}
@@ -125,7 +125,7 @@ func CanonicalGrantObject(kind, object, targetSchema string) string {
 		return ""
 	}
 	if (kind == "TABLE" || kind == "SEQUENCE") && len(parts) == 1 && targetSchema != "" {
-		parts = append([]string{targetSchema}, parts...)
+		parts = append([]string{canonicalTargetIdentifierPart(targetSchema)}, parts...)
 	}
 	for i, part := range parts {
 		parts[i] = canonicalGrantIdentifierPart(part)
@@ -163,7 +163,7 @@ func canonicalFunctionObject(object, targetSchema string) string {
 	}
 	nameParts := splitQualifiedIdentifier(name)
 	if len(nameParts) == 1 && targetSchema != "" {
-		nameParts = append([]string{targetSchema}, nameParts...)
+		nameParts = append([]string{canonicalTargetIdentifierPart(targetSchema)}, nameParts...)
 	}
 	for i, part := range nameParts {
 		nameParts[i] = canonicalGrantIdentifierPart(part)
@@ -177,7 +177,7 @@ func canonicalFunctionArguments(args string) string {
 	}
 	parts, ok := splitSQLList(args)
 	if !ok {
-		return strings.ToLower(strings.Join(strings.Fields(args), " "))
+		return normalizeFunctionTypeAliases(strings.ToLower(strings.Join(strings.Fields(args), " ")))
 	}
 	for i, part := range parts {
 		parts[i] = canonicalGrantType(part)
@@ -206,7 +206,61 @@ func canonicalGrantType(value string) string {
 			}
 		}
 	}
-	return strings.Join(strings.Fields(out.String()), " ")
+	return normalizeFunctionTypeAliases(strings.Join(strings.Fields(out.String()), " "))
+}
+
+// canonicalTargetIdentifierPart canonicalizes a target schema supplied by
+// configuration. Target schemas are catalog identities rather than SQL
+// tokens, so mixed-case and punctuation-bearing names must remain quoted
+// instead of being folded as an unquoted SQL identifier.
+func canonicalTargetIdentifierPart(identifier string) string {
+	identifier = strings.TrimSpace(identifier)
+	if len(identifier) >= 2 && identifier[0] == '"' && identifier[len(identifier)-1] == '"' {
+		return canonicalGrantIdentifierPart(identifier)
+	}
+	if isSimpleLowerIdentifier(identifier) {
+		return strings.ToLower(identifier)
+	}
+	return `"` + strings.ReplaceAll(identifier, `"`, `""`) + `"`
+}
+
+var functionTypeAliases = map[string]string{
+	"int":               "integer",
+	"int2":              "smallint",
+	"int4":              "integer",
+	"int8":              "bigint",
+	"float4":            "real",
+	"float8":            "double precision",
+	"bool":              "boolean",
+	"decimal":           "numeric",
+	"varchar":           "character varying",
+	"varbit":            "bit varying",
+	"timestamptz":       "timestamp with time zone",
+	"timetz":            "time with time zone",
+	"timestamp with tz": "timestamp with time zone",
+	"time with tz":      "time with time zone",
+	"double":            "double precision",
+}
+
+func normalizeFunctionTypeAliases(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	value = strings.ReplaceAll(value, "[ ]", "[]")
+	value = strings.ReplaceAll(value, " [", "[")
+	value = strings.ReplaceAll(value, "] ", "]")
+
+	arraySuffix := ""
+	for strings.HasSuffix(value, "[]") {
+		arraySuffix += "[]"
+		value = strings.TrimSpace(strings.TrimSuffix(value, "[]"))
+	}
+	value = strings.TrimPrefix(value, "pg_catalog.")
+	if alias, ok := functionTypeAliases[value]; ok {
+		value = alias
+	}
+	return value + arraySuffix
 }
 
 func canonicalGrantIdentifierPart(part string) string {
@@ -292,6 +346,32 @@ func MergeRolesSpecsForTarget(schemaSpec, sideSpec *RolesSpec, targetSchema stri
 		applyRevokes(out, sideSpec.revokes, targetSchema)
 	}
 	return out
+}
+
+// FilterRolePrivilegesForServer removes privileges that are not understood by
+// the connected PostgreSQL version. MAINTAIN was added in PostgreSQL 17 and
+// is included in ALL TABLE expansion, but omitting it on older servers keeps
+// the generated SQL valid while preserving the same desired contract.
+func FilterRolePrivilegesForServer(spec *RolesSpec, serverVersion int) *RolesSpec {
+	if spec == nil || serverVersion == 0 || serverVersion >= 170000 {
+		return spec
+	}
+	filteredGrants := spec.Grants[:0]
+	for _, grant := range spec.Grants {
+		filtered := grant.Privileges[:0]
+		for _, privilege := range grant.Privileges {
+			if strings.EqualFold(privilege, "MAINTAIN") {
+				continue
+			}
+			filtered = append(filtered, privilege)
+		}
+		grant.Privileges = filtered
+		if len(grant.Privileges) > 0 {
+			filteredGrants = append(filteredGrants, grant)
+		}
+	}
+	spec.Grants = filteredGrants
+	return spec
 }
 
 func mergeGrantSpecs(schemaSpec, sideSpec *RolesSpec, targetSchema string) []*Grant {
@@ -748,6 +828,8 @@ func ValidateRolesSQL(sql string) error {
 				return fmt.Errorf("unsupported role declaration in RolesSQL (only CREATE ROLE/USER [NOLOGIN] is supported): %q", trimmed)
 			case statementIdentifier(createRoleStatementRe.FindStringSubmatch(trimmed)) == "":
 				return fmt.Errorf("role identifier must not be empty: %q", trimmed)
+			case !validStatementIdentifier(createRoleStatementRe.FindStringSubmatch(trimmed)):
+				return fmt.Errorf("role identifier is invalid or exceeds PostgreSQL's 63-byte limit: %q", trimmed)
 			}
 		case strings.HasPrefix(upper, "GRANT"):
 			matches := grantRe.FindStringSubmatch(trimmed)

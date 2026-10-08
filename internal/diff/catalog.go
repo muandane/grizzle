@@ -17,8 +17,8 @@ type PublicationState struct {
 	Managed bool
 
 	AllTables bool
-	Tables    []string // canonical lowercase schema-qualified
-	Schemas   []string // canonical lowercase
+	Tables    []string // canonical schema-qualified identities
+	Schemas   []string // canonical identifiers
 
 	PublishInsert   bool
 	PublishUpdate   bool
@@ -100,11 +100,11 @@ func canonicalSchemaList(in []string) []string {
 	out := make([]string, 0, len(in))
 	seen := make(map[string]bool, len(in))
 	for _, name := range in {
-		parts := splitQualifiedIdentifier(name)
+		parts := schema.ParseQualifiedIdentifier(name)
 		if len(parts) != 1 {
 			continue
 		}
-		name = canonicalIdentifierPart(parts[0])
+		name = schema.CanonicalIdentifierPart(parts[0])
 		if name != "" && !seen[name] {
 			seen[name] = true
 			out = append(out, name)
@@ -129,71 +129,15 @@ func canonicalQualifiedList(in []string) []string {
 }
 
 func canonicalQualifiedIdentifier(name, targetSchema string) string {
-	parts := splitQualifiedIdentifier(name)
-	if len(parts) == 0 {
-		return ""
-	}
-	if len(parts) == 1 {
-		parts = append([]string{targetSchema}, parts...)
-	}
-	for i, part := range parts {
-		parts[i] = canonicalIdentifierPart(part)
-	}
-	return strings.Join(parts, ".")
+	return schema.CanonicalQualifiedIdentifier(name, targetSchema)
 }
 
 func canonicalIdentifierPart(part string) string {
-	part = strings.TrimSpace(part)
-	if len(part) >= 2 && part[0] == '"' && part[len(part)-1] == '"' {
-		part = strings.ReplaceAll(part[1:len(part)-1], `""`, `"`)
-		if isSimpleLowerIdentifier(part) {
-			return part
-		}
-		return `"` + part + `"`
-	}
-	return strings.ToLower(part)
-}
-
-func isSimpleLowerIdentifier(value string) bool {
-	if value == "" {
-		return false
-	}
-	for i, r := range value {
-		if i == 0 {
-			if r != '_' && (r < 'a' || r > 'z') {
-				return false
-			}
-			continue
-		}
-		if r != '_' && (r < 'a' || r > 'z') &&
-			(r < '0' || r > '9') && r != '$' {
-			return false
-		}
-	}
-	return true
+	return schema.CanonicalIdentifierPart(part)
 }
 
 func splitQualifiedIdentifier(name string) []string {
-	var parts []string
-	start := 0
-	inQuote := false
-	for i := 0; i < len(name); i++ {
-		switch name[i] {
-		case '"':
-			if inQuote && i+1 < len(name) && name[i+1] == '"' {
-				i++
-				continue
-			}
-			inQuote = !inQuote
-		case '.':
-			if !inQuote {
-				parts = append(parts, strings.TrimSpace(name[start:i]))
-				start = i + 1
-			}
-		}
-	}
-	parts = append(parts, strings.TrimSpace(name[start:]))
-	return parts
+	return schema.ParseQualifiedIdentifier(name)
 }
 
 // CatalogDiff computes publication and event-trigger sync steps from the
@@ -247,6 +191,7 @@ func CatalogDiff(desired *schema.CatalogSpec, live *CatalogLiveState, targetSche
 			changes = append(changes, Change{
 				Type:        plan.ChangeAlterPublication,
 				Table:       want.Name,
+				Destructive: publicationIsNarrowing(want, liveP),
 				Publication: want,
 				OldPublication: &schema.Publication{
 					Name:            liveP.Name,
@@ -395,6 +340,39 @@ func publicationNeedsRecreate(want *schema.Publication, live *PublicationState) 
 		len(want.Tables) == 0 && len(want.Schemas) == 0
 }
 
+// publicationIsNarrowing reports replication-surface reductions. PostgreSQL
+// applies these with ALTER PUBLICATION, but they can stop rows from reaching
+// subscribers and therefore require the publication drop policy/hazard gate.
+func publicationIsNarrowing(want *schema.Publication, live *PublicationState) bool {
+	if live.AllTables && !want.AllTables {
+		return true
+	}
+	if !want.AllTables && !live.AllTables {
+		wantTables := make(map[string]bool, len(want.Tables))
+		for _, table := range want.Tables {
+			wantTables[table] = true
+		}
+		for _, table := range live.Tables {
+			if !wantTables[table] {
+				return true
+			}
+		}
+		wantSchemas := make(map[string]bool, len(want.Schemas))
+		for _, schemaName := range want.Schemas {
+			wantSchemas[schemaName] = true
+		}
+		for _, schemaName := range live.Schemas {
+			if !wantSchemas[schemaName] {
+				return true
+			}
+		}
+	}
+	return (live.PublishInsert && !want.PublishInsert) ||
+		(live.PublishUpdate && !want.PublishUpdate) ||
+		(live.PublishDelete && !want.PublishDelete) ||
+		(live.PublishTruncate && !want.PublishTruncate)
+}
+
 // eventTriggerNeedsRecreate reports whether the desired event-trigger
 // definition differs from the live one in a way that requires DROP+CREATE
 // (PostgreSQL has no ALTER EVENT TRIGGER for event/tags/function).
@@ -432,14 +410,8 @@ func eventTriggerFunctionsEqual(want, live, targetSchema string) bool {
 
 func canonicalEventTriggerFunction(value, targetSchema string) string {
 	name, args := splitFunctionIdentity(value)
-	parts := splitQualifiedIdentifier(name)
-	if len(parts) == 1 && targetSchema != "" {
-		parts = append([]string{targetSchema}, parts...)
-	}
-	for i, part := range parts {
-		parts[i] = canonicalIdentifierPart(part)
-	}
-	return strings.Join(parts, ".") + "(" + strings.TrimSpace(args) + ")"
+	return schema.CanonicalQualifiedIdentifier(name, targetSchema) +
+		"(" + strings.TrimSpace(args) + ")"
 }
 
 func splitFunctionIdentity(value string) (name, args string) {

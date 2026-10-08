@@ -69,8 +69,8 @@ func TestCatalogDiff_PublicationDrift(t *testing.T) {
 	}
 
 	changes := CatalogDiff(desired, live, "public")
-	if len(changes) != 1 || changes[0].Type != plan.ChangeAlterPublication {
-		t.Fatalf("want single ALTER_PUBLICATION, got %+v", changes)
+	if len(changes) != 1 || changes[0].Type != plan.ChangeAlterPublication || !changes[0].Destructive {
+		t.Fatalf("want destructive ALTER_PUBLICATION for membership/flag narrowing, got %+v", changes)
 	}
 	c := changes[0]
 	if c.Publication == nil || c.OldPublication == nil {
@@ -85,6 +85,65 @@ func TestCatalogDiff_PublicationDrift(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("desired tables should be canonicalized to target schema, got %v", c.Publication.Tables)
+	}
+}
+
+func TestCatalogDiff_PublicationExpansionIsNotDestructive(t *testing.T) {
+	desired := &schema.CatalogSpec{Publications: []*schema.Publication{{
+		Name: "docs_pub", AllTables: true,
+		PublishInsert: true, PublishUpdate: true, PublishDelete: true, PublishTruncate: true,
+	}}}
+	live := &CatalogLiveState{
+		Publications: map[string]*PublicationState{
+			"docs_pub": {
+				Name: "docs_pub", Managed: true,
+				Tables:        []string{"public.docs"},
+				PublishInsert: true,
+			},
+		},
+		EventTriggers: map[string]*EventTriggerState{},
+	}
+	changes := CatalogDiff(desired, live, "public")
+	if len(changes) != 1 || changes[0].Type != plan.ChangeAlterPublication || changes[0].Destructive {
+		t.Fatalf("publication expansion must remain non-destructive: %+v", changes)
+	}
+}
+
+func TestCatalogDiff_PreservesMixedCaseTargetMembership(t *testing.T) {
+	desired := &schema.CatalogSpec{Publications: []*schema.Publication{{
+		Name: "docs_pub", Tables: []string{"docs"},
+		PublishInsert: true, PublishUpdate: true, PublishDelete: true, PublishTruncate: true,
+	}}}
+	live := &CatalogLiveState{
+		Publications: map[string]*PublicationState{
+			"docs_pub": {
+				Name: "docs_pub", Managed: true,
+				Tables:        []string{`"MixedSchema".docs`},
+				PublishInsert: true, PublishUpdate: true, PublishDelete: true, PublishTruncate: true,
+			},
+		},
+		EventTriggers: map[string]*EventTriggerState{},
+	}
+	if changes := CatalogDiff(desired, live, "MixedSchema"); len(changes) != 0 {
+		t.Fatalf("mixed-case target schema membership should converge: %+v", changes)
+	}
+}
+
+func TestCatalogDiff_PreservesMixedCaseTargetFunctionSchema(t *testing.T) {
+	desired := &schema.CatalogSpec{EventTriggers: []*schema.EventTrigger{{
+		Name: "audit", Event: "ddl_command_end", Function: "audit_fn", Enabled: true,
+	}}}
+	live := &CatalogLiveState{
+		Publications: map[string]*PublicationState{},
+		EventTriggers: map[string]*EventTriggerState{
+			"audit": {
+				Name: "audit", Managed: true, Event: "DDL_COMMAND_END",
+				Function: `"MixedSchema".audit_fn()`, Enabled: true,
+			},
+		},
+	}
+	if changes := CatalogDiff(desired, live, "MixedSchema"); len(changes) != 0 {
+		t.Fatalf("mixed-case target function schema should converge: %+v", changes)
 	}
 }
 
@@ -174,6 +233,26 @@ func TestCatalogDiff_PublicationAllTablesToEmptyIsGatedReplacement(t *testing.T)
 		changes[1].Type != plan.ChangeCreatePublication ||
 		!changes[0].Destructive {
 		t.Fatalf("ALL TABLES to empty must be a gated replacement: %+v", changes)
+	}
+}
+
+func TestCatalogDiff_PublicationAllTablesToExplicitIsDestructive(t *testing.T) {
+	desired := &schema.CatalogSpec{Publications: []*schema.Publication{{
+		Name: "docs_pub", Tables: []string{"docs"},
+		PublishInsert: true, PublishUpdate: true, PublishDelete: true, PublishTruncate: true,
+	}}}
+	live := &CatalogLiveState{
+		Publications: map[string]*PublicationState{
+			"docs_pub": {
+				Name: "docs_pub", Managed: true, AllTables: true,
+				PublishInsert: true, PublishUpdate: true, PublishDelete: true, PublishTruncate: true,
+			},
+		},
+		EventTriggers: map[string]*EventTriggerState{},
+	}
+	changes := CatalogDiff(desired, live, "public")
+	if len(changes) != 1 || changes[0].Type != plan.ChangeAlterPublication || !changes[0].Destructive {
+		t.Fatalf("ALL TABLES to explicit membership must be destructive: %+v", changes)
 	}
 }
 

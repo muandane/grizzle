@@ -438,14 +438,10 @@ func rewriteExtensionSchema(stmt, shadowSchema string) string {
 	if strings.Contains(upper, "WITH SCHEMA") {
 		// Replace existing WITH SCHEMA clause target.
 		re := regexp.MustCompile(`(?i)WITH\s+SCHEMA\s+("[^"]+"|[a-zA-Z_][\w$]*)`)
-		return re.ReplaceAllString(stmt, "WITH SCHEMA "+quoteIdent(shadowSchema))
+		return re.ReplaceAllString(stmt, "WITH SCHEMA "+quoteIdentifier(shadowSchema))
 	}
 	trimmed := strings.TrimRight(strings.TrimSpace(stmt), ";")
-	return trimmed + " WITH SCHEMA " + quoteIdent(shadowSchema)
-}
-
-func quoteIdent(ident string) string {
-	return `"` + strings.ReplaceAll(ident, `"`, `""`) + `"`
+	return trimmed + " WITH SCHEMA " + quoteIdentifier(shadowSchema)
 }
 
 func wrapPartitionShadowError(err error) error {

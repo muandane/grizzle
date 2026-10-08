@@ -141,6 +141,20 @@ func TestCatalog_Lifecycle(t *testing.T) {
 	if !sawAlterPub {
 		t.Fatalf("expected ALTER_PUBLICATION step in drift plan, got %+v", p2.Steps)
 	}
+	var sawDestructivePub bool
+	for _, step := range p2.Steps {
+		if step.Type == plan.ChangeAlterPublication {
+			sawDestructivePub = step.Destructive
+		}
+	}
+	if !sawDestructivePub {
+		t.Fatalf("publication membership/flag narrowing must be destructive: %+v", p2.Steps)
+	}
+	if err := exec.SyncPostgres(ctx, db, driftCfg); err == nil {
+		t.Fatalf("publication narrowing must require AllowDropPublication and DROP_PUBLICATION")
+	}
+	driftCfg.Policy = plan.DropPolicy{AllowDropPublication: true}
+	driftCfg.AcceptHazards = []plan.HazardCode{plan.HazardDropPublication}
 	if err := exec.SyncPostgres(ctx, db, driftCfg); err != nil {
 		t.Fatalf("drift sync: %v", err)
 	}

@@ -214,9 +214,67 @@ func TestMergeRolesSpecs_QualifiesTargetsBeforeSideOverlay(t *testing.T) {
 	}
 }
 
+func TestMergeRolesSpecs_QualifiesMixedCaseTargetBeforeSideOverlay(t *testing.T) {
+	schemaSpec := ParseRolesSQL(`GRANT SELECT ON docs TO app;`)
+	sideSpec := ParseRolesSQL(`GRANT INSERT ON "MixedSchema"."docs" TO app;`)
+	merged := MergeRolesSpecsForTarget(schemaSpec, sideSpec, "MixedSchema")
+	if len(merged.Grants) != 1 || len(merged.Grants[0].Privileges) != 1 ||
+		merged.Grants[0].Privileges[0] != "INSERT" {
+		t.Fatalf("mixed-case qualified and unqualified targets must overlay: %+v", merged.Grants)
+	}
+}
+
 func TestCanonicalGrantObject_PreservesQuotedDotsAndQuotes(t *testing.T) {
 	object := `"schema.with.dot"."table""name"`
 	if got, want := CanonicalGrantObject("TABLE", object, "public"), `"schema.with.dot"."table""name"`; got != want {
 		t.Fatalf("CanonicalGrantObject(%q) = %q, want %q", object, got, want)
+	}
+}
+
+func TestCanonicalGrantObject_NormalizesFunctionTypeAliases(t *testing.T) {
+	tests := []struct {
+		object string
+		want   string
+	}{
+		{object: `touch(int)`, want: `public.touch(integer)`},
+		{object: `touch(int4, bool, varchar, timestamptz)`, want: `public.touch(integer, boolean, character varying, timestamp with time zone)`},
+		{object: `touch(int8[])`, want: `public.touch(bigint[])`},
+	}
+	for _, tt := range tests {
+		if got := CanonicalGrantObject("FUNCTION", tt.object, "public"); got != tt.want {
+			t.Errorf("CanonicalGrantObject(%q) = %q, want %q", tt.object, got, tt.want)
+		}
+	}
+}
+
+func TestCanonicalGrantObject_PreservesMixedCaseTargetSchema(t *testing.T) {
+	if got, want := CanonicalGrantObject("TABLE", "docs", "MixedSchema"), `"MixedSchema".docs`; got != want {
+		t.Fatalf("mixed-case target schema = %q, want %q", got, want)
+	}
+	if got, want := CanonicalGrantObject("TABLE", `"MixedSchema"."Order"`, "MixedSchema"), `"MixedSchema"."Order"`; got != want {
+		t.Fatalf("quoted mixed-case target/table = %q, want %q", got, want)
+	}
+}
+
+func TestValidateRolesSQL_RejectsOverlengthIdentifiers(t *testing.T) {
+	longName := strings.Repeat("r", 64)
+	if err := ValidateRolesSQL(`CREATE ROLE "` + longName + `";`); err == nil {
+		t.Fatal("role identifiers over PostgreSQL's 63-byte limit must be rejected")
+	}
+}
+
+func TestFilterRolePrivilegesForServer_Maintain(t *testing.T) {
+	spec := ParseRolesSQL(`GRANT ALL ON TABLE docs TO app;`)
+	if len(spec.Grants) != 1 || !containsFold(spec.Grants[0].Privileges, "MAINTAIN") {
+		t.Fatalf("ALL TABLE must include MAINTAIN in the desired expansion: %+v", spec.Grants)
+	}
+	FilterRolePrivilegesForServer(spec, 160000)
+	if containsFold(spec.Grants[0].Privileges, "MAINTAIN") {
+		t.Fatal("MAINTAIN must be omitted for PostgreSQL versions before 17")
+	}
+	spec = ParseRolesSQL(`GRANT ALL ON TABLE docs TO app;`)
+	FilterRolePrivilegesForServer(spec, 170000)
+	if !containsFold(spec.Grants[0].Privileges, "MAINTAIN") {
+		t.Fatal("MAINTAIN must remain on PostgreSQL 17+")
 	}
 }

@@ -11,7 +11,7 @@ import (
 type RoleACLGrant struct {
 	Grantee      string   // role name or PUBLIC
 	ObjectKind   string   // TABLE, SEQUENCE, DATABASE, SCHEMA, FUNCTION
-	ObjectName   string   // lowercased, schema-qualified where applicable
+	ObjectName   string   // canonical, schema-qualified where applicable
 	Privileges   []string // sorted privilege_type values
 	GrantOptions []string // subset of Privileges held WITH GRANT OPTION
 }
@@ -42,8 +42,9 @@ type RoleState struct {
 //     swept.
 //   - Grants are diffed per (object, grantee): missing privileges GRANT,
 //     surplus privileges REVOKE (gated by AllowRevoke). Grants to grantees
-//     outside the managed set are operator state and left untouched. Grants
-//     to roles being dropped are skipped — the drop removes them implicitly.
+//     outside the managed set are operator state and left untouched.
+//   - ACL grants held by roles being dropped are revoked before DROP ROLE so
+//     PostgreSQL can remove the role even when explicit ACL dependencies remain.
 //   - Grant-option drift is reconciled by re-grant (option missing) or
 //     revoke + re-grant (option unwanted).
 //
@@ -76,7 +77,25 @@ func RolesDiff(desired *schema.RolesSpec, live *RoleState, targetSchema string) 
 		)
 	}
 
-	// 2. Role drops: marker present live, absent from desired.
+	// 2. Revoke ACLs held by managed roles that are about to be dropped.
+	// DROP ROLE is gated separately; these revokes remain gated by
+	// AllowRevoke and sort before DROP_ROLE.
+	for _, key := range sortedKeys(liveGrants) {
+		lg := liveGrants[key]
+		grantee := schema.CanonicalRoleName(lg.Grantee)
+		if !droppedRoles[grantee] || schema.IsPublicRoleIdentifier(lg.Grantee) {
+			continue
+		}
+		r := &schema.Grant{
+			Grantee:    lg.Grantee,
+			ObjectKind: lg.ObjectKind,
+			ObjectName: lg.ObjectName,
+			Privileges: slices.Clone(lg.Privileges),
+		}
+		changes = append(changes, grantChange(plan.ChangeRevoke, r))
+	}
+
+	// 3. Role drops: marker present live, absent from desired.
 	for _, roleName := range sortedRoleNames(live.ManagedRoles) {
 		if desiredRoles[roleName] {
 			continue
@@ -89,7 +108,7 @@ func RolesDiff(desired *schema.RolesSpec, live *RoleState, targetSchema string) 
 		})
 	}
 
-	// 3. Desired grants: create missing, amend drifted entries.
+	// 4. Desired grants: create missing, amend drifted entries.
 	desiredGrants := indexDesiredGrants(desired, targetSchema)
 	for _, key := range sortedKeys(desiredGrants) {
 		dg := desiredGrants[key]
@@ -128,7 +147,7 @@ func RolesDiff(desired *schema.RolesSpec, live *RoleState, targetSchema string) 
 		}
 	}
 
-	// 4. Live-only grants: revoke behind the gate when the grantee is
+	// 5. Live-only grants: revoke behind the gate when the grantee is
 	// managed; operator grantees are left untouched.
 	for _, key := range sortedKeys(liveGrants) {
 		if _, inDesired := desiredGrants[key]; inDesired {

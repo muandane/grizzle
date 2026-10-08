@@ -224,6 +224,17 @@ func serverAtLeast15(ctx context.Context, dbtx dialect.DBTX) (bool, error) {
 // function returning event_trigger; procedures, aggregates, and similarly
 // named routines are not compatible.
 func EventTriggerFunctionExists(ctx context.Context, dbtx dialect.DBTX, functionName string, lookupSchemas ...string) (bool, error) {
+	return EventTriggerFunctionExistsWithShadowMap(ctx, dbtx, functionName, nil, lookupSchemas...)
+}
+
+// EventTriggerFunctionExistsWithShadowMap is the multi-schema form of
+// EventTriggerFunctionExists. A qualified target-schema routine is resolved
+// in its corresponding shadow schema, matching RewriteShadowSQL and the
+// schema diff's target/shadow mapping.
+func EventTriggerFunctionExistsWithShadowMap(ctx context.Context, dbtx dialect.DBTX, functionName string, shadowMap map[string]string, lookupSchemas ...string) (bool, error) {
+	if len(shadowMap) > 0 {
+		functionName = mapQualifiedFunctionSchema(functionName, shadowMap)
+	}
 	parts := splitQualifiedIdentifier(strings.TrimSpace(functionName))
 	if len(parts) == 0 || len(parts) > 2 {
 		return false, fmt.Errorf("checking event-trigger function %q: invalid qualified function name", functionName)
@@ -276,6 +287,19 @@ func EventTriggerFunctionExists(ctx context.Context, dbtx dialect.DBTX, function
 		return false, fmt.Errorf("checking event-trigger function %q: %w", functionName, err)
 	}
 	return exists, nil
+}
+
+func mapQualifiedFunctionSchema(functionName string, shadowMap map[string]string) string {
+	parts := splitQualifiedIdentifier(strings.TrimSpace(functionName))
+	if len(parts) != 2 {
+		return functionName
+	}
+	targetSchema := decodeCatalogIdentifier(parts[0])
+	shadowSchema, ok := shadowMap[targetSchema]
+	if !ok {
+		return functionName
+	}
+	return quoteIdentifier(shadowSchema) + "." + parts[1]
 }
 
 // GenerateCreatePublicationSQL renders the desired publication.
@@ -452,26 +476,7 @@ func quoteQualifiedList(names []string) []string {
 }
 
 func splitQualifiedIdentifier(name string) []string {
-	var parts []string
-	start := 0
-	inQuote := false
-	for i := 0; i < len(name); i++ {
-		switch name[i] {
-		case '"':
-			if inQuote && i+1 < len(name) && name[i+1] == '"' {
-				i++
-				continue
-			}
-			inQuote = !inQuote
-		case '.':
-			if !inQuote {
-				parts = append(parts, strings.TrimSpace(name[start:i]))
-				start = i + 1
-			}
-		}
-	}
-	parts = append(parts, strings.TrimSpace(name[start:]))
-	return parts
+	return schema.ParseQualifiedIdentifier(name)
 }
 
 func quoteIdentifierPart(part string) string {

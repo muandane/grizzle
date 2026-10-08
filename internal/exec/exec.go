@@ -122,7 +122,9 @@ func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig
 	}
 	var serverVersion int
 	if row := dbtx.QueryRowContext(ctx, "SELECT current_setting('server_version_num')::integer;"); row != nil {
-		_ = row.Scan(&serverVersion)
+		if err := row.Scan(&serverVersion); err != nil {
+			return nil, fmt.Errorf("%w: server version: %w", plan.ErrInspectionFailed, err)
+		}
 	}
 	renderOpts := postgres.RenderOpts{
 		NonConcurrentIndexes: cfg.NonConcurrentIndexes,
@@ -158,7 +160,7 @@ func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig
 			return nil, err
 		}
 		steps := postgres.RenderChangesWithOpts(targetSchema, changes, renderOpts)
-		rolesSteps, err := diffRolesSteps(ctx, dbtx, cfg)
+		rolesSteps, err := diffRolesSteps(ctx, dbtx, cfg, serverVersion)
 		if err != nil {
 			return nil, err
 		}
@@ -213,7 +215,7 @@ func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig
 	}
 
 	steps := postgres.RenderChangesWithOpts(targetSchemas[0], allChanges, renderOpts)
-	rolesSteps, err := diffRolesSteps(ctx, dbtx, cfg)
+	rolesSteps, err := diffRolesSteps(ctx, dbtx, cfg, serverVersion)
 	if err != nil {
 		return nil, err
 	}

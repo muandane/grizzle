@@ -67,7 +67,7 @@ func InspectLiveRoles(ctx context.Context, dbtx dialect.DBTX, targetSchemas []st
 			return fmt.Errorf("scanning roles: %w", err)
 		}
 		live.RoleNames[schema.CanonicalIdentifierKey(name)] = name
-		if strings.Contains(comment, schema.RoleManagedComment) {
+		if roleManagedComment(comment) {
 			live.ManagedRoles[schema.CanonicalIdentifierKey(name)] = true
 		}
 		return nil
@@ -75,8 +75,10 @@ func InspectLiveRoles(ctx context.Context, dbtx dialect.DBTX, targetSchemas []st
 		return nil, err
 	}
 
-	// 2. Table + sequence ACLs scoped to target schemas. INNER join on
-	// aclexplode skips NULL relacl objects (no explicit grants to manage).
+	// 2. Table-like relation + sequence ACLs scoped to target schemas.
+	// INNER join on aclexplode skips NULL relacl objects (no explicit grants
+	// to manage). Views, materialized views, foreign tables, and partitioned
+	// tables all accept the TABLE grant contract.
 	schemaList, args := placeholders(targetSchemas)
 	aclQuery := fmt.Sprintf(`
 		SELECT n.nspname, c.relname, c.relkind,
@@ -86,7 +88,7 @@ func InspectLiveRoles(ctx context.Context, dbtx dialect.DBTX, targetSchemas []st
 		JOIN pg_namespace n ON n.oid = c.relnamespace
 		JOIN aclexplode(c.relacl) a ON true
 		LEFT JOIN pg_roles r ON r.oid = a.grantee
-		WHERE c.relkind IN ('r', 'p', 'S')
+		WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S')
 		  AND n.nspname IN (%s);
 	`, schemaList)
 	aclRows, err := dbtx.QueryContext(ctx, aclQuery, args...)
@@ -197,6 +199,10 @@ func InspectLiveRoles(ctx context.Context, dbtx dialect.DBTX, targetSchemas []st
 	}
 
 	return live, nil
+}
+
+func roleManagedComment(comment string) bool {
+	return comment == schema.RoleManagedComment
 }
 
 // scanRows iterates a *sql.Rows with a per-row callback, closing on all paths.
