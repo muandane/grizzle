@@ -8,6 +8,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/muandane/grizzle/internal/backoff"
 	"github.com/muandane/grizzle/internal/dialect"
 	"github.com/muandane/grizzle/internal/plan"
 )
@@ -34,9 +35,7 @@ func AcquireAdvisoryLock(ctx context.Context, dbtx dialect.DBTX, lockID int64) e
 // It uses pg_try_advisory_lock in a non-blocking loop to avoid holding open server-side lock wait queues
 // that would cause PostgreSQL deadlock detection against concurrent non-transactional DDL such as CREATE INDEX CONCURRENTLY.
 func AcquireSessionAdvisoryLock(ctx context.Context, dbtx dialect.DBTX, lockID int64) error {
-	ticker := time.NewTicker(20 * time.Millisecond)
-	defer ticker.Stop()
-
+	attempt := 0
 	for {
 		var acquired bool
 		err := dbtx.QueryRowContext(ctx, "SELECT pg_try_advisory_lock($1);", lockID).Scan(&acquired)
@@ -52,11 +51,14 @@ func AcquireSessionAdvisoryLock(ctx context.Context, dbtx dialect.DBTX, lockID i
 			return nil
 		}
 
+		timer := time.NewTimer(backoff.Compute(attempt, nil))
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return fmt.Errorf("%w: %v", plan.ErrLockTimeout, ctx.Err())
-		case <-ticker.C:
+		case <-timer.C:
 		}
+		attempt++
 	}
 }
 
@@ -79,9 +81,7 @@ func Hash32(s string) int32 {
 
 // AcquireSessionAdvisoryLock2 acquires a PostgreSQL session-level advisory lock using two 32-bit keys (namespace, key).
 func AcquireSessionAdvisoryLock2(ctx context.Context, dbtx dialect.DBTX, key1, key2 int32) error {
-	ticker := time.NewTicker(20 * time.Millisecond)
-	defer ticker.Stop()
-
+	attempt := 0
 	for {
 		var acquired bool
 		err := dbtx.QueryRowContext(ctx, "SELECT pg_try_advisory_lock($1, $2);", key1, key2).Scan(&acquired)
@@ -97,11 +97,14 @@ func AcquireSessionAdvisoryLock2(ctx context.Context, dbtx dialect.DBTX, key1, k
 			return nil
 		}
 
+		timer := time.NewTimer(backoff.Compute(attempt, nil))
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return fmt.Errorf("%w: %v", plan.ErrLockTimeout, ctx.Err())
-		case <-ticker.C:
+		case <-timer.C:
 		}
+		attempt++
 	}
 }
 
