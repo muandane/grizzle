@@ -165,7 +165,7 @@ func isStepReversible(s plan.Step) bool {
 		plan.ChangeCreatePolicy, plan.ChangeEnableRLS, plan.ChangeDisableRLS, plan.ChangeForceRLS, plan.ChangeNoForceRLS,
 		plan.ChangeCreateFunction, plan.ChangeCreateAggregate, plan.ChangeCreateTrigger, plan.ChangeCreateView, plan.ChangeRefreshMatView,
 		plan.ChangeCommentTable, plan.ChangeCommentColumn, plan.ChangeCreateDomain, plan.ChangeAlterDomain,
-		plan.ChangeCreateRole, plan.ChangeRoleComment, plan.ChangeGrant, plan.ChangeRevoke:
+		plan.ChangeCreateRole, plan.ChangeAlterRole, plan.ChangeRoleComment, plan.ChangeGrant, plan.ChangeRevoke:
 		return true
 	default:
 		// ChangeCreateExtension is intentionally irreversible: uninstalling an
@@ -303,6 +303,9 @@ func reverseStepSQL(s plan.Step) string {
 			return fmt.Sprintf("DROP ROLE IF EXISTS %s;", roleName)
 		}
 		return fmt.Sprintf("-- Reversal not derivable for %s", s.Type)
+
+	case plan.ChangeAlterRole:
+		return fmt.Sprintf("-- ALTER ROLE %s reversal is not auto-derived", s.Table)
 
 	case plan.ChangeRoleComment:
 		// The managed-role marker comment disappears with the role itself.

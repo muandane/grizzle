@@ -203,7 +203,7 @@ func TestRoles_Lifecycle(t *testing.T) {
 		t.Fatalf("query role: %v", err)
 	}
 	if rolCanLogin {
-		t.Fatalf("managed roles must be NOLOGIN")
+		t.Fatalf("roles without LOGIN must stay NOLOGIN")
 	}
 	if rolSuper {
 		t.Fatalf("managed roles must not be superuser")
@@ -345,5 +345,136 @@ func TestRoles_Lifecycle(t *testing.T) {
 	}
 	if managedDropped != 0 {
 		t.Fatalf("marker-stamped role must be dropped, count = %d", managedDropped)
+	}
+}
+
+// TestRoles_LoginPasswordConfigDrift verifies LOGIN + PASSWORD + SET apply,
+// second-sync no-op, password drift hazard, and plan JSON/SQL redaction.
+func TestRoles_LoginPasswordConfigDrift(t *testing.T) {
+	db := testutil.TestDatabase(t)
+	ctx := context.Background()
+
+	schemaName := fmt.Sprintf("test_role_cfg_%d", time.Now().UnixNano())
+	roleName := fmt.Sprintf("login_role_%d", time.Now().UnixNano())
+	secret := "s3cret-not-in-plan"
+	if _, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schemaName)); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	defer func() {
+		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schemaName))
+		_, _ = db.Exec(fmt.Sprintf("DROP ROLE IF EXISTS %q;", roleName))
+	}()
+
+	rolesSQL := fmt.Sprintf(`
+		CREATE ROLE %q LOGIN PASSWORD '%s' CONNECTION LIMIT 2;
+		ALTER ROLE %q SET work_mem = '4096';
+	`, roleName, secret, roleName)
+
+	cfg := exec.PostgresExecConfig{
+		TargetSchema:     schemaName,
+		SchemaSQL:        `CREATE TABLE docs (id bigint PRIMARY KEY);`,
+		RolesSQL:         rolesSQL,
+		Filters:          scope.Filters{},
+		Policy:           plan.DropPolicy{},
+		LockTimeout:      5 * time.Second,
+		StatementTimeout: 30 * time.Second,
+		AcceptHazards:    []plan.HazardCode{plan.HazardPasswordChange},
+	}
+
+	p, err := exec.PlanDiffPostgres(ctx, db, cfg)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	docJSON, err := p.ToJSON()
+	if err != nil {
+		t.Fatalf("plan json: %v", err)
+	}
+	if strings.Contains(string(docJSON), secret) {
+		t.Fatalf("plan JSON must not contain password plaintext")
+	}
+	var sawPasswordStep bool
+	for _, step := range p.Steps {
+		if strings.Contains(step.SQL, secret) {
+			t.Fatalf("Step.SQL leaked password: %s", step.SQL)
+		}
+		if step.Type == plan.ChangeAlterRole && strings.Contains(strings.ToUpper(step.SQL), "PASSWORD") {
+			sawPasswordStep = true
+			if !strings.Contains(step.SQL, schema.PasswordRedacted) {
+				t.Fatalf("password step must use redacted placeholder: %s", step.SQL)
+			}
+		}
+	}
+	if !sawPasswordStep {
+		t.Fatalf("expected redacted PASSWORD alter step, got %+v", p.Steps)
+	}
+	hazards := p.Hazards()
+	var sawPWHazard bool
+	for _, h := range hazards {
+		if h.Code == plan.HazardPasswordChange {
+			sawPWHazard = true
+			if strings.Contains(h.SQL, secret) {
+				t.Fatalf("hazard SQL leaked password")
+			}
+		}
+	}
+	if !sawPWHazard {
+		t.Fatalf("expected PASSWORD_CHANGE hazard, got %+v", hazards)
+	}
+
+	if err := exec.SyncPostgres(ctx, db, cfg); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	var canLogin bool
+	var connLimit int
+	if err := db.QueryRow(`SELECT rolcanlogin, rolconnlimit FROM pg_roles WHERE rolname = $1`, roleName).Scan(&canLogin, &connLimit); err != nil {
+		t.Fatalf("query role: %v", err)
+	}
+	if !canLogin {
+		t.Fatalf("LOGIN role must be able to log in")
+	}
+	if connLimit != 2 {
+		t.Fatalf("connection limit = %d, want 2", connLimit)
+	}
+	var workMem string
+	if err := db.QueryRow(`
+		SELECT split_part(u.entry, '=', 2)
+		FROM pg_db_role_setting s
+		JOIN pg_roles r ON r.oid = s.setrole
+		CROSS JOIN LATERAL unnest(s.setconfig) AS u(entry)
+		WHERE r.rolname = $1 AND s.setdatabase = 0 AND u.entry LIKE 'work_mem=%'
+	`, roleName).Scan(&workMem); err != nil {
+		t.Fatalf("query role setting: %v", err)
+	}
+	if workMem != "4096" {
+		t.Fatalf("work_mem = %q, want 4096", workMem)
+	}
+
+	p2, err := exec.PlanDiffPostgres(ctx, db, cfg)
+	if err != nil {
+		t.Fatalf("second plan: %v", err)
+	}
+	if len(p2.Steps) != 0 {
+		t.Fatalf("second sync must be a no-op, got %+v", p2.Steps)
+	}
+
+	// Password drift: rotate live password, expect PASSWORD_CHANGE again.
+	if _, err := db.Exec(fmt.Sprintf(`ALTER ROLE %q PASSWORD 'other-secret';`, roleName)); err != nil {
+		t.Fatalf("rotate live password: %v", err)
+	}
+	p3, err := exec.PlanDiffPostgres(ctx, db, cfg)
+	if err != nil {
+		t.Fatalf("drift plan: %v", err)
+	}
+	var sawPW bool
+	for _, step := range p3.Steps {
+		if step.Type == plan.ChangeAlterRole && strings.Contains(strings.ToUpper(step.SQL), "PASSWORD") {
+			sawPW = true
+			if strings.Contains(step.SQL, secret) || strings.Contains(step.SQL, "other-secret") {
+				t.Fatalf("drift Step.SQL leaked password: %s", step.SQL)
+			}
+		}
+	}
+	if !sawPW {
+		t.Fatalf("password drift must emit ALTER_ROLE PASSWORD, got %+v", p3.Steps)
 	}
 }

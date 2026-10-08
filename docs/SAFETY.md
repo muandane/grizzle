@@ -154,6 +154,7 @@ Supported hazard codes:
 | `DROP_PUBLICATION` | `CRITICAL` | Grizzle-managed publication dropped (subscribers stop receiving changes); requires `AllowDropPublication` |
 | `DROP_EVENT_TRIGGER` | `CRITICAL` | Grizzle-managed event trigger dropped (DDL auditing/enforcement stops firing); requires `AllowDropEventTrigger` |
 | `GRANT_PUBLIC` | `WARNING` | Privileges granted to `PUBLIC` (ambient access for every role) |
+| `PASSWORD_CHANGE` | `WARNING` | Managed role password will be set or rotated (plaintext never appears in Step.SQL / plan JSON) |
 | `EVENT_TRIGGER_SUPERUSER` | `WARNING` | Event-trigger DDL may require superuser or elevated privileges |
 | `PUBLICATION_ALL_TABLES` | `NOTICE` | Publication publishes ALL tables, including future ones |
 | `PARTITION_ATTACH_SCAN` | `WARNING` | Attaching existing standalone table to parent partitioned table requires validation scan under `ACCESS EXCLUSIVE` lock |

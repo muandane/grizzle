@@ -93,34 +93,41 @@ func TestValidateRolesSQL_UnifiedForms(t *testing.T) {
 
 func TestValidateRolesSQL_RejectsUnsupportedRoleForms(t *testing.T) {
 	tests := []struct {
+		name    string
 		sql     string
 		message string
 	}{
-		{`ALTER ROLE app_read SET search_path = public;`, "role configuration is not supported yet"},
-		{`CREATE ROLE app_read PASSWORD 'secret';`, "passworded roles are not supported yet"},
-		{`CREATE ROLE password;`, ""},
-		{`DROP ROLE app_read;`, "DROP ROLE/USER is not supported"},
-		{`REVOKE GRANT OPTION FOR SELECT ON docs FROM app_read;`, "per-privilege grant-option revocation"},
-		{`GRANT app_read TO app_writer WITH ADMIN OPTION;`, "unsupported GRANT form"},
-		{`GRANT SELECT ON VIEW docs TO app_read;`, "object list contains malformed"},
-		{`GRANT SELECT, ON docs TO app_read;`, "privilege list is malformed"},
-		{`GRANT SELECT ON docs, TO app_read;`, "object list is malformed"},
-		{`GRANT SELECT ON docs TO app_read,;`, "grantee list is malformed"},
-		{`GRANT  ON docs TO app_read;`, "unsupported GRANT form"},
-		{`GRANT SELECT ON FUNCTION fn(integer,) TO app_read;`, "object list contains malformed"},
-		{`GRANT EXECUTE ON FUNCTION fn(IN integer) TO app_read;`, "argument modes are unsupported"},
-		{`GRANT EXECUTE ON FUNCTION fn(arg integer) TO app_read;`, "argument names are unsupported"},
-		{`GRANT SELECT ON FUNCTION ""() TO app_read;`, "object list contains malformed"},
-		{`CREATE ROLE "";`, "role identifier must not be empty"},
-		{`GRANT SELECT ON docs TO "";`, "grantee list contains malformed"},
-		{`GRANT SELECT ON docs TO app_read -- trailing comment`, "SQL comment"},
+		{"password role name", `CREATE ROLE password;`, ""},
+		{"login password set", `CREATE ROLE app_login LOGIN PASSWORD 'secret';`, ""},
+		{"alter set", `ALTER ROLE app_read SET search_path = public;`, ""},
+		{"alter reset", `ALTER ROLE app_read RESET search_path;`, ""},
+		{"alter from current", `ALTER ROLE app_read SET search_path FROM CURRENT;`, ""},
+		{"refuse superuser", `CREATE ROLE evil SUPERUSER;`, "SUPERUSER is not supported"},
+		{"refuse replication", `CREATE ROLE evil REPLICATION;`, "REPLICATION is not supported"},
+		{"refuse bypassrls", `CREATE ROLE evil BYPASSRLS;`, "BYPASSRLS is not supported"},
+		{"refuse password null", `CREATE ROLE app_read PASSWORD NULL;`, "PASSWORD NULL is not supported"},
+		{"refuse drop", `DROP ROLE app_read;`, "DROP ROLE/USER is not supported"},
+		{"refuse grant option revoke", `REVOKE GRANT OPTION FOR SELECT ON docs FROM app_read;`, "per-privilege grant-option revocation"},
+		{"refuse admin option", `GRANT app_read TO app_writer WITH ADMIN OPTION;`, "unsupported GRANT form"},
+		{"refuse view grant", `GRANT SELECT ON VIEW docs TO app_read;`, "object list contains malformed"},
+		{"malformed privileges", `GRANT SELECT, ON docs TO app_read;`, "privilege list is malformed"},
+		{"malformed objects", `GRANT SELECT ON docs, TO app_read;`, "object list is malformed"},
+		{"malformed grantees", `GRANT SELECT ON docs TO app_read,;`, "grantee list is malformed"},
+		{"empty privileges", `GRANT  ON docs TO app_read;`, "unsupported GRANT form"},
+		{"malformed function args", `GRANT SELECT ON FUNCTION fn(integer,) TO app_read;`, "object list contains malformed"},
+		{"function modes", `GRANT EXECUTE ON FUNCTION fn(IN integer) TO app_read;`, "argument modes are unsupported"},
+		{"function arg names", `GRANT EXECUTE ON FUNCTION fn(arg integer) TO app_read;`, "argument names are unsupported"},
+		{"empty function name", `GRANT SELECT ON FUNCTION ""() TO app_read;`, "object list contains malformed"},
+		{"empty role name", `CREATE ROLE "";`, "role identifier must not be empty"},
+		{"empty grantee", `GRANT SELECT ON docs TO "";`, "grantee list contains malformed"},
+		{"trailing comment", `GRANT SELECT ON docs TO app_read -- trailing comment`, "SQL comment"},
 	}
 	for _, tt := range tests {
-		t.Run(tt.message, func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
 			err := ValidateRolesSQL(tt.sql)
 			if tt.message == "" {
 				if err != nil {
-					t.Fatalf("valid role identifier %q was rejected: %v", tt.sql, err)
+					t.Fatalf("valid statement %q was rejected: %v", tt.sql, err)
 				}
 				return
 			}
@@ -128,6 +135,62 @@ func TestValidateRolesSQL_RejectsUnsupportedRoleForms(t *testing.T) {
 				t.Fatalf("ValidateRolesSQL(%q) = %v, want error containing %q", tt.sql, err, tt.message)
 			}
 		})
+	}
+}
+
+func TestParseRolesSQL_LoginPasswordAndConfig(t *testing.T) {
+	spec := ParseRolesSQL(`
+		CREATE ROLE app_login LOGIN PASSWORD 's3cret' VALID UNTIL '2040-01-01' CONNECTION LIMIT 3;
+		ALTER ROLE app_login SET search_path = public;
+		ALTER ROLE app_login SET work_mem FROM CURRENT;
+		ALTER ROLE app_login SET log_statement = 'all';
+		ALTER ROLE app_login RESET log_statement;
+	`)
+	role := spec.Roles[CanonicalIdentifierKey("app_login")]
+	if role == nil {
+		t.Fatal("expected app_login role")
+	}
+	if role.Login == nil || !*role.Login {
+		t.Fatalf("expected LOGIN, got %+v", role.Login)
+	}
+	if !role.HasPassword || role.Password != "s3cret" {
+		t.Fatalf("expected password plaintext on IR, got has=%v pw=%q", role.HasPassword, role.Password)
+	}
+	if role.ValidUntil != "2040-01-01" {
+		t.Fatalf("valid until = %q", role.ValidUntil)
+	}
+	if role.ConnectionLimit == nil || *role.ConnectionLimit != 3 {
+		t.Fatalf("connection limit = %v", role.ConnectionLimit)
+	}
+	if role.Config["search_path"] != "public" {
+		t.Fatalf("search_path config = %q", role.Config["search_path"])
+	}
+	if role.Config["work_mem"] != ConfigFromCurrent {
+		t.Fatalf("work_mem config = %q, want FROM CURRENT", role.Config["work_mem"])
+	}
+	if _, ok := role.Config["log_statement"]; ok {
+		t.Fatalf("RESET must clear prior SET, got %v", role.Config)
+	}
+}
+
+func TestRedactRolePasswordsSQL(t *testing.T) {
+	in := `CREATE ROLE r LOGIN PASSWORD 's3cret'; ALTER ROLE r PASSWORD 'other';`
+	out := RedactRolePasswordsSQL(in)
+	if strings.Contains(out, "s3cret") || strings.Contains(out, "other") {
+		t.Fatalf("password leaked in redaction: %q", out)
+	}
+	if !strings.Contains(out, "'"+PasswordRedacted+"'") {
+		t.Fatalf("expected redacted placeholder, got %q", out)
+	}
+}
+
+func TestMergeRolesSpecs_SideChannelWinsRoleAttrs(t *testing.T) {
+	schemaSpec := ParseRolesSQL(`CREATE ROLE app NOLOGIN;`)
+	sideSpec := ParseRolesSQL(`CREATE ROLE app LOGIN PASSWORD 'x'; ALTER ROLE app SET search_path = app;`)
+	merged := MergeRolesSpecs(schemaSpec, sideSpec)
+	role := merged.Roles[CanonicalIdentifierKey("app")]
+	if role == nil || role.Login == nil || !*role.Login || !role.HasPassword || role.Config["search_path"] != "app" {
+		t.Fatalf("side-channel attrs must win: %+v", role)
 	}
 }
 

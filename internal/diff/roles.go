@@ -1,7 +1,9 @@
 package diff
 
 import (
+	"maps"
 	"slices"
+	"strings"
 
 	"github.com/muandane/grizzle/internal/plan"
 	"github.com/muandane/grizzle/internal/schema"
@@ -16,6 +18,19 @@ type RoleACLGrant struct {
 	GrantOptions []string // subset of Privileges held WITH GRANT OPTION
 }
 
+// LiveRoleAttrs is the live attribute snapshot for one role.
+type LiveRoleAttrs struct {
+	CanLogin        bool
+	ConnLimit       int
+	ValidUntil      string
+	Inherit         bool
+	CreateDB        bool
+	CreateRole      bool
+	HasPassword     bool
+	PasswordMatches bool // true when no desired password or hashes match
+	Config          map[string]string
+}
+
 // RoleState is the live role/ACL snapshot consumed by RolesDiff. It is built
 // by the dialect layer (postgres.InspectLiveRoles) so this package stays free
 // of dialect imports.
@@ -26,6 +41,8 @@ type RoleState struct {
 	// ManagedRoles are canonical names of roles stamped with the
 	// grizzle-managed marker comment.
 	ManagedRoles map[string]bool
+	// RoleAttrs maps canonical role identity -> live attributes.
+	RoleAttrs map[string]*LiveRoleAttrs
 	// Grants is the live ACL inventory.
 	Grants []*RoleACLGrant
 }
@@ -53,8 +70,12 @@ type RoleState struct {
 // reported by ACL introspection.
 func RolesDiff(desired *schema.RolesSpec, live *RoleState, targetSchema string) []Change {
 	var changes []Change
+	if live == nil {
+		live = &RoleState{}
+	}
 
 	desiredRoles := desiredRoleNames(desired)
+	desiredRoleIR := indexDesiredRoles(desired)
 	liveGrants := indexLiveGrants(live.Grants)
 	droppedRoles := rolesBeingDropped(live.ManagedRoles, desiredRoles)
 
@@ -63,18 +84,55 @@ func RolesDiff(desired *schema.RolesSpec, live *RoleState, targetSchema string) 
 		if _, exists := live.RoleNames[roleName]; exists {
 			continue
 		}
+		role := desiredRoleIR[roleName]
+		if role == nil {
+			role = &schema.Role{Name: roleName}
+		}
 		changes = append(changes,
 			Change{
 				Type:  plan.ChangeCreateRole,
 				Table: roleName,
-				Role:  &schema.Role{Name: roleName},
-			},
-			Change{
-				Type:  plan.ChangeRoleComment,
-				Table: roleName,
-				Role:  &schema.Role{Name: roleName},
+				Role:  schema.CloneRole(role),
 			},
 		)
+		if role.HasPassword {
+			// Password on create is applied as a follow-up ALTER so Step.SQL
+			// for CREATE stays free of plaintext and apply can rebuild it.
+			changes = append(changes, Change{
+				Type:  plan.ChangeAlterRole,
+				Table: roleName,
+				Role: &schema.Role{
+					Name:        role.Name,
+					Password:    role.Password,
+					HasPassword: true,
+				},
+			})
+		}
+		if len(role.Config) > 0 {
+			changes = append(changes, Change{
+				Type:  plan.ChangeAlterRole,
+				Table: roleName,
+				Role:  &schema.Role{Name: role.Name, Config: copyStringMap(role.Config)},
+			})
+		}
+		changes = append(changes, Change{
+			Type:  plan.ChangeRoleComment,
+			Table: roleName,
+			Role:  &schema.Role{Name: roleName},
+		})
+	}
+
+	// 1b. Attribute / password / config drift for roles that already exist.
+	for _, roleName := range sortedRoleNames(desiredRoles) {
+		if _, exists := live.RoleNames[roleName]; !exists {
+			continue
+		}
+		desiredRole := desiredRoleIR[roleName]
+		if desiredRole == nil {
+			continue
+		}
+		liveAttrs := live.RoleAttrs[roleName]
+		changes = append(changes, roleAttrDriftChanges(desiredRole, liveAttrs)...)
 	}
 
 	// 2. Revoke ACLs held by managed roles that are about to be dropped.
@@ -356,6 +414,156 @@ func sortedRoleNames(m map[string]bool) []string {
 	}
 	slices.Sort(out)
 	return out
+}
+
+func indexDesiredRoles(spec *schema.RolesSpec) map[string]*schema.Role {
+	out := make(map[string]*schema.Role)
+	if spec == nil {
+		return out
+	}
+	for _, role := range spec.Roles {
+		out[schema.CanonicalIdentifierKey(role.Name)] = role
+	}
+	return out
+}
+
+func copyStringMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	maps.Copy(out, in)
+	return out
+}
+
+func roleAttrDriftChanges(desired *schema.Role, live *LiveRoleAttrs) []Change {
+	var changes []Change
+	if desired == nil {
+		return nil
+	}
+	attrDrift := &schema.Role{Name: desired.Name}
+	hasAttrDrift := false
+	if desired.Login != nil {
+		liveLogin := live != nil && live.CanLogin
+		if *desired.Login != liveLogin {
+			v := *desired.Login
+			attrDrift.Login = &v
+			hasAttrDrift = true
+		}
+	}
+	if desired.Inherit != nil {
+		liveInherit := live == nil || live.Inherit
+		if *desired.Inherit != liveInherit {
+			v := *desired.Inherit
+			attrDrift.Inherit = &v
+			hasAttrDrift = true
+		}
+	}
+	if desired.CreateDB != nil {
+		liveCreateDB := live != nil && live.CreateDB
+		if *desired.CreateDB != liveCreateDB {
+			v := *desired.CreateDB
+			attrDrift.CreateDB = &v
+			hasAttrDrift = true
+		}
+	}
+	if desired.CreateRole != nil {
+		liveCreateRole := live != nil && live.CreateRole
+		if *desired.CreateRole != liveCreateRole {
+			v := *desired.CreateRole
+			attrDrift.CreateRole = &v
+			hasAttrDrift = true
+		}
+	}
+	if desired.ConnectionLimit != nil {
+		liveLimit := -1
+		if live != nil {
+			liveLimit = live.ConnLimit
+		}
+		if *desired.ConnectionLimit != liveLimit {
+			v := *desired.ConnectionLimit
+			attrDrift.ConnectionLimit = &v
+			hasAttrDrift = true
+		}
+	}
+	if desired.ValidUntil != "" {
+		liveUntil := ""
+		if live != nil {
+			liveUntil = live.ValidUntil
+		}
+		if !validUntilEqual(desired.ValidUntil, liveUntil) {
+			attrDrift.ValidUntil = desired.ValidUntil
+			hasAttrDrift = true
+		}
+	}
+	roleKey := schema.CanonicalIdentifierKey(desired.Name)
+	if hasAttrDrift {
+		changes = append(changes, Change{
+			Type:  plan.ChangeAlterRole,
+			Table: roleKey,
+			Role:  attrDrift,
+		})
+	}
+	if desired.HasPassword && (live == nil || !live.PasswordMatches) {
+		changes = append(changes, Change{
+			Type:  plan.ChangeAlterRole,
+			Table: roleKey,
+			Role: &schema.Role{
+				Name:        desired.Name,
+				Password:    desired.Password,
+				HasPassword: true,
+			},
+		})
+	}
+
+	liveConfig := map[string]string{}
+	if live != nil && live.Config != nil {
+		liveConfig = live.Config
+	}
+	desiredConfig := desired.Config
+	if desiredConfig == nil {
+		desiredConfig = map[string]string{}
+	}
+	configRole := &schema.Role{Name: desired.Name, Config: make(map[string]string)}
+	for _, key := range sortedKeys(desiredConfig) {
+		desiredVal := desiredConfig[key]
+		liveVal, liveOK := liveConfig[key]
+		if desiredVal == schema.ConfigFromCurrent {
+			// FROM CURRENT is a set-time directive; once the key exists live
+			// we treat it as satisfied so second sync stays a no-op.
+			if !liveOK {
+				configRole.Config[key] = desiredVal
+			}
+			continue
+		}
+		if !liveOK || liveVal != desiredVal {
+			configRole.Config[key] = desiredVal
+		}
+	}
+	for _, key := range sortedKeys(liveConfig) {
+		if _, ok := desiredConfig[key]; !ok {
+			// Empty value is the RESET sentinel for renderers.
+			configRole.Config[key] = ""
+		}
+	}
+	if len(configRole.Config) > 0 {
+		changes = append(changes, Change{
+			Type:  plan.ChangeAlterRole,
+			Table: roleKey,
+			Role:  configRole,
+		})
+	}
+	return changes
+}
+
+func validUntilEqual(desired, live string) bool {
+	desired = strings.TrimSpace(desired)
+	live = strings.TrimSpace(live)
+	if desired == live {
+		return true
+	}
+	// Live timestamps from PostgreSQL often include time; desired may be date-only.
+	return strings.HasPrefix(live, desired)
 }
 
 func sortedKeys[M ~map[string]V, V any](m M) []string {

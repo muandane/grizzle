@@ -593,7 +593,13 @@ func RenderChangeWithOpts(targetSchema string, c diff.Change, opts RenderOpts) p
 	case plan.ChangeDropDomain, plan.ChangeDropDomainRetype:
 		step.SQL = GenerateDropDomainSQL(effectiveSchema, c.Table)
 	case plan.ChangeCreateRole:
-		step.SQL = GenerateCreateRoleSQL(c.Table)
+		role := c.Role
+		if role == nil {
+			role = &schema.Role{Name: c.Table}
+		}
+		step.SQL = GenerateCreateRoleSQLRedacted(role)
+	case plan.ChangeAlterRole:
+		step.SQL = GenerateAlterRoleStepSQL(c.Role)
 	case plan.ChangeRoleComment:
 		step.SQL = GenerateRoleCommentSQL(c.Table)
 	case plan.ChangeDropRole:

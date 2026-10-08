@@ -7,11 +7,33 @@ import (
 )
 
 // Role represents a managed database role declared in SchemaSQL or RolesSQL.
-// Managed roles are always NOLOGIN group roles: Grizzle never sets or rotates
-// passwords, so interactive-login roles stay outside the contract.
+// Attributes beyond Name are optional. When LOGIN/NOLOGIN is omitted, CREATE
+// ROLE keeps PostgreSQL's default (NOLOGIN). Password plaintext is never
+// serialized (json:"-"); HasPassword records that a password is desired for
+// plan hashing and redaction without embedding the secret.
 type Role struct {
-	Name string `json:"name"`
+	Name            string `json:"name"`
+	Login           *bool  `json:"login,omitempty"`
+	Password        string `json:"-"`
+	HasPassword     bool   `json:"has_password,omitempty"`
+	ValidUntil      string `json:"valid_until,omitempty"`
+	ConnectionLimit *int   `json:"connection_limit,omitempty"`
+	Inherit         *bool  `json:"inherit,omitempty"`
+	CreateDB        *bool  `json:"createdb,omitempty"`
+	CreateRole      *bool  `json:"createrole,omitempty"`
+	// Config is the desired set of role-level pg_db_role_setting entries
+	// (setdatabase = 0). SET param FROM CURRENT stores the sentinel
+	// ConfigFromCurrent. RESET removes a key when merging sequential ALTERs.
+	Config map[string]string `json:"config,omitempty"`
 }
+
+// ConfigFromCurrent is stored in Role.Config when RolesSQL declares
+// ALTER ROLE ... SET param FROM CURRENT.
+const ConfigFromCurrent = "FROM CURRENT"
+
+// PasswordRedacted is the placeholder rendered in Step.SQL and plan documents
+// whenever a role password would otherwise appear in cleartext.
+const PasswordRedacted = "********"
 
 // Grant represents a desired privilege grant scanned from SchemaSQL or
 // RolesSQL.
@@ -35,9 +57,8 @@ type RolesSpec struct {
 
 var (
 	// createRoleRe captures the name from a CREATE ROLE/USER declaration.
-	createRoleRe          = regexp.MustCompile(`(?i)^CREATE\s+(?:ROLE|USER)\s+` + catalogIdentifierPattern)
-	createRoleStatementRe = regexp.MustCompile(`(?is)^CREATE\s+(?:ROLE|USER)\s+` + catalogIdentifierPattern + `(?:\s+(?:WITH\s+)?NOLOGIN)?$`)
-	rolePasswordClauseRe  = regexp.MustCompile(`(?is)^\s+(?:WITH\s+)?(?:ENCRYPTED\s+)?PASSWORD\b`)
+	createRoleRe = regexp.MustCompile(`(?i)^CREATE\s+(?:ROLE|USER)\s+` + catalogIdentifierPattern)
+	alterRoleRe  = regexp.MustCompile(`(?i)^ALTER\s+(?:ROLE|USER)\s+`)
 
 	// grantRe matches GRANT privilege[, ...] ON [TABLE|SEQUENCE|DATABASE|SCHEMA|FUNCTION]
 	// object[, ...] TO grantee[, ...] [WITH GRANT OPTION]. The object slot
@@ -253,16 +274,16 @@ func normalizeFunctionTypeAliases(value string) string {
 	value = strings.ReplaceAll(value, " [", "[")
 	value = strings.ReplaceAll(value, "] ", "]")
 
-	arraySuffix := ""
+	var arraySuffix strings.Builder
 	for strings.HasSuffix(value, "[]") {
-		arraySuffix += "[]"
+		arraySuffix.WriteString("[]")
 		value = strings.TrimSpace(strings.TrimSuffix(value, "[]"))
 	}
 	value = strings.TrimPrefix(value, "pg_catalog.")
 	if alias, ok := functionTypeAliases[value]; ok {
 		value = alias
 	}
-	return value + arraySuffix
+	return value + arraySuffix.String()
 }
 
 func canonicalGrantIdentifierPart(part string) string {
@@ -295,11 +316,25 @@ func ParseRolesSQL(sql string) *RolesSpec {
 		upper := strings.ToUpper(trimmed)
 		switch {
 		case strings.HasPrefix(upper, "CREATE ROLE") || strings.HasPrefix(upper, "CREATE USER"):
-			if m := createRoleRe.FindStringSubmatch(trimmed); m != nil {
-				name := statementIdentifier(m)
-				if name != "" {
-					spec.Roles[CanonicalIdentifierKey(name)] = &Role{Name: name}
+			role, err := parseCreateRoleStatement(trimmed)
+			if err == nil && role != nil {
+				key := CanonicalIdentifierKey(role.Name)
+				if existing := spec.Roles[key]; existing != nil {
+					mergeRoleAttrs(existing, role)
+				} else {
+					spec.Roles[key] = role
 				}
+			}
+		case strings.HasPrefix(upper, "ALTER ROLE") || strings.HasPrefix(upper, "ALTER USER"):
+			name, partial, resetKeys, err := parseAlterRoleStatement(trimmed)
+			if err == nil && name != "" {
+				key := CanonicalIdentifierKey(name)
+				role := spec.Roles[key]
+				if role == nil {
+					role = &Role{Name: name}
+					spec.Roles[key] = role
+				}
+				applyAlterToRole(role, partial, resetKeys)
 			}
 		case strings.HasPrefix(upper, "GRANT"):
 			spec.Grants = append(spec.Grants, parseGrantStatement(trimmed)...)
@@ -331,7 +366,9 @@ func MergeRolesSpecsForTarget(schemaSpec, sideSpec *RolesSpec, targetSchema stri
 			continue
 		}
 		for key, role := range spec.Roles {
-			out.Roles[key] = &Role{Name: role.Name}
+			// Side-channel (second pass) replaces schema entries wholesale,
+			// carrying all attributes so LOGIN/PASSWORD/SET from RolesSQL win.
+			out.Roles[key] = cloneRole(role)
 		}
 	}
 
@@ -991,9 +1028,9 @@ func slicesCloneStrings(in []string) []string {
 const RoleManagedComment = "grizzle-managed"
 
 // ValidateRolesSQL enforces the RolesSQL statement contract. Supported role
-// declarations and object-privilege GRANT/REVOKE statements are accepted;
-// unsupported role configuration fails loudly instead of being silently
-// ignored by the statement scan.
+// declarations (including LOGIN/PASSWORD/config attributes), ALTER ROLE
+// WITH/SET/RESET, and object-privilege GRANT/REVOKE statements are accepted;
+// unsupported forms fail loudly instead of being silently ignored.
 func ValidateRolesSQL(sql string) error {
 	for _, stmt := range SplitStatements(sql) {
 		trimmed := stripLeadingComments(stmt)
@@ -1005,23 +1042,19 @@ func ValidateRolesSQL(sql string) error {
 		}
 		upper := strings.ToUpper(trimmed)
 		switch {
-		case strings.HasPrefix(upper, "CREATE ROLE"), strings.HasPrefix(upper, "CREATE USER"),
-			strings.HasPrefix(upper, "ALTER ROLE"), strings.HasPrefix(upper, "ALTER USER"),
-			strings.HasPrefix(upper, "DROP ROLE"), strings.HasPrefix(upper, "DROP USER"):
-			switch {
-			case strings.HasPrefix(upper, "ALTER ROLE"), strings.HasPrefix(upper, "ALTER USER"):
-				return fmt.Errorf("role configuration is not supported yet in PR1; ALTER ROLE/USER is reserved for PR2: %q", trimmed)
-			case strings.HasPrefix(upper, "DROP ROLE"), strings.HasPrefix(upper, "DROP USER"):
-				return fmt.Errorf("DROP ROLE/USER is not supported in the declarative role contract: %q", trimmed)
-			case rolePasswordClause(trimmed):
-				return fmt.Errorf("passworded roles are not supported yet in PR1: %q", trimmed)
-			case createRoleStatementRe.FindStringSubmatch(trimmed) == nil:
-				return fmt.Errorf("unsupported role declaration in RolesSQL (only CREATE ROLE/USER [NOLOGIN] is supported): %q", trimmed)
-			case statementIdentifier(createRoleStatementRe.FindStringSubmatch(trimmed)) == "":
-				return fmt.Errorf("role identifier must not be empty: %q", trimmed)
-			case !validStatementIdentifier(createRoleStatementRe.FindStringSubmatch(trimmed)):
-				return fmt.Errorf("role identifier is invalid or exceeds PostgreSQL's 63-byte limit: %q", trimmed)
+		case strings.HasPrefix(upper, "CREATE ROLE"), strings.HasPrefix(upper, "CREATE USER"):
+			if _, err := parseCreateRoleStatement(trimmed); err != nil {
+				return fmt.Errorf("unsupported role declaration in RolesSQL: %w: %q", err, trimmed)
 			}
+		case strings.HasPrefix(upper, "ALTER ROLE"), strings.HasPrefix(upper, "ALTER USER"):
+			if !alterRoleRe.MatchString(trimmed) {
+				return fmt.Errorf("unsupported ALTER ROLE/USER form in RolesSQL: %q", trimmed)
+			}
+			if _, _, _, err := parseAlterRoleStatement(trimmed); err != nil {
+				return fmt.Errorf("unsupported ALTER ROLE/USER form in RolesSQL: %w: %q", err, trimmed)
+			}
+		case strings.HasPrefix(upper, "DROP ROLE"), strings.HasPrefix(upper, "DROP USER"):
+			return fmt.Errorf("DROP ROLE/USER is not supported in the declarative role contract: %q", trimmed)
 		case strings.HasPrefix(upper, "GRANT"):
 			matches := grantRe.FindStringSubmatch(trimmed)
 			if matches == nil {
@@ -1042,18 +1075,10 @@ func ValidateRolesSQL(sql string) error {
 				return fmt.Errorf("unsupported REVOKE form in RolesSQL: %w: %q", err, trimmed)
 			}
 		default:
-			return fmt.Errorf("unsupported statement in RolesSQL (only CREATE ROLE/USER [NOLOGIN] and GRANT/REVOKE are managed): %q", trimmed)
+			return fmt.Errorf("unsupported statement in RolesSQL (only CREATE/ALTER ROLE/USER and GRANT/REVOKE are managed): %q", trimmed)
 		}
 	}
 	return nil
-}
-
-func rolePasswordClause(statement string) bool {
-	match := createRoleRe.FindString(statement)
-	if match == "" {
-		return false
-	}
-	return rolePasswordClauseRe.MatchString(statement[len(match):])
 }
 
 // FormatGrantKey is a stable display key for grant records.

@@ -19,6 +19,9 @@ type LiveRoles struct {
 	RoleNames map[string]string
 	// ManagedRoles are roles stamped with the grizzle-managed catalog comment.
 	ManagedRoles map[string]bool
+	// RoleAttrs holds live login/limit/config attributes keyed by canonical
+	// role identity.
+	RoleAttrs map[string]*diff.LiveRoleAttrs
 	// Grants maps schema.GrantKey(kind, object, grantee) -> privileges with
 	// grant option tracking. Object names retain quoted identity components.
 	Grants map[string]*LiveGrant
@@ -35,41 +38,107 @@ type LiveGrant struct {
 	GrantOption map[string]bool // privilege_type -> is_grantable
 }
 
-// InspectLiveRoles reads managed-role markers and object ACLs. Tables and
-// sequences are scoped to the target schemas; schema ACLs cover the target
-// schemas; the database ACL covers the current database.
-func InspectLiveRoles(ctx context.Context, dbtx dialect.DBTX, targetSchemas []string) (*LiveRoles, error) {
+// InspectLiveRoles reads managed-role markers, role attributes, role-level
+// settings, and object ACLs. Tables and sequences are scoped to the target
+// schemas; schema ACLs cover the target schemas; the database ACL covers the
+// current database. desiredPasswords maps canonical role identity -> plaintext
+// password for server-side hash comparison (never returned to callers).
+func InspectLiveRoles(ctx context.Context, dbtx dialect.DBTX, targetSchemas []string, desiredPasswords map[string]string) (*LiveRoles, error) {
 	live := &LiveRoles{
 		RoleNames:    make(map[string]string),
 		ManagedRoles: make(map[string]bool),
+		RoleAttrs:    make(map[string]*diff.LiveRoleAttrs),
 		Grants:       make(map[string]*LiveGrant),
 	}
 
-	// 1. Roles: all non-system roles plus the managed marker comment.
+	// 1. Roles: attributes, password hash, managed marker comment.
 	// Role comments live in pg_shdescription (obj_description does not see
 	// shared-object comments), keyed by the pg_authid catalog class.
 	roleRows, err := dbtx.QueryContext(ctx, `
 		SELECT r.rolname,
+		       r.rolcanlogin,
+		       r.rolconnlimit,
+		       COALESCE(r.rolvaliduntil::text, ''),
+		       r.rolinherit,
+		       r.rolcreatedb,
+		       r.rolcreaterole,
+		       COALESCE(a.rolpassword, ''),
 		       COALESCE((SELECT d.description
 		                 FROM pg_shdescription d
 		                 WHERE d.objoid = r.oid
 		                   AND d.classoid = 'pg_authid'::regclass
 		                ), '') AS comment
 		FROM pg_roles r
+		JOIN pg_authid a ON a.oid = r.oid
 		WHERE r.rolname NOT LIKE 'pg\_%';
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("inspecting roles: %w", err)
 	}
 	if err := scanRows(roleRows, func(scan func(...any) error) error {
-		var name, comment string
-		if err := scan(&name, &comment); err != nil {
+		var name, validUntil, passwordHash, comment string
+		var canLogin, inherit, createDB, createRole bool
+		var connLimit int
+		if err := scan(&name, &canLogin, &connLimit, &validUntil, &inherit, &createDB, &createRole, &passwordHash, &comment); err != nil {
 			return fmt.Errorf("scanning roles: %w", err)
 		}
-		live.RoleNames[schema.CanonicalIdentifierKey(name)] = name
+		key := schema.CanonicalIdentifierKey(name)
+		live.RoleNames[key] = name
 		if roleManagedComment(comment) {
-			live.ManagedRoles[schema.CanonicalIdentifierKey(name)] = true
+			live.ManagedRoles[key] = true
 		}
+		attrs := &diff.LiveRoleAttrs{
+			CanLogin:    canLogin,
+			ConnLimit:   connLimit,
+			ValidUntil:  normalizeValidUntil(validUntil),
+			Inherit:     inherit,
+			CreateDB:    createDB,
+			CreateRole:  createRole,
+			HasPassword: passwordHash != "",
+			Config:      make(map[string]string),
+		}
+		if desired, ok := desiredPasswords[key]; ok && desired != "" {
+			attrs.PasswordMatches = passwordMatchesStored(desired, passwordHash, name)
+		} else {
+			attrs.PasswordMatches = true
+		}
+		live.RoleAttrs[key] = attrs
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	// 1b. Role-level settings (database-independent: setdatabase = 0).
+	settingRows, err := dbtx.QueryContext(ctx, `
+		SELECT r.rolname, u.entry
+		FROM pg_db_role_setting s
+		JOIN pg_roles r ON r.oid = s.setrole
+		CROSS JOIN LATERAL unnest(s.setconfig) AS u(entry)
+		WHERE s.setdatabase = 0
+		  AND r.rolname NOT LIKE 'pg\_%';
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("inspecting role settings: %w", err)
+	}
+	if err := scanRows(settingRows, func(scan func(...any) error) error {
+		var name, entry string
+		if err := scan(&name, &entry); err != nil {
+			return fmt.Errorf("scanning role settings: %w", err)
+		}
+		key := schema.CanonicalIdentifierKey(name)
+		attrs := live.RoleAttrs[key]
+		if attrs == nil {
+			attrs = &diff.LiveRoleAttrs{Config: make(map[string]string)}
+			live.RoleAttrs[key] = attrs
+		}
+		if attrs.Config == nil {
+			attrs.Config = make(map[string]string)
+		}
+		param, value, ok := strings.Cut(entry, "=")
+		if !ok {
+			return nil
+		}
+		attrs.Config[strings.ToLower(param)] = value
 		return nil
 	}); err != nil {
 		return nil, err
@@ -582,9 +651,177 @@ func RoleHasUnhandledACLs(ctx context.Context, dbtx dialect.DBTX, roleName strin
 	return hasACL, nil
 }
 
-// GenerateCreateRoleSQL renders the NOLOGIN group role Grizzle manages.
-func GenerateCreateRoleSQL(roleName string) string {
-	return fmt.Sprintf("CREATE ROLE %s NOLOGIN;", quoteIdentifier(roleName))
+func normalizeValidUntil(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.EqualFold(value, "infinity") {
+		return ""
+	}
+	return value
+}
+
+// GenerateCreateRoleSQL renders CREATE ROLE with declared attributes.
+// When Login is unset or false the PostgreSQL default NOLOGIN is rendered.
+// Password plaintext is never included; use GenerateAlterRolePasswordSQL at
+// apply time when Role.HasPassword is set.
+func GenerateCreateRoleSQL(role *schema.Role) string {
+	if role == nil {
+		return "CREATE ROLE ;"
+	}
+	var b strings.Builder
+	b.WriteString("CREATE ROLE ")
+	b.WriteString(quoteIdentifier(role.Name))
+	attrs := renderRoleAttrClauses(role, false)
+	if attrs != "" {
+		b.WriteByte(' ')
+		b.WriteString(attrs)
+	} else {
+		b.WriteString(" NOLOGIN")
+	}
+	b.WriteByte(';')
+	return b.String()
+}
+
+// GenerateCreateRoleSQLRedacted renders CREATE ROLE for plan steps. Passwords
+// are applied via a follow-up ALTER_ROLE step so CREATE SQL never embeds secrets.
+func GenerateCreateRoleSQLRedacted(role *schema.Role) string {
+	return GenerateCreateRoleSQL(role)
+}
+
+func renderRoleAttrClauses(role *schema.Role, forAlter bool) string {
+	if role == nil {
+		return ""
+	}
+	var parts []string
+	if role.Login != nil {
+		if *role.Login {
+			parts = append(parts, "LOGIN")
+		} else {
+			parts = append(parts, "NOLOGIN")
+		}
+	} else if !forAlter {
+		parts = append(parts, "NOLOGIN")
+	}
+	if role.Inherit != nil {
+		if *role.Inherit {
+			parts = append(parts, "INHERIT")
+		} else {
+			parts = append(parts, "NOINHERIT")
+		}
+	}
+	if role.CreateDB != nil {
+		if *role.CreateDB {
+			parts = append(parts, "CREATEDB")
+		} else {
+			parts = append(parts, "NOCREATEDB")
+		}
+	}
+	if role.CreateRole != nil {
+		if *role.CreateRole {
+			parts = append(parts, "CREATEROLE")
+		} else {
+			parts = append(parts, "NOCREATEROLE")
+		}
+	}
+	if role.ConnectionLimit != nil {
+		parts = append(parts, fmt.Sprintf("CONNECTION LIMIT %d", *role.ConnectionLimit))
+	}
+	if role.ValidUntil != "" {
+		parts = append(parts, "VALID UNTIL "+quoteStringLiteral(role.ValidUntil))
+	}
+	return strings.Join(parts, " ")
+}
+
+// GenerateAlterRoleAttrsSQL renders ALTER ROLE ... WITH attr clauses (no password).
+func GenerateAlterRoleAttrsSQL(role *schema.Role) string {
+	attrs := renderRoleAttrClauses(role, true)
+	if attrs == "" {
+		return ""
+	}
+	return fmt.Sprintf("ALTER ROLE %s WITH %s;", quoteIdentifier(role.Name), attrs)
+}
+
+// GenerateAlterRoleSetSQL renders ALTER ROLE ... SET/RESET for config drift.
+func GenerateAlterRoleSetSQL(roleName, param, value string, reset bool) string {
+	ident := quoteIdentifier(roleName)
+	if reset {
+		return fmt.Sprintf("ALTER ROLE %s RESET %s;", ident, param)
+	}
+	if value == schema.ConfigFromCurrent {
+		return fmt.Sprintf("ALTER ROLE %s SET %s FROM CURRENT;", ident, param)
+	}
+	return fmt.Sprintf("ALTER ROLE %s SET %s = %s;", ident, param, quoteConfigValue(value))
+}
+
+func quoteConfigValue(value string) string {
+	// Numbers and simple keywords stay unquoted; everything else is a literal.
+	if _, err := fmt.Sscanf(value, "%d", new(int)); err == nil && fmt.Sprintf("%d", atoiOrZero(value)) == value {
+		return value
+	}
+	upper := strings.ToUpper(value)
+	if upper == "ON" || upper == "OFF" || upper == "TRUE" || upper == "FALSE" {
+		return value
+	}
+	return quoteStringLiteral(value)
+}
+
+func atoiOrZero(value string) int {
+	var n int
+	_, _ = fmt.Sscanf(value, "%d", &n)
+	return n
+}
+
+// GenerateAlterRoleStepSQL renders redacted ALTER ROLE SQL for plan steps.
+// Password plaintext is never included; apply rebuilds it from Role IR.
+func GenerateAlterRoleStepSQL(role *schema.Role) string {
+	if role == nil {
+		return ""
+	}
+	var stmts []string
+	if attrs := GenerateAlterRoleAttrsSQL(role); attrs != "" {
+		stmts = append(stmts, attrs)
+	}
+	if role.HasPassword {
+		stmts = append(stmts, GenerateAlterRolePasswordSQLRedacted(role.Name))
+	}
+	if len(role.Config) > 0 {
+		keys := make([]string, 0, len(role.Config))
+		for k := range role.Config {
+			keys = append(keys, k)
+		}
+		slices.Sort(keys)
+		for _, key := range keys {
+			value := role.Config[key]
+			stmts = append(stmts, GenerateAlterRoleSetSQL(role.Name, key, value, value == ""))
+		}
+	}
+	return strings.Join(stmts, "\n")
+}
+
+// GenerateAlterRoleApplySQL rebuilds executable ALTER ROLE SQL including the
+// real password from IR. Used only at apply time.
+func GenerateAlterRoleApplySQL(role *schema.Role) string {
+	if role == nil {
+		return ""
+	}
+	var stmts []string
+	if attrs := GenerateAlterRoleAttrsSQL(role); attrs != "" {
+		stmts = append(stmts, attrs)
+	}
+	if role.HasPassword {
+		stmts = append(stmts, GenerateAlterRolePasswordSQL(role.Name, role.Password))
+	}
+	if len(role.Config) > 0 {
+		keys := make([]string, 0, len(role.Config))
+		for k := range role.Config {
+			keys = append(keys, k)
+		}
+		slices.Sort(keys)
+		for _, key := range keys {
+			value := role.Config[key]
+			stmts = append(stmts, GenerateAlterRoleSetSQL(role.Name, key, value, value == ""))
+		}
+	}
+	return strings.Join(stmts, "\n")
 }
 
 // GenerateRoleCommentSQL stamps the managed-role marker used to distinguish
@@ -676,6 +913,7 @@ func (l *LiveRoles) RoleState() *diff.RoleState {
 	state := &diff.RoleState{
 		RoleNames:    l.RoleNames,
 		ManagedRoles: l.ManagedRoles,
+		RoleAttrs:    l.RoleAttrs,
 		Grants:       make([]*diff.RoleACLGrant, 0, len(l.Grants)),
 	}
 	for _, key := range sortedGrantKeys(l.Grants) {

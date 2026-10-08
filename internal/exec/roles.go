@@ -42,7 +42,8 @@ func diffRolesSteps(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConf
 		return nil, fmt.Errorf("validating role privileges: %w", err)
 	}
 
-	live, err := postgres.InspectLiveRoles(ctx, dbtx, cfg.targetSchemas())
+	desiredPasswords := desiredRolePasswords(desired)
+	live, err := postgres.InspectLiveRoles(ctx, dbtx, cfg.targetSchemas(), desiredPasswords)
 	if err != nil {
 		return nil, fmt.Errorf("%w: roles: %w", plan.ErrInspectionFailed, err)
 	}
@@ -73,7 +74,7 @@ func validateRoleDropSafety(ctx context.Context, dbtx dialect.DBTX, roleNames, t
 	var live *postgres.LiveRoles
 	if len(roleNames) > 0 {
 		var err error
-		live, err = postgres.InspectLiveRoles(ctx, dbtx, targetSchemas)
+		live, err = postgres.InspectLiveRoles(ctx, dbtx, targetSchemas, nil)
 		if err != nil {
 			return fmt.Errorf("%w: roles: %w", plan.ErrInspectionFailed, err)
 		}
@@ -200,7 +201,7 @@ func parseRevokeStep(step plan.Step) (parsedRevoke, bool) {
 		return parsedRevoke{}, false
 	}
 	privileges := make([]string, 0)
-	for _, privilege := range strings.Split(privilegeText, ",") {
+	for privilege := range strings.SplitSeq(privilegeText, ",") {
 		privilege = strings.ToUpper(strings.TrimSpace(privilege))
 		if privilege != "" {
 			privileges = append(privileges, privilege)
@@ -273,4 +274,39 @@ func desiredRolesSpec(cfg PostgresExecConfig) (*schema.RolesSpec, error) {
 		schema.ParseRolesSQL(cfg.RolesSQL),
 		cfg.primarySchema(),
 	), nil
+}
+
+func desiredRolePasswords(spec *schema.RolesSpec) map[string]string {
+	out := make(map[string]string)
+	if spec == nil {
+		return out
+	}
+	for _, role := range spec.Roles {
+		if role.HasPassword {
+			out[schema.CanonicalIdentifierKey(role.Name)] = role.Password
+		}
+	}
+	return out
+}
+
+// materializeRoleStepSQL replaces redacted PASSWORD placeholders with the
+// real password from desired RolesSQL IR. Step.SQL stays redacted for plans,
+// logs, and hazards; only the in-memory exec string carries the secret.
+func materializeRoleStepSQL(step plan.Step, passwords map[string]string) string {
+	if step.Type != plan.ChangeAlterRole && step.Type != plan.ChangeCreateRole {
+		return step.SQL
+	}
+	if !strings.Contains(strings.ToUpper(step.SQL), "PASSWORD") {
+		return step.SQL
+	}
+	password, ok := passwords[schema.CanonicalIdentifierKey(step.Table)]
+	if !ok || password == "" {
+		// Also try catalog role name as stored on the step table field.
+		password, ok = passwords[step.Table]
+	}
+	if !ok || password == "" {
+		return step.SQL
+	}
+	redacted := schema.PasswordRedacted
+	return strings.ReplaceAll(step.SQL, "'"+redacted+"'", "'"+strings.ReplaceAll(password, "'", "''")+"'")
 }

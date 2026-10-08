@@ -194,8 +194,11 @@ type Options struct {
 	// alongside SchemaSQL. Duplicate role/grant identities in this explicit
 	// side-channel override entries extracted from SchemaSQL. Role statements
 	// are never shadow-compiled, and schema DDL is not valid here. Managed
-	// roles are NOLOGIN group roles; passwords are never managed. PostgreSQL
-	// only — ignored on SQLite.
+	// attributes include LOGIN/NOLOGIN, PASSWORD, VALID UNTIL, CONNECTION
+	// LIMIT, INHERIT, CREATEDB, CREATEROLE, and ALTER ROLE SET/RESET.
+	// SUPERUSER/REPLICATION/BYPASSRLS are refused. Passwords are compared by
+	// server-side hash equality and never written into Step.SQL or plan JSON.
+	// PostgreSQL only — ignored on SQLite.
 	RolesSQL string
 
 	// CatalogSQL optionally supplies desired cluster-catalog objects alongside

@@ -2,6 +2,7 @@ package schema
 
 import (
 	"fmt"
+	"maps"
 	"regexp"
 	"slices"
 	"strings"
@@ -405,9 +406,7 @@ func cloneBoolMap(in map[string]bool) map[string]bool {
 		return nil
 	}
 	out := make(map[string]bool, len(in))
-	for key, value := range in {
-		out[key] = value
-	}
+	maps.Copy(out, in)
 	return out
 }
 
@@ -1210,7 +1209,7 @@ func containsSQLCommentOutsideQuotes(s string) bool {
 
 func validatePublishOptions(options string) error {
 	seen := make(map[string]bool)
-	for _, option := range strings.Split(options, ",") {
+	for option := range strings.SplitSeq(options, ",") {
 		option = strings.ToLower(strings.TrimSpace(option))
 		switch option {
 		case "insert", "update", "delete", "truncate":

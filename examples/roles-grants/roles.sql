@@ -8,12 +8,11 @@
 -- Contract (docs/SPEC.md §2.2 "RolesSQL contract"):
 --   * The same role statements may be placed in SchemaSQL. This optional
 --     --roles file is authoritative when a role/grant identity is duplicated.
---   * CREATE ROLE/USER [NOLOGIN] and object-privilege GRANT/REVOKE statements
---     are accepted. ALTER/DROP ROLE/USER, password options, and other role
---     configuration fail with ErrInvalidOptions instead of being silently
---     ignored; role configuration is reserved for PR2.
---   * Declared roles are created NOLOGIN (group roles). Grizzle never sets or
---     rotates passwords; interactive-login roles stay outside the contract.
+--   * CREATE/ALTER ROLE/USER (LOGIN/PASSWORD/config attrs) and object-privilege
+--     GRANT/REVOKE statements are accepted. DROP ROLE/USER and
+--     SUPERUSER/REPLICATION/BYPASSRLS fail with ErrInvalidOptions.
+--   * Omitting LOGIN/NOLOGIN keeps PostgreSQL's CREATE ROLE default (NOLOGIN).
+--     Passwords are managed via hash compare and never written into Step.SQL.
 --   * Roles Grizzle creates are stamped with a "grizzle-managed" catalog
 --     comment. Only marker-stamped roles that leave this file are dropped,
 --     and only behind AllowDropRole + the DROP_ROLE critical hazard.

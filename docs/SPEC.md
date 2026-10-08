@@ -201,8 +201,12 @@ authoritative. Schema DDL remains in the shadow-compiled portion of
 
 ```sql
 -- roles.sql or SchemaSQL — these role statement forms are accepted:
-CREATE ROLE app_read;                    -- always rendered/managed as NOLOGIN group role
+CREATE ROLE app_read;                    -- default NOLOGIN when LOGIN/NOLOGIN omitted
 CREATE USER app_writer WITH NOLOGIN;     -- USER is an alias for CREATE ROLE
+CREATE ROLE app_login LOGIN PASSWORD 'secret' VALID UNTIL '2040-01-01' CONNECTION LIMIT 4;
+ALTER ROLE app_login SET search_path = public;
+ALTER ROLE app_login SET work_mem FROM CURRENT;
+ALTER ROLE app_login RESET log_statement;
 GRANT SELECT, INSERT ON docs TO app_read;
 GRANT ALL ON TABLE docs TO app_read WITH GRANT OPTION;
 GRANT USAGE ON SEQUENCE docs_id_seq TO app_read;
@@ -217,11 +221,19 @@ Semantics:
 - Statement scan rejects anything else (`ErrInvalidOptions`) — no silent
   ignoring. Other `SchemaSQL` statements remain in the shadow-compiled
   portion rather than being treated as RolesSQL.
-- PR1 rejects `ALTER ROLE/USER`, `DROP ROLE/USER`, password options, and
-  other role-configuration forms explicitly. Role configuration and password
-  management are reserved for PR2.
-- Declared roles are created `NOLOGIN` and stamped with a `grizzle-managed`
-  catalog comment. Only marker-stamped roles absent from the desired state are
+- Managed role attributes: `LOGIN`/`NOLOGIN`, `PASSWORD` (plaintext literal
+  only; `PASSWORD NULL` refused), `VALID UNTIL`, `CONNECTION LIMIT`,
+  `INHERIT`/`NOINHERIT`, `CREATEDB`/`NOCREATEDB`, `CREATEROLE`/`NOCREATEROLE`,
+  and `ALTER ROLE ... SET`/`RESET` (role-level `pg_db_role_setting`,
+  `setdatabase = 0`). `SUPERUSER`, `REPLICATION`, and `BYPASSRLS` are refused.
+  `DROP ROLE/USER` remains unsupported in the declarative contract.
+- Passwords are compared by hash equality against `pg_authid.rolpassword`
+  (md5/scram). Plaintext never appears in `Step.SQL`, plan JSON, or logs;
+  apply rebuilds password SQL from parsed IR. Password drift emits
+  `PASSWORD_CHANGE` (WARNING).
+- When `LOGIN`/`NOLOGIN` is omitted, CREATE keeps PostgreSQL's default
+  (`NOLOGIN`). Declared roles are stamped with a `grizzle-managed` catalog
+  comment. Only marker-stamped roles absent from the desired state are
   dropped, and only behind `AllowDropRole` + `DROP_ROLE` (CRITICAL). A managed
   role that owns cluster objects aborts the sync with an ownership error.
 - Grants are diffed per (object kind, object, grantee): missing → `GRANT`;
@@ -401,6 +413,7 @@ const (
     HazardRevokePrivilege        HazardCode = "REVOKE_PRIVILEGE"
     HazardDropRole               HazardCode = "DROP_ROLE"
     HazardGrantPublic            HazardCode = "GRANT_PUBLIC"
+    HazardPasswordChange         HazardCode = "PASSWORD_CHANGE"
     HazardDropPublication        HazardCode = "DROP_PUBLICATION"
     HazardDropEventTrigger       HazardCode = "DROP_EVENT_TRIGGER"
     HazardEventTriggerSuperuser  HazardCode = "EVENT_TRIGGER_SUPERUSER"
@@ -448,7 +461,7 @@ type Hazard struct {
 | `Domains` | Yes | Managed types diffed from `pg_type` (`typtype='d'`) + `pg_constraint` (`conrelid = 0`); base type/nullability/default drift is DROP+CREATE (no in-place retype); CHECK drift → `ALTER DOMAIN ADD/DROP CONSTRAINT`; drops gated by `AllowDropDomain` + `DROP_DOMAIN` (CRITICAL); no implicit `CASCADE` — dependent columns fail at apply |
 | `Triggers` | Yes | `pg_trigger` + canonical `pg_get_triggerdef`; drift → DROP+CREATE; drops gated by `AllowDropTrigger` + `DROP_TRIGGER` (CRITICAL); surviving managed triggers block dependent column drops via `UNMANAGED_DEPENDENCY` |
 | `Views` & `Materialized Views` | Yes | Canonical `pg_get_viewdef`; append-only column changes replace in place (`CREATE OR REPLACE VIEW`), otherwise DROP+CREATE; matviews always DROP+CREATE plus `REFRESH MATERIALIZED VIEW`; drops gated by `AllowDropView` + `DROP_VIEW` (CRITICAL) |
-| `Roles & Grants` | Yes | Via unified `SchemaSQL` or the `RolesSQL` side-channel overlay (§2.2): managed `NOLOGIN` roles and object grants diffed against `pg_authid` + ACLs (`aclexplode`); duplicate side-channel identities override SchemaSQL; missing → `GRANT`, surplus → `REVOKE` gated by `AllowRevoke` + `REVOKE_PRIVILEGE` (CRITICAL); marker-stamped roles dropped behind `AllowDropRole` + `DROP_ROLE` (CRITICAL) with ownership refusal; grants to `PUBLIC`/unmanaged grantees never revoked; `GRANT ... TO PUBLIC` emits `GRANT_PUBLIC` (WARNING) |
+| `Roles & Grants` | Yes | Via unified `SchemaSQL` or the `RolesSQL` side-channel overlay (§2.2): managed roles (LOGIN/PASSWORD/config attrs) and object grants diffed against `pg_authid` + `pg_db_role_setting` + ACLs (`aclexplode`); duplicate side-channel identities override SchemaSQL; missing → `GRANT`, surplus → `REVOKE` gated by `AllowRevoke` + `REVOKE_PRIVILEGE` (CRITICAL); marker-stamped roles dropped behind `AllowDropRole` + `DROP_ROLE` (CRITICAL) with ownership refusal; grants to `PUBLIC`/unmanaged grantees never revoked; `GRANT ... TO PUBLIC` emits `GRANT_PUBLIC` (WARNING); password drift emits `PASSWORD_CHANGE` (WARNING); `SUPERUSER`/`REPLICATION`/`BYPASSRLS` refused |
 | `Publications` | Yes | Via unified `SchemaSQL` or the `CatalogSQL` side-channel overlay (§2.2): membership and `publish` flags diffed from `pg_publication` / `pg_publication_rel` / `pg_publication_namespace`; duplicate side-channel names override SchemaSQL; drift → `ALTER PUBLICATION`; drops gated by `AllowDropPublication` + `DROP_PUBLICATION` (CRITICAL), narrow to marker-stamped objects; `FOR ALL TABLES` emits `PUBLICATION_ALL_TABLES` (NOTICE); schema-level publications require PostgreSQL 15+ |
 | `Event Triggers` | Yes | Via unified `SchemaSQL` or the `CatalogSQL` side-channel overlay (§2.2): event/tag/function/enabled state diffed from `pg_event_trigger`; duplicate side-channel names override SchemaSQL; definition drift is DROP+CREATE, enabled-only drift renders `ALTER EVENT TRIGGER ENABLE/DISABLE`; creation refuses missing trigger functions; drops gated by `AllowDropEventTrigger` + `DROP_EVENT_TRIGGER` (CRITICAL), narrow to marker-stamped objects; `EVENT_TRIGGER_SUPERUSER` (WARNING) on any event-trigger step |
 

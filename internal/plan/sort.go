@@ -66,10 +66,11 @@ func SortSteps(steps []Step) {
 		ChangeDropTable:            100, // 12. Drop tables (if allowed)
 		ChangeDropDomain:           101, // 13. Drop domains after dependent tables/columns are gone
 		ChangeCreateRole:           119, // 14. Create roles before grants reference them
-		ChangeRoleComment:          120, // 14b. Stamp managed-role markers
-		ChangeGrant:                121, // 15. Grants after all schema objects and roles exist
-		ChangeRevoke:               122, // 16. Revokes after grants (replacement flows)
-		ChangeDropRole:             123, // 17. Drop roles last, after their grants are gone
+		ChangeAlterRole:            120, // 14a. Role attrs/password/config after create
+		ChangeRoleComment:          121, // 14b. Stamp managed-role markers
+		ChangeGrant:                122, // 15. Grants after all schema objects and roles exist
+		ChangeRevoke:               123, // 16. Revokes after grants (replacement flows)
+		ChangeDropRole:             124, // 17. Drop roles last, after their grants are gone
 		ChangeDropPublication:      129, // 18. Publication replacement/removal before creates
 		ChangeCreatePublication:    130, // 19. Publications after schema objects exist
 		ChangeAlterPublication:     131, // 20. Publication drift after creation

@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/muandane/grizzle/internal/schema"
 )
 
 // ChangeType describes the category of a schema mutation.
@@ -68,12 +70,13 @@ const (
 	ChangeRefreshMatView       ChangeType = "REFRESH_MATVIEW"
 	ChangeCommentTable         ChangeType = "COMMENT_TABLE"
 	ChangeCommentColumn        ChangeType = "COMMENT_COLUMN"
-	// RolesSQL surface: managed NOLOGIN roles and object privilege grants.
-	// GRANT/REVOKE steps sort after all schema DDL; CREATE_ROLE precedes the
-	// grants that reference the role.
+	// RolesSQL surface: managed roles (attrs/password/config) and object
+	// privilege grants. GRANT/REVOKE steps sort after all schema DDL;
+	// CREATE_ROLE precedes ALTER_ROLE, which precedes grants.
 	ChangeGrant       ChangeType = "GRANT"
 	ChangeRevoke      ChangeType = "REVOKE"
 	ChangeCreateRole  ChangeType = "CREATE_ROLE"
+	ChangeAlterRole   ChangeType = "ALTER_ROLE"
 	ChangeRoleComment ChangeType = "ROLE_COMMENT"
 	ChangeDropRole    ChangeType = "DROP_ROLE"
 	// CatalogSQL surface: publications and event triggers (statement-scan
@@ -283,10 +286,12 @@ func (p *Plan) Hash() string {
 		write("non_concurrent:true\n")
 	}
 	if p.SchemaSQL != "" {
-		write("schema_sql:%s\n", p.SchemaSQL)
+		// Password literals are replaced with digests so secrets never enter
+		// the hash payload while password changes still move the digest.
+		write("schema_sql:%s\n", schema.HashStableRolesSQL(p.SchemaSQL))
 	}
 	if p.RolesSQL != "" {
-		write("roles_sql:%s\n", p.RolesSQL)
+		write("roles_sql:%s\n", schema.HashStableRolesSQL(p.RolesSQL))
 	}
 	if p.CatalogSQL != "" {
 		write("catalog_sql:%s\n", p.CatalogSQL)
@@ -354,7 +359,7 @@ func (p *Plan) Modifications() int {
 		switch s.Type {
 		case ChangeAlterColumn, ChangeAlterEnum, ChangeRefreshMatView,
 			ChangeDisableRLS, ChangeNoForceRLS, ChangeAlterDomain, ChangeRevoke,
-			ChangeAlterPublication, ChangeAlterEventTrigger:
+			ChangeAlterRole, ChangeAlterPublication, ChangeAlterEventTrigger:
 			count++
 		}
 	}
@@ -449,6 +454,8 @@ const (
 	HazardDropRole HazardCode = "DROP_ROLE"
 	// HazardGrantPublic indicates privileges are granted to PUBLIC (ambient access).
 	HazardGrantPublic HazardCode = "GRANT_PUBLIC"
+	// HazardPasswordChange indicates a managed role password will be set or rotated.
+	HazardPasswordChange HazardCode = "PASSWORD_CHANGE"
 	// HazardDropPublication indicates dropping a managed publication.
 	HazardDropPublication HazardCode = "DROP_PUBLICATION"
 	// HazardDropEventTrigger indicates dropping a managed event trigger.
@@ -785,6 +792,17 @@ func stepHazards(s Step) []Hazard {
 				Type:        s.Type,
 				Table:       s.Table,
 				Description: fmt.Sprintf("Privileges on %q will be granted to PUBLIC, making them available to every role", s.Table),
+				SQL:         s.SQL,
+			})
+		}
+	case ChangeAlterRole, ChangeCreateRole:
+		if strings.Contains(strings.ToUpper(s.SQL), "PASSWORD") {
+			hazards = append(hazards, Hazard{
+				Code:        HazardPasswordChange,
+				Level:       HazardLevelWarning,
+				Type:        s.Type,
+				Table:       s.Table,
+				Description: fmt.Sprintf("Password for role %q will be set or rotated", s.Table),
 				SQL:         s.SQL,
 			})
 		}
