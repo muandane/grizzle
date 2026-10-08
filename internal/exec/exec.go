@@ -700,6 +700,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig, b
 	for groupIdx, group := range groups {
 		isLastGroup := groupIdx == len(groups)-1
 		if group.NonTx {
+			_ = DisableStatementTimeout(ctx, conn)
 			// Non-transactional steps (e.g. CREATE INDEX CONCURRENTLY) executed directly on dedicated conn
 			for _, s := range group.Steps {
 				stepIdx++
@@ -761,6 +762,9 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig, b
 					}
 					recordFailureHistory(stepIdx, hookErr, false)
 					return committedSteps, hookErr
+				}
+				if s.Type == plan.ChangeValidateConstraint {
+					_, _ = tx.ExecContext(ctx, "SET LOCAL statement_timeout = 0;")
 				}
 				if err := execStepWithTracing(ctx, tx, s, false, cfg.Tracer, roleIR, subIR); err != nil {
 					_ = tx.Rollback()
