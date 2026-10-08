@@ -9,7 +9,7 @@ import (
 
 // TestPlan_Hash_StableAcrossMapOrder verifies Hash() is invariant to the
 // insertion order of map-backed fields (Renames) and unsorted slices
-// (IncludeTables/ExcludeTables). A hash that varies across Go runs would
+// (IncludeTables/ExcludeTables/TargetSchemas). A hash that varies across Go runs would
 // falsely trip the ExpectedHash drift check for byte-identical plans.
 func TestPlan_Hash_StableAcrossMapOrder(t *testing.T) {
 	newPlan := func(renames map[string]string, includes, excludes []string) *plan.Plan {
@@ -49,12 +49,13 @@ func TestPlan_Hash_StableAcrossMapOrder(t *testing.T) {
 func TestPlan_Hash_Golden(t *testing.T) {
 	p := &plan.Plan{
 		TargetSchema:  "public",
+		TargetSchemas: []string{"public"},
 		Steps:         []plan.Step{{Type: plan.ChangeAddColumn, Table: "users", SQL: `ALTER TABLE "public"."users" ADD COLUMN name TEXT;`}},
 		IncludeTables: []string{"users", "posts"},
 		Renames:       map[string]string{"users_accounts": "users"},
 	}
 
-	const want = "8b9be88dbc53571f373404554e238c110f3bb67c071ba19b31a13c52f5e924f1"
+	const want = "fed488b287bc127c043ff6e746a7109f0c5f7589fd335b0a3e51064b2d20ed7e"
 	if got := p.Hash(); got != want {
 		t.Errorf("golden hash mismatch:\n got  %s\n want %s\nIf this change is intentional (hash format edit), update the golden value.", got, want)
 	}
@@ -84,7 +85,10 @@ func TestPlan_Hash_ApprovalSensitiveFields(t *testing.T) {
 		mutate func(p *plan.Plan)
 	}{
 		{"policy", func(p *plan.Plan) { p.Policy.AllowTable = true }},
-		{"target_schema", func(p *plan.Plan) { p.TargetSchema = "billing" }},
+		{"target_schema_without_target_schemas", func(p *plan.Plan) {
+			p.TargetSchemas = nil
+			p.TargetSchema = "billing"
+		}},
 		{"target_schemas", func(p *plan.Plan) { p.TargetSchemas = []string{"billing", "public"} }},
 		{"include_tables", func(p *plan.Plan) { p.IncludeTables = []string{"users", "posts"} }},
 		{"exclude_tables", func(p *plan.Plan) { p.ExcludeTables = []string{"audit", "log"} }},
@@ -110,6 +114,14 @@ func TestPlan_Hash_ApprovalSensitiveFields(t *testing.T) {
 				t.Fatalf("mutating %s did not change hash", tc.name)
 			}
 		})
+	}
+}
+
+func TestPlan_Hash_TargetSchemasOneElementIsIncluded(t *testing.T) {
+	base := &plan.Plan{TargetSchema: "public"}
+	withOneTarget := &plan.Plan{TargetSchema: "public", TargetSchemas: []string{"billing"}}
+	if base.Hash() == withOneTarget.Hash() {
+		t.Fatal("one-element TargetSchemas must participate in the plan hash")
 	}
 }
 

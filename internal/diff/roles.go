@@ -119,6 +119,15 @@ func RolesDiff(desired *schema.RolesSpec, live *RoleState, targetSchema string) 
 			continue
 		}
 		missing := missingPrivileges(dg.Privileges, lg.Privileges)
+		if schema.IsPublicRoleIdentifier(dg.Grantee) || schema.IsPublicRoleIdentifier(lg.Grantee) {
+			if len(missing) > 0 {
+				g := *dg
+				g.Privileges = missing
+				g.GrantOption = dg.GrantOption
+				changes = append(changes, grantChange(plan.ChangeGrant, &g))
+			}
+			continue
+		}
 		missingOptions := missingPrivileges(optionSubset(dg), lg.GrantOptions)
 		if len(missing) > 0 {
 			g := *dg

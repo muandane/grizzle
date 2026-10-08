@@ -375,6 +375,10 @@ func TestValidateCatalogSQL(t *testing.T) {
 			t.Errorf("ValidateCatalogSQL(%q) = nil, want error", sql)
 		}
 	}
+	if err := ValidateCatalogSQL(`CREATE PUBLICATION p FOR TABLE a, b, TABLES IN SCHEMA analytics;`); err == nil ||
+		!strings.Contains(err.Error(), "mixed TABLE and TABLES IN SCHEMA") {
+		t.Fatalf("native mixed publication syntax must be rejected clearly: %v", err)
+	}
 }
 
 func TestValidateCatalogSQL_RejectsAllTablesMembershipMutations(t *testing.T) {

@@ -114,6 +114,26 @@ func TestRolesDiff_ExplicitRevokeCannotTouchPublicOrUnmanaged(t *testing.T) {
 	}
 }
 
+func TestRolesDiff_PublicDesiredStateNeverRevokes(t *testing.T) {
+	desired := roleSpec(t, `GRANT SELECT ON docs TO PUBLIC WITH GRANT OPTION;`)
+	live := &diff.RoleState{
+		RoleNames:    map[string]string{},
+		ManagedRoles: map[string]bool{},
+		Grants: []*diff.RoleACLGrant{{
+			Grantee:      "PUBLIC",
+			ObjectKind:   "TABLE",
+			ObjectName:   "public.docs",
+			Privileges:   []string{"SELECT", "INSERT"},
+			GrantOptions: []string{"SELECT", "INSERT"},
+		}},
+	}
+	for _, change := range diff.RolesDiff(desired, live, "public") {
+		if change.Type == plan.ChangeRevoke {
+			t.Fatalf("PUBLIC privileges and grant options must never be revoked: %+v", change)
+		}
+	}
+}
+
 func TestRolesDiff_GrantOptionDrift(t *testing.T) {
 	// Desired adds WITH GRANT OPTION: re-grant.
 	desired := roleSpec(t, `GRANT SELECT ON docs TO app_read WITH GRANT OPTION;`)

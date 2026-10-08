@@ -49,9 +49,10 @@ var (
 	// revokeRe matches the desired-state counterpart of grantRe. Captures:
 	// (1) optional "GRANT OPTION FOR", (2) privileges, (3) optional object
 	// kind, (4) object list, (5) grantee list.
-	revokeRe         = regexp.MustCompile(`(?is)^REVOKE\s+(GRANT\s+OPTION\s+FOR\s+)?(.+?)\s+ON\s+(?:(TABLE|SEQUENCE|DATABASE|SCHEMA|FUNCTION)\s+)?(.+?)\s+FROM\s+(.+?)(?:\s+(?:CASCADE|RESTRICT))?\s*$`)
-	adminOptionRe    = regexp.MustCompile(`(?is)\s+WITH\s+ADMIN\s+OPTION\s*$`)
-	functionObjectRe = regexp.MustCompile(`(?is)^` + catalogIdentifierPartPattern + `(?:\s*\.\s*` + catalogIdentifierPartPattern + `)?\s*\([^()]*\)$`)
+	revokeRe               = regexp.MustCompile(`(?is)^REVOKE\s+(GRANT\s+OPTION\s+FOR\s+)?(.+?)\s+ON\s+(?:(TABLE|SEQUENCE|DATABASE|SCHEMA|FUNCTION)\s+)?(.+?)\s+FROM\s+(.+?)(?:\s+(?:CASCADE|RESTRICT))?\s*$`)
+	adminOptionRe          = regexp.MustCompile(`(?is)\s+WITH\s+ADMIN\s+OPTION\s*$`)
+	functionObjectRe       = regexp.MustCompile(`(?is)^` + catalogIdentifierPartPattern + `(?:\s*\.\s*` + catalogIdentifierPartPattern + `)?\s*\([^()]*\)$`)
+	functionArgumentModeRe = regexp.MustCompile(`(?i)^(?:INOUT|IN|OUT|VARIADIC)\b`)
 )
 
 // Privilege sets used to expand ALL per object kind. They mirror the
@@ -367,7 +368,10 @@ func ValidateRolesSpecScope(spec *RolesSpec, targetSchemas []string, currentData
 		targets[CanonicalTargetIdentifier(targetSchema)] = true
 	}
 	currentDatabase = CanonicalTargetIdentifier(currentDatabase)
-	for _, grant := range spec.Grants {
+	entries := make([]*Grant, 0, len(spec.Grants)+len(spec.revokes))
+	entries = append(entries, spec.Grants...)
+	entries = append(entries, spec.revokes...)
+	for _, grant := range entries {
 		kind := strings.ToUpper(strings.TrimSpace(grant.ObjectKind))
 		parts := grantObjectNameParts(kind, grant.ObjectName)
 		if len(parts) == 0 {
@@ -844,13 +848,13 @@ func validateGrantLists(matches []string, revoke bool) error {
 		kind = "TABLE"
 	}
 	for _, object := range objectList {
-		valid := false
 		if kind == "FUNCTION" {
-			valid = validFunctionObject(strings.TrimSpace(object))
-		} else {
-			valid = validRoleObject(strings.TrimSpace(object), kind == "TABLE" || kind == "SEQUENCE")
+			if err := validateFunctionObject(strings.TrimSpace(object)); err != nil {
+				return fmt.Errorf("object list contains malformed item %q: %w", object, err)
+			}
+			continue
 		}
-		if !valid {
+		if !validRoleObject(strings.TrimSpace(object), kind == "TABLE" || kind == "SEQUENCE") {
 			return fmt.Errorf("object list contains malformed item %q", object)
 		}
 	}
@@ -866,25 +870,86 @@ func validateGrantLists(matches []string, revoke bool) error {
 	return nil
 }
 
-func validFunctionObject(object string) bool {
+func validateFunctionObject(object string) error {
+	name, args, ok := splitFunctionObjectIdentity(object)
+	if !ok {
+		return fmt.Errorf("FUNCTION grants require a schema/name followed by an identity argument list")
+	}
 	if !functionObjectRe.MatchString(object) {
-		return false
+		return fmt.Errorf("FUNCTION name is malformed")
 	}
-	open := strings.IndexByte(object, '(')
-	if open < 0 {
-		return false
-	}
-	for _, part := range splitQualifiedIdentifier(strings.TrimSpace(object[:open])) {
+	for _, part := range splitQualifiedIdentifier(name) {
 		if !validCatalogIdentifierPart(part) {
-			return false
+			return fmt.Errorf("FUNCTION name contains an invalid identifier")
 		}
 	}
-	args := strings.TrimSpace(object[open+1 : len(object)-1])
 	if args == "" {
-		return true
+		return nil
 	}
-	_, ok := splitSQLList(args)
-	return ok
+	parts, ok := splitSQLList(args)
+	if !ok {
+		return fmt.Errorf("FUNCTION identity argument list is malformed")
+	}
+	for _, part := range parts {
+		if err := validateFunctionIdentityArgument(part); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func splitFunctionObjectIdentity(object string) (name, args string, ok bool) {
+	object = strings.TrimSpace(object)
+	inQuote := false
+	for i := 0; i < len(object); i++ {
+		switch object[i] {
+		case '"':
+			if inQuote && i+1 < len(object) && object[i+1] == '"' {
+				i++
+				continue
+			}
+			inQuote = !inQuote
+		case '(':
+			if inQuote {
+				continue
+			}
+			if !strings.HasSuffix(object, ")") {
+				return "", "", false
+			}
+			return strings.TrimSpace(object[:i]), strings.TrimSpace(object[i+1 : len(object)-1]), true
+		}
+	}
+	return "", "", false
+}
+
+func validateFunctionIdentityArgument(argument string) error {
+	argument = strings.TrimSpace(argument)
+	if argument == "" {
+		return fmt.Errorf("FUNCTION identity argument is empty")
+	}
+	if functionArgumentModeRe.MatchString(argument) {
+		return fmt.Errorf("FUNCTION grants accept identity types only; argument modes are unsupported")
+	}
+	fields := strings.Fields(argument)
+	if len(fields) == 1 {
+		return nil
+	}
+	lower := strings.ToLower(strings.Join(fields, " "))
+	for _, prefix := range []string{
+		"bit varying",
+		"character varying",
+		"double precision",
+		"interval",
+		"time with time zone",
+		"time without time zone",
+		"timestamp with time zone",
+		"timestamp without time zone",
+	} {
+		if lower == prefix || strings.HasPrefix(lower, prefix+" ") {
+			return nil
+		}
+	}
+	return fmt.Errorf("FUNCTION grants accept identity types only; argument names are unsupported")
 }
 
 func validRoleObject(object string, qualified bool) bool {

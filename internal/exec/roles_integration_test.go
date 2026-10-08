@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +15,27 @@ import (
 	"github.com/muandane/grizzle/internal/scope"
 	"github.com/muandane/grizzle/internal/testutil"
 )
+
+func TestRoles_FunctionGrantRejectsProcedure(t *testing.T) {
+	db := testutil.TestDatabase(t)
+	ctx := context.Background()
+	schemaName := fmt.Sprintf("test_role_fn_%d", time.Now().UnixNano())
+	cfg := exec.PostgresExecConfig{
+		TargetSchema: schemaName,
+		SchemaSQL: fmt.Sprintf(`
+			CREATE PROCEDURE proc_only()
+			LANGUAGE plpgsql AS $$ BEGIN NULL; END; $$;
+		`),
+		RolesSQL: `CREATE ROLE fn_grant_role; GRANT EXECUTE ON FUNCTION proc_only() TO fn_grant_role;`,
+		Filters:  scope.Filters{},
+		Policy:   plan.DropPolicy{},
+	}
+	if _, err := exec.PlanDiffPostgres(ctx, db, cfg); err == nil {
+		t.Fatal("FUNCTION grants to procedures must be rejected")
+	} else if !strings.Contains(err.Error(), "aggregates, procedures, and window functions are not supported") {
+		t.Fatalf("unexpected non-function grant error: %v", err)
+	}
+}
 
 // TestRoles_Lifecycle verifies RolesSQL privilege sync end-to-end: role
 // creation (NOLOGIN, marker-stamped), grants applied, second-sync no-op,

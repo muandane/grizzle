@@ -1323,6 +1323,15 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 		}
 		return 0, nil
 	}
+	var droppedRoles []string
+	for _, step := range p.Steps {
+		if step.Type == plan.ChangeDropRole {
+			droppedRoles = append(droppedRoles, step.Table)
+		}
+	}
+	if err := validateRoleDropSafety(ctx, conn, droppedRoles, targetSchemas); err != nil {
+		return 0, err
+	}
 
 	// Apply DDL statements split into transactional and non-transactional groups
 	groups := GroupSteps(p.Steps)

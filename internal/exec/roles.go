@@ -49,26 +49,14 @@ func diffRolesSteps(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConf
 
 	changes := diff.RolesDiff(desired, live.RoleState(), cfg.primarySchema())
 
-	// Ownership refusal: a managed role that owns cluster objects must not be
-	// dropped — the dependency transfer is an operator decision.
+	var droppedRoles []string
 	for _, c := range changes {
-		if c.Type != plan.ChangeDropRole {
-			continue
+		if c.Type == plan.ChangeDropRole {
+			droppedRoles = append(droppedRoles, c.Table)
 		}
-		owns, err := postgres.RoleOwnsObjects(ctx, dbtx, c.Table)
-		if err != nil {
-			return nil, fmt.Errorf("%w: %w", plan.ErrInspectionFailed, err)
-		}
-		if owns {
-			return nil, fmt.Errorf("role %q has catalog ownership or dependency; transfer ownership or remove the role from the desired state before syncing roles", c.Table)
-		}
-		unhandledACL, err := postgres.RoleHasUnhandledACLs(ctx, dbtx, c.Table, cfg.targetSchemas())
-		if err != nil {
-			return nil, fmt.Errorf("%w: %w", plan.ErrInspectionFailed, err)
-		}
-		if unhandledACL {
-			return nil, fmt.Errorf("role %q has ACL dependencies outside the managed role scope; revoke or transfer them before dropping the role", c.Table)
-		}
+	}
+	if err := validateRoleDropSafety(ctx, dbtx, droppedRoles, cfg.targetSchemas()); err != nil {
+		return nil, err
 	}
 
 	steps := make([]plan.Step, 0, len(changes))
@@ -80,6 +68,33 @@ func diffRolesSteps(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConf
 	// order, since the schema step list is already sorted.
 	plan.SortSteps(steps)
 	return steps, nil
+}
+
+func validateRoleDropSafety(ctx context.Context, dbtx dialect.DBTX, roleNames, targetSchemas []string) error {
+	for _, roleName := range roleNames {
+		owns, err := postgres.RoleOwnsObjects(ctx, dbtx, roleName)
+		if err != nil {
+			return fmt.Errorf("%w: %w", plan.ErrInspectionFailed, err)
+		}
+		if owns {
+			return fmt.Errorf("role %q has catalog ownership or dependency; transfer ownership or remove the role from the desired state before syncing roles", roleName)
+		}
+		dependency, err := postgres.RoleHasUnhandledDependencies(ctx, dbtx, roleName)
+		if err != nil {
+			return fmt.Errorf("%w: %w", plan.ErrInspectionFailed, err)
+		}
+		if dependency {
+			return fmt.Errorf("role %q has an unhandled shared-catalog dependency; transfer or remove it before dropping the role", roleName)
+		}
+		unhandledACL, err := postgres.RoleHasUnhandledACLs(ctx, dbtx, roleName, targetSchemas)
+		if err != nil {
+			return fmt.Errorf("%w: %w", plan.ErrInspectionFailed, err)
+		}
+		if unhandledACL {
+			return fmt.Errorf("role %q has ACL dependencies outside the managed role scope; revoke or transfer them before dropping the role", roleName)
+		}
+	}
+	return nil
 }
 
 func desiredRolesSpec(cfg PostgresExecConfig) (*schema.RolesSpec, error) {

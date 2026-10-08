@@ -239,22 +239,30 @@ func ValidateFunctionGrantTargets(ctx context.Context, dbtx dialect.DBTX, spec *
 			placeholders = append(placeholders, fmt.Sprintf("$%d", i+3))
 			args = append(args, candidateSchema)
 		}
-		var exists bool
+		orderCases := make([]string, 0, len(candidateSchemas))
+		for i := range candidateSchemas {
+			orderCases = append(orderCases, fmt.Sprintf("WHEN $%d THEN %d", i+3, i+1))
+		}
+		var prokind string
 		err := dbtx.QueryRowContext(ctx, fmt.Sprintf(`
-			SELECT EXISTS (
-				SELECT 1
+			SELECT COALESCE((
+				SELECT p.prokind
 				FROM pg_proc p
 				JOIN pg_namespace n ON n.oid = p.pronamespace
 				WHERE p.proname = $1
-				  AND p.prokind = 'f'
 				  AND pg_get_function_identity_arguments(p.oid) = $2
 				  AND n.nspname IN (%s)
-			);`, strings.Join(placeholders, ", ")), args...).Scan(&exists)
+				ORDER BY CASE n.nspname %s END
+				LIMIT 1
+			), '');`, strings.Join(placeholders, ", "), strings.Join(orderCases, " ")), args...).Scan(&prokind)
 		if err != nil {
 			return fmt.Errorf("checking FUNCTION grant target %q: %w", grant.ObjectName, err)
 		}
-		if !exists {
-			return fmt.Errorf("FUNCTION grant target %q is not an existing ordinary function in the managed schemas", grant.ObjectName)
+		if prokind == "" {
+			return fmt.Errorf("FUNCTION grant target %q does not resolve to a managed routine", grant.ObjectName)
+		}
+		if prokind != "f" {
+			return fmt.Errorf("FUNCTION grant target %q resolves to unsupported PostgreSQL routine kind %q; aggregates, procedures, and window functions are not supported", grant.ObjectName, prokind)
 		}
 	}
 	return nil
@@ -395,6 +403,27 @@ func RoleOwnsObjects(ctx context.Context, dbtx dialect.DBTX, roleName string) (b
 	return owns, nil
 }
 
+// RoleHasUnhandledDependencies checks shared-catalog dependencies that are
+// not ACL rows. ACL dependencies are handled separately so in-scope grants
+// can be revoked before DROP ROLE; every other dependency fails closed.
+func RoleHasUnhandledDependencies(ctx context.Context, dbtx dialect.DBTX, roleName string) (bool, error) {
+	var hasDependency bool
+	err := dbtx.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM pg_shdepend d
+			JOIN pg_roles r
+			  ON d.refclassid = 'pg_authid'::regclass
+			 AND d.refobjid = r.oid
+			WHERE r.rolname = $1
+			  AND d.deptype <> 'a'
+		);`, roleName).Scan(&hasDependency)
+	if err != nil {
+		return false, fmt.Errorf("checking shared dependencies for role %q: %w", roleName, err)
+	}
+	return hasDependency, nil
+}
+
 // RoleHasUnhandledACLs reports ACL entries that the RolesSQL inspector does
 // not reconcile for a managed role. In-scope relation/function/schema/current
 // database ACLs are deliberately excluded because RolesDiff emits revokes
@@ -408,8 +437,10 @@ func RoleHasUnhandledACLs(ctx context.Context, dbtx dialect.DBTX, roleName strin
 		schemaArgs = append(schemaArgs, targetSchema)
 	}
 	schemaFilter := "TRUE"
+	schemaInFilter := "FALSE"
 	if len(schemaPlaceholders) > 0 {
 		schemaFilter = "n.nspname NOT IN (" + strings.Join(schemaPlaceholders, ", ") + ")"
+		schemaInFilter = "n.nspname IN (" + strings.Join(schemaPlaceholders, ", ") + ")"
 	}
 	query := fmt.Sprintf(`
 		SELECT EXISTS (
@@ -453,8 +484,54 @@ func RoleHasUnhandledACLs(ctx context.Context, dbtx dialect.DBTX, roleName strin
 					CROSS JOIN LATERAL aclexplode(d.defaclacl) a
 					WHERE a.grantee = r.oid
 				)
+				OR EXISTS (
+					SELECT 1
+					FROM pg_shdepend d
+					WHERE d.refclassid = 'pg_authid'::regclass
+					  AND d.refobjid = r.oid
+					  AND d.deptype = 'a'
+					  AND (
+						d.classid NOT IN (
+							'pg_class'::regclass,
+							'pg_proc'::regclass,
+							'pg_namespace'::regclass,
+							'pg_database'::regclass
+						)
+						OR NOT (
+							(d.classid = 'pg_class'::regclass AND EXISTS (
+								SELECT 1
+								FROM pg_class c
+								JOIN pg_namespace n ON n.oid = c.relnamespace
+								WHERE c.oid = d.objid
+								  AND %s
+								  AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S')
+							))
+							OR (d.classid = 'pg_proc'::regclass AND EXISTS (
+								SELECT 1
+								FROM pg_proc p
+								JOIN pg_namespace n ON n.oid = p.pronamespace
+								WHERE p.oid = d.objid
+								  AND %s
+								  AND p.prokind = 'f'
+							))
+							OR (d.classid = 'pg_namespace'::regclass AND EXISTS (
+								SELECT 1
+								FROM pg_namespace n
+								WHERE n.oid = d.objid
+								  AND %s
+							))
+							OR (d.classid = 'pg_database'::regclass AND EXISTS (
+								SELECT 1
+								FROM pg_database db
+								WHERE db.oid = d.objid
+								  AND db.datname = current_database()
+							))
+						)
+					  )
+				)
 			)
-		);`, schemaFilter, schemaFilter, schemaFilter)
+		);`, schemaFilter, schemaFilter, schemaFilter,
+		schemaInFilter, schemaInFilter, schemaInFilter)
 	args := append([]any{roleName}, schemaArgs...)
 	var hasACL bool
 	if err := dbtx.QueryRowContext(ctx, query, args...).Scan(&hasACL); err != nil {

@@ -250,16 +250,14 @@ func (p *Plan) Hash() string {
 		_, _ = fmt.Fprintf(h, format, args...)
 	}
 
-	schema := p.TargetSchema
-	if len(p.TargetSchemas) > 1 {
+	write("schema:%s\n", p.TargetSchema)
+	if len(p.TargetSchemas) > 0 {
 		schemas := slices.Clone(p.TargetSchemas)
 		slices.Sort(schemas)
 		schemas = slices.Compact(schemas)
-		schema = schemas[0]
-		write("schema:%s\n", schema)
-		write("schemas:%s\n", strings.Join(schemas, ","))
-	} else {
-		write("schema:%s\n", schema)
+		if len(schemas) > 0 {
+			write("schemas:%s\n", strings.Join(schemas, ","))
+		}
 	}
 	write("includes:%s\n", strings.Join(includes, ","))
 	write("excludes:%s\n", strings.Join(excludes, ","))

@@ -943,6 +943,9 @@ func parsePublicationStatement(stmt string) *Publication {
 		if len(clause) >= 3 && strings.EqualFold(clause[:3], "FOR") {
 			clause = strings.TrimSpace(clause[3:])
 		}
+		if hasMixedPublicationMembership(clause) {
+			return nil
+		}
 		forAll := publicationForAllRe.FindStringSubmatch(clause)
 		forTables := publicationForTablesRe.FindStringSubmatch(clause)
 		switch {
@@ -1044,6 +1047,16 @@ func ValidateCatalogSQL(sql string) error {
 		switch {
 		case strings.HasPrefix(upper, "CREATE PUBLICATION"):
 			matches := createPublicationRe.FindStringSubmatch(trimmed)
+			mixedClause := ""
+			if matches != nil {
+				mixedClause = strings.TrimSpace(matches[3])
+				if len(mixedClause) >= 3 && strings.EqualFold(mixedClause[:3], "FOR") {
+					mixedClause = strings.TrimSpace(mixedClause[3:])
+				}
+			}
+			if hasMixedPublicationMembership(mixedClause) {
+				return fmt.Errorf("mixed TABLE and TABLES IN SCHEMA publication membership is not supported; use CREATE plus ALTER PUBLICATION ADD TABLES IN SCHEMA: %q", trimmed)
+			}
 			if matches == nil || !validStatementIdentifier(matches) || !validatePublicationCreate(matches) {
 				return fmt.Errorf("unsupported CREATE PUBLICATION form in CatalogSQL (expected CREATE PUBLICATION <name> [FOR ALL TABLES | FOR TABLE <tables> | FOR TABLES IN SCHEMA <schemas>] [WITH (publish = '...')]): %q", trimmed)
 			}
@@ -1095,6 +1108,9 @@ func validatePublicationCreate(matches []string) bool {
 			return false
 		}
 		clause := strings.TrimSpace(forClause[3:])
+		if hasMixedPublicationMembership(clause) {
+			return false
+		}
 		if publicationForAllRe.MatchString(clause) {
 			// Valid.
 		} else if tableMatches := publicationForTablesRe.FindStringSubmatch(clause); tableMatches != nil {
@@ -1124,6 +1140,38 @@ func validatePublicationCreate(matches []string) bool {
 		}
 	}
 	return true
+}
+
+func hasMixedPublicationMembership(clause string) bool {
+	clause = strings.TrimSpace(clause)
+	if len(clause) < len("TABLE ") || !strings.EqualFold(clause[:len("TABLE ")], "TABLE ") {
+		return false
+	}
+	return containsOutsideDoubleQuotes(clause, "TABLES IN SCHEMA")
+}
+
+func containsOutsideDoubleQuotes(value, phrase string) bool {
+	phrase = strings.ToUpper(phrase)
+	for i := 0; i+len(phrase) <= len(value); i++ {
+		if value[i] == '"' {
+			i++
+			for i < len(value) {
+				if value[i] == '"' {
+					if i+1 < len(value) && value[i+1] == '"' {
+						i += 2
+						continue
+					}
+					break
+				}
+				i++
+			}
+			continue
+		}
+		if strings.EqualFold(value[i:i+len(phrase)], phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 func containsSQLCommentOutsideQuotes(s string) bool {

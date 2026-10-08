@@ -108,6 +108,8 @@ func TestValidateRolesSQL_RejectsUnsupportedRoleForms(t *testing.T) {
 		{`GRANT SELECT ON docs TO app_read,;`, "grantee list is malformed"},
 		{`GRANT  ON docs TO app_read;`, "unsupported GRANT form"},
 		{`GRANT SELECT ON FUNCTION fn(integer,) TO app_read;`, "object list contains malformed"},
+		{`GRANT EXECUTE ON FUNCTION fn(IN integer) TO app_read;`, "argument modes are unsupported"},
+		{`GRANT EXECUTE ON FUNCTION fn(arg integer) TO app_read;`, "argument names are unsupported"},
 		{`GRANT SELECT ON FUNCTION ""() TO app_read;`, "object list contains malformed"},
 		{`CREATE ROLE "";`, "role identifier must not be empty"},
 		{`GRANT SELECT ON docs TO "";`, "grantee list contains malformed"},
@@ -281,6 +283,9 @@ func TestValidateRolesSpecScope_RejectsUninspectedObjects(t *testing.T) {
 	}
 	if err := ValidateRolesSpecScope(ParseRolesSQL(`GRANT CONNECT ON DATABASE app_db TO app;`), []string{"public"}, "app_db"); err != nil {
 		t.Fatalf("current database ACL should be accepted: %v", err)
+	}
+	if err := ValidateRolesSpecScope(ParseRolesSQL(`REVOKE SELECT ON TABLE other.docs FROM PUBLIC;`), []string{"public"}, "app_db"); err == nil {
+		t.Fatal("standalone REVOKE outside the managed scope must be rejected")
 	}
 	if err := ValidateRolesSpecScope(ParseRolesSQL(`GRANT SELECT ON TABLE "Mixed"."docs" TO app;`), []string{"Mixed"}, "app_db"); err != nil {
 		t.Fatalf("quoted target schema should be accepted: %v", err)

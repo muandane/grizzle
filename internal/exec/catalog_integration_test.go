@@ -10,11 +10,43 @@ import (
 	"testing"
 	"time"
 
+	"github.com/muandane/grizzle/internal/dialect/postgres"
 	"github.com/muandane/grizzle/internal/exec"
 	"github.com/muandane/grizzle/internal/plan"
 	"github.com/muandane/grizzle/internal/scope"
 	"github.com/muandane/grizzle/internal/testutil"
 )
+
+func TestEventTriggerFunctionLookupSkipsInvalidEarlierRoutine(t *testing.T) {
+	db := testutil.TestDatabase(t)
+	ctx := context.Background()
+	suffix := time.Now().UnixNano()
+	shadowSchema := fmt.Sprintf("test_et_shadow_%d", suffix)
+	targetSchema := fmt.Sprintf("test_et_target_%d", suffix)
+	if _, err := db.Exec(fmt.Sprintf(`CREATE SCHEMA %q; CREATE SCHEMA %q;`, shadowSchema, targetSchema)); err != nil {
+		t.Fatalf("create lookup schemas: %v", err)
+	}
+	defer func() {
+		_, _ = db.Exec(fmt.Sprintf(`DROP SCHEMA %q CASCADE; DROP SCHEMA %q CASCADE;`, shadowSchema, targetSchema))
+	}()
+	if _, err := db.Exec(fmt.Sprintf(`
+		CREATE FUNCTION %q.event_fn() RETURNS integer
+		LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+		CREATE FUNCTION %q.event_fn() RETURNS event_trigger
+		LANGUAGE plpgsql AS $$ BEGIN NULL; END; $$;
+	`, shadowSchema, targetSchema)); err != nil {
+		t.Fatalf("create lookup routines: %v", err)
+	}
+	exists, err := postgres.EventTriggerFunctionExistsWithShadowMap(
+		ctx, db, "event_fn", nil, shadowSchema, targetSchema, "public",
+	)
+	if err != nil {
+		t.Fatalf("event-trigger function lookup: %v", err)
+	}
+	if !exists {
+		t.Fatal("an invalid earlier routine must not hide a valid later event-trigger function")
+	}
+}
 
 // TestCatalog_Lifecycle verifies CatalogSQL sync end-to-end: publication and
 // event-trigger creation (marker-stamped), second-sync no-op, drift

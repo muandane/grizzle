@@ -252,13 +252,14 @@ func EventTriggerFunctionExistsWithShadowMap(ctx context.Context, dbtx dialect.D
 	}
 
 	query := `
-		SELECT COALESCE((
-			SELECT p.prokind = 'f'
-			       AND p.prorettype = 'event_trigger'::regtype
+		SELECT EXISTS (
+			SELECT 1
 			FROM pg_proc p
 			JOIN pg_namespace n ON n.oid = p.pronamespace
 			WHERE p.proname = $1
 			  AND p.pronargs = 0
+			  AND p.prokind = 'f'
+			  AND p.prorettype = 'event_trigger'::regtype
 `
 	args := []any{parts[len(parts)-1]}
 	if len(parts) == 2 {
@@ -299,7 +300,7 @@ func EventTriggerFunctionExistsWithShadowMap(ctx context.Context, dbtx dialect.D
 			LIMIT 1`
 	}
 	query += `
-		), false);`
+		);`
 	var exists bool
 	err := dbtx.QueryRowContext(ctx, query, args...).Scan(&exists)
 	if err != nil {
