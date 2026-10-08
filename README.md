@@ -23,7 +23,7 @@ Embed your desired schema and run `Sync` on application startup:
 ```sql
 -- schema.sql
 CREATE TABLE users (
-    id         BIGSERIAL PRIMARY KEY,
+    id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     email      VARCHAR(255) NOT NULL UNIQUE,
     full_name  TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -31,6 +31,9 @@ CREATE TABLE users (
 
 CREATE INDEX idx_users_created_at ON users (created_at);
 ```
+
+> **Note:** Grizzle supports both `SERIAL` and standard-compliant identity columns, but recommends `GENERATED ALWAYS AS IDENTITY` for new tables (see [SAFETY.md](docs/SAFETY.md)).
+
 
 ```go
 package main

@@ -700,6 +700,12 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig, b
 	for groupIdx, group := range groups {
 		isLastGroup := groupIdx == len(groups)-1
 		if group.NonTx {
+			// Long-running non-transactional DDL (CREATE INDEX CONCURRENTLY etc.)
+			// must not be killed by statement_timeout: disable it for this group
+			// and restore the configured session timeout on every exit path.
+			if restoreStmtTimeout, dErr := DisableStatementTimeout(ctx, conn, cfg.StatementTimeout); dErr == nil {
+				defer restoreStmtTimeout()
+			}
 			// Non-transactional steps (e.g. CREATE INDEX CONCURRENTLY) executed directly on dedicated conn
 			for _, s := range group.Steps {
 				stepIdx++
@@ -762,6 +768,13 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig, b
 					recordFailureHistory(stepIdx, hookErr, false)
 					return committedSteps, hookErr
 				}
+				// VALIDATE CONSTRAINT scans the whole table under SHARE UPDATE EXCLUSIVE;
+				// exempt it from the statement timeout, then restore it so later steps
+				// in this same transaction remain protected.
+				validateExempt := s.Type == plan.ChangeValidateConstraint && cfg.StatementTimeout > 0
+				if validateExempt {
+					_, _ = tx.ExecContext(ctx, "SET LOCAL statement_timeout = 0;")
+				}
 				if err := execStepWithTracing(ctx, tx, s, false, cfg.Tracer, roleIR, subIR); err != nil {
 					_ = tx.Rollback()
 					if logger != nil {
@@ -769,6 +782,9 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig, b
 					}
 					recordFailureHistory(stepIdx, err, false)
 					return committedSteps, wrapStepExecError(s, err, false)
+				}
+				if validateExempt {
+					_, _ = tx.ExecContext(ctx, fmt.Sprintf("SET LOCAL statement_timeout = '%dms';", cfg.StatementTimeout.Milliseconds()))
 				}
 				if err := callAfterStep(cfg.AfterStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: stepIdx, Total: len(steps), IsNonTx: false}); err != nil {
 					_ = tx.Rollback()
@@ -1385,6 +1401,12 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 	for groupIdx, group := range groups {
 		isLastGroup := groupIdx == len(groups)-1
 		if group.NonTx {
+			// Long-running non-transactional DDL (CREATE INDEX CONCURRENTLY etc.)
+			// must not be killed by statement_timeout: disable it for this group
+			// and restore the configured session timeout on every exit path.
+			if restoreStmtTimeout, dErr := DisableStatementTimeout(ctx, conn, cfg.StatementTimeout); dErr == nil {
+				defer restoreStmtTimeout()
+			}
 			for _, s := range group.Steps {
 				stepIdx++
 				stepStart := time.Now()
@@ -1445,6 +1467,13 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 					recordFailureHistory(stepIdx, hookErr, false)
 					return committedSteps, hookErr
 				}
+				// VALIDATE CONSTRAINT scans the whole table under SHARE UPDATE EXCLUSIVE;
+				// exempt it from the statement timeout, then restore it so later steps
+				// in this same transaction remain protected.
+				validateExempt := s.Type == plan.ChangeValidateConstraint && cfg.StatementTimeout > 0
+				if validateExempt {
+					_, _ = tx.ExecContext(ctx, "SET LOCAL statement_timeout = 0;")
+				}
 				if err := execStepWithTracing(ctx, tx, s, false, cfg.Tracer, roleIR, subIR); err != nil {
 					_ = tx.Rollback()
 					if logger != nil {
@@ -1452,6 +1481,9 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 					}
 					recordFailureHistory(stepIdx, err, false)
 					return committedSteps, wrapStepExecError(s, err, false)
+				}
+				if validateExempt {
+					_, _ = tx.ExecContext(ctx, fmt.Sprintf("SET LOCAL statement_timeout = '%dms';", cfg.StatementTimeout.Milliseconds()))
 				}
 				if err := callAfterStep(cfg.AfterStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: stepIdx, Total: len(p.Steps), IsNonTx: false}); err != nil {
 					_ = tx.Rollback()
