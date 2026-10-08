@@ -32,8 +32,8 @@ func AttachDatabases(ctx context.Context, dbtx dialect.DBTX, attach map[string]s
 // DetachDatabases runs DETACH DATABASE for each name (reverse order).
 func DetachDatabases(ctx context.Context, dbtx dialect.DBTX, names []string) error {
 	var first error
-	for i := len(names) - 1; i >= 0; i-- {
-		name := names[i]
+	for _, name := range slices.Backward(names) {
+
 		if _, err := dbtx.ExecContext(ctx, fmt.Sprintf(`DETACH DATABASE %q`, name)); err != nil && first == nil {
 			first = fmt.Errorf("sqlite: DETACH DATABASE %q: %w", name, err)
 		}

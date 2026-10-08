@@ -21,7 +21,7 @@ type Dialect string
 const (
 	// DialectAuto instructs Grizzle to auto-detect the engine from the driver type.
 	DialectAuto Dialect = ""
-	// DialectPostgres specifies PostgreSQL (13+).
+	// DialectPostgres specifies PostgreSQL (14+; CI-tested through 18).
 	DialectPostgres Dialect = "postgres"
 	// DialectSQLite specifies SQLite (3.35+).
 	DialectSQLite Dialect = "sqlite"
