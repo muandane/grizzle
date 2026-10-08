@@ -1359,6 +1359,9 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 	if err := validateRoleDropSafety(ctx, conn, droppedRoles, targetSchemas, p.Steps); err != nil {
 		return 0, err
 	}
+	if err := validateCatalogDropSafety(ctx, conn, p.Steps); err != nil {
+		return 0, err
+	}
 
 	// Apply DDL statements split into transactional and non-transactional groups
 	groups := GroupSteps(p.Steps)
