@@ -52,3 +52,11 @@ func ApplySessionTimeouts(ctx context.Context, dbtx dialect.DBTX, lockTimeout, s
 	}
 	return nil
 }
+
+// DisableStatementTimeout disables the statement_timeout on the dedicated session connection.
+func DisableStatementTimeout(ctx context.Context, dbtx dialect.DBTX) error {
+	if _, err := dbtx.ExecContext(ctx, "SET statement_timeout = 0;"); err != nil {
+		return fmt.Errorf("failed disabling session statement_timeout: %w", err)
+	}
+	return nil
+}
