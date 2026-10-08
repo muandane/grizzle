@@ -287,9 +287,9 @@ func prepareOptions(ctx context.Context, db *sql.DB, opts *Options) error {
 		if len(opts.TargetSchemas) > 0 {
 			slices.Sort(opts.TargetSchemas)
 			opts.TargetSchemas = slices.Compact(opts.TargetSchemas)
-			if opts.TargetSchema == "" || opts.TargetSchema == "main" {
-				opts.TargetSchema = opts.TargetSchemas[0]
-			}
+			// TargetSchema is the open primary database ("main" unless the
+			// caller set it explicitly). Never reassign it from the sorted
+			// list: that would make an ATTACH name the primary.
 		} else if opts.TargetSchema != "" {
 			opts.TargetSchemas = []string{opts.TargetSchema}
 		} else {
