@@ -257,6 +257,16 @@ Grizzle maintains an immutable audit log and provides drift inspection:
 * **History Tracking**: Successfully applied plans are recorded in `grizzle_history` with the plan hash, execution timestamp, duration, applied user, and serialized steps JSON—committed in the same transaction as the schema changes where possible.
 * **Read-Only Drift Check**: `grizzle.Check(ctx, db, opts)` inspects the live database without acquiring exclusive write locks or executing mutations. If any schema drift exists, it returns `ErrDrift` (carrying the diff details in `*plan.DriftError`).
 
+
+### Invariant 10: Prefer identity columns over SERIAL
+
+PostgreSQL 10 introduced standard-compliant identity columns (`GENERATED ALWAYS AS IDENTITY`). Grizzle fully supports both `SERIAL` and identity columns, but strongly recommends using identity columns for new applications:
+
+1. **Permission safety:** `SERIAL` creates an implicit sequence owned by the column, which requires explicit `GRANT USAGE ON SEQUENCE` if the table owner and application roles differ. Identity columns transparently bind sequence permissions to the table itself.
+2. **Preventing drift:** Identity columns strictly prevent accidental `INSERT` statements from drifting the sequence state if a client inserts explicit IDs. `GENERATED ALWAYS` enforces that PostgreSQL manages the value.
+
+Grizzle preserves `SERIAL` columns in existing databases but encourages `BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY` when defining new primary keys.
+
 ---
 
 ## Recommended production usage pattern
