@@ -194,6 +194,28 @@ func TestMergeRolesSpecs_SideChannelWinsRoleAttrs(t *testing.T) {
 	}
 }
 
+func TestMergeRolesSpecs_AlterOnlySidePreservesSchemaAttrs(t *testing.T) {
+	schemaSpec := ParseRolesSQL(`CREATE ROLE app LOGIN PASSWORD 'keep-me' CONNECTION LIMIT 3;`)
+	sideSpec := ParseRolesSQL(`ALTER ROLE app SET search_path = app;`)
+	merged := MergeRolesSpecs(schemaSpec, sideSpec)
+	role := merged.Roles[CanonicalIdentifierKey("app")]
+	if role == nil {
+		t.Fatal("expected merged role")
+	}
+	if role.Login == nil || !*role.Login {
+		t.Fatalf("ALTER-only side-channel must preserve SchemaSQL LOGIN: %+v", role)
+	}
+	if !role.HasPassword || role.Password != "keep-me" {
+		t.Fatalf("ALTER-only side-channel must preserve SchemaSQL PASSWORD: %+v", role)
+	}
+	if role.ConnectionLimit == nil || *role.ConnectionLimit != 3 {
+		t.Fatalf("ALTER-only side-channel must preserve CONNECTION LIMIT: %+v", role)
+	}
+	if role.Config["search_path"] != "app" {
+		t.Fatalf("side-channel SET must apply: %+v", role.Config)
+	}
+}
+
 func TestCanonicalGrantObject_FunctionIdentity(t *testing.T) {
 	tests := []struct {
 		name, object, want string

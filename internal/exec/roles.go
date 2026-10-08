@@ -276,37 +276,69 @@ func desiredRolesSpec(cfg PostgresExecConfig) (*schema.RolesSpec, error) {
 	), nil
 }
 
-func desiredRolePasswords(spec *schema.RolesSpec) map[string]string {
-	out := make(map[string]string)
+func desiredRoleIR(spec *schema.RolesSpec) map[string]*schema.Role {
+	out := make(map[string]*schema.Role)
 	if spec == nil {
 		return out
 	}
 	for _, role := range spec.Roles {
-		if role.HasPassword {
-			out[schema.CanonicalIdentifierKey(role.Name)] = role.Password
+		out[schema.CanonicalIdentifierKey(role.Name)] = role
+	}
+	return out
+}
+
+func desiredRolePasswords(spec *schema.RolesSpec) map[string]string {
+	out := make(map[string]string)
+	for key, role := range desiredRoleIR(spec) {
+		if schema.RoleHasUsablePassword(role) {
+			out[key] = role.Password
 		}
 	}
 	return out
 }
 
-// materializeRoleStepSQL replaces redacted PASSWORD placeholders with the
-// real password from desired RolesSQL IR. Step.SQL stays redacted for plans,
-// logs, and hazards; only the in-memory exec string carries the secret.
-func materializeRoleStepSQL(step plan.Step, passwords map[string]string) string {
-	if step.Type != plan.ChangeAlterRole && step.Type != plan.ChangeCreateRole {
-		return step.SQL
+func stepNeedsRolePassword(step plan.Step) bool {
+	switch step.Type {
+	case plan.ChangeAlterRole, plan.ChangeCreateRole:
+		return strings.Contains(strings.ToUpper(step.SQL), "PASSWORD")
+	default:
+		return false
 	}
-	if !strings.Contains(strings.ToUpper(step.SQL), "PASSWORD") {
-		return step.SQL
+}
+
+func lookupDesiredRole(roles map[string]*schema.Role, name string) *schema.Role {
+	if roles == nil {
+		return nil
 	}
-	password, ok := passwords[schema.CanonicalIdentifierKey(step.Table)]
-	if !ok || password == "" {
-		// Also try catalog role name as stored on the step table field.
-		password, ok = passwords[step.Table]
+	if role := roles[schema.CanonicalIdentifierKey(name)]; role != nil {
+		return role
 	}
-	if !ok || password == "" {
-		return step.SQL
+	return roles[name]
+}
+
+// materializeRoleStepSQL rebuilds executable role SQL from desired Role IR.
+// Password-bearing steps never execute redacted Step.SQL; missing plaintext IR
+// fails closed with a clear error.
+func materializeRoleStepSQL(step plan.Step, roles map[string]*schema.Role) (string, error) {
+	if !stepNeedsRolePassword(step) {
+		return step.SQL, nil
 	}
-	redacted := schema.PasswordRedacted
-	return strings.ReplaceAll(step.SQL, "'"+redacted+"'", "'"+strings.ReplaceAll(password, "'", "''")+"'")
+	role := lookupDesiredRole(roles, step.Table)
+	if !schema.RoleHasUsablePassword(role) {
+		return "", fmt.Errorf("cannot apply PASSWORD for role %q: plaintext password IR is unavailable; provide RolesSQL/SchemaSQL with the real PASSWORD (plan artifacts redact secrets and cannot be applied alone)", step.Table)
+	}
+	switch step.Type {
+	case plan.ChangeAlterRole:
+		// Password alters are emitted as password-only changes; rebuild from IR.
+		return postgres.GenerateAlterRoleApplySQL(&schema.Role{
+			Name:        role.Name,
+			Password:    role.Password,
+			HasPassword: true,
+		}), nil
+	case plan.ChangeCreateRole:
+		// CREATE steps do not embed passwords; password follows as ALTER_ROLE.
+		return step.SQL, nil
+	default:
+		return step.SQL, nil
+	}
 }

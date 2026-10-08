@@ -1,8 +1,6 @@
 package schema
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"maps"
 	"strconv"
@@ -450,15 +448,9 @@ func applyAlterToRole(role *Role, partial *Role, resetKeys []string) {
 	}
 }
 
-// PasswordDigest returns a non-reversible hex digest of a password for plan
-// hashing without embedding plaintext.
-func PasswordDigest(password string) string {
-	sum := sha256.Sum256([]byte(password))
-	return hex.EncodeToString(sum[:])
-}
-
 // RedactRolePasswordsSQL replaces PASSWORD '...' literals with the redacted
-// placeholder so plan documents and step SQL never echo secrets.
+// placeholder so plan documents, Plan.Hash(), and step SQL never echo secrets.
+// Hash and Document must use the same redaction so ParsePlanJSON round-trips.
 func RedactRolePasswordsSQL(sql string) string {
 	if sql == "" || !strings.Contains(strings.ToUpper(sql), "PASSWORD") {
 		return sql
@@ -512,62 +504,14 @@ func RedactRolePasswordsSQL(sql string) string {
 	return b.String()
 }
 
-// HashStableRolesSQL returns RolesSQL/SchemaSQL with password literals replaced
-// by digests so Plan.Hash changes when a password changes without embedding
-// plaintext in the hash payload.
-func HashStableRolesSQL(sql string) string {
-	if sql == "" || !strings.Contains(strings.ToUpper(sql), "PASSWORD") {
-		return sql
+// RoleHasUsablePassword reports whether role IR carries a real plaintext
+// password suitable for apply (not empty and not the redaction placeholder).
+func RoleHasUsablePassword(role *Role) bool {
+	if role == nil || !role.HasPassword {
+		return false
 	}
-	var b strings.Builder
-	upper := strings.ToUpper(sql)
-	i := 0
-	for i < len(sql) {
-		idx := strings.Index(upper[i:], "PASSWORD")
-		if idx < 0 {
-			b.WriteString(sql[i:])
-			break
-		}
-		idx += i
-		if idx > 0 {
-			prev := sql[idx-1]
-			if (prev >= 'a' && prev <= 'z') || (prev >= 'A' && prev <= 'Z') || (prev >= '0' && prev <= '9') || prev == '_' {
-				b.WriteString(sql[i : idx+8])
-				i = idx + 8
-				continue
-			}
-		}
-		b.WriteString(sql[i:idx])
-		b.WriteString(sql[idx : idx+8])
-		j := idx + 8
-		for j < len(sql) && unicode.IsSpace(rune(sql[j])) {
-			b.WriteByte(sql[j])
-			j++
-		}
-		if j < len(sql) && strings.EqualFold(sql[j:min(j+4, len(sql))], "NULL") {
-			b.WriteString(sql[j : j+4])
-			i = j + 4
-			continue
-		}
-		if j >= len(sql) || sql[j] != '\'' {
-			i = j
-			continue
-		}
-		end, err := scanSingleQuotedLiteral(sql, j)
-		if err != nil {
-			b.WriteString(sql[j:])
-			break
-		}
-		decoded, decErr := decodeSingleQuotedLiteral(sql[j:end])
-		if decErr != nil {
-			b.WriteString(sql[j:end])
-			i = end
-			continue
-		}
-		b.WriteString("'sha256:")
-		b.WriteString(PasswordDigest(decoded))
-		b.WriteByte('\'')
-		i = end
+	if role.Password == "" || role.Password == PasswordRedacted {
+		return false
 	}
-	return b.String()
+	return true
 }

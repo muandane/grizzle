@@ -157,3 +157,35 @@ func TestPlan_Document_OmitsLockAndShadow(t *testing.T) {
 			parsed.RolesSQL, p.RolesSQL, parsed.CatalogSQL, p.CatalogSQL)
 	}
 }
+
+// TestPlan_Document_PasswordRoundTripHashStable verifies Hash uses the same
+// password redaction as Document storage so apply --plan does not see drift.
+func TestPlan_Document_PasswordRoundTripHashStable(t *testing.T) {
+	p := &plan.Plan{
+		TargetSchema: "public",
+		RolesSQL:     `CREATE ROLE app_login LOGIN PASSWORD 's3cret-live';`,
+		Steps: []plan.Step{{
+			Type:  plan.ChangeAlterRole,
+			Table: "app_login",
+			SQL:   `ALTER ROLE "app_login" PASSWORD '********';`,
+		}},
+	}
+	want := p.Hash()
+	data, err := p.ToJSON()
+	if err != nil {
+		t.Fatalf("ToJSON: %v", err)
+	}
+	if strings.Contains(string(data), "s3cret-live") {
+		t.Fatal("document must not embed plaintext password")
+	}
+	parsed, envelopeHash, err := plan.ParsePlanJSON(data)
+	if err != nil {
+		t.Fatalf("ParsePlanJSON: %v", err)
+	}
+	if envelopeHash != want {
+		t.Fatalf("document envelope hash %q != original %q", envelopeHash, want)
+	}
+	if got := parsed.Hash(); got != want {
+		t.Fatalf("reloaded plan hash %q != original %q (Document/Hash redaction mismatch)", got, want)
+	}
+}

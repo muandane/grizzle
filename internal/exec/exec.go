@@ -294,7 +294,7 @@ func inspectPostgresSchemas(ctx context.Context, dbtx dialect.DBTX, schemas []st
 	return postgres.InspectSchemas(ctx, dbtx, schemas)
 }
 
-func execStepWithTracing(ctx context.Context, execer dialect.DBTX, s plan.Step, isNonTx bool, tracer Tracer, rolePasswords map[string]string) error {
+func execStepWithTracing(ctx context.Context, execer dialect.DBTX, s plan.Step, isNonTx bool, tracer Tracer, roleIR map[string]*schema.Role) error {
 	var span Span
 	if tracer != nil {
 		_, span = tracer.Start(ctx, "grizzle.exec_step")
@@ -304,8 +304,15 @@ func execStepWithTracing(ctx context.Context, execer dialect.DBTX, s plan.Step, 
 		span.SetAttribute("step.sql", s.SQL)
 		span.SetAttribute("step.non_tx", isNonTx)
 	}
-	sql := materializeRoleStepSQL(s, rolePasswords)
-	_, err := execer.ExecContext(ctx, sql)
+	sql, err := materializeRoleStepSQL(s, roleIR)
+	if err != nil {
+		if span != nil {
+			span.RecordError(err)
+			span.End()
+		}
+		return err
+	}
+	_, err = execer.ExecContext(ctx, sql)
 	if span != nil {
 		if err != nil {
 			span.RecordError(err)
@@ -315,12 +322,12 @@ func execStepWithTracing(ctx context.Context, execer dialect.DBTX, s plan.Step, 
 	return err
 }
 
-func rolePasswordsFromConfig(cfg PostgresExecConfig) map[string]string {
+func roleIRFromConfig(cfg PostgresExecConfig) map[string]*schema.Role {
 	desired, err := desiredRolesSpec(cfg)
 	if err != nil || desired == nil {
 		return nil
 	}
-	return desiredRolePasswords(desired)
+	return desiredRoleIR(desired)
 }
 
 // StepGroup partitions contiguous steps into transactional and non-transactional execution batches.
@@ -658,7 +665,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig, b
 
 	// 7. Apply DDL statements split into transactional and non-transactional groups
 	groups := GroupSteps(steps)
-	rolePasswords := rolePasswordsFromConfig(cfg)
+	roleIR := roleIRFromConfig(cfg)
 	stepIdx := 0
 	committedSteps := 0
 	// histErr captures a failed success-path history write: reported as a
@@ -698,7 +705,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig, b
 					recordFailureHistory(stepIdx, hookErr, false)
 					return committedSteps, hookErr
 				}
-				if err := execStepWithTracing(ctx, conn, s, true, cfg.Tracer, rolePasswords); err != nil {
+				if err := execStepWithTracing(ctx, conn, s, true, cfg.Tracer, roleIR); err != nil {
 					if logger != nil {
 						logger.ErrorContext(ctx, "grizzle: failed executing non-tx step", "step_index", stepIdx, "sql", s.SQL, "error", err)
 					}
@@ -747,7 +754,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig, b
 					recordFailureHistory(stepIdx, hookErr, false)
 					return committedSteps, hookErr
 				}
-				if err := execStepWithTracing(ctx, tx, s, false, cfg.Tracer, rolePasswords); err != nil {
+				if err := execStepWithTracing(ctx, tx, s, false, cfg.Tracer, roleIR); err != nil {
 					_ = tx.Rollback()
 					if logger != nil {
 						logger.ErrorContext(ctx, "grizzle: failed executing step in tx", "step_index", stepIdx, "sql", s.SQL, "error", err)
@@ -1346,10 +1353,10 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 
 	// Apply DDL statements split into transactional and non-transactional groups
 	groups := GroupSteps(p.Steps)
-	rolePasswords := rolePasswordsFromConfig(cfg)
-	if len(rolePasswords) == 0 && (p.RolesSQL != "" || p.SchemaSQL != "") {
+	roleIR := roleIRFromConfig(cfg)
+	if len(roleIR) == 0 && (p.RolesSQL != "" || p.SchemaSQL != "") {
 		// Direct apply may carry RolesSQL on the plan when cfg omits it.
-		rolePasswords = rolePasswordsFromConfig(PostgresExecConfig{
+		roleIR = roleIRFromConfig(PostgresExecConfig{
 			SchemaSQL:    p.SchemaSQL,
 			RolesSQL:     p.RolesSQL,
 			TargetSchema: primarySchema,
@@ -1392,7 +1399,7 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 					recordFailureHistory(stepIdx, hookErr, false)
 					return committedSteps, hookErr
 				}
-				if err := execStepWithTracing(ctx, conn, s, true, cfg.Tracer, rolePasswords); err != nil {
+				if err := execStepWithTracing(ctx, conn, s, true, cfg.Tracer, roleIR); err != nil {
 					if logger != nil {
 						logger.ErrorContext(ctx, "grizzle: failed executing non-tx step", "step_index", stepIdx, "sql", s.SQL, "error", err)
 					}
@@ -1440,7 +1447,7 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 					recordFailureHistory(stepIdx, hookErr, false)
 					return committedSteps, hookErr
 				}
-				if err := execStepWithTracing(ctx, tx, s, false, cfg.Tracer, rolePasswords); err != nil {
+				if err := execStepWithTracing(ctx, tx, s, false, cfg.Tracer, roleIR); err != nil {
 					_ = tx.Rollback()
 					if logger != nil {
 						logger.ErrorContext(ctx, "grizzle: failed executing step in tx", "step_index", stepIdx, "sql", s.SQL, "error", err)

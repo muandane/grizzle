@@ -361,13 +361,19 @@ func MergeRolesSpecs(schemaSpec, sideSpec *RolesSpec) *RolesSpec {
 // canonical grant target.
 func MergeRolesSpecsForTarget(schemaSpec, sideSpec *RolesSpec, targetSchema string) *RolesSpec {
 	out := &RolesSpec{Roles: make(map[string]*Role)}
-	for _, spec := range []*RolesSpec{schemaSpec, sideSpec} {
-		if spec == nil {
-			continue
+	if schemaSpec != nil {
+		for key, role := range schemaSpec.Roles {
+			out.Roles[key] = cloneRole(role)
 		}
-		for key, role := range spec.Roles {
-			// Side-channel (second pass) replaces schema entries wholesale,
-			// carrying all attributes so LOGIN/PASSWORD/SET from RolesSQL win.
+	}
+	if sideSpec != nil {
+		for key, role := range sideSpec.Roles {
+			if existing := out.Roles[key]; existing != nil {
+				// Preserve SchemaSQL attrs when RolesSQL only carries ALTER
+				// fragments; side-channel values still win on conflicts.
+				mergeRoleAttrs(existing, role)
+				continue
+			}
 			out.Roles[key] = cloneRole(role)
 		}
 	}

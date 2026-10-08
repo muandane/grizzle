@@ -286,12 +286,13 @@ func (p *Plan) Hash() string {
 		write("non_concurrent:true\n")
 	}
 	if p.SchemaSQL != "" {
-		// Password literals are replaced with digests so secrets never enter
-		// the hash payload while password changes still move the digest.
-		write("schema_sql:%s\n", schema.HashStableRolesSQL(p.SchemaSQL))
+		// Redact password literals so Hash matches Document() storage and
+		// ParsePlanJSON round-trips without ErrPlanDrift. Secrets never enter
+		// the hash payload.
+		write("schema_sql:%s\n", schema.RedactRolePasswordsSQL(p.SchemaSQL))
 	}
 	if p.RolesSQL != "" {
-		write("roles_sql:%s\n", schema.HashStableRolesSQL(p.RolesSQL))
+		write("roles_sql:%s\n", schema.RedactRolePasswordsSQL(p.RolesSQL))
 	}
 	if p.CatalogSQL != "" {
 		write("catalog_sql:%s\n", p.CatalogSQL)
