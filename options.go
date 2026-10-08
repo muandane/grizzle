@@ -146,24 +146,16 @@ type Options struct {
 
 	// Renames maps old column names to new column names (e.g. "users.old_col": "new_col" or "old_col": "new_col")
 	// to explicitly disambiguate column renames instead of treating them as DROP + ADD.
-	//
-	// Experimental: the rename mapping format and RENAME_AMBIGUOUS semantics
-	// may change before the 1.0 release.
+	// Keys are `table.old` or `old`; values are the new column name.
 	Renames map[string]string
 
 	// ExpandContract enables staged expand-and-contract zero-downtime migrations (ZDM).
 	// In expand mode, renamed or modified columns are added alongside existing columns,
 	// delaying destructive drops to a later, separately approved plan.
-	//
-	// Experimental: staged expand-and-contract plans are under active development;
-	// the contract phase and hazard surface may change before the 1.0 release.
 	ExpandContract bool
 
 	// Backfill hook function run outside the DDL lock window in batches during staged expand migration.
-	//
-	// Experimental: backfill batching semantics (batch size, ordering, error
-	// handling) may change before the 1.0 release. The CLI installs a hook via
-	// --backfill / --backfill-file when --expand-contract is set; a library
+	// The CLI installs a hook via --backfill / --backfill-file when --expand-contract is set; a library
 	// Backfill still wins when both are configured by the caller.
 	Backfill BackfillFunc
 
@@ -660,9 +652,7 @@ func resolveDropPolicy(opts Options) plan.DropPolicy {
 }
 
 // WithRenames sets the explicit column rename mapping.
-//
-// Experimental: the rename mapping format and RENAME_AMBIGUOUS semantics
-// may change before the 1.0 release.
+// Keys are `table.old` or `old`; values are the new column name.
 func WithRenames(renames map[string]string) Option {
 	return func(o *Options) {
 		o.Renames = renames
@@ -670,9 +660,6 @@ func WithRenames(renames map[string]string) Option {
 }
 
 // WithExpandContract enables or disables staged expand-and-contract zero-downtime migrations.
-//
-// Experimental: staged expand-and-contract plans are under active development;
-// the contract phase and hazard surface may change before the 1.0 release.
 func WithExpandContract(expand bool) Option {
 	return func(o *Options) {
 		o.ExpandContract = expand
@@ -680,10 +667,8 @@ func WithExpandContract(expand bool) Option {
 }
 
 // WithBackfill configures the batch backfill hook function for staged expand migrations.
-//
-// Experimental: backfill batching semantics (batch size, ordering, error
-// handling) may change before the 1.0 release. There is no CLI equivalent;
-// backfill is library-only.
+// The CLI also installs a hook via --backfill / --backfill-file; a library Backfill
+// wins when both are configured by the caller.
 func WithBackfill(fn BackfillFunc) Option {
 	return func(o *Options) {
 		o.Backfill = fn

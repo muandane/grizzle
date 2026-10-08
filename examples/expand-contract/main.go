@@ -1,16 +1,15 @@
 // Package main demonstrates zero-downtime expand/contract migrations with
 // Grizzle: a column rename executed in two separately-approved stages with a
-// library-side backfill between them.
+// backfill between them.
 //
 //	Phase 1 (expand):   add users.display_name alongside users.full_name,
 //	                    nullable, while the application keeps both alive.
 //	Phase 2 (backfill): copy existing values outside the DDL lock window
-//	                    (library-only: Options.Backfill / WithBackfill).
+//	                    (Options.Backfill / WithBackfill, or CLI --backfill).
 //	Phase 3 (contract): a second plan drops users.full_name once the
 //	                    application only reads display_name.
 //
-// The CLI exposes --expand-contract and --rename for planning the same flow;
-// backfill remains library-only.
+// The CLI exposes --expand-contract, --rename, and --backfill for the same flow.
 package main
 
 import (
@@ -78,11 +77,11 @@ func main() {
 		TargetSchema:   targetSchema,
 		SchemaSQL:      schemaSQL,
 		Renames:        renames,
-		ExpandContract: true, // Experimental: staged expand-and-contract
+		ExpandContract: true,
 		Backfill: func(_ context.Context, tx *sql.Tx, table, oldCol, newCol string) error {
-			// Library-only hook: run in batches inside a dedicated
-			// transaction, outside the DDL lock window. The hook receives the
-			// bare table name, so qualify it with the target schema.
+			// Run in batches inside a dedicated transaction, outside the DDL
+			// lock window. The hook receives the bare table name, so qualify
+			// it with the target schema.
 			tbl := fmt.Sprintf("%q", table)
 			if targetSchema != "" {
 				tbl = fmt.Sprintf("%q.%q", targetSchema, table)

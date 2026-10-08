@@ -2,12 +2,12 @@
 
 ## Overview
 
-Demonstrates a column rename (`users.full_name` → `users.display_name`) executed without downtime using Grizzle's staged expand-and-contract flow (experimental):
+Demonstrates a column rename (`users.full_name` → `users.display_name`) executed without downtime using Grizzle's staged expand-and-contract flow:
 
 | Phase | What happens | Approval |
 | :--- | :--- | :--- |
 | 1. Expand | `display_name` is added alongside `full_name` as nullable — no existing column or data is touched | Safe; non-destructive |
-| 2. Backfill | Existing values are copied in batches **outside** the DDL lock window via the library-only `Options.Backfill` hook | Library code (`WithBackfill`) |
+| 2. Backfill | Existing values are copied in batches **outside** the DDL lock window via `Options.Backfill` or CLI `--backfill` | Library hook or `--backfill=copy` / `--backfill-file` |
 | 3. Contract | A second, separately-approved plan drops `full_name` once the application only reads `display_name` | Requires `AllowDropColumn` + `AcceptHazards: [DROP_COLUMN]` |
 
 The old column stays fully functional during the expand and backfill phases, so rolling deploys and long-running queries are unaffected.
@@ -24,21 +24,16 @@ The example is idempotent: on an empty database it bootstraps the v1 shape, then
 
 ## CLI equivalents
 
-Planning the same flow with the CLI (backfill stays library-only):
-
 ```bash
-# Phase 1: expand plan (adds display_name alongside full_name)
-grizzle plan --schema schema.sql --out expand.json \
-  --rename users.full_name=display_name --expand-contract
+# Phase 1: expand plan (adds display_name alongside full_name) + copy backfill
+grizzle apply --schema schema.sql \
+  --rename users.full_name=display_name --expand-contract --backfill=copy
 
 # Phase 3: contract plan (drops full_name once clients are migrated)
 grizzle plan --schema schema.sql --out contract.json \
   --rename users.full_name=display_name --allow-drop
 grizzle apply --plan contract.json --accept-hazard DROP_COLUMN
 ```
-
-> [!NOTE]
-> `Options.Renames`, `ExpandContract`, and `Backfill` are **Experimental**: the mapping format, staged plan shape, and backfill batching semantics may change before 1.0. There is no CLI backfill runner; backfill is library-only.
 
 ## Operational sequence
 

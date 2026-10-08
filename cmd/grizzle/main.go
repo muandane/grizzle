@@ -157,8 +157,8 @@ func run(args []string) int {
 	fs.Var(&hazards, "accept-hazard", "Hazard code to accept (can be repeated or comma-separated)")
 
 	renames := renameFlags{}
-	fs.Var(&renames, "rename", "Explicit column rename mapping old=new, optionally table-qualified table.old=new (experimental; can be repeated)")
-	expandContract := fs.Bool("expand-contract", false, "Emit staged expand-and-contract (ZDM) plans; new columns are added alongside existing ones and drops are deferred to a separate contract plan (experimental)")
+	fs.Var(&renames, "rename", "Explicit column rename mapping old=new, optionally table-qualified table.old=new (can be repeated)")
+	expandContract := fs.Bool("expand-contract", false, "Emit staged expand-and-contract (ZDM) plans; new columns are added alongside existing ones and drops are deferred to a separate contract plan")
 	var backfill backfillFlag
 	fs.Var(&backfill, "backfill", "Backfill strategy during expand-contract (default copy when flag present); use --backfill, --backfill=copy, or --backfill copy")
 	backfillFile := fs.String("backfill-file", "", "SQL file for expand-contract backfill with {table}, {old}, {new}, {batch} placeholders")

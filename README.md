@@ -66,7 +66,7 @@ For a reviewable plan instead of boot sync, use `PlanDiff` then `Apply` with `Ex
 
 **SQLite 3.35+**: tables, columns, indexes, FKs, CHECKs, generated columns, and 12-step rebuilds when in-place ALTER is not enough. Pure Go (`modernc.org/sqlite`) or CGo (`mattn/go-sqlite3`).
 
-Experimental (API may change before 1.0): column renames (`Options.Renames`) and expand/contract (`Options.ExpandContract`, `Options.Backfill`).
+Column renames (`Options.Renames`) and expand/contract (`Options.ExpandContract`, `Options.Backfill`, CLI `--backfill`) are supported staged-migration surfaces.
 
 Full surface and hazards: [docs/SPEC.md](docs/SPEC.md), [docs/SAFETY.md](docs/SAFETY.md).
 
@@ -101,7 +101,7 @@ Advisory locks are session-scoped. Use session pooling or a direct Postgres conn
 - [sqlc-workflow](examples/sqlc-workflow) — shared `schema.sql` with sqlc
 - [postgres-pgxpool](examples/postgres-pgxpool) — `*pgxpool.Pool`
 - [kubernetes-blueprint](examples/kubernetes-blueprint) — multi-replica boot
-- [expand-contract](examples/expand-contract) — staged rename (experimental)
+- [expand-contract](examples/expand-contract) — staged rename
 - [roles-grants](examples/roles-grants) / [catalog-sync](examples/catalog-sync) — role/catalog files and unified-schema overlays
 
 ## Docs

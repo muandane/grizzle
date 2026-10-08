@@ -108,7 +108,7 @@ This document outlines the step-by-step execution plan to build, test, and ship 
 - [x] **5.4 First release (v0.1.0)**
   - All test suites passing with race detector, zero static analysis issues.
   - Tag `v0.1.0-rc.1` from a green `main`; docs and code claims reconciled (see CONTRIBUTING release steps).
-  - Not yet v1.0.0: the API carries `Experimental:` surfaces (renames, expand/contract, backfill) that may still change.
+  - Renames, expand/contract, and backfill are frozen shapes (no longer marked Experimental). A v1.0.0 tag is a separate release decision.
 
 ## Post-0.1 backlog
 
@@ -117,9 +117,9 @@ Ordered by expected impact; nothing here blocks the first release.
 - [x] **Declarative management surface expansion** — shipped (see "Managed surface expansion" below): extensions, RLS + policies, functions, triggers, and views/matviews are now first-class managed constructs.
 - [x] **SQLite declarative CHECK constraints** — named and inline CHECK constraints are parsed from `sqlite_schema.sql`, emitted on create/rebuild, and diffed (check drift triggers a rebuild; removals gated by `AllowDropCheck` + `DROP_CHECK`).
 - [x] **Domain CHECK management** — domains are managed end-to-end: base type/nullability/default diffed from `pg_type` + `pg_constraint` (`conrelid = 0`), CHECK drift via `ALTER DOMAIN ADD/DROP CONSTRAINT`, drops gated by `AllowDropDomain` + `DROP_DOMAIN`.
-- [ ] **CLI backfill runner** — batched backfill is library-only (`Options.Backfill`); a CLI runner would need a durable batching contract.
+- [x] **CLI backfill runner** — `--backfill copy` / `--backfill-file` on the existing `RunBackfill` loop when `--expand-contract` is set; `--backfill-batch` default 1000; single-column PK required.
 - [x] **Multi-schema SQLite** — `SQLiteAttach` + `TargetSchemas`; per-schema diff/rebuild; shadow uses `:memory:` ATTACH (cross-DB FKs not validated).
-- [ ] **v1.0.0 API freeze** — remove `Experimental:` markers once rename mapping, staged plans, and backfill batching stabilize.
+- [x] **Stabilize Renames / ExpandContract / Backfill** — `Experimental:` markers removed; field shapes and `Plan.Hash()` inputs unchanged. No v1.0 tag in this slice.
 
 ## Managed surface expansion (shipped)
 

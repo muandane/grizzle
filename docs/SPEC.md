@@ -136,15 +136,17 @@ type Options struct {
 
     // Renames maps old column names to new column names (e.g. "users.old_col": "new_col")
     // to disambiguate renames instead of treating them as DROP + ADD.
-    // Experimental: mapping format may change before 1.0.
+    // Keys are `table.old` or `old`; values are the new column name.
     Renames map[string]string
 
-    // ExpandContract enables staged expand-and-contract zero-downtime migrations.
-    // Experimental: staged plan shape may change before 1.0.
+    // ExpandContract enables staged expand-and-contract zero-downtime migrations
+    // (expand plan vs contract plan; see invariant 7).
     ExpandContract bool
 
-    // Backfill hook is executed during staged expand migration outside the DDL lock window in batches.
-    // Experimental: library-only; no CLI equivalent.
+    // Backfill hook is executed during staged expand migration outside the DDL
+    // lock window in batches. The CLI installs a hook via --backfill /
+    // --backfill-file when --expand-contract is set; a library Backfill wins
+    // when both are configured.
     Backfill BackfillFunc
 
     // BeforeSync runs once before any migration steps or locks execute; a
@@ -557,7 +559,7 @@ Critical hazards (`DROP_TABLE`, `DROP_COLUMN`, `TYPE_NARROW`, `RENAME_AMBIGUOUS`
 Ambiguous column renames are blocked with `RENAME_AMBIGUOUS`; map them explicitly via `Options.Renames` (CLI: repeatable `--rename old=new`, optionally table-qualified `table.old=new`). Explicit renames execute either as atomic renames or, with `Options.ExpandContract` enabled (CLI: `--expand-contract`), as staged zero-downtime migrations:
 
 1. **Expand plan**: renamed/modified columns are added alongside existing columns as nullable; nothing is dropped or rewritten.
-2. **Backfill**: values are copied in batches outside the DDL lock window via the library-only `Options.Backfill` hook. There is no CLI backfill runner.
+2. **Backfill**: values are copied in batches outside the DDL lock window via `Options.Backfill` or the CLI `--backfill` / `--backfill-file` hooks (requires `--expand-contract`).
 3. **Contract plan**: a second, separately-approved plan (own deterministic hash) drops the legacy columns once the application no longer reads them; destructive, so it requires `AllowDropColumn` and explicit `AcceptHazards`.
 
 The `RENAME_AMBIGUOUS` hazard description and the interactive summary remediation point to `--rename`. See `examples/expand-contract` for a runnable end-to-end flow.
