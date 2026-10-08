@@ -52,7 +52,7 @@ jobs:
           (cd otelgrizzle && go vet ./...)
           go test -race -count=1 ./...
           (cd otelgrizzle && go test -race -count=1 ./...)
-          out=$(go test -tags integration -race -count=1 -v ./...)
+          out=$(go test -tags integration -race -count=1 -p 1 -v ./...)
           echo "$out"
           pass_count=$(echo "$out" | grep -c "^--- PASS" || true)
           echo "Executed passing integration tests: $pass_count"

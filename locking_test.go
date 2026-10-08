@@ -704,10 +704,13 @@ func TestLocking_PgTerminateBackendRecovery(t *testing.T) {
 				return
 			case <-ticker.C:
 				var pid int
+				// Scope to this test's index name + database so a parallel
+				// package's CREATE INDEX CONCURRENTLY is never terminated.
 				query := `
 					SELECT pid FROM pg_stat_activity
 					WHERE state = 'active'
-					  AND query LIKE '%CREATE INDEX CONCURRENTLY%'
+					  AND datname = current_database()
+					  AND query LIKE '%CREATE INDEX CONCURRENTLY%idx_term_email%'
 					  AND pid <> pg_backend_pid()
 					LIMIT 1;
 				`

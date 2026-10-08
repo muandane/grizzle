@@ -284,7 +284,8 @@ func TestHistory_PartialOnKilledNonTxStep(t *testing.T) {
 			findPID := `
 				SELECT pid FROM pg_stat_activity
 				WHERE state = 'active'
-				  AND query LIKE '%CREATE INDEX CONCURRENTLY%'
+				  AND datname = current_database()
+				  AND query LIKE '%CREATE INDEX CONCURRENTLY%idx_items_name%'
 				  AND pid <> pg_backend_pid()
 				LIMIT 1`
 			if err := db.QueryRowContext(terminateCtx, findPID).Scan(&pid); err != nil || pid <= 0 {
