@@ -12,8 +12,8 @@ In-process declarative migrations for embedded SQLite with zero Cgo (pure-Go `mo
 
 ## SQLite scope notes
 
-- Multi-schema is supported via `TargetSchemas` + `SQLiteAttach` (ATTACH DATABASE). Cross-database FKs are not enforced by SQLite and are not validated.
-- CHECK constraints are not introspected or diffed; rebuilds rewrite tables from the managed IR (see SPEC §3).
+- Multi-schema is supported via `TargetSchemas` + `SQLiteAttach` (`ATTACH DATABASE`). Cross-database FKs are not enforced by SQLite and are not validated.
+- CHECK constraints are parsed from `sqlite_schema` DDL, emitted on create/rebuild, and diffed (drift rebuilds the table; removals need `AllowDropCheck` + `DROP_CHECK`).
 
 ## Running
 
