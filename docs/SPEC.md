@@ -323,8 +323,11 @@ Semantics:
   or live objects); the sync aborts naming the missing function.
 - Drops are narrow: publications, event triggers, and subscriptions stamped
   with the `grizzle-managed` catalog comment are considered for dropping
-  (behind their AllowDrop* gates + CRITICAL hazards); operator-created
-  objects without markers are never swept. Slots use the explicit-drop policy above.
+  (behind their AllowDrop* gates + CRITICAL hazards), including the
+  DROP+CREATE recreate path used when definition drift cannot be expressed
+  as `ALTER`. Operator-created objects without markers are never swept; a
+  same-name unmanaged object that requires recreate fails closed at plan
+  time. Slots use the explicit-drop policy above.
 - `CREATE EVENT TRIGGER` DDL may require superuser; every plan step
   touching one emits `EVENT_TRIGGER_SUPERUSER` (WARNING). `FOR ALL
   TABLES` breadth emits `PUBLICATION_ALL_TABLES` (NOTICE).

@@ -1,6 +1,7 @@
 package diff
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 
@@ -174,12 +175,14 @@ func splitQualifiedIdentifier(name string) []string {
 // logical-slot sync steps from the desired CatalogSQL state and the live
 // catalog state.
 //
-// Destructive drops are narrow: live-only publications, event triggers, and
+// Destructive drops are narrow: publications, event triggers, and
 // subscriptions are dropped only when they carry the grizzle-managed marker
-// comment (operator-created catalog objects are never swept). Standalone
-// logical slots never auto-sweep (COMMENT ON unsupported); drops require an
-// explicit pg_drop_replication_slot. Objects named in the desired state are
-// always managed.
+// comment — including the recreate (DROP+CREATE) path used when definition
+// drift cannot be expressed as ALTER. Operator-created catalog objects without
+// the marker are never swept. Standalone logical slots never auto-sweep
+// (COMMENT ON unsupported); drops require an explicit pg_drop_replication_slot.
+// Objects named in the desired state are managed for create/alter; drops still
+// require the marker.
 //
 // targetSchema qualifies unqualified table names in desired publications.
 func CatalogDiff(desired *schema.CatalogSpec, live *CatalogLiveState, targetSchema string) []Change {
@@ -205,6 +208,12 @@ func CatalogDiff(desired *schema.CatalogSpec, live *CatalogLiveState, targetSche
 			continue
 		}
 		if publicationNeedsRecreate(want, liveP) {
+			if !liveP.Managed {
+				// Operator-created publication occupies this name. Never DROP
+				// it; callers must refuse via RefuseUnmanagedCatalogRecreates
+				// so Sync fails closed instead of silently drifting.
+				continue
+			}
 			changes = append(changes,
 				Change{
 					Type:        plan.ChangeDropPublication,
@@ -290,6 +299,11 @@ func CatalogDiff(desired *schema.CatalogSpec, live *CatalogLiveState, targetSche
 			continue
 		}
 		if eventTriggerNeedsRecreate(e, liveE, targetSchema) {
+			if !liveE.Managed {
+				// Operator-created event trigger occupies this name. Never
+				// DROP it; callers must refuse via RefuseUnmanagedCatalogRecreates.
+				continue
+			}
 			changes = append(changes,
 				Change{
 					Type:         plan.ChangeDropEventTrigger,
@@ -475,6 +489,45 @@ func CatalogDiff(desired *schema.CatalogSpec, live *CatalogLiveState, targetSche
 	}
 
 	return changes
+}
+
+// RefuseUnmanagedCatalogRecreates fails closed when a desired publication or
+// event trigger shares a name with an operator-created live object whose
+// definition cannot be reconciled without DROP+CREATE. CatalogDiff never
+// emits that DROP (marker-narrow policy); without this check Sync would
+// silently leave the desired state unconverged.
+func RefuseUnmanagedCatalogRecreates(desired *schema.CatalogSpec, live *CatalogLiveState, targetSchema string) error {
+	if desired == nil || live == nil {
+		return nil
+	}
+	for _, p := range desired.Publications {
+		if p == nil {
+			continue
+		}
+		key := schema.CanonicalIdentifierKey(p.Name)
+		liveP, exists := live.Publications[key]
+		if !exists || liveP.Managed {
+			continue
+		}
+		want := canonicalizePublication(p, targetSchema)
+		if publicationNeedsRecreate(want, liveP) {
+			return fmt.Errorf("refusing to replace publication %q: live object lacks the grizzle-managed marker; drop or rename the operator-created publication, or stamp COMMENT ON PUBLICATION ... IS 'grizzle-managed' before syncing", liveP.Name)
+		}
+	}
+	for _, e := range desired.EventTriggers {
+		if e == nil {
+			continue
+		}
+		key := schema.CanonicalIdentifierKey(e.Name)
+		liveE, exists := live.EventTriggers[key]
+		if !exists || liveE.Managed {
+			continue
+		}
+		if eventTriggerNeedsRecreate(e, liveE, targetSchema) {
+			return fmt.Errorf("refusing to replace event trigger %q: live object lacks the grizzle-managed marker; drop or rename the operator-created event trigger, or stamp COMMENT ON EVENT TRIGGER ... IS 'grizzle-managed' before syncing", liveE.Name)
+		}
+	}
+	return nil
 }
 
 func canonicalizeSubscription(s *schema.Subscription) *schema.Subscription {

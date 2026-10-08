@@ -54,6 +54,9 @@ func diffCatalogSteps(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecCo
 	if err := refuseActiveSlotDrops(desired, liveState); err != nil {
 		return nil, err
 	}
+	if err := diff.RefuseUnmanagedCatalogRecreates(desired, liveState, cfg.primarySchema()); err != nil {
+		return nil, err
+	}
 
 	changes := diff.CatalogDiff(desired, liveState, cfg.primarySchema())
 
