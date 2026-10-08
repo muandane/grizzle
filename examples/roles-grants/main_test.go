@@ -34,14 +34,21 @@ func TestExample_RolesGrants(t *testing.T) {
 	defer func() { _, _ = db.Exec("DROP SCHEMA IF EXISTS " + schema + " CASCADE") }()
 
 	// Roles are cluster-global; clear leftovers so the example stays idempotent.
-	_, _ = db.Exec(`DROP ROLE IF EXISTS app_read`)
-	_, _ = db.Exec(`DROP ROLE IF EXISTS app_writer`)
-	defer func() {
-		_, _ = db.Exec(`DROP ROLE IF EXISTS app_read`)
-		_, _ = db.Exec(`DROP ROLE IF EXISTS app_writer`)
-	}()
+	dropExampleRoles(db)
+	defer dropExampleRoles(db)
 
 	t.Setenv("DATABASE_URL", dsn)
 	t.Setenv("PG_SCHEMA", schema)
 	main()
+}
+
+// dropExampleRoles removes the example roles. DROP ROLE fails while the role
+// still holds privileges (the example grants CONNECT and schema/table access),
+// so revoke them first with DROP OWNED. Errors are ignored: a missing role is
+// the expected clean state.
+func dropExampleRoles(db *sql.DB) {
+	for _, role := range []string{"app_read", "app_writer"} {
+		_, _ = db.Exec(`DROP OWNED BY ` + role)
+		_, _ = db.Exec(`DROP ROLE IF EXISTS ` + role)
+	}
 }
