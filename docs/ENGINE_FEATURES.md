@@ -138,7 +138,7 @@ Check constraints enforce row-level validation predicates on table columns.
 
 ```sql
 CREATE TABLE products (
-    id BIGSERIAL PRIMARY KEY,
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     name TEXT NOT NULL,
     price_cents INT NOT NULL,
     discount_cents INT NOT NULL DEFAULT 0,
