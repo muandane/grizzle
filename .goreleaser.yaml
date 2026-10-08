@@ -37,6 +37,12 @@ archives:
 checksum:
   name_template: "checksums.txt"
 
+# Semver prerelease tags (rc / beta / alpha) publish as GitHub prereleases so
+# the Update Changelog workflow (`on: release: types: [released]`) does not run.
+release:
+  prerelease: auto
+  mode: replace
+
 snapshot:
   version_template: "{{ incpatch .Version }}-next"
 
