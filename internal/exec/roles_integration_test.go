@@ -10,8 +10,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/muandane/grizzle/internal/dialect/postgres"
 	"github.com/muandane/grizzle/internal/exec"
+	"github.com/muandane/grizzle/internal/history"
 	"github.com/muandane/grizzle/internal/plan"
+	"github.com/muandane/grizzle/internal/schema"
 	"github.com/muandane/grizzle/internal/scope"
 	"github.com/muandane/grizzle/internal/testutil"
 )
@@ -34,6 +37,120 @@ func TestRoles_FunctionGrantRejectsProcedure(t *testing.T) {
 		t.Fatal("FUNCTION grants to procedures must be rejected")
 	} else if !strings.Contains(err.Error(), "aggregates, procedures, and window functions are not supported") {
 		t.Fatalf("unexpected non-function grant error: %v", err)
+	}
+}
+
+func TestRoles_FunctionGrantSkipsInvalidEarlierRoutine(t *testing.T) {
+	db := testutil.TestDatabase(t)
+	ctx := context.Background()
+	shadowSchema := fmt.Sprintf("test_fn_shadow_%d", time.Now().UnixNano())
+	targetSchema := fmt.Sprintf("test_fn_target_%d", time.Now().UnixNano())
+	if _, err := db.Exec(fmt.Sprintf(`
+		CREATE SCHEMA %q;
+		CREATE SCHEMA %q;
+		CREATE PROCEDURE %q.same_name() LANGUAGE plpgsql AS $$ BEGIN NULL; END; $$;
+		CREATE FUNCTION %q.same_name() RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+	`, shadowSchema, targetSchema, shadowSchema, targetSchema)); err != nil {
+		t.Fatalf("create routine candidates: %v", err)
+	}
+	defer func() {
+		_, _ = db.Exec(fmt.Sprintf(`DROP SCHEMA %q CASCADE; DROP SCHEMA %q CASCADE;`, shadowSchema, targetSchema))
+	}()
+	spec := schema.ParseRolesSQL(`GRANT EXECUTE ON FUNCTION same_name() TO PUBLIC;`)
+	if err := postgres.ValidateFunctionGrantTargets(
+		ctx, db, spec, targetSchema, map[string]string{targetSchema: shadowSchema},
+	); err != nil {
+		t.Fatalf("valid later function must not be hidden by earlier procedure: %v", err)
+	}
+}
+
+func TestApplyPostgresRefusesUnmanagedRoleDrop(t *testing.T) {
+	db := testutil.TestDatabase(t)
+	ctx := context.Background()
+	roleName := fmt.Sprintf("unmanaged_drop_%d", time.Now().UnixNano())
+	if _, err := db.Exec(fmt.Sprintf(`CREATE ROLE %q;`, roleName)); err != nil {
+		t.Fatalf("create unmanaged role: %v", err)
+	}
+	defer func() { _, _ = db.Exec(fmt.Sprintf(`DROP ROLE IF EXISTS %q;`, roleName)) }()
+	if err := history.EnsureTable(ctx, db, "postgres", "public"); err != nil {
+		t.Fatalf("ensure history table: %v", err)
+	}
+
+	p := &plan.Plan{
+		TargetSchema: "public",
+		Policy:       plan.DropPolicy{AllowDropRole: true},
+		Steps: []plan.Step{{
+			Type:        plan.ChangeDropRole,
+			Table:       roleName,
+			SQL:         fmt.Sprintf(`DROP ROLE %q;`, roleName),
+			Destructive: true,
+		}},
+	}
+	err := exec.ApplyPostgres(ctx, db, p, exec.PostgresExecConfig{
+		TargetSchema:  "public",
+		Policy:        plan.DropPolicy{AllowDropRole: true},
+		AcceptHazards: []plan.HazardCode{plan.HazardDropRole},
+		LockTimeout:   5 * time.Second,
+	})
+	if err == nil || !strings.Contains(err.Error(), "exact grizzle-managed marker is absent") {
+		t.Fatalf("unmanaged role drop must be refused at apply time, got %v", err)
+	}
+	var count int
+	if err := db.QueryRow(`SELECT count(*) FROM pg_roles WHERE rolname = $1;`, roleName).Scan(&count); err != nil {
+		t.Fatalf("check unmanaged role: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("unmanaged role must remain after refused apply, count=%d", count)
+	}
+}
+
+func TestApplyPostgresRefusesDropWithUnrevokedRoleACL(t *testing.T) {
+	db := testutil.TestDatabase(t)
+	ctx := context.Background()
+	schemaName := fmt.Sprintf("test_drop_acl_%d", time.Now().UnixNano())
+	roleName := fmt.Sprintf("managed_drop_acl_%d", time.Now().UnixNano())
+	if _, err := db.Exec(fmt.Sprintf(`
+		CREATE SCHEMA %q;
+		CREATE TABLE %q.docs (id integer);
+		CREATE ROLE %q;
+		COMMENT ON ROLE %q IS 'grizzle-managed';
+		GRANT SELECT ON TABLE %q.docs TO %q;
+	`, schemaName, schemaName, roleName, roleName, schemaName, roleName)); err != nil {
+		t.Fatalf("create managed role dependency: %v", err)
+	}
+	defer func() {
+		_, _ = db.Exec(fmt.Sprintf(`DROP SCHEMA IF EXISTS %q CASCADE;`, schemaName))
+		_, _ = db.Exec(fmt.Sprintf(`DROP ROLE IF EXISTS %q;`, roleName))
+	}()
+	if err := history.EnsureTable(ctx, db, "postgres", "public"); err != nil {
+		t.Fatalf("ensure history table: %v", err)
+	}
+
+	p := &plan.Plan{
+		TargetSchema: schemaName,
+		Policy:       plan.DropPolicy{AllowDropRole: true},
+		Steps: []plan.Step{{
+			Type:        plan.ChangeDropRole,
+			Table:       roleName,
+			SQL:         fmt.Sprintf(`DROP ROLE %q;`, roleName),
+			Destructive: true,
+		}},
+	}
+	err := exec.ApplyPostgres(ctx, db, p, exec.PostgresExecConfig{
+		TargetSchema:  schemaName,
+		Policy:        plan.DropPolicy{AllowDropRole: true},
+		AcceptHazards: []plan.HazardCode{plan.HazardDropRole},
+		LockTimeout:   5 * time.Second,
+	})
+	if err == nil || !strings.Contains(err.Error(), "plan does not revoke ACL privilege") {
+		t.Fatalf("drop-only plan with ACL dependency must be refused, got %v", err)
+	}
+	var count int
+	if err := db.QueryRow(`SELECT count(*) FROM pg_roles WHERE rolname = $1;`, roleName).Scan(&count); err != nil {
+		t.Fatalf("check managed role: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("managed role must remain after refused apply, count=%d", count)
 	}
 }
 

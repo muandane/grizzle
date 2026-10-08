@@ -126,6 +126,15 @@ func RolesDiff(desired *schema.RolesSpec, live *RoleState, targetSchema string) 
 				g.GrantOption = dg.GrantOption
 				changes = append(changes, grantChange(plan.ChangeGrant, &g))
 			}
+			if missingOptions := subtractPrivileges(
+				missingPrivileges(optionSubset(dg), lg.GrantOptions),
+				missing,
+			); len(missingOptions) > 0 {
+				g := *dg
+				g.Privileges = missingOptions
+				g.GrantOption = true
+				changes = append(changes, grantChange(plan.ChangeGrant, &g))
+			}
 			continue
 		}
 		missingOptions := missingPrivileges(optionSubset(dg), lg.GrantOptions)

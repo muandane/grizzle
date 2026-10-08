@@ -164,7 +164,7 @@ func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig
 		if err != nil {
 			return nil, err
 		}
-		catalogSteps, err := diffCatalogSteps(ctx, dbtx, cfg)
+		catalogSteps, err := diffCatalogSteps(ctx, dbtx, cfg, serverVersion)
 		if err != nil {
 			return nil, err
 		}
@@ -219,7 +219,7 @@ func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig
 	if err != nil {
 		return nil, err
 	}
-	catalogSteps, err := diffCatalogSteps(ctx, dbtx, cfg)
+	catalogSteps, err := diffCatalogSteps(ctx, dbtx, cfg, serverVersion)
 	if err != nil {
 		return nil, err
 	}
@@ -1329,7 +1329,7 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 			droppedRoles = append(droppedRoles, step.Table)
 		}
 	}
-	if err := validateRoleDropSafety(ctx, conn, droppedRoles, targetSchemas); err != nil {
+	if err := validateRoleDropSafety(ctx, conn, droppedRoles, targetSchemas, p.Steps); err != nil {
 		return 0, err
 	}
 

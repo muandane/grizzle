@@ -252,11 +252,32 @@ func ValidateFunctionGrantTargets(ctx context.Context, dbtx dialect.DBTX, spec *
 				WHERE p.proname = $1
 				  AND pg_get_function_identity_arguments(p.oid) = $2
 				  AND n.nspname IN (%s)
+				  AND p.prokind = 'f'
 				ORDER BY CASE n.nspname %s END
 				LIMIT 1
 			), '');`, strings.Join(placeholders, ", "), strings.Join(orderCases, " ")), args...).Scan(&prokind)
 		if err != nil {
 			return fmt.Errorf("checking FUNCTION grant target %q: %w", grant.ObjectName, err)
+		}
+		if prokind == "" {
+			// Run a diagnostic lookup only after the ordinary-function lookup
+			// has failed. This preserves shadow/search-path precedence for
+			// valid functions while still reporting unsupported routine kinds
+			// clearly when no valid function exists.
+			err := dbtx.QueryRowContext(ctx, fmt.Sprintf(`
+				SELECT COALESCE((
+					SELECT p.prokind
+					FROM pg_proc p
+					JOIN pg_namespace n ON n.oid = p.pronamespace
+					WHERE p.proname = $1
+					  AND pg_get_function_identity_arguments(p.oid) = $2
+					  AND n.nspname IN (%s)
+					ORDER BY CASE n.nspname %s END
+					LIMIT 1
+				), '');`, strings.Join(placeholders, ", "), strings.Join(orderCases, " ")), args...).Scan(&prokind)
+			if err != nil {
+				return fmt.Errorf("checking FUNCTION grant target %q: %w", grant.ObjectName, err)
+			}
 		}
 		if prokind == "" {
 			return fmt.Errorf("FUNCTION grant target %q does not resolve to a managed routine", grant.ObjectName)
@@ -270,6 +291,27 @@ func ValidateFunctionGrantTargets(ctx context.Context, dbtx dialect.DBTX, spec *
 
 func roleManagedComment(comment string) bool {
 	return comment == schema.RoleManagedComment
+}
+
+// RoleHasManagedMarker verifies the exact catalog marker immediately before
+// a DROP ROLE. Direct plan application cannot rely on the marker snapshot
+// captured during planning.
+func RoleHasManagedMarker(ctx context.Context, dbtx dialect.DBTX, roleName string) (bool, error) {
+	var managed bool
+	err := dbtx.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM pg_roles r
+			JOIN pg_shdescription d
+			  ON d.objoid = r.oid
+			 AND d.classoid = 'pg_authid'::regclass
+			WHERE r.rolname = $1
+			  AND d.description = $2
+		);`, roleName, schema.RoleManagedComment).Scan(&managed)
+	if err != nil {
+		return false, fmt.Errorf("checking managed marker for role %q: %w", roleName, err)
+	}
+	return managed, nil
 }
 
 // scanRows iterates a *sql.Rows with a per-row callback, closing on all paths.

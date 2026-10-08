@@ -134,6 +134,28 @@ func TestRolesDiff_PublicDesiredStateNeverRevokes(t *testing.T) {
 	}
 }
 
+func TestRolesDiff_PublicAddsMissingGrantOptionWithoutRevoking(t *testing.T) {
+	desired := roleSpec(t, `GRANT SELECT ON docs TO PUBLIC WITH GRANT OPTION;`)
+	live := &diff.RoleState{
+		RoleNames:    map[string]string{},
+		ManagedRoles: map[string]bool{},
+		Grants: []*diff.RoleACLGrant{{
+			Grantee:    "PUBLIC",
+			ObjectKind: "TABLE",
+			ObjectName: "public.docs",
+			Privileges: []string{"SELECT", "INSERT"},
+		}},
+	}
+	changes := diff.RolesDiff(desired, live, "public")
+	if len(changes) != 1 ||
+		changes[0].Type != plan.ChangeGrant ||
+		!changes[0].Grant.GrantOption ||
+		len(changes[0].Grant.Privileges) != 1 ||
+		changes[0].Grant.Privileges[0] != "SELECT" {
+		t.Fatalf("PUBLIC grant-option addition must be precise and additive, got %+v", changes)
+	}
+}
+
 func TestRolesDiff_GrantOptionDrift(t *testing.T) {
 	// Desired adds WITH GRANT OPTION: re-grant.
 	desired := roleSpec(t, `GRANT SELECT ON docs TO app_read WITH GRANT OPTION;`)

@@ -18,13 +18,16 @@ import (
 // statement-scanned, the live state is inspected from
 // pg_publication/pg_event_trigger, and the diff renders CREATE/ALTER/DROP
 // steps that sort after roles and grants.
-func diffCatalogSteps(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig) ([]plan.Step, error) {
+func diffCatalogSteps(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig, serverVersion int) ([]plan.Step, error) {
 	desired, err := desiredCatalogSpec(cfg)
 	if err != nil {
 		return nil, err
 	}
 	if desired == nil {
 		return nil, nil
+	}
+	if err := validateCatalogServerVersion(desired, serverVersion); err != nil {
+		return nil, err
 	}
 
 	live, err := postgres.InspectLiveCatalog(ctx, dbtx)
@@ -58,6 +61,18 @@ func diffCatalogSteps(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecCo
 	// global order, since the schema step list is already sorted.
 	plan.SortSteps(steps)
 	return steps, nil
+}
+
+func validateCatalogServerVersion(spec *schema.CatalogSpec, serverVersion int) error {
+	if spec == nil || serverVersion == 0 || serverVersion >= 150000 {
+		return nil
+	}
+	for _, publication := range spec.Publications {
+		if len(publication.Schemas) > 0 {
+			return fmt.Errorf("%w: publication %q uses FOR TABLES IN SCHEMA, which requires PostgreSQL 15 or newer", plan.ErrInvalidOptions, publication.Name)
+		}
+	}
+	return nil
 }
 
 func desiredCatalogSpec(cfg PostgresExecConfig) (*schema.CatalogSpec, error) {
