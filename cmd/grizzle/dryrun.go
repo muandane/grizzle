@@ -13,7 +13,7 @@ import (
 
 // runDryRunApply verifies the planned DDL against live data without
 // persisting any change (live dry-run rollback verification).
-func runDryRunApply(ctx context.Context, db *sql.DB, planFile, schemaFile, rolesSQL, catalogSQL string, allowDrop bool, acceptedCodes []grizzle.HazardCode, renames map[string]string, expandContract bool) int {
+func runDryRunApply(ctx context.Context, db *sql.DB, planFile, schemaFile, rolesSQL, catalogSQL string, allowDrop bool, acceptedCodes []grizzle.HazardCode, renames map[string]string, expandContract bool, backfill grizzle.BackfillFunc) int {
 	if planFile != "" {
 		planData, err := os.ReadFile(filepath.Clean(planFile)) //nolint:gosec // G304: CLI accepts user-provided plan file path
 		if err != nil {
@@ -28,6 +28,7 @@ func runDryRunApply(ctx context.Context, db *sql.DB, planFile, schemaFile, roles
 		res, err := grizzle.DryRunVerifyPlan(ctx, db, p, grizzle.ApplyOpts{
 			ExpectedHash:  recordedHash,
 			AcceptHazards: acceptedCodes,
+			Backfill:      backfill,
 		})
 		if err != nil {
 			slog.Error("dry-run verification failed", "err", err)
@@ -51,6 +52,7 @@ func runDryRunApply(ctx context.Context, db *sql.DB, planFile, schemaFile, roles
 		AcceptHazards:  acceptedCodes,
 		Renames:        renames,
 		ExpandContract: expandContract,
+		Backfill:       backfill,
 	}
 	res, err := grizzle.DryRunVerify(ctx, db, opts)
 	if err != nil {

@@ -162,8 +162,9 @@ type Options struct {
 	// Backfill hook function run outside the DDL lock window in batches during staged expand migration.
 	//
 	// Experimental: backfill batching semantics (batch size, ordering, error
-	// handling) may change before the 1.0 release. There is no CLI equivalent;
-	// backfill is library-only.
+	// handling) may change before the 1.0 release. The CLI installs a hook via
+	// --backfill / --backfill-file when --expand-contract is set; a library
+	// Backfill still wins when both are configured by the caller.
 	Backfill BackfillFunc
 
 	// BeforeSync runs once before any migration steps or locks are executed.
