@@ -28,7 +28,7 @@ func TestPostgresIdentifierRenderingEscapesAndPreservesQualifiedNames(t *testing
 	if got, want := quoteIdentifier(`role"name`), `"role""name"`; got != want {
 		t.Fatalf("quoteIdentifier = %q, want %q", got, want)
 	}
-	if got, want := GenerateCreateRoleSQL(`role"name`), `CREATE ROLE "role""name" NOLOGIN;`; got != want {
+	if got, want := GenerateCreateRoleSQL(&schema.Role{Name: `role"name`}), `CREATE ROLE "role""name" NOLOGIN;`; got != want {
 		t.Fatalf("role renderer = %q, want %q", got, want)
 	}
 	grantSQL := GenerateGrantSQL(&schema.Grant{
@@ -71,7 +71,7 @@ func TestRoleManagedCommentRequiresExactMarker(t *testing.T) {
 
 func TestGenerateRoleSQL_DoublesMaliciousQuotes(t *testing.T) {
 	roleName := `role"; DROP ROLE admin; --`
-	if got, want := GenerateCreateRoleSQL(roleName), `CREATE ROLE "role""; DROP ROLE admin; --" NOLOGIN;`; got != want {
+	if got, want := GenerateCreateRoleSQL(&schema.Role{Name: roleName}), `CREATE ROLE "role""; DROP ROLE admin; --" NOLOGIN;`; got != want {
 		t.Fatalf("malicious role name rendering = %q, want %q", got, want)
 	}
 	grantSQL := GenerateGrantSQL(&schema.Grant{

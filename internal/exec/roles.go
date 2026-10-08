@@ -42,7 +42,8 @@ func diffRolesSteps(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConf
 		return nil, fmt.Errorf("validating role privileges: %w", err)
 	}
 
-	live, err := postgres.InspectLiveRoles(ctx, dbtx, cfg.targetSchemas())
+	desiredPasswords := desiredRolePasswords(desired)
+	live, err := postgres.InspectLiveRoles(ctx, dbtx, cfg.targetSchemas(), desiredPasswords)
 	if err != nil {
 		return nil, fmt.Errorf("%w: roles: %w", plan.ErrInspectionFailed, err)
 	}
@@ -73,7 +74,7 @@ func validateRoleDropSafety(ctx context.Context, dbtx dialect.DBTX, roleNames, t
 	var live *postgres.LiveRoles
 	if len(roleNames) > 0 {
 		var err error
-		live, err = postgres.InspectLiveRoles(ctx, dbtx, targetSchemas)
+		live, err = postgres.InspectLiveRoles(ctx, dbtx, targetSchemas, nil)
 		if err != nil {
 			return fmt.Errorf("%w: roles: %w", plan.ErrInspectionFailed, err)
 		}
@@ -200,7 +201,7 @@ func parseRevokeStep(step plan.Step) (parsedRevoke, bool) {
 		return parsedRevoke{}, false
 	}
 	privileges := make([]string, 0)
-	for _, privilege := range strings.Split(privilegeText, ",") {
+	for privilege := range strings.SplitSeq(privilegeText, ",") {
 		privilege = strings.ToUpper(strings.TrimSpace(privilege))
 		if privilege != "" {
 			privileges = append(privileges, privilege)
@@ -273,4 +274,71 @@ func desiredRolesSpec(cfg PostgresExecConfig) (*schema.RolesSpec, error) {
 		schema.ParseRolesSQL(cfg.RolesSQL),
 		cfg.primarySchema(),
 	), nil
+}
+
+func desiredRoleIR(spec *schema.RolesSpec) map[string]*schema.Role {
+	out := make(map[string]*schema.Role)
+	if spec == nil {
+		return out
+	}
+	for _, role := range spec.Roles {
+		out[schema.CanonicalIdentifierKey(role.Name)] = role
+	}
+	return out
+}
+
+func desiredRolePasswords(spec *schema.RolesSpec) map[string]string {
+	out := make(map[string]string)
+	for key, role := range desiredRoleIR(spec) {
+		if schema.RoleHasUsablePassword(role) {
+			out[key] = role.Password
+		}
+	}
+	return out
+}
+
+func stepNeedsRolePassword(step plan.Step) bool {
+	switch step.Type {
+	case plan.ChangeAlterRole, plan.ChangeCreateRole:
+		return strings.Contains(strings.ToUpper(step.SQL), "PASSWORD")
+	default:
+		return false
+	}
+}
+
+func lookupDesiredRole(roles map[string]*schema.Role, name string) *schema.Role {
+	if roles == nil {
+		return nil
+	}
+	if role := roles[schema.CanonicalIdentifierKey(name)]; role != nil {
+		return role
+	}
+	return roles[name]
+}
+
+// materializeRoleStepSQL rebuilds executable role SQL from desired Role IR.
+// Password-bearing steps never execute redacted Step.SQL; missing plaintext IR
+// fails closed with a clear error.
+func materializeRoleStepSQL(step plan.Step, roles map[string]*schema.Role) (string, error) {
+	if !stepNeedsRolePassword(step) {
+		return step.SQL, nil
+	}
+	role := lookupDesiredRole(roles, step.Table)
+	if !schema.RoleHasUsablePassword(role) {
+		return "", fmt.Errorf("cannot apply PASSWORD for role %q: plaintext password IR is unavailable; provide RolesSQL/SchemaSQL with the real PASSWORD (plan artifacts redact secrets and cannot be applied alone)", step.Table)
+	}
+	switch step.Type {
+	case plan.ChangeAlterRole:
+		// Password alters are emitted as password-only changes; rebuild from IR.
+		return postgres.GenerateAlterRoleApplySQL(&schema.Role{
+			Name:        role.Name,
+			Password:    role.Password,
+			HasPassword: true,
+		}), nil
+	case plan.ChangeCreateRole:
+		// CREATE steps do not embed passwords; password follows as ALTER_ROLE.
+		return step.SQL, nil
+	default:
+		return step.SQL, nil
+	}
 }

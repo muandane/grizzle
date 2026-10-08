@@ -8,12 +8,11 @@
 -- Contract (docs/SPEC.md §2.2 "RolesSQL contract"):
 --   * The same role statements may be placed in SchemaSQL. This optional
 --     --roles file is authoritative when a role/grant identity is duplicated.
---   * CREATE ROLE/USER [NOLOGIN] and object-privilege GRANT/REVOKE statements
---     are accepted. ALTER/DROP ROLE/USER, password options, and other role
---     configuration fail with ErrInvalidOptions instead of being silently
---     ignored; role configuration is reserved for PR2.
---   * Declared roles are created NOLOGIN (group roles). Grizzle never sets or
---     rotates passwords; interactive-login roles stay outside the contract.
+--   * CREATE/ALTER ROLE/USER (LOGIN/PASSWORD/config attrs) and object-privilege
+--     GRANT/REVOKE statements are accepted. DROP ROLE/USER and
+--     SUPERUSER/REPLICATION/BYPASSRLS fail with ErrInvalidOptions.
+--   * Omitting LOGIN/NOLOGIN keeps PostgreSQL's CREATE ROLE default (NOLOGIN).
+--     Passwords are managed via hash compare and never written into Step.SQL.
 --   * Roles Grizzle creates are stamped with a "grizzle-managed" catalog
 --     comment. Only marker-stamped roles that leave this file are dropped,
 --     and only behind AllowDropRole + the DROP_ROLE critical hazard.
@@ -23,22 +22,22 @@
 --     SEQUENCE: USAGE/SELECT/UPDATE, DATABASE: CONNECT/CREATE/TEMPORARY,
 --     SCHEMA: USAGE/CREATE, FUNCTION: EXECUTE).
 
-CREATE ROLE app_read;
-CREATE ROLE app_writer;
+CREATE ROLE grizzle_example_read;
+CREATE ROLE grizzle_example_writer;
 
 -- Read-only access to the docs table.
-GRANT SELECT ON docs TO app_read;
+GRANT SELECT ON docs TO grizzle_example_read;
 
 -- Full row CRUD on docs, plus the sequence backing its primary key.
-GRANT SELECT, INSERT, UPDATE, DELETE ON docs TO app_writer;
-GRANT USAGE ON SEQUENCE docs_id_seq TO app_writer;
+GRANT SELECT, INSERT, UPDATE, DELETE ON docs TO grizzle_example_writer;
+GRANT USAGE ON SEQUENCE docs_id_seq TO grizzle_example_writer;
 
 -- Schema and database level access.
-GRANT USAGE ON SCHEMA public TO app_read, app_writer;
-GRANT CONNECT ON DATABASE app TO app_read, app_writer;
+GRANT USAGE ON SCHEMA public TO grizzle_example_read, grizzle_example_writer;
+GRANT CONNECT ON DATABASE app TO grizzle_example_read, grizzle_example_writer;
 
 -- Function execution.
-GRANT EXECUTE ON FUNCTION notify_event() TO app_writer;
+GRANT EXECUTE ON FUNCTION notify_event() TO grizzle_example_writer;
 
 -- A grant WITH GRANT OPTION lets the grantee re-grant the privilege;
 -- revoking it renders REVOKE GRANT OPTION FOR ...

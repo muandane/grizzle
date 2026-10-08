@@ -12,14 +12,50 @@ import (
 
 // CompileSchemaSQLite compiles schemaSQL in an isolated in-memory SQLite
 // shadow database and returns the desired schema IR without touching any
-// persistent database.
-func CompileSchemaSQLite(ctx context.Context, schemaSQL string) (*schema.Schema, error) {
-	s, err := sqlite.CompileInShadow(ctx, schemaSQL)
+// persistent database. When schemas lists attached names, empty :memory:
+// databases are ATTACHed so multi-schema DDL compiles without live files.
+func CompileSchemaSQLite(ctx context.Context, schemaSQL string, schemas ...string) (*schema.Schema, error) {
+	if len(schemas) == 0 {
+		schemas = []string{"main"}
+	}
+	m, err := sqlite.CompileInShadowSchemas(ctx, schemaSQL, schemas)
 	if err != nil {
 		return nil, err
 	}
-	s.SourceSQL = schemaSQL
-	return s, nil
+	if len(schemas) == 1 {
+		s := m[schemas[0]]
+		if s == nil {
+			return nil, fmt.Errorf("sqlite: shadow schema %q missing after compile", schemas[0])
+		}
+		s.SourceSQL = schemaSQL
+		return s, nil
+	}
+	// Merge attached schemas into one IR; table keys are schema-qualified to
+	// avoid collisions across ATTACH databases.
+	merged := &schema.Schema{
+		Name:      schemas[0],
+		Tables:    make(map[string]*schema.Table),
+		Enums:     make(map[string]*schema.Enum),
+		Unmanaged: make(map[string]*schema.UnmanagedObject),
+		SourceSQL: schemaSQL,
+	}
+	for _, sch := range schemas {
+		s := m[sch]
+		if s == nil {
+			continue
+		}
+		for name, tbl := range s.Tables {
+			key := name
+			if sch != "main" {
+				key = sch + "." + name
+			}
+			merged.Tables[key] = tbl
+		}
+		for k, u := range s.Unmanaged {
+			merged.Unmanaged[sch+":"+k] = u
+		}
+	}
+	return merged, nil
 }
 
 // CompileSchemaPostgres compiles schemaSQL in the shadow schema within a

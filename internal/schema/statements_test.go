@@ -131,6 +131,8 @@ CREATE PUBLICATION docs_pub FOR TABLE docs;
 CREATE EVENT TRIGGER audit_ddl ON ddl_command_end EXECUTE FUNCTION log_ddl();
 ALTER PUBLICATION docs_pub ADD TABLE audit;
 DROP EVENT TRIGGER old_audit;
+CREATE SUBSCRIPTION docs_sub CONNECTION 'host=publisher dbname=pub' PUBLICATION docs_pub;
+SELECT pg_create_logical_replication_slot('docs_slot', 'pgoutput');
 ALTER TABLE docs ADD COLUMN title text;
 DROP ROLE should_stay_shadow;`
 
@@ -140,7 +142,9 @@ DROP ROLE should_stay_shadow;`
 		t.Fatalf("shadow SQL lost unsupported/DDL statements: %q", groups.ShadowSQL)
 	}
 	if strings.Contains(groups.ShadowSQL, "CREATE ROLE app_read") ||
-		strings.Contains(groups.ShadowSQL, "CREATE PUBLICATION docs_pub") {
+		strings.Contains(groups.ShadowSQL, "CREATE PUBLICATION docs_pub") ||
+		strings.Contains(groups.ShadowSQL, "CREATE SUBSCRIPTION") ||
+		strings.Contains(groups.ShadowSQL, "pg_create_logical_replication_slot") {
 		t.Fatalf("side-channel statements leaked into shadow SQL: %q", groups.ShadowSQL)
 	}
 	if !strings.Contains(groups.RolesSQL, "CREATE ROLE app_read") ||
@@ -153,7 +157,9 @@ DROP ROLE should_stay_shadow;`
 	if !strings.Contains(groups.CatalogSQL, "CREATE PUBLICATION docs_pub") ||
 		!strings.Contains(groups.CatalogSQL, "CREATE EVENT TRIGGER audit_ddl") ||
 		!strings.Contains(groups.CatalogSQL, "ALTER PUBLICATION docs_pub") ||
-		!strings.Contains(groups.CatalogSQL, "DROP EVENT TRIGGER old_audit") {
+		!strings.Contains(groups.CatalogSQL, "DROP EVENT TRIGGER old_audit") ||
+		!strings.Contains(groups.CatalogSQL, "CREATE SUBSCRIPTION docs_sub") ||
+		!strings.Contains(groups.CatalogSQL, "pg_create_logical_replication_slot") {
 		t.Fatalf("catalog statements not extracted: %q", groups.CatalogSQL)
 	}
 }

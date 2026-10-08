@@ -152,8 +152,12 @@ Supported hazard codes:
 | `REVOKE_PRIVILEGE` | `CRITICAL` | Privilege revoked from a grantee (access loss); requires `AllowRevoke` |
 | `DROP_ROLE` | `CRITICAL` | Grizzle-managed role dropped (memberships and grants disappear); requires `AllowDropRole`; refused outright if the role owns cluster objects |
 | `DROP_PUBLICATION` | `CRITICAL` | Grizzle-managed publication dropped (subscribers stop receiving changes); requires `AllowDropPublication` |
+| `DROP_SUBSCRIPTION` | `CRITICAL` | Grizzle-managed subscription dropped (remote slot kept via `slot_name = NONE`); requires `AllowDropSubscription` |
+| `DROP_REPLICATION_SLOT` | `CRITICAL` | Standalone logical replication slot dropped via explicit drop; requires `AllowDropReplicationSlot`; refused when active |
 | `DROP_EVENT_TRIGGER` | `CRITICAL` | Grizzle-managed event trigger dropped (DDL auditing/enforcement stops firing); requires `AllowDropEventTrigger` |
 | `GRANT_PUBLIC` | `WARNING` | Privileges granted to `PUBLIC` (ambient access for every role) |
+| `PASSWORD_CHANGE` | `WARNING` | Managed role password will be set or rotated (plaintext never appears in Step.SQL / plan JSON) |
+| `SUBSCRIPTION_CONNINFO` | `WARNING` | Subscription create/alter carries a connection string (redacted in Step.SQL / plan JSON) |
 | `EVENT_TRIGGER_SUPERUSER` | `WARNING` | Event-trigger DDL may require superuser or elevated privileges |
 | `PUBLICATION_ALL_TABLES` | `NOTICE` | Publication publishes ALL tables, including future ones |
 | `PARTITION_ATTACH_SCAN` | `WARNING` | Attaching existing standalone table to parent partitioned table requires validation scan under `ACCESS EXCLUSIVE` lock |
@@ -174,9 +178,9 @@ Supported hazard codes:
 
 ### Invariant 4b: Unmanaged objects policy — detected, protected, not managed
 
-Most schema constructs declared in `SchemaSQL` are managed declaratively (tables, columns, indexes, enums, CHECK/FK constraints, extensions, RLS + policies, COMMENT ON, functions, procedures, aggregates, domains, triggers, views/matviews). Role/grant and cluster-catalog statements (publications, event triggers) may also live in `SchemaSQL` and are statement-scanned outside shadow compilation; `RolesSQL` and `CatalogSQL` remain authoritative optional overlays. The objects Grizzle deliberately leaves unmanaged are those without a clean shadow-compile or diff story:
+Most schema constructs declared in `SchemaSQL` are managed declaratively (tables, columns, indexes, enums, CHECK/FK constraints, extensions, RLS + policies, COMMENT ON, functions, procedures, aggregates, domains, triggers, views/matviews). Role/grant and cluster-catalog statements (publications, event triggers, subscriptions, logical replication slots) may also live in `SchemaSQL` and are statement-scanned outside shadow compilation; `RolesSQL` and `CatalogSQL` remain authoritative optional overlays. The objects Grizzle deliberately leaves unmanaged are those without a clean shadow-compile or diff story:
 
-* Subscriptions and replication slots (`CREATE SUBSCRIPTION` etc. — cluster-attached replication consumers with side effects beyond any single managed database)
+* Physical replication slots (`pg_create_physical_replication_slot`)
 * Standalone sequences not owned by managed tables
 * Window functions (`prokind = 'w'`) and ordered-set/hypothetical aggregates, which fall outside the managed routine surface
 * Extension-owned objects (e.g. types and functions installed by `citext`, `pgcrypto`)

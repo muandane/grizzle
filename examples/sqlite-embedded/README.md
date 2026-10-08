@@ -12,7 +12,7 @@ In-process declarative migrations for embedded SQLite with zero Cgo (pure-Go `mo
 
 ## SQLite scope notes
 
-- Multi-schema configurations are rejected (`ErrUnsupportedMultiSchema`) — SQLite operates on one attached database per connection.
+- Multi-schema is supported via `TargetSchemas` + `SQLiteAttach` (ATTACH DATABASE). Cross-database FKs are not enforced by SQLite and are not validated.
 - CHECK constraints are not introspected or diffed; rebuilds rewrite tables from the managed IR (see SPEC §3).
 
 ## Running

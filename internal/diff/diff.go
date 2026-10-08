@@ -37,6 +37,9 @@ type Change struct {
 	OldPublication    *schema.Publication
 	EventTrigger      *schema.EventTrigger
 	OldEventTrigger   *schema.EventTrigger
+	Subscription      *schema.Subscription
+	OldSubscription   *schema.Subscription
+	ReplicationSlot   *schema.ReplicationSlot
 	Trigger           *schema.Trigger
 	View              *schema.View
 	Replace           bool

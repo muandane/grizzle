@@ -21,7 +21,7 @@ type Dialect string
 const (
 	// DialectAuto instructs Grizzle to auto-detect the engine from the driver type.
 	DialectAuto Dialect = ""
-	// DialectPostgres specifies PostgreSQL (13+).
+	// DialectPostgres specifies PostgreSQL (14+; CI-tested through 18).
 	DialectPostgres Dialect = "postgres"
 	// DialectSQLite specifies SQLite (3.35+).
 	DialectSQLite Dialect = "sqlite"
@@ -42,7 +42,14 @@ type Options struct {
 	TargetSchema string
 
 	// TargetSchemas specifies the database schemas to manage (defaults to [TargetSchema] or ["public"] for Postgres).
+	// For SQLite, entries other than "main" are ATTACH DATABASE schema names listed in SQLiteAttach.
 	TargetSchemas []string
+
+	// SQLiteAttach maps ATTACH DATABASE schema names to filesystem paths.
+	// Every TargetSchemas entry other than "main" must appear here; "main" is
+	// the primary database already open and must not be listed. Unknown keys,
+	// empty paths, and duplicate names are rejected. PostgreSQL ignores this field.
+	SQLiteAttach map[string]string
 
 	// ShadowSchema is the temporary schema name used for validation (defaults to "_grizzle_shadow").
 	ShadowSchema string
@@ -70,6 +77,19 @@ type Options struct {
 	// left CatalogSQL. Has no granular override; DROP_EVENT_TRIGGER
 	// (CRITICAL) still requires AcceptHazards.
 	AllowDropEventTrigger bool
+
+	// AllowDropSubscription permits dropping a managed subscription that
+	// left CatalogSQL. Has no granular override; DROP_SUBSCRIPTION
+	// (CRITICAL) still requires AcceptHazards. Remote slots are kept
+	// (DISABLE + SET slot_name = NONE before DROP).
+	AllowDropSubscription bool
+
+	// AllowDropReplicationSlot permits dropping a standalone logical
+	// replication slot via explicit SELECT pg_drop_replication_slot.
+	// Live-only slots are never swept. DROP_REPLICATION_SLOT (CRITICAL)
+	// still requires AcceptHazards. Active slots (active_pid IS NOT NULL)
+	// are refused.
+	AllowDropReplicationSlot bool
 
 	// Granular drop overrides (nil inherits from AllowDrop):
 	AllowDropTable     *bool
@@ -126,24 +146,17 @@ type Options struct {
 
 	// Renames maps old column names to new column names (e.g. "users.old_col": "new_col" or "old_col": "new_col")
 	// to explicitly disambiguate column renames instead of treating them as DROP + ADD.
-	//
-	// Experimental: the rename mapping format and RENAME_AMBIGUOUS semantics
-	// may change before the 1.0 release.
+	// Keys are `table.old` or `old`; values are the new column name.
 	Renames map[string]string
 
 	// ExpandContract enables staged expand-and-contract zero-downtime migrations (ZDM).
 	// In expand mode, renamed or modified columns are added alongside existing columns,
 	// delaying destructive drops to a later, separately approved plan.
-	//
-	// Experimental: staged expand-and-contract plans are under active development;
-	// the contract phase and hazard surface may change before the 1.0 release.
 	ExpandContract bool
 
 	// Backfill hook function run outside the DDL lock window in batches during staged expand migration.
-	//
-	// Experimental: backfill batching semantics (batch size, ordering, error
-	// handling) may change before the 1.0 release. There is no CLI equivalent;
-	// backfill is library-only.
+	// The CLI installs a hook via --backfill / --backfill-file when --expand-contract is set; a library
+	// Backfill still wins when both are configured by the caller.
 	Backfill BackfillFunc
 
 	// BeforeSync runs once before any migration steps or locks are executed.
@@ -194,8 +207,11 @@ type Options struct {
 	// alongside SchemaSQL. Duplicate role/grant identities in this explicit
 	// side-channel override entries extracted from SchemaSQL. Role statements
 	// are never shadow-compiled, and schema DDL is not valid here. Managed
-	// roles are NOLOGIN group roles; passwords are never managed. PostgreSQL
-	// only — ignored on SQLite.
+	// attributes include LOGIN/NOLOGIN, PASSWORD, VALID UNTIL, CONNECTION
+	// LIMIT, INHERIT, CREATEDB, CREATEROLE, and ALTER ROLE SET/RESET.
+	// SUPERUSER/REPLICATION/BYPASSRLS are refused. Passwords are compared by
+	// server-side hash equality and never written into Step.SQL or plan JSON.
+	// PostgreSQL only — ignored on SQLite.
 	RolesSQL string
 
 	// CatalogSQL optionally supplies desired cluster-catalog objects alongside
@@ -288,6 +304,13 @@ func WithTargetSchemas(schemas ...string) Option {
 		if len(schemas) > 0 {
 			o.TargetSchema = schemas[0]
 		}
+	}
+}
+
+// WithSQLiteAttach sets the SQLite ATTACH DATABASE map (schema name → path).
+func WithSQLiteAttach(attach map[string]string) Option {
+	return func(o *Options) {
+		o.SQLiteAttach = attach
 	}
 }
 
@@ -412,8 +435,8 @@ func (o *Options) Validate() error {
 
 	switch o.Dialect {
 	case DialectSQLite:
-		if len(o.TargetSchemas) > 1 {
-			return ErrUnsupportedMultiSchema
+		if err := validateSQLiteAttach(o); err != nil {
+			return err
 		}
 		if strings.TrimSpace(o.RolesSQL) != "" {
 			return fmt.Errorf("%w: RolesSQL requires PostgreSQL; roles are not managed on SQLite", ErrInvalidOptions)
@@ -484,6 +507,61 @@ func validateOptionIdent(ident string) error {
 	return nil
 }
 
+// validateSQLiteAttach enforces TargetSchemas ↔ SQLiteAttach consistency for SQLite.
+func validateSQLiteAttach(o *Options) error {
+	targets := o.TargetSchemas
+	if len(targets) == 0 && o.TargetSchema != "" {
+		targets = []string{o.TargetSchema}
+	}
+
+	seenTarget := make(map[string]bool, len(targets))
+	for _, name := range targets {
+		if name == "" {
+			return fmt.Errorf("%w: TargetSchemas entry must not be empty", ErrInvalidOptions)
+		}
+		if err := validateOptionIdent(name); err != nil {
+			return err
+		}
+		if seenTarget[name] {
+			return fmt.Errorf("%w: duplicate TargetSchemas entry %q", ErrInvalidOptions, name)
+		}
+		seenTarget[name] = true
+	}
+
+	seenAttach := make(map[string]bool, len(o.SQLiteAttach))
+	for name, path := range o.SQLiteAttach {
+		if name == "" {
+			return fmt.Errorf("%w: SQLiteAttach key must not be empty", ErrInvalidOptions)
+		}
+		if name == "main" {
+			return fmt.Errorf("%w: SQLiteAttach must not include %q (primary database is already open)", ErrInvalidOptions, name)
+		}
+		if err := validateOptionIdent(name); err != nil {
+			return fmt.Errorf("%w: SQLiteAttach key: %w", ErrInvalidOptions, err)
+		}
+		if seenAttach[name] {
+			return fmt.Errorf("%w: duplicate SQLiteAttach key %q", ErrInvalidOptions, name)
+		}
+		seenAttach[name] = true
+		if strings.TrimSpace(path) == "" {
+			return fmt.Errorf("%w: SQLiteAttach[%q] path must not be empty", ErrInvalidOptions, name)
+		}
+		if !seenTarget[name] {
+			return fmt.Errorf("%w: SQLiteAttach key %q is not listed in TargetSchemas", ErrInvalidOptions, name)
+		}
+	}
+
+	for name := range seenTarget {
+		if name == "main" {
+			continue
+		}
+		if _, ok := o.SQLiteAttach[name]; !ok {
+			return fmt.Errorf("%w: TargetSchemas entry %q requires SQLiteAttach[%q] filesystem path", ErrInvalidOptions, name, name)
+		}
+	}
+	return nil
+}
+
 // resolveDropPolicy extracts the effective fine-grained drop policy from Options.
 func resolveDropPolicy(opts Options) plan.DropPolicy {
 	allowTable := opts.AllowDrop
@@ -549,30 +627,32 @@ func resolveDropPolicy(opts Options) plan.DropPolicy {
 	allowDropRole := opts.AllowDrop || opts.AllowDropRole
 	allowDropPublication := opts.AllowDrop || opts.AllowDropPublication
 	allowDropEventTrigger := opts.AllowDrop || opts.AllowDropEventTrigger
+	allowDropSubscription := opts.AllowDrop || opts.AllowDropSubscription
+	allowDropReplicationSlot := opts.AllowDrop || opts.AllowDropReplicationSlot
 
 	return plan.DropPolicy{
-		AllowTable:            allowTable,
-		AllowColumn:           allowColumn,
-		AllowIndex:            allowIndex,
-		AllowFK:               allowFK,
-		AllowCheck:            allowCheck,
-		AllowExtension:        allowExtension,
-		AllowFunction:         allowFunction,
-		AllowPolicy:           allowPolicy,
-		AllowTrigger:          allowTrigger,
-		AllowView:             allowView,
-		AllowDomain:           allowDomain,
-		AllowRevoke:           allowRevoke,
-		AllowDropRole:         allowDropRole,
-		AllowDropPublication:  allowDropPublication,
-		AllowDropEventTrigger: allowDropEventTrigger,
+		AllowTable:               allowTable,
+		AllowColumn:              allowColumn,
+		AllowIndex:               allowIndex,
+		AllowFK:                  allowFK,
+		AllowCheck:               allowCheck,
+		AllowExtension:           allowExtension,
+		AllowFunction:            allowFunction,
+		AllowPolicy:              allowPolicy,
+		AllowTrigger:             allowTrigger,
+		AllowView:                allowView,
+		AllowDomain:              allowDomain,
+		AllowRevoke:              allowRevoke,
+		AllowDropRole:            allowDropRole,
+		AllowDropPublication:     allowDropPublication,
+		AllowDropEventTrigger:    allowDropEventTrigger,
+		AllowDropSubscription:    allowDropSubscription,
+		AllowDropReplicationSlot: allowDropReplicationSlot,
 	}
 }
 
 // WithRenames sets the explicit column rename mapping.
-//
-// Experimental: the rename mapping format and RENAME_AMBIGUOUS semantics
-// may change before the 1.0 release.
+// Keys are `table.old` or `old`; values are the new column name.
 func WithRenames(renames map[string]string) Option {
 	return func(o *Options) {
 		o.Renames = renames
@@ -580,9 +660,6 @@ func WithRenames(renames map[string]string) Option {
 }
 
 // WithExpandContract enables or disables staged expand-and-contract zero-downtime migrations.
-//
-// Experimental: staged expand-and-contract plans are under active development;
-// the contract phase and hazard surface may change before the 1.0 release.
 func WithExpandContract(expand bool) Option {
 	return func(o *Options) {
 		o.ExpandContract = expand
@@ -590,10 +667,8 @@ func WithExpandContract(expand bool) Option {
 }
 
 // WithBackfill configures the batch backfill hook function for staged expand migrations.
-//
-// Experimental: backfill batching semantics (batch size, ordering, error
-// handling) may change before the 1.0 release. There is no CLI equivalent;
-// backfill is library-only.
+// The CLI also installs a hook via --backfill / --backfill-file; a library Backfill
+// wins when both are configured by the caller.
 func WithBackfill(fn BackfillFunc) Option {
 	return func(o *Options) {
 		o.Backfill = fn

@@ -50,7 +50,15 @@ func diffCatalogSteps(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecCo
 		}
 	}
 
-	changes := diff.CatalogDiff(desired, live.CatalogState(), cfg.primarySchema())
+	liveState := live.CatalogState()
+	if err := refuseActiveSlotDrops(desired, liveState); err != nil {
+		return nil, err
+	}
+	if err := diff.RefuseUnmanagedCatalogRecreates(desired, liveState, cfg.primarySchema()); err != nil {
+		return nil, err
+	}
+
+	changes := diff.CatalogDiff(desired, liveState, cfg.primarySchema())
 
 	steps := make([]plan.Step, 0, len(changes))
 	for _, c := range changes {
@@ -61,6 +69,60 @@ func diffCatalogSteps(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecCo
 	// global order, since the schema step list is already sorted.
 	plan.SortSteps(steps)
 	return steps, nil
+}
+
+// validateCatalogDropSafety re-verifies destructive catalog steps immediately
+// before a saved plan executes. Plan-time checks can be stale: a marker may
+// have been removed or a slot may have become active since planning. Drops
+// fail closed unless the live object still matches the plan's preconditions.
+func validateCatalogDropSafety(ctx context.Context, dbtx dialect.DBTX, steps []plan.Step) error {
+	for _, step := range steps {
+		var kind string
+		switch step.Type {
+		case plan.ChangeDropPublication:
+			kind = postgres.ManagedKindPublication
+		case plan.ChangeDropEventTrigger:
+			kind = postgres.ManagedKindEventTrigger
+		case plan.ChangeDropSubscription:
+			kind = postgres.ManagedKindSubscription
+		case plan.ChangeDropReplicationSlot:
+			active, err := postgres.ReplicationSlotIsActive(ctx, dbtx, step.Table)
+			if err != nil {
+				return fmt.Errorf("%w: %w", plan.ErrInspectionFailed, err)
+			}
+			if active {
+				return fmt.Errorf("refusing to drop logical replication slot %q: slot became active after planning (active_pid set)", step.Table)
+			}
+			continue
+		default:
+			continue
+		}
+		managed, err := postgres.ObjectHasManagedMarker(ctx, dbtx, kind, step.Table)
+		if err != nil {
+			return fmt.Errorf("%w: %w", plan.ErrInspectionFailed, err)
+		}
+		if !managed {
+			return fmt.Errorf("refusing to drop %s %q: exact grizzle-managed marker is absent or object changed after planning", kind, step.Table)
+		}
+	}
+	return nil
+}
+
+// refuseActiveSlotDrops fails closed when an explicit slot drop targets a
+// slot whose active_pid is non-NULL.
+func refuseActiveSlotDrops(desired *schema.CatalogSpec, live *diff.CatalogLiveState) error {
+	if desired == nil || live == nil {
+		return nil
+	}
+	for name, slot := range live.ReplicationSlots {
+		if slot == nil || slot.ActivePID == nil {
+			continue
+		}
+		if desired.ReplicationSlotExplicitlyDropped(name) {
+			return fmt.Errorf("refusing to drop logical replication slot %q: active_pid=%d (slot is in use)", name, *slot.ActivePID)
+		}
+	}
+	return nil
 }
 
 func validateCatalogServerVersion(spec *schema.CatalogSpec, serverVersion int) error {

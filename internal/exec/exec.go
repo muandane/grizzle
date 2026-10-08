@@ -18,7 +18,6 @@ import (
 
 	"github.com/muandane/grizzle/internal/dialect"
 	"github.com/muandane/grizzle/internal/dialect/postgres"
-	"github.com/muandane/grizzle/internal/dialect/sqlite"
 	"github.com/muandane/grizzle/internal/diff"
 	"github.com/muandane/grizzle/internal/history"
 	"github.com/muandane/grizzle/internal/plan"
@@ -294,16 +293,33 @@ func inspectPostgresSchemas(ctx context.Context, dbtx dialect.DBTX, schemas []st
 	return postgres.InspectSchemas(ctx, dbtx, schemas)
 }
 
-func execStepWithTracing(ctx context.Context, execer dialect.DBTX, s plan.Step, isNonTx bool, tracer Tracer) error {
+func execStepWithTracing(ctx context.Context, execer dialect.DBTX, s plan.Step, isNonTx bool, tracer Tracer, roleIR map[string]*schema.Role, subIR map[string]*schema.Subscription) error {
 	var span Span
 	if tracer != nil {
 		_, span = tracer.Start(ctx, "grizzle.exec_step")
 		span.SetAttribute("step.type", string(s.Type))
 		span.SetAttribute("step.table", s.Table)
+		// Always attribute the redacted Step.SQL — never the materialized secret form.
 		span.SetAttribute("step.sql", s.SQL)
 		span.SetAttribute("step.non_tx", isNonTx)
 	}
-	_, err := execer.ExecContext(ctx, s.SQL)
+	sql, err := materializeRoleStepSQL(s, roleIR)
+	if err != nil {
+		if span != nil {
+			span.RecordError(err)
+			span.End()
+		}
+		return err
+	}
+	sql, err = materializeSubscriptionStepSQL(plan.Step{Type: s.Type, Table: s.Table, SQL: sql}, subIR)
+	if err != nil {
+		if span != nil {
+			span.RecordError(err)
+			span.End()
+		}
+		return err
+	}
+	_, err = execer.ExecContext(ctx, sql)
 	if span != nil {
 		if err != nil {
 			span.RecordError(err)
@@ -311,6 +327,14 @@ func execStepWithTracing(ctx context.Context, execer dialect.DBTX, s plan.Step, 
 		span.End()
 	}
 	return err
+}
+
+func roleIRFromConfig(cfg PostgresExecConfig) map[string]*schema.Role {
+	desired, err := desiredRolesSpec(cfg)
+	if err != nil || desired == nil {
+		return nil
+	}
+	return desiredRoleIR(desired)
 }
 
 // StepGroup partitions contiguous steps into transactional and non-transactional execution batches.
@@ -648,6 +672,8 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig, b
 
 	// 7. Apply DDL statements split into transactional and non-transactional groups
 	groups := GroupSteps(steps)
+	roleIR := roleIRFromConfig(cfg)
+	subIR := subscriptionIRFromConfig(cfg)
 	stepIdx := 0
 	committedSteps := 0
 	// histErr captures a failed success-path history write: reported as a
@@ -687,7 +713,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig, b
 					recordFailureHistory(stepIdx, hookErr, false)
 					return committedSteps, hookErr
 				}
-				if err := execStepWithTracing(ctx, conn, s, true, cfg.Tracer); err != nil {
+				if err := execStepWithTracing(ctx, conn, s, true, cfg.Tracer, roleIR, subIR); err != nil {
 					if logger != nil {
 						logger.ErrorContext(ctx, "grizzle: failed executing non-tx step", "step_index", stepIdx, "sql", s.SQL, "error", err)
 					}
@@ -736,7 +762,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig, b
 					recordFailureHistory(stepIdx, hookErr, false)
 					return committedSteps, hookErr
 				}
-				if err := execStepWithTracing(ctx, tx, s, false, cfg.Tracer); err != nil {
+				if err := execStepWithTracing(ctx, tx, s, false, cfg.Tracer, roleIR, subIR); err != nil {
 					_ = tx.Rollback()
 					if logger != nil {
 						logger.ErrorContext(ctx, "grizzle: failed executing step in tx", "step_index", stepIdx, "sql", s.SQL, "error", err)
@@ -902,6 +928,9 @@ func uniqueShadowName(base string) string {
 // SQLiteExecConfig specifies the execution options for SQLite synchronization.
 type SQLiteExecConfig struct {
 	SchemaSQL            string
+	TargetSchema         string
+	TargetSchemas        []string
+	SQLiteAttach         map[string]string
 	Filters              scope.Filters
 	Policy               plan.DropPolicy
 	AcceptHazards        []plan.HazardCode
@@ -921,173 +950,164 @@ type SQLiteExecConfig struct {
 	RebuildBatchSize int
 }
 
+func (cfg SQLiteExecConfig) targetSchemas() []string {
+	if len(cfg.TargetSchemas) > 0 {
+		return cfg.TargetSchemas
+	}
+	if cfg.TargetSchema != "" {
+		return []string{cfg.TargetSchema}
+	}
+	return []string{"main"}
+}
+
+func (cfg SQLiteExecConfig) primarySchema() string {
+	return cfg.targetSchemas()[0]
+}
+
+func (cfg SQLiteExecConfig) needsAttach() bool {
+	return len(cfg.SQLiteAttach) > 0
+}
+
 // SyncSQLite synchronizes SQLite in a single transaction with foreign keys handling.
 func SyncSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) error {
 	start := time.Now()
 	logger := cfg.Logger
+	schemas := cfg.targetSchemas()
 	if logger != nil {
-		logger.InfoContext(ctx, "sqlite: starting SQLite schema synchronization")
+		logger.InfoContext(ctx, "sqlite: starting SQLite schema synchronization", "target_schemas", schemas)
 	}
 
-	// 1. Compile in shadow database
-	desired, err := sqlite.CompileInShadow(ctx, cfg.SchemaSQL)
-	if err != nil {
-		if logger != nil {
-			logger.ErrorContext(ctx, "sqlite: shadow compilation failed", "error", err)
-		}
-		return fmt.Errorf("%w: %w", plan.ErrCompilationFailed, err)
-	}
-
-	// 2. Introspect live schema
-	live, err := sqlite.Inspect(ctx, db)
-	if err != nil {
-		return fmt.Errorf("%w: %w", plan.ErrInspectionFailed, err)
-	}
-
-	// 3. Diff schemas
-	steps := sqlite.Diff(live, desired, cfg.Filters)
-
-	p := &plan.Plan{
-		TargetSchema:   "main",
-		Steps:          steps,
-		Policy:         cfg.Policy,
-		IncludeTables:  cfg.Filters.Includes,
-		ExcludeTables:  cfg.Filters.Excludes,
-		Renames:        cfg.Filters.Renames,
-		ExpandContract: cfg.Filters.ExpandContract,
-		SchemaSQL:      cfg.SchemaSQL,
-	}
-
-	// 3b. Verify expected plan hash if provided (aborts with ErrPlanDrift on mismatch)
-	if cfg.ExpectedHash != "" && p.Hash() != cfg.ExpectedHash {
-		if logger != nil {
-			logger.WarnContext(ctx, "sqlite: plan drift detected post-lock", "expected", cfg.ExpectedHash, "actual", p.Hash())
-		}
-		return fmt.Errorf("%w: expected hash %q, actual post-lock hash %q", plan.ErrPlanDrift, cfg.ExpectedHash, p.Hash())
-	}
-
-	if len(steps) == 0 {
-		if logger != nil {
-			logger.InfoContext(ctx, "sqlite: schema is already in sync", "duration", time.Since(start))
-		}
-		return nil
-	}
-
-	if logger != nil {
-		logger.InfoContext(ctx, "sqlite: computed migration plan", "steps_count", len(steps))
-	}
-
-	// 4. Enforce safety policy (policy check hard-blocks drops regardless of AcceptHazards)
-	if err := p.ValidatePolicy(); err != nil {
-		if logger != nil {
-			if vErr, ok := errors.AsType[*plan.DestructiveViolationError](err); ok {
-				logger.WarnContext(ctx, "sqlite: migration blocked by safety policy", "violations_count", len(vErr.Violations))
-			} else {
-				logger.WarnContext(ctx, "sqlite: migration blocked by safety policy", "error", err)
-			}
-		}
-		return err
-	}
-
-	// 4b. Enforce hazard gating (fails on critical hazards unless explicitly accepted)
-	if err := p.ValidateHazards(cfg.AcceptHazards); err != nil {
-		if logger != nil {
-			logger.WarnContext(ctx, "sqlite: migration blocked by unaccepted critical hazards", "error", err)
-		}
-		return err
-	}
-
-	if cfg.DryRun {
-		return nil
-	}
-
-	// BeforeSync runs once before any migration steps are executed.
-	// SQLite passes the *sql.DB handle because the entire sync is a single transaction.
-	if err := callBeforeSync(cfg.BeforeSync, ctx, db); err != nil {
-		hookErr := fmt.Errorf("sqlite: before_sync hook: %w", err)
-		if logger != nil {
-			logger.ErrorContext(ctx, "grizzle: hook failed", "error", hookErr)
-		}
-		return hookErr
-	}
-
-	// 5. Execute in a transaction pinned to a single connection with foreign
-	// keys disabled (per-connection PRAGMA; a no-op inside a transaction).
-	// histErr captures a failed success-path history write; surfaced as a
-	// typed non-fatal error after the transaction commits.
+	var p *plan.Plan
 	var histErr error
-	err = runSQLiteWithForeignKeysOff(ctx, db, func(tx *sql.Tx, conn *sql.Conn) error {
-		for i, s := range steps {
-			stepStart := time.Now()
-			sqlToExec := strings.TrimSpace(s.SQL)
-			if sqlToExec == "" {
-				continue
+
+	run := func(conn *sql.Conn) error {
+		var err error
+		p, err = buildSQLitePlan(ctx, conn, cfg)
+		if err != nil {
+			if logger != nil && errors.Is(err, plan.ErrCompilationFailed) {
+				logger.ErrorContext(ctx, "sqlite: shadow compilation failed", "error", err)
 			}
-			if err := callBeforeStep(cfg.BeforeStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: i + 1, Total: len(steps), IsNonTx: false}); err != nil {
-				_ = tx.Rollback()
-				hookErr := fmt.Errorf("before_step hook: %w", err)
-				if logger != nil {
-					logger.ErrorContext(ctx, "grizzle: hook failed", "step_index", i+1, "error", hookErr)
-				}
-				histCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				if rErr := history.RecordProgress(histCtx, conn, "sqlite", "", p, "failed", i+1, hookErr, time.Since(start)); rErr != nil && logger != nil {
-					logger.WarnContext(histCtx, "sqlite: failed recording failure history", "error", rErr)
-				}
-				return hookErr
-			}
-			if err := executeSQLiteStep(ctx, tx, s, cfg); err != nil {
-				_ = tx.Rollback()
-				if logger != nil {
-					logger.ErrorContext(ctx, "sqlite: failed executing step", "step_index", i+1, "sql", sqlToExec, "error", err)
-				}
-				histCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				if rErr := history.RecordProgress(histCtx, conn, "sqlite", "", p, "failed", i+1, err, time.Since(start)); rErr != nil && logger != nil {
-					logger.WarnContext(histCtx, "sqlite: failed recording failure history", "error", rErr)
-				}
-				return fmt.Errorf("%w: failed executing [%s]: %w", plan.ErrExecutionFailed, sqlToExec, err)
-			}
-			if err := callAfterStep(cfg.AfterStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: i + 1, Total: len(steps), IsNonTx: false}); err != nil {
-				_ = tx.Rollback()
-				hookErr := fmt.Errorf("after_step hook: %w", err)
-				if logger != nil {
-					logger.ErrorContext(ctx, "grizzle: hook failed", "step_index", i+1, "error", hookErr)
-				}
-				histCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				if rErr := history.RecordProgress(histCtx, conn, "sqlite", "", p, "failed", i+1, hookErr, time.Since(start)); rErr != nil && logger != nil {
-					logger.WarnContext(histCtx, "sqlite: failed recording failure history", "error", rErr)
-				}
-				return hookErr
-			}
-			if logger != nil {
-				logger.DebugContext(ctx, "sqlite: executed step", "step_index", i+1, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
-			}
+			return err
 		}
 
-		finalFKRows, err := tx.QueryContext(ctx, "PRAGMA foreign_key_check;")
-		if err != nil {
-			return fmt.Errorf("sqlite: foreign key check failed: %w", err)
-		}
-		var fkViolations []string
-		for finalFKRows.Next() {
-			var vTbl, vParent string
-			var vRowID, vFKID int64
-			if err := finalFKRows.Scan(&vTbl, &vRowID, &vParent, &vFKID); err == nil {
-				fkViolations = append(fkViolations, fmt.Sprintf("table %q row %d -> %q", vTbl, vRowID, vParent))
+		if cfg.ExpectedHash != "" && p.Hash() != cfg.ExpectedHash {
+			if logger != nil {
+				logger.WarnContext(ctx, "sqlite: plan drift detected post-lock", "expected", cfg.ExpectedHash, "actual", p.Hash())
 			}
+			return fmt.Errorf("%w: expected hash %q, actual post-lock hash %q", plan.ErrPlanDrift, cfg.ExpectedHash, p.Hash())
 		}
-		_ = finalFKRows.Close()
-		if len(fkViolations) > 0 {
-			return fmt.Errorf("sqlite: foreign key constraint violation: %s", strings.Join(fkViolations, "; "))
+
+		if len(p.Steps) == 0 {
+			if logger != nil {
+				logger.InfoContext(ctx, "sqlite: schema is already in sync", "duration", time.Since(start))
+			}
+			return nil
 		}
-		// Model B: do not record history inside the migration transaction.
-		return nil
-	})
+
+		if logger != nil {
+			logger.InfoContext(ctx, "sqlite: computed migration plan", "steps_count", len(p.Steps))
+		}
+
+		if err := p.ValidatePolicy(); err != nil {
+			if logger != nil {
+				if vErr, ok := errors.AsType[*plan.DestructiveViolationError](err); ok {
+					logger.WarnContext(ctx, "sqlite: migration blocked by safety policy", "violations_count", len(vErr.Violations))
+				} else {
+					logger.WarnContext(ctx, "sqlite: migration blocked by safety policy", "error", err)
+				}
+			}
+			return err
+		}
+
+		if err := p.ValidateHazards(cfg.AcceptHazards); err != nil {
+			if logger != nil {
+				logger.WarnContext(ctx, "sqlite: migration blocked by unaccepted critical hazards", "error", err)
+			}
+			return err
+		}
+
+		if cfg.DryRun {
+			return nil
+		}
+
+		// BeforeSync runs once before any migration steps are executed.
+		if err := callBeforeSync(cfg.BeforeSync, ctx, conn); err != nil {
+			hookErr := fmt.Errorf("sqlite: before_sync hook: %w", err)
+			if logger != nil {
+				logger.ErrorContext(ctx, "grizzle: hook failed", "error", hookErr)
+			}
+			return hookErr
+		}
+
+		steps := p.Steps
+		err = runSQLiteConnWithForeignKeysOff(ctx, conn, func(tx *sql.Tx) error {
+			for i, s := range steps {
+				stepStart := time.Now()
+				sqlToExec := strings.TrimSpace(s.SQL)
+				if sqlToExec == "" {
+					continue
+				}
+				if err := callBeforeStep(cfg.BeforeStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: i + 1, Total: len(steps), IsNonTx: false}); err != nil {
+					_ = tx.Rollback()
+					hookErr := fmt.Errorf("before_step hook: %w", err)
+					if logger != nil {
+						logger.ErrorContext(ctx, "grizzle: hook failed", "step_index", i+1, "error", hookErr)
+					}
+					histCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					if rErr := history.RecordProgress(histCtx, conn, "sqlite", "", p, "failed", i+1, hookErr, time.Since(start)); rErr != nil && logger != nil {
+						logger.WarnContext(histCtx, "sqlite: failed recording failure history", "error", rErr)
+					}
+					return hookErr
+				}
+				if err := executeSQLiteStep(ctx, tx, s, cfg); err != nil {
+					_ = tx.Rollback()
+					if logger != nil {
+						logger.ErrorContext(ctx, "sqlite: failed executing step", "step_index", i+1, "sql", sqlToExec, "error", err)
+					}
+					histCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					if rErr := history.RecordProgress(histCtx, conn, "sqlite", "", p, "failed", i+1, err, time.Since(start)); rErr != nil && logger != nil {
+						logger.WarnContext(histCtx, "sqlite: failed recording failure history", "error", rErr)
+					}
+					return fmt.Errorf("%w: failed executing [%s]: %w", plan.ErrExecutionFailed, sqlToExec, err)
+				}
+				if err := callAfterStep(cfg.AfterStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: i + 1, Total: len(steps), IsNonTx: false}); err != nil {
+					_ = tx.Rollback()
+					hookErr := fmt.Errorf("after_step hook: %w", err)
+					if logger != nil {
+						logger.ErrorContext(ctx, "grizzle: hook failed", "step_index", i+1, "error", hookErr)
+					}
+					histCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					if rErr := history.RecordProgress(histCtx, conn, "sqlite", "", p, "failed", i+1, hookErr, time.Since(start)); rErr != nil && logger != nil {
+						logger.WarnContext(histCtx, "sqlite: failed recording failure history", "error", rErr)
+					}
+					return hookErr
+				}
+				if logger != nil {
+					logger.DebugContext(ctx, "sqlite: executed step", "step_index", i+1, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
+				}
+			}
+			// Cross-database FKs are not enforced by SQLite; check each attached schema independently.
+			return sqliteForeignKeyCheck(ctx, tx, schemas)
+		})
+		return err
+	}
+
+	var err error
+	if cfg.needsAttach() {
+		err = withSQLiteAttachedConn(ctx, db, cfg.SQLiteAttach, run)
+	} else {
+		err = withSQLiteAttachedConn(ctx, db, nil, run)
+	}
 	if err != nil {
 		return err
 	}
+	if cfg.DryRun || p == nil || len(p.Steps) == 0 {
+		return nil
+	}
+
 	// Model B: history is advisory — recorded after DDL commit.
 	if err := history.RecordPlan(ctx, db, "sqlite", "", p, time.Since(start)); err != nil {
 		histErr = fmt.Errorf("%w: %w", plan.ErrHistoryRecord, err)
@@ -1100,7 +1120,7 @@ func SyncSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) error {
 	}
 
 	if cfg.Backfill != nil && cfg.Filters.ExpandContract {
-		if err := RunBackfill(ctx, db, "main", cfg.Filters.Renames, steps, cfg.Backfill, cfg.Logger); err != nil {
+		if err := RunBackfill(ctx, db, cfg.primarySchema(), cfg.Filters.Renames, p.Steps, cfg.Backfill, cfg.Logger); err != nil {
 			return err
 		}
 	}
@@ -1114,7 +1134,7 @@ func SyncSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) error {
 	}
 
 	if logger != nil {
-		logger.InfoContext(ctx, "sqlite: synchronization finished successfully", "steps_applied", len(steps), "total_duration", time.Since(start))
+		logger.InfoContext(ctx, "sqlite: synchronization finished successfully", "steps_applied", len(p.Steps), "total_duration", time.Since(start))
 	}
 
 	return nil
@@ -1122,28 +1142,13 @@ func SyncSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) error {
 
 // PlanDiffSQLite generates the migration plan for SQLite without applying it.
 func PlanDiffSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) (*plan.Plan, error) {
-	desired, err := sqlite.CompileInShadow(ctx, cfg.SchemaSQL)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w", plan.ErrCompilationFailed, err)
-	}
-
-	live, err := sqlite.Inspect(ctx, db)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w", plan.ErrInspectionFailed, err)
-	}
-
-	steps := sqlite.Diff(live, desired, cfg.Filters)
-
-	return &plan.Plan{
-		TargetSchema:   "main",
-		Steps:          steps,
-		Policy:         cfg.Policy,
-		IncludeTables:  cfg.Filters.Includes,
-		ExcludeTables:  cfg.Filters.Excludes,
-		Renames:        cfg.Filters.Renames,
-		ExpandContract: cfg.Filters.ExpandContract,
-		SchemaSQL:      cfg.SchemaSQL,
-	}, nil
+	var p *plan.Plan
+	err := withSQLiteAttachedConn(ctx, db, cfg.SQLiteAttach, func(conn *sql.Conn) error {
+		var err error
+		p, err = buildSQLitePlan(ctx, conn, cfg)
+		return err
+	})
+	return p, err
 }
 
 // ApplyPostgres applies a precomputed plan to PostgreSQL using a dedicated connection,
@@ -1332,9 +1337,29 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 	if err := validateRoleDropSafety(ctx, conn, droppedRoles, targetSchemas, p.Steps); err != nil {
 		return 0, err
 	}
+	if err := validateCatalogDropSafety(ctx, conn, p.Steps); err != nil {
+		return 0, err
+	}
 
 	// Apply DDL statements split into transactional and non-transactional groups
 	groups := GroupSteps(p.Steps)
+	roleIR := roleIRFromConfig(cfg)
+	if len(roleIR) == 0 && (p.RolesSQL != "" || p.SchemaSQL != "") {
+		// Direct apply may carry RolesSQL on the plan when cfg omits it.
+		roleIR = roleIRFromConfig(PostgresExecConfig{
+			SchemaSQL:    p.SchemaSQL,
+			RolesSQL:     p.RolesSQL,
+			TargetSchema: primarySchema,
+		})
+	}
+	subIR := subscriptionIRFromConfig(cfg)
+	if len(subIR) == 0 && (p.CatalogSQL != "" || p.SchemaSQL != "") {
+		subIR = subscriptionIRFromConfig(PostgresExecConfig{
+			SchemaSQL:    p.SchemaSQL,
+			CatalogSQL:   p.CatalogSQL,
+			TargetSchema: primarySchema,
+		})
+	}
 	stepIdx := 0
 	committedSteps := 0
 	// histErr captures a failed success-path history write: reported as a
@@ -1372,7 +1397,7 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 					recordFailureHistory(stepIdx, hookErr, false)
 					return committedSteps, hookErr
 				}
-				if err := execStepWithTracing(ctx, conn, s, true, cfg.Tracer); err != nil {
+				if err := execStepWithTracing(ctx, conn, s, true, cfg.Tracer, roleIR, subIR); err != nil {
 					if logger != nil {
 						logger.ErrorContext(ctx, "grizzle: failed executing non-tx step", "step_index", stepIdx, "sql", s.SQL, "error", err)
 					}
@@ -1420,7 +1445,7 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 					recordFailureHistory(stepIdx, hookErr, false)
 					return committedSteps, hookErr
 				}
-				if err := execStepWithTracing(ctx, tx, s, false, cfg.Tracer); err != nil {
+				if err := execStepWithTracing(ctx, tx, s, false, cfg.Tracer, roleIR, subIR); err != nil {
 					_ = tx.Rollback()
 					if logger != nil {
 						logger.ErrorContext(ctx, "grizzle: failed executing step in tx", "step_index", stepIdx, "sql", s.SQL, "error", err)
@@ -1511,96 +1536,81 @@ func ApplySQLite(ctx context.Context, db *sql.DB, p *plan.Plan, cfg SQLiteExecCo
 		logger.InfoContext(ctx, "sqlite: starting SQLite plan application")
 	}
 
-	// BeforeSync runs once before any migration steps are executed.
-	if err := callBeforeSync(cfg.BeforeSync, ctx, db); err != nil {
-		hookErr := fmt.Errorf("sqlite: before_sync hook: %w", err)
-		if logger != nil {
-			logger.ErrorContext(ctx, "grizzle: hook failed", "error", hookErr)
-		}
-		return hookErr
+	schemas := cfg.targetSchemas()
+	if len(p.TargetSchemas) > 0 {
+		schemas = p.TargetSchemas
 	}
 
-	// Execute in a transaction pinned to a single connection with foreign
-	// keys disabled (per-connection PRAGMA; a no-op inside a transaction).
-	// histErr captures a failed success-path history write; surfaced as a
-	// typed non-fatal error after the transaction commits.
 	var histErr error
-	err := runSQLiteWithForeignKeysOff(ctx, db, func(tx *sql.Tx, conn *sql.Conn) error {
-		// Idempotency: if this plan has already been applied by another process, skip execution.
-		if history.IsApplied(ctx, tx, "sqlite", "", p.Hash()) {
+	err := withSQLiteAttachedConn(ctx, db, cfg.SQLiteAttach, func(conn *sql.Conn) error {
+		// BeforeSync runs once before any migration steps are executed.
+		if err := callBeforeSync(cfg.BeforeSync, ctx, conn); err != nil {
+			hookErr := fmt.Errorf("sqlite: before_sync hook: %w", err)
 			if logger != nil {
-				logger.InfoContext(ctx, "sqlite: plan already applied by another process, skipping", "plan_hash", p.Hash())
+				logger.ErrorContext(ctx, "grizzle: hook failed", "error", hookErr)
 			}
-			return nil
+			return hookErr
 		}
 
-		for i, s := range p.Steps {
-			stepStart := time.Now()
-			sqlToExec := strings.TrimSpace(s.SQL)
-			if sqlToExec == "" {
-				continue
-			}
-			if err := callBeforeStep(cfg.BeforeStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: i + 1, Total: len(p.Steps), IsNonTx: false}); err != nil {
-				_ = tx.Rollback()
-				hookErr := fmt.Errorf("before_step hook: %w", err)
+		return runSQLiteConnWithForeignKeysOff(ctx, conn, func(tx *sql.Tx) error {
+			// Idempotency: if this plan has already been applied by another process, skip execution.
+			if history.IsApplied(ctx, tx, "sqlite", "", p.Hash()) {
 				if logger != nil {
-					logger.ErrorContext(ctx, "grizzle: hook failed", "step_index", i+1, "error", hookErr)
+					logger.InfoContext(ctx, "sqlite: plan already applied by another process, skipping", "plan_hash", p.Hash())
 				}
-				histCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				if rErr := history.RecordProgress(histCtx, conn, "sqlite", "", p, "failed", i+1, hookErr, time.Since(start)); rErr != nil && logger != nil {
-					logger.WarnContext(histCtx, "sqlite: failed recording failure history", "error", rErr)
-				}
-				return hookErr
+				return nil
 			}
-			if err := executeSQLiteStep(ctx, tx, s, cfg); err != nil {
-				_ = tx.Rollback()
-				if logger != nil {
-					logger.ErrorContext(ctx, "sqlite: failed executing step", "step_index", i+1, "sql", sqlToExec, "error", err)
-				}
-				histCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				if rErr := history.RecordProgress(histCtx, conn, "sqlite", "", p, "failed", i+1, err, time.Since(start)); rErr != nil && logger != nil {
-					logger.WarnContext(histCtx, "sqlite: failed recording failure history", "error", rErr)
-				}
-				return fmt.Errorf("%w: failed executing [%s]: %w", plan.ErrExecutionFailed, sqlToExec, err)
-			}
-			if err := callAfterStep(cfg.AfterStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: i + 1, Total: len(p.Steps), IsNonTx: false}); err != nil {
-				_ = tx.Rollback()
-				hookErr := fmt.Errorf("after_step hook: %w", err)
-				if logger != nil {
-					logger.ErrorContext(ctx, "grizzle: hook failed", "step_index", i+1, "error", hookErr)
-				}
-				histCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				if rErr := history.RecordProgress(histCtx, conn, "sqlite", "", p, "failed", i+1, hookErr, time.Since(start)); rErr != nil && logger != nil {
-					logger.WarnContext(histCtx, "sqlite: failed recording failure history", "error", rErr)
-				}
-				return hookErr
-			}
-			if logger != nil {
-				logger.DebugContext(ctx, "sqlite: executed step", "step_index", i+1, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
-			}
-		}
 
-		finalFKRows, err := tx.QueryContext(ctx, "PRAGMA foreign_key_check;")
-		if err != nil {
-			return fmt.Errorf("sqlite: foreign key check failed: %w", err)
-		}
-		var fkViolations []string
-		for finalFKRows.Next() {
-			var vTbl, vParent string
-			var vRowID, vFKID int64
-			if err := finalFKRows.Scan(&vTbl, &vRowID, &vParent, &vFKID); err == nil {
-				fkViolations = append(fkViolations, fmt.Sprintf("table %q row %d -> %q", vTbl, vRowID, vParent))
+			for i, s := range p.Steps {
+				stepStart := time.Now()
+				sqlToExec := strings.TrimSpace(s.SQL)
+				if sqlToExec == "" {
+					continue
+				}
+				if err := callBeforeStep(cfg.BeforeStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: i + 1, Total: len(p.Steps), IsNonTx: false}); err != nil {
+					_ = tx.Rollback()
+					hookErr := fmt.Errorf("before_step hook: %w", err)
+					if logger != nil {
+						logger.ErrorContext(ctx, "grizzle: hook failed", "step_index", i+1, "error", hookErr)
+					}
+					histCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					if rErr := history.RecordProgress(histCtx, conn, "sqlite", "", p, "failed", i+1, hookErr, time.Since(start)); rErr != nil && logger != nil {
+						logger.WarnContext(histCtx, "sqlite: failed recording failure history", "error", rErr)
+					}
+					return hookErr
+				}
+				if err := executeSQLiteStep(ctx, tx, s, cfg); err != nil {
+					_ = tx.Rollback()
+					if logger != nil {
+						logger.ErrorContext(ctx, "sqlite: failed executing step", "step_index", i+1, "sql", sqlToExec, "error", err)
+					}
+					histCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					if rErr := history.RecordProgress(histCtx, conn, "sqlite", "", p, "failed", i+1, err, time.Since(start)); rErr != nil && logger != nil {
+						logger.WarnContext(histCtx, "sqlite: failed recording failure history", "error", rErr)
+					}
+					return fmt.Errorf("%w: failed executing [%s]: %w", plan.ErrExecutionFailed, sqlToExec, err)
+				}
+				if err := callAfterStep(cfg.AfterStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: i + 1, Total: len(p.Steps), IsNonTx: false}); err != nil {
+					_ = tx.Rollback()
+					hookErr := fmt.Errorf("after_step hook: %w", err)
+					if logger != nil {
+						logger.ErrorContext(ctx, "grizzle: hook failed", "step_index", i+1, "error", hookErr)
+					}
+					histCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					if rErr := history.RecordProgress(histCtx, conn, "sqlite", "", p, "failed", i+1, hookErr, time.Since(start)); rErr != nil && logger != nil {
+						logger.WarnContext(histCtx, "sqlite: failed recording failure history", "error", rErr)
+					}
+					return hookErr
+				}
+				if logger != nil {
+					logger.DebugContext(ctx, "sqlite: executed step", "step_index", i+1, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
+				}
 			}
-		}
-		_ = finalFKRows.Close()
-		if len(fkViolations) > 0 {
-			return fmt.Errorf("sqlite: foreign key constraint violation: %s", strings.Join(fkViolations, "; "))
-		}
-		// Model B: do not record history inside the migration transaction.
-		return nil
+			return sqliteForeignKeyCheck(ctx, tx, schemas)
+		})
 	})
 	if err != nil {
 		return err
@@ -1617,7 +1627,11 @@ func ApplySQLite(ctx context.Context, db *sql.DB, p *plan.Plan, cfg SQLiteExecCo
 	}
 
 	if cfg.Backfill != nil && p.ExpandContract {
-		if err := RunBackfill(ctx, db, "main", p.Renames, p.Steps, cfg.Backfill, cfg.Logger); err != nil {
+		primary := cfg.primarySchema()
+		if p.TargetSchema != "" {
+			primary = p.TargetSchema
+		}
+		if err := RunBackfill(ctx, db, primary, p.Renames, p.Steps, cfg.Backfill, cfg.Logger); err != nil {
 			return err
 		}
 	}
@@ -1680,17 +1694,29 @@ func executeSQLiteStepInner(ctx context.Context, tx *sql.Tx, s plan.Step, cfg SQ
 		batchSize = 10000
 	}
 
-	var rowCount int64
-	_ = tx.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %q;", s.Table)).Scan(&rowCount)
-
+	tblRef := quoteSQLiteTable(s.Schema, s.Table)
 	tempTable := "_grizzle_new_" + s.Table
-	copyDataPrefix := fmt.Sprintf("INSERT INTO %q", tempTable)
+	tempRef := quoteSQLiteTable(s.Schema, tempTable)
+
+	var rowCount int64
+	_ = tx.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %s;", tblRef)).Scan(&rowCount)
+
+	// Rebuild SQL may quote temp as schema.temp or bare "temp".
+	copyDataPrefix := fmt.Sprintf("INSERT INTO %s", tempRef)
 	idx := strings.Index(s.SQL, copyDataPrefix)
+	if idx == -1 {
+		copyDataPrefix = fmt.Sprintf("INSERT INTO %q", tempTable)
+		idx = strings.Index(s.SQL, copyDataPrefix)
+	}
 
 	// WITHOUT ROWID tables have no usable rowid for keyset batching.
 	hasRowID := true
 	var probeDDL string
-	if qErr := tx.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name=?;`, s.Table).Scan(&probeDDL); qErr == nil {
+	catalog := "sqlite_master"
+	if s.Schema != "" && s.Schema != "main" {
+		catalog = fmt.Sprintf("%q.sqlite_schema", s.Schema)
+	}
+	if qErr := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT sql FROM %s WHERE type='table' AND name=?`, catalog), s.Table).Scan(&probeDDL); qErr == nil {
 		if strings.Contains(strings.ToUpper(probeDDL), "WITHOUT ROWID") {
 			hasRowID = false
 			if cfg.Logger != nil {
@@ -1726,7 +1752,7 @@ func executeSQLiteStepInner(ctx context.Context, tx *sql.Tx, s plan.Step, cfg SQ
 		if colStart != -1 && colEnd != -1 && colEnd > colStart {
 			colList := strings.TrimSpace(copyStmt[colStart+1 : colEnd])
 			if colList != "" {
-				if err := copyDataKeysetChunks(ctx, tx, tempTable, colList, s.Table, batchSize, cfg.Logger); err != nil {
+				if err := copyDataKeysetChunks(ctx, tx, tempRef, colList, tblRef, batchSize, cfg.Logger); err != nil {
 					_, _ = tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT grizzle_rebuild;")
 					_, _ = tx.ExecContext(ctx, "RELEASE SAVEPOINT grizzle_rebuild;")
 					return err
@@ -1749,8 +1775,12 @@ func executeSQLiteStepInner(ctx context.Context, tx *sql.Tx, s plan.Step, cfg SQ
 		}
 	}
 
-	// Validate foreign keys under the savepoint
-	fkRows, err := tx.QueryContext(ctx, "PRAGMA foreign_key_check;")
+	// Validate foreign keys under the savepoint (per-schema; cross-DB FKs are not enforced).
+	fkPragma := "PRAGMA foreign_key_check;"
+	if s.Schema != "" && s.Schema != "main" {
+		fkPragma = fmt.Sprintf("PRAGMA %q.foreign_key_check;", s.Schema)
+	}
+	fkRows, err := tx.QueryContext(ctx, fkPragma)
 	if err != nil {
 		_, _ = tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT grizzle_rebuild;")
 		_, _ = tx.ExecContext(ctx, "RELEASE SAVEPOINT grizzle_rebuild;")
@@ -1779,7 +1809,17 @@ func executeSQLiteStepInner(ctx context.Context, tx *sql.Tx, s plan.Step, cfg SQ
 	return nil
 }
 
-func copyDataKeysetChunks(ctx context.Context, tx *sql.Tx, tempTable, colList, liveTable string, batchSize int, logger *slog.Logger) error {
+// quoteSQLiteTable returns a quoted table reference, schema-qualified when needed.
+func quoteSQLiteTable(schemaName, tableName string) string {
+	if schemaName == "" || schemaName == "main" {
+		return fmt.Sprintf("%q", tableName)
+	}
+	return fmt.Sprintf("%q.%q", schemaName, tableName)
+}
+
+// copyDataKeysetChunks copies rows in batches. tempRef and liveRef must already
+// be SQL-quoted table references (optionally schema-qualified).
+func copyDataKeysetChunks(ctx context.Context, tx *sql.Tx, tempRef, colList, liveRef string, batchSize int, logger *slog.Logger) error {
 	var lastRowID int64
 	var hasStarted bool
 	var batchNum int
@@ -1789,10 +1829,10 @@ func copyDataKeysetChunks(ctx context.Context, tx *sql.Tx, tempTable, colList, l
 		var query string
 		var args []any
 		if !hasStarted {
-			query = fmt.Sprintf("INSERT INTO %q (%s) SELECT %s FROM %q ORDER BY rowid ASC LIMIT ?;", tempTable, colList, colList, liveTable)
+			query = fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM %s ORDER BY rowid ASC LIMIT ?;", tempRef, colList, colList, liveRef)
 			args = []any{batchSize}
 		} else {
-			query = fmt.Sprintf("INSERT INTO %q (%s) SELECT %s FROM %q WHERE rowid > ? ORDER BY rowid ASC LIMIT ?;", tempTable, colList, colList, liveTable)
+			query = fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM %s WHERE rowid > ? ORDER BY rowid ASC LIMIT ?;", tempRef, colList, colList, liveRef)
 			args = []any{lastRowID, batchSize}
 		}
 
@@ -1808,17 +1848,17 @@ func copyDataKeysetChunks(ctx context.Context, tx *sql.Tx, tempTable, colList, l
 			break
 		}
 		if logger != nil {
-			logger.DebugContext(ctx, "sqlite: copied keyset batch", "table", liveTable, "batch", batchNum, "rows", affected)
+			logger.DebugContext(ctx, "sqlite: copied keyset batch", "table", liveRef, "batch", batchNum, "rows", affected)
 		}
 
 		var maxRowID int64
 		var maxQuery string
 		var maxArgs []any
 		if !hasStarted {
-			maxQuery = fmt.Sprintf("SELECT MAX(rowid) FROM (SELECT rowid FROM %q ORDER BY rowid ASC LIMIT ?);", liveTable)
+			maxQuery = fmt.Sprintf("SELECT MAX(rowid) FROM (SELECT rowid FROM %s ORDER BY rowid ASC LIMIT ?);", liveRef)
 			maxArgs = []any{batchSize}
 		} else {
-			maxQuery = fmt.Sprintf("SELECT MAX(rowid) FROM (SELECT rowid FROM %q WHERE rowid > ? ORDER BY rowid ASC LIMIT ?);", liveTable)
+			maxQuery = fmt.Sprintf("SELECT MAX(rowid) FROM (SELECT rowid FROM %s WHERE rowid > ? ORDER BY rowid ASC LIMIT ?);", liveRef)
 			maxArgs = []any{lastRowID, batchSize}
 		}
 

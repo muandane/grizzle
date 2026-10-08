@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/muandane/grizzle/internal/dialect/sqlite"
 	"github.com/muandane/grizzle/internal/plan"
 )
 
@@ -113,7 +112,7 @@ func DryRunVerifyPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfi
 					return rollback(fmt.Errorf("dry-run verification failed at before_step hook %d: %w", stepIdx, err))
 				}
 			}
-			if err := execStepWithTracing(ctx, tx, s, false, cfg.Tracer); err != nil {
+			if err := execStepWithTracing(ctx, tx, s, false, cfg.Tracer, roleIRFromConfig(cfg), subscriptionIRFromConfig(cfg)); err != nil {
 				return rollback(fmt.Errorf("dry-run verification failed at step %d: %w", stepIdx, err))
 			}
 			if cfg.ExecuteHooksInDryRun {
@@ -147,25 +146,14 @@ func DryRunVerifySQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) (
 	start := time.Now()
 	logger := cfg.Logger
 
-	desired, err := sqlite.CompileInShadow(ctx, cfg.SchemaSQL)
+	var p *plan.Plan
+	err := withSQLiteAttachedConn(ctx, db, cfg.SQLiteAttach, func(conn *sql.Conn) error {
+		var err error
+		p, err = buildSQLitePlan(ctx, conn, cfg)
+		return err
+	})
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", plan.ErrCompilationFailed, err)
-	}
-	live, err := sqlite.Inspect(ctx, db)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w", plan.ErrInspectionFailed, err)
-	}
-
-	steps := sqlite.Diff(live, desired, cfg.Filters)
-	p := &plan.Plan{
-		TargetSchema:   "main",
-		Steps:          steps,
-		Policy:         cfg.Policy,
-		IncludeTables:  cfg.Filters.Includes,
-		ExcludeTables:  cfg.Filters.Excludes,
-		Renames:        cfg.Filters.Renames,
-		ExpandContract: cfg.Filters.ExpandContract,
-		SchemaSQL:      cfg.SchemaSQL,
+		return nil, err
 	}
 
 	if err := p.ValidatePolicy(); err != nil {
@@ -175,6 +163,7 @@ func DryRunVerifySQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) (
 		return nil, err
 	}
 
+	steps := p.Steps
 	result := &DryRunResult{Plan: p, UnverifiedNonTx: []plan.Step{}, VerifiedTx: []plan.Step{}}
 	if len(steps) == 0 {
 		result.Duration = time.Since(start)
@@ -183,68 +172,71 @@ func DryRunVerifySQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) (
 
 	// Run the sandbox pinned to a single connection with foreign keys
 	// disabled (per-connection PRAGMA; a no-op inside a transaction), so
-	// rebuild DROPs cannot cascade against live child rows.
-	err = runSQLiteWithForeignKeysOff(ctx, db, func(tx *sql.Tx, conn *sql.Conn) error {
-		if _, err := tx.ExecContext(ctx, "SAVEPOINT grizzle_dryrun;"); err != nil {
-			return fmt.Errorf("sqlite: failed to create dry-run savepoint: %w", err)
-		}
-
-		for i, s := range steps {
-			sqlToExec := strings.TrimSpace(s.SQL)
-			if sqlToExec == "" {
-				continue
+	// rebuild DROPs cannot cascade against live child rows. ATTACH must
+	// remain on the same connection as the dry-run transaction.
+	err = withSQLiteAttachedConn(ctx, db, cfg.SQLiteAttach, func(conn *sql.Conn) error {
+		return runSQLiteConnWithForeignKeysOff(ctx, conn, func(tx *sql.Tx) error {
+			if _, err := tx.ExecContext(ctx, "SAVEPOINT grizzle_dryrun;"); err != nil {
+				return fmt.Errorf("sqlite: failed to create dry-run savepoint: %w", err)
 			}
-			if cfg.ExecuteHooksInDryRun {
-				if err := callBeforeStep(cfg.BeforeStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: i + 1, Total: len(steps), IsNonTx: false}); err != nil {
+
+			for i, s := range steps {
+				sqlToExec := strings.TrimSpace(s.SQL)
+				if sqlToExec == "" {
+					continue
+				}
+				if cfg.ExecuteHooksInDryRun {
+					if err := callBeforeStep(cfg.BeforeStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: i + 1, Total: len(steps), IsNonTx: false}); err != nil {
+						_, _ = tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT grizzle_dryrun;")
+						_, _ = tx.ExecContext(ctx, "RELEASE SAVEPOINT grizzle_dryrun;")
+						return fmt.Errorf("dry-run verification failed at before_step hook %d: %w", i+1, err)
+					}
+				}
+				if err := executeSQLiteStep(ctx, tx, s, cfg); err != nil {
 					_, _ = tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT grizzle_dryrun;")
 					_, _ = tx.ExecContext(ctx, "RELEASE SAVEPOINT grizzle_dryrun;")
-					return fmt.Errorf("dry-run verification failed at before_step hook %d: %w", i+1, err)
+					return fmt.Errorf("dry-run verification failed at step %d: %w", i+1, err)
+				}
+				if cfg.ExecuteHooksInDryRun {
+					if err := callAfterStep(cfg.AfterStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: i + 1, Total: len(steps), IsNonTx: false}); err != nil {
+						_, _ = tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT grizzle_dryrun;")
+						_, _ = tx.ExecContext(ctx, "RELEASE SAVEPOINT grizzle_dryrun;")
+						return fmt.Errorf("dry-run verification failed at after_step hook %d: %w", i+1, err)
+					}
+				}
+				result.VerifiedTx = append(result.VerifiedTx, s)
+				result.ExecutedSteps++
+			}
+
+			// Validate foreign key integrity against live data before discarding.
+			rows, err := tx.QueryContext(ctx, "PRAGMA foreign_key_check;")
+			if err != nil {
+				return fmt.Errorf("sqlite: foreign key check failed: %w", err)
+			}
+			var fkViolations []string
+			for rows.Next() {
+				var vTbl, vParent string
+				var vRowID, vFKID int64
+				if err := rows.Scan(&vTbl, &vRowID, &vParent, &vFKID); err == nil {
+					fkViolations = append(fkViolations, fmt.Sprintf("table %q row %d -> %q", vTbl, vRowID, vParent))
 				}
 			}
-			if err := executeSQLiteStep(ctx, tx, s, cfg); err != nil {
+			_ = rows.Close()
+			if len(fkViolations) > 0 {
 				_, _ = tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT grizzle_dryrun;")
 				_, _ = tx.ExecContext(ctx, "RELEASE SAVEPOINT grizzle_dryrun;")
-				return fmt.Errorf("dry-run verification failed at step %d: %w", i+1, err)
+				return fmt.Errorf("sqlite: dry-run foreign key violation: %s", strings.Join(fkViolations, "; "))
 			}
-			if cfg.ExecuteHooksInDryRun {
-				if err := callAfterStep(cfg.AfterStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: i + 1, Total: len(steps), IsNonTx: false}); err != nil {
-					_, _ = tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT grizzle_dryrun;")
-					_, _ = tx.ExecContext(ctx, "RELEASE SAVEPOINT grizzle_dryrun;")
-					return fmt.Errorf("dry-run verification failed at after_step hook %d: %w", i+1, err)
-				}
-			}
-			result.VerifiedTx = append(result.VerifiedTx, s)
-			result.ExecutedSteps++
-		}
 
-		// Validate foreign key integrity against live data before discarding.
-		rows, err := tx.QueryContext(ctx, "PRAGMA foreign_key_check;")
-		if err != nil {
-			return fmt.Errorf("sqlite: foreign key check failed: %w", err)
-		}
-		var fkViolations []string
-		for rows.Next() {
-			var vTbl, vParent string
-			var vRowID, vFKID int64
-			if err := rows.Scan(&vTbl, &vRowID, &vParent, &vFKID); err == nil {
-				fkViolations = append(fkViolations, fmt.Sprintf("table %q row %d -> %q", vTbl, vRowID, vParent))
+			// Zero mutation invariant: discard every change.
+			if _, err := tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT grizzle_dryrun;"); err != nil {
+				return fmt.Errorf("sqlite: dry-run rollback failed: %w", err)
 			}
-		}
-		_ = rows.Close()
-		if len(fkViolations) > 0 {
-			_, _ = tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT grizzle_dryrun;")
-			_, _ = tx.ExecContext(ctx, "RELEASE SAVEPOINT grizzle_dryrun;")
-			return fmt.Errorf("sqlite: dry-run foreign key violation: %s", strings.Join(fkViolations, "; "))
-		}
-
-		// Zero mutation invariant: discard every change.
-		if _, err := tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT grizzle_dryrun;"); err != nil {
-			return fmt.Errorf("sqlite: dry-run rollback failed: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, "RELEASE SAVEPOINT grizzle_dryrun;"); err != nil {
-			return fmt.Errorf("sqlite: dry-run savepoint release failed: %w", err)
-		}
-		return nil
+			if _, err := tx.ExecContext(ctx, "RELEASE SAVEPOINT grizzle_dryrun;"); err != nil {
+				return fmt.Errorf("sqlite: dry-run savepoint release failed: %w", err)
+			}
+			return nil
+		})
 	})
 	if err != nil {
 		return nil, err

@@ -55,7 +55,7 @@ func TestPlan_Hash_Golden(t *testing.T) {
 		Renames:       map[string]string{"users_accounts": "users"},
 	}
 
-	const want = "fed488b287bc127c043ff6e746a7109f0c5f7589fd335b0a3e51064b2d20ed7e"
+	const want = "5535ef580cf9685c596b1ec84856498d732d77974a5e056e296f752849e0b825"
 	if got := p.Hash(); got != want {
 		t.Errorf("golden hash mismatch:\n got  %s\n want %s\nIf this change is intentional (hash format edit), update the golden value.", got, want)
 	}
@@ -155,5 +155,37 @@ func TestPlan_Document_OmitsLockAndShadow(t *testing.T) {
 	if parsed.RolesSQL != p.RolesSQL || parsed.CatalogSQL != p.CatalogSQL {
 		t.Fatalf("side-channel SQL did not round-trip: roles=%q/%q catalog=%q/%q",
 			parsed.RolesSQL, p.RolesSQL, parsed.CatalogSQL, p.CatalogSQL)
+	}
+}
+
+// TestPlan_Document_PasswordRoundTripHashStable verifies Hash uses the same
+// password redaction as Document storage so apply --plan does not see drift.
+func TestPlan_Document_PasswordRoundTripHashStable(t *testing.T) {
+	p := &plan.Plan{
+		TargetSchema: "public",
+		RolesSQL:     `CREATE ROLE app_login LOGIN PASSWORD 's3cret-live';`,
+		Steps: []plan.Step{{
+			Type:  plan.ChangeAlterRole,
+			Table: "app_login",
+			SQL:   `ALTER ROLE "app_login" PASSWORD '********';`,
+		}},
+	}
+	want := p.Hash()
+	data, err := p.ToJSON()
+	if err != nil {
+		t.Fatalf("ToJSON: %v", err)
+	}
+	if strings.Contains(string(data), "s3cret-live") {
+		t.Fatal("document must not embed plaintext password")
+	}
+	parsed, envelopeHash, err := plan.ParsePlanJSON(data)
+	if err != nil {
+		t.Fatalf("ParsePlanJSON: %v", err)
+	}
+	if envelopeHash != want {
+		t.Fatalf("document envelope hash %q != original %q", envelopeHash, want)
+	}
+	if got := parsed.Hash(); got != want {
+		t.Fatalf("reloaded plan hash %q != original %q (Document/Hash redaction mismatch)", got, want)
 	}
 }

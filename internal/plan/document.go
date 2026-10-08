@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"slices"
 	"time"
+
+	"github.com/muandane/grizzle/internal/schema"
 )
 
 // ScopeDocument records included and excluded table patterns for the plan.
@@ -59,9 +61,9 @@ func (p *Plan) Document() Document {
 		Policy:               p.Policy,
 		Renames:              p.Renames,
 		ExpandContract:       p.ExpandContract,
-		SchemaSQL:            p.SchemaSQL,
-		RolesSQL:             p.RolesSQL,
-		CatalogSQL:           p.CatalogSQL,
+		SchemaSQL:            schema.RedactSecretsSQL(p.SchemaSQL),
+		RolesSQL:             schema.RedactRolePasswordsSQL(p.RolesSQL),
+		CatalogSQL:           schema.RedactSubscriptionConnInfoSQL(p.CatalogSQL),
 		NonConcurrentIndexes: p.NonConcurrentIndexes,
 		LockTimeoutNs:        int64(p.LockTimeout / time.Nanosecond),
 		StatementTimeoutNs:   int64(p.StatementTimeout / time.Nanosecond),

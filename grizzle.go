@@ -284,8 +284,17 @@ func prepareOptions(ctx context.Context, db *sql.DB, opts *Options) error {
 	switch opts.Dialect {
 	case DialectSQLite:
 		opts.TargetSchema = cmp.Or(opts.TargetSchema, "main")
-		if len(opts.TargetSchemas) == 0 {
+		if len(opts.TargetSchemas) > 0 {
+			slices.Sort(opts.TargetSchemas)
+			opts.TargetSchemas = slices.Compact(opts.TargetSchemas)
+			// TargetSchema is the open primary database ("main" unless the
+			// caller set it explicitly). Never reassign it from the sorted
+			// list: that would make an ATTACH name the primary.
+		} else if opts.TargetSchema != "" {
 			opts.TargetSchemas = []string{opts.TargetSchema}
+		} else {
+			opts.TargetSchema = "main"
+			opts.TargetSchemas = []string{"main"}
 		}
 		if opts.SQLiteRebuildThreshold == 0 {
 			opts.SQLiteRebuildThreshold = 100000
@@ -336,6 +345,9 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error {
 	if opts.Dialect == DialectSQLite {
 		syncErr = exec.SyncSQLite(ctx, db, exec.SQLiteExecConfig{
 			SchemaSQL:        opts.SchemaSQL,
+			TargetSchema:     opts.TargetSchema,
+			TargetSchemas:    opts.TargetSchemas,
+			SQLiteAttach:     opts.SQLiteAttach,
 			Filters:          filters,
 			Policy:           policy,
 			AcceptHazards:    opts.AcceptHazards,
@@ -452,12 +464,15 @@ func PlanDiff(ctx context.Context, db *sql.DB, opts Options) (*Plan, error) {
 
 	if opts.Dialect == DialectSQLite {
 		return exec.PlanDiffSQLite(ctx, db, exec.SQLiteExecConfig{
-			SchemaSQL: opts.SchemaSQL,
-			Filters:   filters,
-			Policy:    policy,
-			Logger:    opts.Logger,
-			Tracer:    opts.Tracer,
-			DryRun:    opts.DryRun,
+			SchemaSQL:     opts.SchemaSQL,
+			TargetSchema:  opts.TargetSchema,
+			TargetSchemas: opts.TargetSchemas,
+			SQLiteAttach:  opts.SQLiteAttach,
+			Filters:       filters,
+			Policy:        policy,
+			Logger:        opts.Logger,
+			Tracer:        opts.Tracer,
+			DryRun:        opts.DryRun,
 		})
 	}
 
@@ -516,6 +531,10 @@ type ApplyOpts struct {
 	// Defaults to 10000.
 	SQLiteRebuildBatchSize int
 
+	// SQLiteAttach maps ATTACH DATABASE schema names to filesystem paths for
+	// multi-schema SQLite Apply. Not carried in the plan artifact.
+	SQLiteAttach map[string]string
+
 	// LockNamespace specifies the application namespace string used for PostgreSQL advisory locking (defaults to "grizzle").
 	LockNamespace string
 
@@ -534,44 +553,47 @@ type ApplyOpts struct {
 // identity, and ShadowSchema is generated ephemerally at apply time.
 func optionsFromPlan(p *Plan, opts ApplyOpts) Options {
 	return Options{
-		SchemaSQL:              p.SchemaSQL,
-		RolesSQL:               p.RolesSQL,
-		CatalogSQL:             p.CatalogSQL,
-		TargetSchema:           p.TargetSchema,
-		TargetSchemas:          p.TargetSchemas,
-		IncludeTables:          p.IncludeTables,
-		ExcludeTables:          p.ExcludeTables,
-		Renames:                p.Renames,
-		ExpandContract:         p.ExpandContract,
-		AllowDropTable:         &p.Policy.AllowTable,
-		AllowDropColumn:        &p.Policy.AllowColumn,
-		AllowDropIndex:         &p.Policy.AllowIndex,
-		AllowDropFK:            &p.Policy.AllowFK,
-		AllowDropCheck:         &p.Policy.AllowCheck,
-		AllowDropExtension:     &p.Policy.AllowExtension,
-		AllowDropFunction:      &p.Policy.AllowFunction,
-		AllowDropPolicy:        &p.Policy.AllowPolicy,
-		AllowDropTrigger:       &p.Policy.AllowTrigger,
-		AllowDropView:          &p.Policy.AllowView,
-		AllowDropDomain:        &p.Policy.AllowDomain,
-		AllowRevoke:            p.Policy.AllowRevoke,
-		AllowDropRole:          p.Policy.AllowDropRole,
-		AllowDropPublication:   p.Policy.AllowDropPublication,
-		AllowDropEventTrigger:  p.Policy.AllowDropEventTrigger,
-		AcceptHazards:          opts.AcceptHazards,
-		Backfill:               opts.Backfill,
-		BeforeSync:             opts.BeforeSync,
-		AfterSync:              opts.AfterSync,
-		BeforeStep:             opts.BeforeStep,
-		AfterStep:              opts.AfterStep,
-		SQLiteRebuildThreshold: opts.SQLiteRebuildThreshold,
-		SQLiteRebuildBatchSize: opts.SQLiteRebuildBatchSize,
-		LockNamespace:          opts.LockNamespace,
-		LockTimeout:            p.LockTimeout,
-		StatementTimeout:       p.StatementTimeout,
-		NonConcurrentIndexes:   p.NonConcurrentIndexes,
-		Logger:                 opts.Logger,
-		Tracer:                 opts.Tracer,
+		SchemaSQL:                p.SchemaSQL,
+		RolesSQL:                 p.RolesSQL,
+		CatalogSQL:               p.CatalogSQL,
+		TargetSchema:             p.TargetSchema,
+		TargetSchemas:            p.TargetSchemas,
+		IncludeTables:            p.IncludeTables,
+		ExcludeTables:            p.ExcludeTables,
+		Renames:                  p.Renames,
+		ExpandContract:           p.ExpandContract,
+		AllowDropTable:           &p.Policy.AllowTable,
+		AllowDropColumn:          &p.Policy.AllowColumn,
+		AllowDropIndex:           &p.Policy.AllowIndex,
+		AllowDropFK:              &p.Policy.AllowFK,
+		AllowDropCheck:           &p.Policy.AllowCheck,
+		AllowDropExtension:       &p.Policy.AllowExtension,
+		AllowDropFunction:        &p.Policy.AllowFunction,
+		AllowDropPolicy:          &p.Policy.AllowPolicy,
+		AllowDropTrigger:         &p.Policy.AllowTrigger,
+		AllowDropView:            &p.Policy.AllowView,
+		AllowDropDomain:          &p.Policy.AllowDomain,
+		AllowRevoke:              p.Policy.AllowRevoke,
+		AllowDropRole:            p.Policy.AllowDropRole,
+		AllowDropPublication:     p.Policy.AllowDropPublication,
+		AllowDropEventTrigger:    p.Policy.AllowDropEventTrigger,
+		AllowDropSubscription:    p.Policy.AllowDropSubscription,
+		AllowDropReplicationSlot: p.Policy.AllowDropReplicationSlot,
+		AcceptHazards:            opts.AcceptHazards,
+		Backfill:                 opts.Backfill,
+		BeforeSync:               opts.BeforeSync,
+		AfterSync:                opts.AfterSync,
+		BeforeStep:               opts.BeforeStep,
+		AfterStep:                opts.AfterStep,
+		SQLiteRebuildThreshold:   opts.SQLiteRebuildThreshold,
+		SQLiteRebuildBatchSize:   opts.SQLiteRebuildBatchSize,
+		SQLiteAttach:             opts.SQLiteAttach,
+		LockNamespace:            opts.LockNamespace,
+		LockTimeout:              p.LockTimeout,
+		StatementTimeout:         p.StatementTimeout,
+		NonConcurrentIndexes:     p.NonConcurrentIndexes,
+		Logger:                   opts.Logger,
+		Tracer:                   opts.Tracer,
 	}
 }
 
@@ -605,6 +627,9 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 		if syncOpts.Dialect == DialectSQLite {
 			return exec.SyncSQLite(ctx, db, exec.SQLiteExecConfig{
 				SchemaSQL:        syncOpts.SchemaSQL,
+				TargetSchema:     syncOpts.TargetSchema,
+				TargetSchemas:    syncOpts.TargetSchemas,
+				SQLiteAttach:     syncOpts.SQLiteAttach,
 				Filters:          filters,
 				Policy:           policy,
 				AcceptHazards:    opts.AcceptHazards,
@@ -676,6 +701,9 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 	switch dialect {
 	case DialectSQLite:
 		return exec.ApplySQLite(ctx, db, p, exec.SQLiteExecConfig{
+			TargetSchema:     p.TargetSchema,
+			TargetSchemas:    p.TargetSchemas,
+			SQLiteAttach:     opts.SQLiteAttach,
 			Policy:           p.Policy,
 			AcceptHazards:    opts.AcceptHazards,
 			ExpectedHash:     opts.ExpectedHash,
@@ -810,7 +838,11 @@ func CompileSchema(ctx context.Context, db *sql.DB, opts Options) (*SchemaIR, er
 	}
 	switch opts.Dialect {
 	case DialectSQLite:
-		return exec.CompileSchemaSQLite(ctx, opts.SchemaSQL)
+		schemas := opts.TargetSchemas
+		if len(schemas) == 0 && opts.TargetSchema != "" {
+			schemas = []string{opts.TargetSchema}
+		}
+		return exec.CompileSchemaSQLite(ctx, opts.SchemaSQL, schemas...)
 	case DialectPostgres:
 		if len(opts.TargetSchemas) > 1 {
 			return nil, ErrUnsupportedMultiSchema
@@ -908,6 +940,9 @@ func DryRunVerify(ctx context.Context, db *sql.DB, opts Options) (*DryRunResult,
 	if opts.Dialect == DialectSQLite {
 		return exec.DryRunVerifySQLite(ctx, db, exec.SQLiteExecConfig{
 			SchemaSQL:            opts.SchemaSQL,
+			TargetSchema:         opts.TargetSchema,
+			TargetSchemas:        opts.TargetSchemas,
+			SQLiteAttach:         opts.SQLiteAttach,
 			Filters:              filters,
 			Policy:               policy,
 			AcceptHazards:        opts.AcceptHazards,

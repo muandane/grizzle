@@ -108,7 +108,7 @@ This document outlines the step-by-step execution plan to build, test, and ship 
 - [x] **5.4 First release (v0.1.0)**
   - All test suites passing with race detector, zero static analysis issues.
   - Tag `v0.1.0-rc.1` from a green `main`; docs and code claims reconciled (see CONTRIBUTING release steps).
-  - Not yet v1.0.0: the API carries `Experimental:` surfaces (renames, expand/contract, backfill) that may still change.
+  - Renames, expand/contract, and backfill are frozen shapes (no longer marked Experimental). A v1.0.0 tag is a separate release decision.
 
 ## Post-0.1 backlog
 
@@ -117,9 +117,9 @@ Ordered by expected impact; nothing here blocks the first release.
 - [x] **Declarative management surface expansion** — shipped (see "Managed surface expansion" below): extensions, RLS + policies, functions, triggers, and views/matviews are now first-class managed constructs.
 - [x] **SQLite declarative CHECK constraints** — named and inline CHECK constraints are parsed from `sqlite_schema.sql`, emitted on create/rebuild, and diffed (check drift triggers a rebuild; removals gated by `AllowDropCheck` + `DROP_CHECK`).
 - [x] **Domain CHECK management** — domains are managed end-to-end: base type/nullability/default diffed from `pg_type` + `pg_constraint` (`conrelid = 0`), CHECK drift via `ALTER DOMAIN ADD/DROP CONSTRAINT`, drops gated by `AllowDropDomain` + `DROP_DOMAIN`.
-- [ ] **CLI backfill runner** — batched backfill is library-only (`Options.Backfill`); a CLI runner would need a durable batching contract.
-- [ ] **Multi-schema SQLite** — rejected today (`ErrUnsupportedMultiSchema`).
-- [ ] **v1.0.0 API freeze** — remove `Experimental:` markers once rename mapping, staged plans, and backfill batching stabilize.
+- [x] **CLI backfill runner** — `--backfill copy` / `--backfill-file` on the existing `RunBackfill` loop when `--expand-contract` is set; `--backfill-batch` default 1000; single-column PK required.
+- [x] **Multi-schema SQLite** — `SQLiteAttach` + `TargetSchemas`; per-schema diff/rebuild; shadow uses `:memory:` ATTACH (cross-DB FKs not validated).
+- [x] **Stabilize Renames / ExpandContract / Backfill** — `Experimental:` markers removed; field shapes and `Plan.Hash()` inputs unchanged. No v1.0 tag in this slice.
 
 ## Managed surface expansion (shipped)
 
@@ -136,8 +136,7 @@ Declarative lifecycle for objects previously detected-and-protected. Each constr
 - **Views / materialized views** — `pg_get_viewdef` canonical; append-only column growth replaces in place, everything else is DROP+CREATE; matviews additionally emit `REFRESH MATERIALIZED VIEW`. `DROP_VIEW` critical + `AllowDropView`.
 - **Lint L009** — rejects DML in `SchemaSQL` (silently ignored today; seeds belong in `SeedSQL`).
 - **Export** — reversal (`Down`) SQL for policy/RLS/function/trigger/view/comment creation (comments restore the previous text; aggregates reverse to `DROP AGGREGATE`; domain creation and `ALTER DOMAIN ... ADD CONSTRAINT` reverse to `DROP DOMAIN` / `DROP CONSTRAINT`; `GRANT`/`REVOKE` reverse to each other, `CREATE ROLE` reverses to `DROP ROLE`); extension creation deliberately irreversible.
-- **Unified role & catalog statements** — shipped: `SchemaSQL` may contain role/grant and publication/event-trigger statements alongside shadow-compiled schema DDL. The optional `--roles roles.sql` and `--catalog catalog.sql` files remain supported as authoritative overlays on duplicate role/grant identities or catalog object names. Role and catalog statements are statement-scanned and applied after schema DDL; drops remain narrow and gated by the existing `AllowRevoke`, `AllowDropRole`, `AllowDropPublication`, and `AllowDropEventTrigger` controls. Password/config management, subscriptions, and replication slots stay out of scope.
+- **Unified role & catalog statements** — shipped: `SchemaSQL` may contain role/grant and publication/event-trigger statements alongside shadow-compiled schema DDL. The optional `--roles roles.sql` and `--catalog catalog.sql` files remain supported as authoritative overlays on duplicate role/grant identities or catalog object names. Role and catalog statements are statement-scanned and applied after schema DDL; drops remain narrow and gated by the existing `AllowRevoke`, `AllowDropRole`, `AllowDropPublication`, and `AllowDropEventTrigger` controls. Password/config management is shipped for roles.
+- **Subscriptions / logical replication slots** — shipped: `CREATE`/`ALTER`/`DROP SUBSCRIPTION` and `SELECT pg_create_logical_replication_slot` / `pg_drop_replication_slot` strip into CatalogSQL; subscriptions use `COMMENT ON SUBSCRIPTION … 'grizzle-managed'` narrow drops behind `AllowDropSubscription`; standalone logical slots never auto-sweep (no COMMENT ON) and drop only via explicit `pg_drop_replication_slot` behind `AllowDropReplicationSlot` (refused when `active_pid IS NOT NULL`); subscription-owned slots are not a second object; conninfo is redacted like passwords; `DROP SUBSCRIPTION` keeps the remote slot (`DISABLE` + `SET (slot_name = NONE)` then `DROP`). Physical slots and unsupported `WITH` options are refused.
 
 ### Deferred (rationale)
-
-- **Subscriptions / replication slots** — replication consumers are cluster-attached state with side effects beyond any single managed database; syncing them declaratively is an operator-level concern.

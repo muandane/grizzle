@@ -55,7 +55,14 @@ type Options struct {
     TargetSchema string
 
     // TargetSchemas specifies the database schemas to manage (defaults to [TargetSchema] or ["public"] for Postgres).
+    // For SQLite, entries other than "main" are ATTACH DATABASE names listed in SQLiteAttach.
     TargetSchemas []string
+
+    // SQLiteAttach maps ATTACH DATABASE schema names to filesystem paths.
+    // Every TargetSchemas entry other than "main" must appear here; "main" is
+    // the primary database already open and must not be listed. Unknown keys,
+    // empty paths, and duplicate names are rejected. Ignored on PostgreSQL.
+    SQLiteAttach map[string]string
 
     // ShadowSchema is the temporary schema name used for validation (defaults to "_grizzle_shadow").
     // Must use the reserved "_grizzle_shadow" prefix, be a valid identifier of at most 63 bytes,
@@ -129,15 +136,17 @@ type Options struct {
 
     // Renames maps old column names to new column names (e.g. "users.old_col": "new_col")
     // to disambiguate renames instead of treating them as DROP + ADD.
-    // Experimental: mapping format may change before 1.0.
+    // Keys are `table.old` or `old`; values are the new column name.
     Renames map[string]string
 
-    // ExpandContract enables staged expand-and-contract zero-downtime migrations.
-    // Experimental: staged plan shape may change before 1.0.
+    // ExpandContract enables staged expand-and-contract zero-downtime migrations
+    // (expand plan vs contract plan; see invariant 7).
     ExpandContract bool
 
-    // Backfill hook is executed during staged expand migration outside the DDL lock window in batches.
-    // Experimental: library-only; no CLI equivalent.
+    // Backfill hook is executed during staged expand migration outside the DDL
+    // lock window in batches. The CLI installs a hook via --backfill /
+    // --backfill-file when --expand-contract is set; a library Backfill wins
+    // when both are configured.
     Backfill BackfillFunc
 
     // BeforeSync runs once before any migration steps or locks execute; a
@@ -201,8 +210,12 @@ authoritative. Schema DDL remains in the shadow-compiled portion of
 
 ```sql
 -- roles.sql or SchemaSQL — these role statement forms are accepted:
-CREATE ROLE app_read;                    -- always rendered/managed as NOLOGIN group role
+CREATE ROLE app_read;                    -- default NOLOGIN when LOGIN/NOLOGIN omitted
 CREATE USER app_writer WITH NOLOGIN;     -- USER is an alias for CREATE ROLE
+CREATE ROLE app_login LOGIN PASSWORD 'secret' VALID UNTIL '2040-01-01' CONNECTION LIMIT 4;
+ALTER ROLE app_login SET search_path = public;
+ALTER ROLE app_login SET work_mem FROM CURRENT;
+ALTER ROLE app_login RESET log_statement;
 GRANT SELECT, INSERT ON docs TO app_read;
 GRANT ALL ON TABLE docs TO app_read WITH GRANT OPTION;
 GRANT USAGE ON SEQUENCE docs_id_seq TO app_read;
@@ -217,11 +230,19 @@ Semantics:
 - Statement scan rejects anything else (`ErrInvalidOptions`) — no silent
   ignoring. Other `SchemaSQL` statements remain in the shadow-compiled
   portion rather than being treated as RolesSQL.
-- PR1 rejects `ALTER ROLE/USER`, `DROP ROLE/USER`, password options, and
-  other role-configuration forms explicitly. Role configuration and password
-  management are reserved for PR2.
-- Declared roles are created `NOLOGIN` and stamped with a `grizzle-managed`
-  catalog comment. Only marker-stamped roles absent from the desired state are
+- Managed role attributes: `LOGIN`/`NOLOGIN`, `PASSWORD` (plaintext literal
+  only; `PASSWORD NULL` refused), `VALID UNTIL`, `CONNECTION LIMIT`,
+  `INHERIT`/`NOINHERIT`, `CREATEDB`/`NOCREATEDB`, `CREATEROLE`/`NOCREATEROLE`,
+  and `ALTER ROLE ... SET`/`RESET` (role-level `pg_db_role_setting`,
+  `setdatabase = 0`). `SUPERUSER`, `REPLICATION`, and `BYPASSRLS` are refused.
+  `DROP ROLE/USER` remains unsupported in the declarative contract.
+- Passwords are compared by hash equality against `pg_authid.rolpassword`
+  (md5/scram). Plaintext never appears in `Step.SQL`, plan JSON, or logs;
+  apply rebuilds password SQL from parsed IR. Password drift emits
+  `PASSWORD_CHANGE` (WARNING).
+- When `LOGIN`/`NOLOGIN` is omitted, CREATE keeps PostgreSQL's default
+  (`NOLOGIN`). Declared roles are stamped with a `grizzle-managed` catalog
+  comment. Only marker-stamped roles absent from the desired state are
   dropped, and only behind `AllowDropRole` + `DROP_ROLE` (CRITICAL). A managed
   role that owns cluster objects aborts the sync with an ownership error.
 - Grants are diffed per (object kind, object, grantee): missing → `GRANT`;
@@ -241,11 +262,12 @@ Semantics:
 #### CatalogSQL contract (PostgreSQL)
 
 `CatalogSQL` is an optional side-channel overlay (CLI: `--catalog catalog.sql`)
-for the desired cluster-catalog state of logical-replication publications and
-DDL event triggers. The same catalog statements may appear in `SchemaSQL`;
-both inputs bypass shadow compilation. When a publication or event-trigger
-name is present in both inputs, `CatalogSQL` is authoritative. Catalog DDL
-cannot run inside the shadow-compile transaction model.
+for the desired cluster-catalog state of logical-replication publications,
+DDL event triggers, subscriptions, and standalone logical replication slots.
+The same catalog statements may appear in `SchemaSQL`; both inputs bypass
+shadow compilation. When a catalog object name is present in both inputs,
+`CatalogSQL` is authoritative. Catalog DDL cannot run inside the
+shadow-compile transaction model.
 
 ```sql
 -- catalog.sql or SchemaSQL — these catalog statement forms are accepted:
@@ -255,6 +277,15 @@ CREATE PUBLICATION all_pub FOR ALL TABLES;
 CREATE PUBLICATION ins_only WITH (publish = 'insert');           -- defaults to all four
 ALTER PUBLICATION docs_pub ADD TABLE audit;
 DROP PUBLICATION old_pub;
+CREATE SUBSCRIPTION docs_sub CONNECTION 'host=publisher dbname=pub' PUBLICATION docs_pub;
+-- WITH defaults: enabled=true, copy_data=true, create_slot=true, slot_name=<subscription name>
+-- create_slot / copy_data are create-time only (not altered on existing subscriptions)
+ALTER SUBSCRIPTION docs_sub CONNECTION 'host=publisher dbname=pub password=secret';
+ALTER SUBSCRIPTION docs_sub ENABLE;
+ALTER SUBSCRIPTION docs_sub SET PUBLICATION docs_pub, audit_pub;
+DROP SUBSCRIPTION old_sub;
+SELECT pg_create_logical_replication_slot('docs_slot', 'pgoutput');
+SELECT pg_drop_replication_slot('old_slot');
 CREATE EVENT TRIGGER audit_ddl ON ddl_command_end EXECUTE FUNCTION log_ddl();
 CREATE EVENT TRIGGER block_drop ON sql_drop WHEN TAG IN ('DROP TABLE') EXECUTE FUNCTION refuse_ddl();
 ALTER EVENT TRIGGER audit_ddl DISABLE;
@@ -263,37 +294,57 @@ DROP EVENT TRIGGER old_audit;
 
 Semantics:
 
-- Statement scan rejects anything else (`WHEN VALUE IN`, schema DDL —
+- Statement scan rejects anything else (`WHEN VALUE IN`, schema DDL,
+  physical slots, unsupported subscription `WITH` options —
   `ErrInvalidOptions`); no silent ignoring. Other `SchemaSQL` statements
   remain in the shadow-compiled portion rather than being treated as
-  CatalogSQL.
-- `ALTER` statements require a matching publication or event-trigger
-  declaration across the unified file and `CatalogSQL`; a side-channel
-  `CREATE` replaces a same-name unified declaration before its side-channel
-  `ALTER`/`DROP` operations are replayed. Operation-only inputs do not imply
-  drops of unrelated managed catalog objects.
+  CatalogSQL. `SELECT pg_create_logical_replication_slot` / `pg_drop_replication_slot`
+  are stripped into CatalogSQL (exempt from shadow compile and L009).
+- `ALTER` statements require a matching declaration across the unified file
+  and `CatalogSQL`; a side-channel `CREATE` replaces a same-name unified
+  declaration before its side-channel `ALTER`/`DROP` operations are replayed.
+  Operation-only inputs do not imply drops of unrelated managed catalog objects.
 - Publications are diffed on membership and `publish` flags from
   `pg_publication` / `pg_publication_rel` / `pg_publication_namespace`:
   missing → create, drift → `ALTER PUBLICATION`, drop → gated by
   `AllowDropPublication` + `DROP_PUBLICATION` (CRITICAL). Unqualified
   `TABLE` names resolve against the primary target schema.
+- Subscriptions are diffed on conninfo, enabled state, and publication set
+  from `pg_subscription` (current database): missing → `CREATE SUBSCRIPTION`
+  + `COMMENT ON SUBSCRIPTION … 'grizzle-managed'`, drift → `ALTER
+  SUBSCRIPTION`, drop → gated by `AllowDropSubscription` +
+  `DROP_SUBSCRIPTION` (CRITICAL). Default `DROP` keeps the remote slot
+  (`DISABLE` + `SET (slot_name = NONE)` then `DROP`). Conninfo is redacted
+  in Step.SQL / plan JSON / Hash like role passwords (`SUBSCRIPTION_CONNINFO`
+  WARNING). Apply materializes CONNECTION from IR; redacted-only IR refuses apply.
+- Standalone logical slots (`pg_replication_slots` where `database =
+  current_database()` and `slot_type = 'logical'`): create missing desired
+  slots; never auto-sweep live-only slots (COMMENT ON is unsupported);
+  explicit `SELECT pg_drop_replication_slot` sets a dropped set gated by
+  `AllowDropReplicationSlot` + `DROP_REPLICATION_SLOT` (CRITICAL). Slots
+  owned by a managed subscription (`subslotname`) are not a second object.
+  Active slots (`active_pid IS NOT NULL`) refuse drop.
 - Event triggers are diffed on event, tag filter, function, and enabled
   state from `pg_event_trigger`: definition drift is DROP+CREATE
   (PostgreSQL has no in-place ALTER for event/tags/function);
   enabled-only drift renders `ALTER EVENT TRIGGER ENABLE/DISABLE`.
 - Event-trigger functions must exist (managed routines from `SchemaSQL`
   or live objects); the sync aborts naming the missing function.
-- Drops are narrow: only objects stamped with the `grizzle-managed`
-  catalog comment are considered for dropping (behind
-  `AllowDropEventTrigger` + `DROP_EVENT_TRIGGER`, CRITICAL);
-  operator-created publications and event triggers are never swept.
+- Drops are narrow: publications, event triggers, and subscriptions stamped
+  with the `grizzle-managed` catalog comment are considered for dropping
+  (behind their AllowDrop* gates + CRITICAL hazards), including the
+  DROP+CREATE recreate path used when definition drift cannot be expressed
+  as `ALTER`. Operator-created objects without markers are never swept; a
+  same-name unmanaged object that requires recreate fails closed at plan
+  time. Slots use the explicit-drop policy above.
 - `CREATE EVENT TRIGGER` DDL may require superuser; every plan step
   touching one emits `EVENT_TRIGGER_SUPERUSER` (WARNING). `FOR ALL
   TABLES` breadth emits `PUBLICATION_ALL_TABLES` (NOTICE).
-- Catalog steps sort after roles and grants; the original `SchemaSQL` and
-  `CatalogSQL` strings each participate in `Plan.Hash()` when non-empty.
-  Extracted statements are not hashed a second time. SQLite + non-empty
-  `CatalogSQL` is rejected.
+- Catalog steps sort after roles and grants (subscriptions after
+  publications, before event triggers); the original `SchemaSQL` and
+  `CatalogSQL` strings each participate in `Plan.Hash()` when non-empty
+  (conninfo redacted). Extracted statements are not hashed a second time.
+  SQLite + non-empty `CatalogSQL` is rejected.
 
 ```go
 type ApplyOpts struct {
@@ -335,7 +386,7 @@ type Plan struct {
     RolesSQL string
 
     // Approval-sensitive: participates in Hash() when non-empty (desired
-    // publications/event-triggers side-channel).
+    // publications/event-triggers/subscriptions/slots side-channel).
     CatalogSQL string
 
     // Approval-sensitive: participates in Hash() because it changes generated SQL.
@@ -364,8 +415,8 @@ func (p *Plan) String() string
 type HazardLevel string
 
 const (
-    HazardLevelCritical HazardLevel = "CRITICAL" // Data destruction (DROP TABLE/COLUMN, DROP_EXTENSION, DROP_POLICY, DROP_FUNCTION, DROP_TRIGGER, DROP_VIEW, DROP_DOMAIN, DROP_ROLE, REVOKE_PRIVILEGE, DROP_PUBLICATION, DROP_EVENT_TRIGGER, TYPE_NARROW, RENAME_AMBIGUOUS, UNMANAGED_DEPENDENCY, GENERATED_REWRITE)
-    HazardLevelWarning  HazardLevel = "WARNING"  // Execution or lockout risk (EXTENSION_PRIVILEGE, GRANT_PUBLIC, EVENT_TRIGGER_SUPERUSER, RLS_ENABLE, SECURITY_DEFINER, PARTITION_ATTACH_SCAN, PARTITION_PENDING_DETACH)
+    HazardLevelCritical HazardLevel = "CRITICAL" // Data destruction (DROP TABLE/COLUMN, DROP_EXTENSION, DROP_POLICY, DROP_FUNCTION, DROP_TRIGGER, DROP_VIEW, DROP_DOMAIN, DROP_ROLE, REVOKE_PRIVILEGE, DROP_PUBLICATION, DROP_SUBSCRIPTION, DROP_REPLICATION_SLOT, DROP_EVENT_TRIGGER, TYPE_NARROW, RENAME_AMBIGUOUS, UNMANAGED_DEPENDENCY, GENERATED_REWRITE)
+    HazardLevelWarning  HazardLevel = "WARNING"  // Execution or lockout risk (EXTENSION_PRIVILEGE, GRANT_PUBLIC, EVENT_TRIGGER_SUPERUSER, SUBSCRIPTION_CONNINFO, RLS_ENABLE, SECURITY_DEFINER, PARTITION_ATTACH_SCAN, PARTITION_PENDING_DETACH)
     HazardLevelNotice   HazardLevel = "NOTICE"   // Locking or performance impact (INDEX creation/drop, FK drop, COMMENT_CLEAR, PUBLICATION_ALL_TABLES)
 )
 
@@ -401,7 +452,11 @@ const (
     HazardRevokePrivilege        HazardCode = "REVOKE_PRIVILEGE"
     HazardDropRole               HazardCode = "DROP_ROLE"
     HazardGrantPublic            HazardCode = "GRANT_PUBLIC"
+    HazardPasswordChange         HazardCode = "PASSWORD_CHANGE"
     HazardDropPublication        HazardCode = "DROP_PUBLICATION"
+    HazardDropSubscription       HazardCode = "DROP_SUBSCRIPTION"
+    HazardDropReplicationSlot    HazardCode = "DROP_REPLICATION_SLOT"
+    HazardSubscriptionConnInfo   HazardCode = "SUBSCRIPTION_CONNINFO"
     HazardDropEventTrigger       HazardCode = "DROP_EVENT_TRIGGER"
     HazardEventTriggerSuperuser  HazardCode = "EVENT_TRIGGER_SUPERUSER"
     HazardPublicationAllTables   HazardCode = "PUBLICATION_ALL_TABLES"
@@ -448,8 +503,10 @@ type Hazard struct {
 | `Domains` | Yes | Managed types diffed from `pg_type` (`typtype='d'`) + `pg_constraint` (`conrelid = 0`); base type/nullability/default drift is DROP+CREATE (no in-place retype); CHECK drift → `ALTER DOMAIN ADD/DROP CONSTRAINT`; drops gated by `AllowDropDomain` + `DROP_DOMAIN` (CRITICAL); no implicit `CASCADE` — dependent columns fail at apply |
 | `Triggers` | Yes | `pg_trigger` + canonical `pg_get_triggerdef`; drift → DROP+CREATE; drops gated by `AllowDropTrigger` + `DROP_TRIGGER` (CRITICAL); surviving managed triggers block dependent column drops via `UNMANAGED_DEPENDENCY` |
 | `Views` & `Materialized Views` | Yes | Canonical `pg_get_viewdef`; append-only column changes replace in place (`CREATE OR REPLACE VIEW`), otherwise DROP+CREATE; matviews always DROP+CREATE plus `REFRESH MATERIALIZED VIEW`; drops gated by `AllowDropView` + `DROP_VIEW` (CRITICAL) |
-| `Roles & Grants` | Yes | Via unified `SchemaSQL` or the `RolesSQL` side-channel overlay (§2.2): managed `NOLOGIN` roles and object grants diffed against `pg_authid` + ACLs (`aclexplode`); duplicate side-channel identities override SchemaSQL; missing → `GRANT`, surplus → `REVOKE` gated by `AllowRevoke` + `REVOKE_PRIVILEGE` (CRITICAL); marker-stamped roles dropped behind `AllowDropRole` + `DROP_ROLE` (CRITICAL) with ownership refusal; grants to `PUBLIC`/unmanaged grantees never revoked; `GRANT ... TO PUBLIC` emits `GRANT_PUBLIC` (WARNING) |
+| `Roles & Grants` | Yes | Via unified `SchemaSQL` or the `RolesSQL` side-channel overlay (§2.2): managed roles (LOGIN/PASSWORD/config attrs) and object grants diffed against `pg_authid` + `pg_db_role_setting` + ACLs (`aclexplode`); duplicate side-channel identities override SchemaSQL; missing → `GRANT`, surplus → `REVOKE` gated by `AllowRevoke` + `REVOKE_PRIVILEGE` (CRITICAL); marker-stamped roles dropped behind `AllowDropRole` + `DROP_ROLE` (CRITICAL) with ownership refusal; grants to `PUBLIC`/unmanaged grantees never revoked; `GRANT ... TO PUBLIC` emits `GRANT_PUBLIC` (WARNING); password drift emits `PASSWORD_CHANGE` (WARNING); `SUPERUSER`/`REPLICATION`/`BYPASSRLS` refused |
 | `Publications` | Yes | Via unified `SchemaSQL` or the `CatalogSQL` side-channel overlay (§2.2): membership and `publish` flags diffed from `pg_publication` / `pg_publication_rel` / `pg_publication_namespace`; duplicate side-channel names override SchemaSQL; drift → `ALTER PUBLICATION`; drops gated by `AllowDropPublication` + `DROP_PUBLICATION` (CRITICAL), narrow to marker-stamped objects; `FOR ALL TABLES` emits `PUBLICATION_ALL_TABLES` (NOTICE); schema-level publications require PostgreSQL 15+ |
+| `Subscriptions` | Yes | Via unified `SchemaSQL` or `CatalogSQL`: conninfo/enabled/publication-set diffed from `pg_subscription` (current DB); CREATE stamps `COMMENT ON SUBSCRIPTION … 'grizzle-managed'`; DROP keeps remote slot (`DISABLE` + `SET (slot_name = NONE)`); gated by `AllowDropSubscription` + `DROP_SUBSCRIPTION` (CRITICAL); conninfo redacted (`SUBSCRIPTION_CONNINFO` WARNING); unsupported WITH options refused |
+| `Logical replication slots` | Yes | Standalone `SELECT pg_create_logical_replication_slot` / `pg_drop_replication_slot`; live-only never swept (no COMMENT ON); subscription-owned slots ignored; active slots refused; gated by `AllowDropReplicationSlot` + `DROP_REPLICATION_SLOT` (CRITICAL); physical slots refused |
 | `Event Triggers` | Yes | Via unified `SchemaSQL` or the `CatalogSQL` side-channel overlay (§2.2): event/tag/function/enabled state diffed from `pg_event_trigger`; duplicate side-channel names override SchemaSQL; definition drift is DROP+CREATE, enabled-only drift renders `ALTER EVENT TRIGGER ENABLE/DISABLE`; creation refuses missing trigger functions; drops gated by `AllowDropEventTrigger` + `DROP_EVENT_TRIGGER` (CRITICAL), narrow to marker-stamped objects; `EVENT_TRIGGER_SUPERUSER` (WARNING) on any event-trigger step |
 
 ### SQLite
@@ -487,7 +544,7 @@ If `AllowDrop` is false (the default), Grizzle refuses to execute any plan conta
 PostgreSQL migrations acquire advisory locks (`pg_advisory_xact_lock` or session lock for concurrent indexes). Grizzle recomputes the diff post-lock to avoid TOCTOU races.
 
 ### Invariant 3: Hazard gating
-Critical hazards (`DROP_TABLE`, `DROP_COLUMN`, `TYPE_NARROW`, `RENAME_AMBIGUOUS`, `UNMANAGED_DEPENDENCY`, `GENERATED_REWRITE`, `DROP_ROLE`, `REVOKE_PRIVILEGE`, `DROP_PUBLICATION`, `DROP_EVENT_TRIGGER`) fail execution unless accepted via `AcceptHazards`.
+Critical hazards (`DROP_TABLE`, `DROP_COLUMN`, `TYPE_NARROW`, `RENAME_AMBIGUOUS`, `UNMANAGED_DEPENDENCY`, `GENERATED_REWRITE`, `DROP_ROLE`, `REVOKE_PRIVILEGE`, `DROP_PUBLICATION`, `DROP_SUBSCRIPTION`, `DROP_REPLICATION_SLOT`, `DROP_EVENT_TRIGGER`) fail execution unless accepted via `AcceptHazards`.
 
 ### Invariant 4: Plan/Apply approval hash
 `Plan.Hash()` digests approval-sensitive intent (target schemas, scope, renames, expand/contract, policy, NonConcurrentIndexes, SchemaSQL, RolesSQL, CatalogSQL, ordered steps). `Apply` / `DryRunVerifyPlan` verify against `ExpectedHash`, aborting with `ErrPlanDrift` on mismatch. History is advisory (Model B): DDL commits first; a failed history write returns `ErrHistoryRecord` while leaving schema changes applied.
@@ -502,7 +559,7 @@ Critical hazards (`DROP_TABLE`, `DROP_COLUMN`, `TYPE_NARROW`, `RENAME_AMBIGUOUS`
 Ambiguous column renames are blocked with `RENAME_AMBIGUOUS`; map them explicitly via `Options.Renames` (CLI: repeatable `--rename old=new`, optionally table-qualified `table.old=new`). Explicit renames execute either as atomic renames or, with `Options.ExpandContract` enabled (CLI: `--expand-contract`), as staged zero-downtime migrations:
 
 1. **Expand plan**: renamed/modified columns are added alongside existing columns as nullable; nothing is dropped or rewritten.
-2. **Backfill**: values are copied in batches outside the DDL lock window via the library-only `Options.Backfill` hook. There is no CLI backfill runner.
+2. **Backfill**: values are copied in batches outside the DDL lock window via `Options.Backfill` or the CLI `--backfill` / `--backfill-file` hooks (requires `--expand-contract`).
 3. **Contract plan**: a second, separately-approved plan (own deterministic hash) drops the legacy columns once the application no longer reads them; destructive, so it requires `AllowDropColumn` and explicit `AcceptHazards`.
 
 The `RENAME_AMBIGUOUS` hazard description and the interactive summary remediation point to `--rename`. See `examples/expand-contract` for a runnable end-to-end flow.
@@ -528,7 +585,7 @@ var (
     ErrInvalidOptions          = errors.New("grizzle: invalid options")
     ErrStrictScope             = errors.New("grizzle: strict scope requires non-empty IncludeTables")
     ErrPartitionConversion     = errors.New("grizzle: in-place conversion between regular and partitioned table is unsupported")
-    ErrUnsupportedMultiSchema  = errors.New("grizzle: multi-schema configuration is unsupported on SQLite")
+    ErrUnsupportedMultiSchema  = errors.New("grizzle: multi-schema CompileSchema is unsupported for PostgreSQL")
     ErrPartitionKeyNotInUnique = errors.New("grizzle: primary key or unique constraint must include all partition key columns")
     ErrHistoryRecord           = errors.New("grizzle: migration succeeded but history record was not written") // non-fatal
 )

@@ -171,6 +171,28 @@ func TestCatalogDiff_EventTriggerDrift(t *testing.T) {
 		}
 	})
 
+	t.Run("unmanaged definition drift never drops", func(t *testing.T) {
+		desired := &schema.CatalogSpec{
+			EventTriggers: []*schema.EventTrigger{
+				{Name: "audit", Event: "ddl_command_end", Function: "log_ddl_v2", Enabled: true},
+			},
+		}
+		live := &CatalogLiveState{
+			EventTriggers: map[string]*EventTriggerState{
+				"audit": {Name: "audit", Managed: false, Event: "DDL_COMMAND_END", Function: "log_ddl", Enabled: true},
+			},
+		}
+		changes := CatalogDiff(desired, live, "public")
+		for _, c := range changes {
+			if c.Type == plan.ChangeDropEventTrigger {
+				t.Fatalf("unmanaged event trigger must never be dropped on recreate: %+v", changes)
+			}
+		}
+		if err := RefuseUnmanagedCatalogRecreates(desired, live, "public"); err == nil {
+			t.Fatal("expected refusal for unmanaged event-trigger recreate")
+		}
+	})
+
 	t.Run("enabled drift alters", func(t *testing.T) {
 		desired := &schema.CatalogSpec{
 			EventTriggers: []*schema.EventTrigger{
@@ -233,6 +255,46 @@ func TestCatalogDiff_PublicationAllTablesToEmptyIsGatedReplacement(t *testing.T)
 		changes[1].Type != plan.ChangeCreatePublication ||
 		!changes[0].Destructive {
 		t.Fatalf("ALL TABLES to empty must be a gated replacement: %+v", changes)
+	}
+}
+
+func TestCatalogDiff_UnmanagedPublicationRecreateNeverDrops(t *testing.T) {
+	desired := &schema.CatalogSpec{
+		Publications: []*schema.Publication{{
+			Name:          "docs_pub",
+			PublishInsert: true, PublishUpdate: true,
+			PublishDelete: true, PublishTruncate: true,
+		}},
+	}
+	live := &CatalogLiveState{
+		Publications: map[string]*PublicationState{
+			"docs_pub": {
+				Name: "docs_pub", Managed: false, AllTables: true,
+				PublishInsert: true, PublishUpdate: true,
+				PublishDelete: true, PublishTruncate: true,
+			},
+		},
+		EventTriggers: map[string]*EventTriggerState{},
+	}
+	changes := CatalogDiff(desired, live, "public")
+	for _, c := range changes {
+		if c.Type == plan.ChangeDropPublication {
+			t.Fatalf("unmanaged publication must never be dropped on recreate: %+v", changes)
+		}
+	}
+	if err := RefuseUnmanagedCatalogRecreates(desired, live, "public"); err == nil {
+		t.Fatal("expected refusal for unmanaged publication recreate")
+	}
+	if err := RefuseUnmanagedCatalogRecreates(desired, &CatalogLiveState{
+		Publications: map[string]*PublicationState{
+			"docs_pub": {
+				Name: "docs_pub", Managed: true, AllTables: true,
+				PublishInsert: true, PublishUpdate: true,
+				PublishDelete: true, PublishTruncate: true,
+			},
+		},
+	}, "public"); err != nil {
+		t.Fatalf("managed recreate must be allowed by the refusal check: %v", err)
 	}
 }
 
