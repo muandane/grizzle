@@ -14,12 +14,13 @@ import (
 
 // LiveRoles captures the role/privilege state relevant to a RolesSQL diff.
 type LiveRoles struct {
-	// RoleNames is every non-system role name in the database (lowercased key).
+	// RoleNames is every non-system role name in the database, keyed by exact
+	// PostgreSQL role identity.
 	RoleNames map[string]string
 	// ManagedRoles are roles stamped with the grizzle-managed catalog comment.
 	ManagedRoles map[string]bool
 	// Grants maps schema.GrantKey(kind, object, grantee) -> privileges with
-	// grant option tracking. Object names are canonical (lowercased).
+	// grant option tracking. Object names retain quoted identity components.
 	Grants map[string]*LiveGrant
 }
 
@@ -79,7 +80,7 @@ func InspectLiveRoles(ctx context.Context, dbtx dialect.DBTX, targetSchemas []st
 	schemaList, args := placeholders(targetSchemas)
 	aclQuery := fmt.Sprintf(`
 		SELECT n.nspname, c.relname, c.relkind,
-		       CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE r.rolname END AS grantee,
+		       a.grantee = 0 AS is_public, COALESCE(r.rolname, '') AS rolname,
 		       a.privilege_type, a.is_grantable
 		FROM pg_class c
 		JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -93,16 +94,17 @@ func InspectLiveRoles(ctx context.Context, dbtx dialect.DBTX, targetSchemas []st
 		return nil, fmt.Errorf("inspecting table ACLs: %w", err)
 	}
 	if err := scanRows(aclRows, func(scan func(...any) error) error {
-		var schemaName, objectName, relKind, grantee, priv string
+		var schemaName, objectName, relKind, roleName, priv string
+		var isPublic bool
 		var grantable bool
-		if err := scan(&schemaName, &objectName, &relKind, &grantee, &priv, &grantable); err != nil {
+		if err := scan(&schemaName, &objectName, &relKind, &isPublic, &roleName, &priv, &grantable); err != nil {
 			return fmt.Errorf("scanning table ACLs: %w", err)
 		}
 		kind := "TABLE"
 		if relKind == "S" {
 			kind = "SEQUENCE"
 		}
-		recordLiveGrant(live, kind, schemaName+"."+objectName, grantee, priv, grantable)
+		recordLiveGrant(live, kind, []string{schemaName, objectName}, "", isPublic, roleName, priv, grantable)
 		return nil
 	}); err != nil {
 		return nil, err
@@ -114,27 +116,28 @@ func InspectLiveRoles(ctx context.Context, dbtx dialect.DBTX, targetSchemas []st
 		SELECT n.nspname,
 		       p.proname,
 		       pg_get_function_identity_arguments(p.oid),
-		       CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE r.rolname END AS grantee,
+		       a.grantee = 0 AS is_public, COALESCE(r.rolname, '') AS rolname,
 		       a.privilege_type, a.is_grantable
 		FROM pg_proc p
 		JOIN pg_namespace n ON n.oid = p.pronamespace
 		JOIN aclexplode(p.proacl) a ON true
 		LEFT JOIN pg_roles r ON r.oid = a.grantee
-		WHERE n.nspname IN (%s);
+		WHERE n.nspname IN (%s)
+		  AND p.prokind = 'f';
 	`, schemaList)
 	functionACLRows, err := dbtx.QueryContext(ctx, functionACLQuery, args...)
 	if err != nil {
 		return nil, fmt.Errorf("inspecting function ACLs: %w", err)
 	}
 	if err := scanRows(functionACLRows, func(scan func(...any) error) error {
-		var schemaName, functionName, identityArgs, grantee, priv string
+		var schemaName, functionName, identityArgs, roleName, priv string
+		var isPublic bool
 		var grantable bool
-		if err := scan(&schemaName, &functionName, &identityArgs, &grantee, &priv, &grantable); err != nil {
+		if err := scan(&schemaName, &functionName, &identityArgs, &isPublic, &roleName, &priv, &grantable); err != nil {
 			return fmt.Errorf("scanning function ACLs: %w", err)
 		}
 		recordLiveGrant(live, "FUNCTION",
-			schemaName+"."+functionName+"("+identityArgs+")",
-			grantee, priv, grantable)
+			[]string{schemaName, functionName}, identityArgs, isPublic, roleName, priv, grantable)
 		return nil
 	}); err != nil {
 		return nil, err
@@ -143,7 +146,7 @@ func InspectLiveRoles(ctx context.Context, dbtx dialect.DBTX, targetSchemas []st
 	// 4. Schema ACLs for target schemas.
 	schemaACLQuery := fmt.Sprintf(`
 		SELECT n.nspname,
-		       CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE r.rolname END AS grantee,
+		       a.grantee = 0 AS is_public, COALESCE(r.rolname, '') AS rolname,
 		       a.privilege_type, a.is_grantable
 		FROM pg_namespace n
 		JOIN aclexplode(n.nspacl) a ON true
@@ -155,12 +158,13 @@ func InspectLiveRoles(ctx context.Context, dbtx dialect.DBTX, targetSchemas []st
 		return nil, fmt.Errorf("inspecting schema ACLs: %w", err)
 	}
 	if err := scanRows(schemaACLRows, func(scan func(...any) error) error {
-		var schemaName, grantee, priv string
+		var schemaName, roleName, priv string
+		var isPublic bool
 		var grantable bool
-		if err := scan(&schemaName, &grantee, &priv, &grantable); err != nil {
+		if err := scan(&schemaName, &isPublic, &roleName, &priv, &grantable); err != nil {
 			return fmt.Errorf("scanning schema ACLs: %w", err)
 		}
-		recordLiveGrant(live, "SCHEMA", schemaName, grantee, priv, grantable)
+		recordLiveGrant(live, "SCHEMA", []string{schemaName}, "", isPublic, roleName, priv, grantable)
 		return nil
 	}); err != nil {
 		return nil, err
@@ -169,7 +173,7 @@ func InspectLiveRoles(ctx context.Context, dbtx dialect.DBTX, targetSchemas []st
 	// 5. Database ACLs (current database only).
 	dbACLRows, err := dbtx.QueryContext(ctx, `
 		SELECT d.datname,
-		       CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE r.rolname END AS grantee,
+		       a.grantee = 0 AS is_public, COALESCE(r.rolname, '') AS rolname,
 		       a.privilege_type, a.is_grantable
 		FROM pg_database d
 		JOIN aclexplode(d.datacl) a ON true
@@ -180,12 +184,13 @@ func InspectLiveRoles(ctx context.Context, dbtx dialect.DBTX, targetSchemas []st
 		return nil, fmt.Errorf("inspecting database ACLs: %w", err)
 	}
 	if err := scanRows(dbACLRows, func(scan func(...any) error) error {
-		var dbName, grantee, priv string
+		var dbName, roleName, priv string
+		var isPublic bool
 		var grantable bool
-		if err := scan(&dbName, &grantee, &priv, &grantable); err != nil {
+		if err := scan(&dbName, &isPublic, &roleName, &priv, &grantable); err != nil {
 			return fmt.Errorf("scanning database ACLs: %w", err)
 		}
-		recordLiveGrant(live, "DATABASE", dbName, grantee, priv, grantable)
+		recordLiveGrant(live, "DATABASE", []string{dbName}, "", isPublic, roleName, priv, grantable)
 		return nil
 	}); err != nil {
 		return nil, err
@@ -220,13 +225,13 @@ func placeholders(values []string) (string, []any) {
 }
 
 // recordLiveGrant folds one aclexplode row into the live grant map.
-func recordLiveGrant(live *LiveRoles, kind, object, grantee, priv string, grantable bool) {
-	if grantee == "" || priv == "" {
+func recordLiveGrant(live *LiveRoles, kind string, objectParts []string, functionArgs string, isPublic bool, roleName, priv string, grantable bool) {
+	if (!isPublic && roleName == "") || priv == "" {
 		return
 	}
-	displayObject := canonicalLiveGrantObject(kind, object)
+	displayObject := canonicalLiveGrantObjectParts(kind, objectParts, functionArgs)
 	canonicalObject := schema.CanonicalGrantObject(kind, displayObject, "")
-	granteeToken := canonicalLiveRoleToken(grantee)
+	granteeToken := canonicalLiveRoleToken(roleName, isPublic)
 	key := schema.GrantKey(kind, canonicalObject, granteeToken)
 	g := live.Grants[key]
 	if g == nil {
@@ -245,37 +250,49 @@ func recordLiveGrant(live *LiveRoles, kind, object, grantee, priv string, granta
 	}
 }
 
-func canonicalLiveRoleToken(name string) string {
-	name = strings.TrimSpace(name)
-	if schema.IsPublicRoleIdentifier(name) {
+func canonicalLiveRoleToken(name string, isPublic bool) string {
+	if isPublic {
 		return "PUBLIC"
+	}
+	name = strings.TrimSpace(name)
+	if name == "public" {
+		return quoteIdentifier(name)
 	}
 	if name == strings.ToLower(name) && schema.CanonicalRoleName(name) == name {
 		return name
 	}
-	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+	return quoteIdentifier(name)
 }
 
 func canonicalLiveGrantObject(kind, object string) string {
 	kind = strings.ToUpper(strings.TrimSpace(kind))
 	if kind == "FUNCTION" {
-		open := strings.IndexByte(object, '(')
-		if open < 0 {
-			return object
+		name, suffix, ok := splitFunctionObject(object)
+		if !ok {
+			return canonicalLiveGrantObjectParts(kind, splitQualifiedIdentifier(object), "")
 		}
-		name := strings.TrimSpace(object[:open])
-		args := object[open:]
-		parts := splitQualifiedIdentifier(name)
-		for i, part := range parts {
-			parts[i] = canonicalLiveIdentifier(strings.Trim(strings.TrimSpace(part), `"`))
+		args := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(suffix, "("), ")"))
+		if args == suffix {
+			args = ""
 		}
-		return strings.Join(parts, ".") + args
+		return canonicalLiveGrantObjectParts(kind, splitQualifiedIdentifier(name), args)
 	}
-	parts := splitQualifiedIdentifier(object)
+	return canonicalLiveGrantObjectParts(kind, splitQualifiedIdentifier(object), "")
+}
+
+func canonicalLiveGrantObjectParts(kind string, parts []string, functionArgs string) string {
 	for i, part := range parts {
-		parts[i] = canonicalLiveIdentifier(strings.Trim(strings.TrimSpace(part), `"`))
+		part = strings.TrimSpace(part)
+		if len(part) >= 2 && part[0] == '"' && part[len(part)-1] == '"' {
+			part = strings.ReplaceAll(part[1:len(part)-1], `""`, `"`)
+		}
+		parts[i] = canonicalLiveIdentifier(part)
 	}
-	return strings.Join(parts, ".")
+	object := strings.Join(parts, ".")
+	if strings.EqualFold(kind, "FUNCTION") {
+		return object + "(" + strings.TrimSpace(functionArgs) + ")"
+	}
+	return object
 }
 
 // RoleOwnsObjects reports whether the named role owns any cluster object
@@ -303,18 +320,18 @@ func RoleOwnsObjects(ctx context.Context, dbtx dialect.DBTX, roleName string) (b
 
 // GenerateCreateRoleSQL renders the NOLOGIN group role Grizzle manages.
 func GenerateCreateRoleSQL(roleName string) string {
-	return fmt.Sprintf("CREATE ROLE %q NOLOGIN;", roleName)
+	return fmt.Sprintf("CREATE ROLE %s NOLOGIN;", quoteIdentifier(roleName))
 }
 
 // GenerateRoleCommentSQL stamps the managed-role marker used to distinguish
 // Grizzle-owned roles from operator-created ones.
 func GenerateRoleCommentSQL(roleName string) string {
-	return fmt.Sprintf("COMMENT ON ROLE %q IS '%s';", roleName, schema.RoleManagedComment)
+	return fmt.Sprintf("COMMENT ON ROLE %s IS '%s';", quoteIdentifier(roleName), schema.RoleManagedComment)
 }
 
 // GenerateDropRoleSQL renders DROP ROLE.
 func GenerateDropRoleSQL(roleName string) string {
-	return fmt.Sprintf("DROP ROLE %q;", roleName)
+	return fmt.Sprintf("DROP ROLE %s;", quoteIdentifier(roleName))
 }
 
 // GenerateGrantSQL renders a GRANT statement from desired IR.
@@ -326,8 +343,8 @@ func GenerateGrantSQL(g *schema.Grant) string {
 	return fmt.Sprintf("GRANT %s ON %s %s TO %s%s;",
 		strings.Join(g.Privileges, ", "),
 		g.ObjectKind,
-		g.ObjectName,
-		schema.RenderRoleIdentifier(g.Grantee),
+		renderGrantObject(g.ObjectKind, g.ObjectName),
+		renderRoleIdentifier(g.Grantee),
 		suffix)
 }
 
@@ -343,14 +360,50 @@ func GenerateRevokeSQL(g *schema.Grant, privileges []string) string {
 		return fmt.Sprintf("REVOKE GRANT OPTION FOR %s ON %s %s FROM %s;",
 			strings.Join(privs, ", "),
 			g.ObjectKind,
-			g.ObjectName,
-			schema.RenderRoleIdentifier(g.Grantee))
+			renderGrantObject(g.ObjectKind, g.ObjectName),
+			renderRoleIdentifier(g.Grantee))
 	}
 	return fmt.Sprintf("REVOKE %s ON %s %s FROM %s;",
 		strings.Join(privs, ", "),
 		g.ObjectKind,
-		g.ObjectName,
-		schema.RenderRoleIdentifier(g.Grantee))
+		renderGrantObject(g.ObjectKind, g.ObjectName),
+		renderRoleIdentifier(g.Grantee))
+}
+
+func renderRoleIdentifier(identifier string) string {
+	if schema.IsPublicRoleIdentifier(identifier) {
+		return "PUBLIC"
+	}
+	return quoteIdentifier(schema.CanonicalRoleName(identifier))
+}
+
+func renderGrantObject(kind, object string) string {
+	if strings.EqualFold(strings.TrimSpace(kind), "FUNCTION") {
+		if name, suffix, ok := splitFunctionObject(object); ok {
+			return quoteQualifiedIdentifier(name) + suffix
+		}
+	}
+	return quoteQualifiedIdentifier(object)
+}
+
+func splitFunctionObject(value string) (name, suffix string, ok bool) {
+	value = strings.TrimSpace(value)
+	inQuote := false
+	for i := 0; i < len(value); i++ {
+		switch value[i] {
+		case '"':
+			if inQuote && i+1 < len(value) && value[i+1] == '"' {
+				i++
+				continue
+			}
+			inQuote = !inQuote
+		case '(':
+			if !inQuote {
+				return strings.TrimSpace(value[:i]), strings.TrimSpace(value[i:]), true
+			}
+		}
+	}
+	return value, "", false
 }
 
 // RoleState adapts the inspected live state to the dialect-independent

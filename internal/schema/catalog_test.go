@@ -405,3 +405,40 @@ func TestMergeCatalogSpecs_SideChannelWinsDuplicateName(t *testing.T) {
 		t.Fatalf("side-channel DROP should override duplicate SchemaSQL publication: %+v", merged.Publications)
 	}
 }
+
+func TestMergeCatalogSpecs_PreservesCreateAlterDropOrder(t *testing.T) {
+	spec := ParseCatalogSQL(`
+		CREATE PUBLICATION p FOR TABLE docs;
+		ALTER PUBLICATION p ADD TABLE audit;
+		DROP PUBLICATION p;
+	`)
+	if err := ValidateCatalogSpecMerge(spec, nil); err != nil {
+		t.Fatalf("CREATE/ALTER/DROP sequence should validate: %v", err)
+	}
+	merged := MergeCatalogSpecs(spec, nil)
+	if len(merged.Publications) != 0 || !merged.PublicationExplicitlyDropped("p") {
+		t.Fatalf("DROP must remain after ALTER and remove the declaration: %+v", merged)
+	}
+}
+
+func TestMergeCatalogSpecs_SideDropCannotBeResurrected(t *testing.T) {
+	schemaSpec := ParseCatalogSQL(`CREATE PUBLICATION p FOR TABLE docs;`)
+	sideSpec := ParseCatalogSQL(`DROP PUBLICATION p;`)
+	if err := ValidateCatalogSpecMerge(schemaSpec, sideSpec); err != nil {
+		t.Fatalf("side-channel DROP over a SchemaSQL CREATE should validate: %v", err)
+	}
+	merged := MergeCatalogSpecs(schemaSpec, sideSpec)
+	if len(merged.Publications) != 0 || !merged.PublicationExplicitlyDropped("p") {
+		t.Fatalf("side-channel DROP must be authoritative: %+v", merged)
+	}
+}
+
+func TestParseCatalogSQL_QualifiedEventFunctionIdentity(t *testing.T) {
+	spec := ParseCatalogSQL(`CREATE EVENT TRIGGER t ON ddl_command_end EXECUTE FUNCTION "audit.schema"."Fn"();`)
+	if len(spec.EventTriggers) != 1 {
+		t.Fatalf("expected one event trigger: %+v", spec.EventTriggers)
+	}
+	if got, want := spec.EventTriggers[0].Function, `"audit.schema"."Fn"`; got != want {
+		t.Fatalf("event function identity = %q, want %q", got, want)
+	}
+}

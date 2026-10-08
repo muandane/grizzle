@@ -80,10 +80,10 @@ func GrantKey(kind, object, grantee string) string {
 
 func canonicalRoleKey(identifier string) string {
 	identifier = strings.TrimSpace(identifier)
-	if len(identifier) >= 2 && identifier[0] == '"' && identifier[len(identifier)-1] == '"' {
-		return "quoted:" + decodeIdentifier(identifier)
+	if IsPublicRoleIdentifier(identifier) {
+		return "public-grantee"
 	}
-	return "unquoted:" + strings.ToLower(identifier)
+	return "role:" + canonicalRoleName(identifier)
 }
 
 func canonicalRoleName(identifier string) string {
@@ -108,16 +108,6 @@ func IsPublicRoleIdentifier(identifier string) bool {
 		return false
 	}
 	return strings.EqualFold(identifier, "PUBLIC")
-}
-
-// RenderRoleIdentifier renders a role token without changing quoted-role
-// identity. PUBLIC is a keyword and must not be double-quoted.
-func RenderRoleIdentifier(identifier string) string {
-	name := canonicalRoleName(identifier)
-	if IsPublicRoleIdentifier(identifier) {
-		return "PUBLIC"
-	}
-	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 
 // CanonicalGrantObject returns the identity key used for ACL comparison.
@@ -261,7 +251,7 @@ func ParseRolesSQL(sql string) *RolesSpec {
 			revokes = append(revokes, parseRevokeStatement(trimmed)...)
 		}
 	}
-	applyRevokes(spec, revokes)
+	applyRevokes(spec, revokes, "")
 	spec.revokes = revokes
 	return spec
 }
@@ -271,6 +261,14 @@ func ParseRolesSQL(sql string) *RolesSpec {
 // SchemaSQL entries with the same role or grant identity, making the explicit
 // side-channel authoritative on duplicates.
 func MergeRolesSpecs(schemaSpec, sideSpec *RolesSpec) *RolesSpec {
+	return MergeRolesSpecsForTarget(schemaSpec, sideSpec, "")
+}
+
+// MergeRolesSpecsForTarget combines role desired state while resolving
+// unqualified TABLE/SEQUENCE grant targets against targetSchema. The
+// side-channel remains authoritative when both sources describe the same
+// canonical grant target.
+func MergeRolesSpecsForTarget(schemaSpec, sideSpec *RolesSpec, targetSchema string) *RolesSpec {
 	out := &RolesSpec{Roles: make(map[string]*Role)}
 	for _, spec := range []*RolesSpec{schemaSpec, sideSpec} {
 		if spec == nil {
@@ -281,14 +279,22 @@ func MergeRolesSpecs(schemaSpec, sideSpec *RolesSpec) *RolesSpec {
 		}
 	}
 
-	out.Grants = mergeGrantSpecs(schemaSpec, sideSpec)
+	schemaGrants := schemaSpec
+	if schemaSpec != nil && len(schemaSpec.revokes) > 0 {
+		schemaGrants = &RolesSpec{Grants: make([]*Grant, 0, len(schemaSpec.Grants))}
+		for _, grant := range schemaSpec.Grants {
+			schemaGrants.Grants = append(schemaGrants.Grants, cloneGrant(grant))
+		}
+		applyRevokes(schemaGrants, schemaSpec.revokes, targetSchema)
+	}
+	out.Grants = mergeGrantSpecs(schemaGrants, sideSpec, targetSchema)
 	if sideSpec != nil {
-		applyRevokes(out, sideSpec.revokes)
+		applyRevokes(out, sideSpec.revokes, targetSchema)
 	}
 	return out
 }
 
-func mergeGrantSpecs(schemaSpec, sideSpec *RolesSpec) []*Grant {
+func mergeGrantSpecs(schemaSpec, sideSpec *RolesSpec, targetSchema string) []*Grant {
 	var out []*Grant
 	for _, spec := range []*RolesSpec{schemaSpec, sideSpec} {
 		if spec == nil {
@@ -298,7 +304,7 @@ func mergeGrantSpecs(schemaSpec, sideSpec *RolesSpec) []*Grant {
 		for _, grant := range spec.Grants {
 			replaced := false
 			for i, existing := range next {
-				if sameGrantTarget(existing, grant) {
+				if sameGrantTargetForSchema(existing, grant, targetSchema) {
 					next[i] = mergeGrant(existing, grant)
 					replaced = true
 					break
@@ -312,7 +318,7 @@ func mergeGrantSpecs(schemaSpec, sideSpec *RolesSpec) []*Grant {
 			for _, grant := range next {
 				replaced := false
 				for i, existing := range out {
-					if sameGrantTarget(existing, grant) {
+					if sameGrantTargetForSchema(existing, grant, targetSchema) {
 						out[i] = grant
 						replaced = true
 						break
@@ -447,7 +453,7 @@ func expandPrivileges(privList, kind string) []string {
 	return dedupeStrings(privileges)
 }
 
-func applyRevokes(spec *RolesSpec, revokes []*Grant) {
+func applyRevokes(spec *RolesSpec, revokes []*Grant, targetSchema string) {
 	if len(revokes) == 0 || len(spec.Grants) == 0 {
 		return
 	}
@@ -455,7 +461,7 @@ func applyRevokes(spec *RolesSpec, revokes []*Grant) {
 	for _, revoke := range revokes {
 		var kept []*Grant
 		for _, grant := range spec.Grants {
-			if !sameGrantTarget(grant, revoke) {
+			if !sameGrantTargetForSchema(grant, revoke, targetSchema) {
 				kept = append(kept, grant)
 				continue
 			}
@@ -497,11 +503,11 @@ func samePrivilegeSet(a, b []string) bool {
 	return true
 }
 
-func sameGrantTarget(a, b *Grant) bool {
+func sameGrantTargetForSchema(a, b *Grant, targetSchema string) bool {
 	return strings.EqualFold(a.ObjectKind, b.ObjectKind) &&
-		CanonicalGrantObject(a.ObjectKind, a.ObjectName, "") ==
-			CanonicalGrantObject(b.ObjectKind, b.ObjectName, "") &&
-		canonicalRoleName(a.Grantee) == canonicalRoleName(b.Grantee)
+		CanonicalGrantObject(a.ObjectKind, a.ObjectName, targetSchema) ==
+			CanonicalGrantObject(b.ObjectKind, b.ObjectName, targetSchema) &&
+		canonicalRoleKey(a.Grantee) == canonicalRoleKey(b.Grantee)
 }
 
 func containsFold(values []string, want string) bool {

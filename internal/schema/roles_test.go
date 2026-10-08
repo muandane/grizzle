@@ -191,3 +191,32 @@ func TestMergeRolesSpecs_SideChannelWinsDuplicateGrant(t *testing.T) {
 		t.Fatalf("side-channel GRANT should override SchemaSQL REVOKE: %+v", merged.Grants)
 	}
 }
+
+func TestRoleIdentity_PublicPseudoGranteeDiffersFromRealRole(t *testing.T) {
+	if !IsPublicRoleIdentifier("PUBLIC") || IsPublicRoleIdentifier(`"public"`) {
+		t.Fatal("PUBLIC keyword and quoted public role must have distinct identities")
+	}
+	if GrantKey("TABLE", "docs", "PUBLIC") == GrantKey("TABLE", "docs", `"public"`) {
+		t.Fatal("PUBLIC pseudo-grantee must not share a key with real role public")
+	}
+	if GrantKey("TABLE", "docs", "app") != GrantKey("TABLE", "docs", `"app"`) {
+		t.Fatal("quoted and unquoted lower-case role identifiers should match")
+	}
+}
+
+func TestMergeRolesSpecs_QualifiesTargetsBeforeSideOverlay(t *testing.T) {
+	schemaSpec := ParseRolesSQL(`GRANT SELECT ON docs TO app;`)
+	sideSpec := ParseRolesSQL(`GRANT INSERT ON public.docs TO app;`)
+	merged := MergeRolesSpecsForTarget(schemaSpec, sideSpec, "public")
+	if len(merged.Grants) != 1 || len(merged.Grants[0].Privileges) != 1 ||
+		merged.Grants[0].Privileges[0] != "INSERT" {
+		t.Fatalf("qualified and unqualified duplicate targets must overlay: %+v", merged.Grants)
+	}
+}
+
+func TestCanonicalGrantObject_PreservesQuotedDotsAndQuotes(t *testing.T) {
+	object := `"schema.with.dot"."table""name"`
+	if got, want := CanonicalGrantObject("TABLE", object, "public"), `"schema.with.dot"."table""name"`; got != want {
+		t.Fatalf("CanonicalGrantObject(%q) = %q, want %q", object, got, want)
+	}
+}

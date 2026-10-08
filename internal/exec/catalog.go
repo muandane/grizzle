@@ -37,7 +37,8 @@ func diffCatalogSteps(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecCo
 	// Creating a trigger whose function is missing would fail at apply with
 	// a confusing error, so refuse up front with the offending trigger name.
 	for _, e := range desired.EventTriggers {
-		exists, err := postgres.EventTriggerFunctionExists(ctx, dbtx, e.Function)
+		lookupSchemas := []string{cfg.ShadowSchema, cfg.primarySchema(), "public"}
+		exists, err := postgres.EventTriggerFunctionExists(ctx, dbtx, e.Function, lookupSchemas...)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %w", plan.ErrInspectionFailed, err)
 		}

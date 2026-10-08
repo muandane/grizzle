@@ -145,20 +145,23 @@ func InspectLiveCatalog(ctx context.Context, dbtx dialect.DBTX) (*LiveCatalog, e
 		SELECT e.evtname,
 		       e.evtevent,
 		       COALESCE(e.evttags, '{}') AS evtTags,
+		       n.nspname,
 		       p.proname,
+		       pg_get_function_identity_arguments(p.oid),
 		       e.evtenabled,
 		       COALESCE(obj_description(e.oid, 'pg_event_trigger'), '') AS comment
 		FROM pg_event_trigger e
-		JOIN pg_proc p ON p.oid = e.evtfoid;
+		JOIN pg_proc p ON p.oid = e.evtfoid
+		JOIN pg_namespace n ON n.oid = p.pronamespace;
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("inspecting event triggers: %w", err)
 	}
 	defer func() { _ = etRows.Close() }()
 	err = scanRows(etRows, func(scan func(...any) error) error {
-		var name, event, function, comment, enabled string
+		var name, event, functionSchema, functionName, identityArgs, comment, enabled string
 		var tags []string
-		if err := scan(&name, &event, &tags, &function, &enabled, &comment); err != nil {
+		if err := scan(&name, &event, &tags, &functionSchema, &functionName, &identityArgs, &enabled, &comment); err != nil {
 			return err
 		}
 		live.EventTriggers[schema.CanonicalIdentifierKey(name)] = &diff.EventTriggerState{
@@ -166,7 +169,7 @@ func InspectLiveCatalog(ctx context.Context, dbtx dialect.DBTX) (*LiveCatalog, e
 			Managed:  comment == schema.EventTriggerManagedComment,
 			Event:    strings.ToUpper(event),
 			Tags:     tags,
-			Function: function,
+			Function: canonicalLiveFunctionIdentity(functionSchema, functionName, identityArgs),
 			// evtenabled: O = origin, A = always, R = replica, D =
 			// disabled. Replica/always are enabled states even though they
 			// only fire for their corresponding replication mode.
@@ -187,6 +190,11 @@ func eventTriggerEnabled(status string) bool {
 	default:
 		return false
 	}
+}
+
+func canonicalLiveFunctionIdentity(functionSchema, functionName, identityArgs string) string {
+	name := canonicalLiveIdentifier(functionSchema) + "." + canonicalLiveIdentifier(functionName)
+	return name + "(" + strings.TrimSpace(identityArgs) + ")"
 }
 
 // CatalogState adapts the inspected live state to the dialect-independent
@@ -211,18 +219,59 @@ func serverAtLeast15(ctx context.Context, dbtx dialect.DBTX) (bool, error) {
 	return num >= 150000, nil
 }
 
-// EventTriggerFunctionExists reports whether the named unqualified function
-// exists (any signature). Used to refuse event-trigger creation when the
-// trigger function is missing.
-func EventTriggerFunctionExists(ctx context.Context, dbtx dialect.DBTX, functionName string) (bool, error) {
-	var exists bool
-	err := dbtx.QueryRowContext(ctx, `
+// EventTriggerFunctionExists reports whether the exact desired no-argument
+// event-trigger function exists. PostgreSQL event triggers require a regular
+// function returning event_trigger; procedures, aggregates, and similarly
+// named routines are not compatible.
+func EventTriggerFunctionExists(ctx context.Context, dbtx dialect.DBTX, functionName string, lookupSchemas ...string) (bool, error) {
+	parts := splitQualifiedIdentifier(strings.TrimSpace(functionName))
+	if len(parts) == 0 || len(parts) > 2 {
+		return false, fmt.Errorf("checking event-trigger function %q: invalid qualified function name", functionName)
+	}
+	for i, part := range parts {
+		parts[i] = decodeCatalogIdentifier(part)
+		if parts[i] == "" {
+			return false, fmt.Errorf("checking event-trigger function %q: empty function identifier", functionName)
+		}
+	}
+
+	query := `
 		SELECT EXISTS (
 			SELECT 1
 			FROM pg_proc p
-			WHERE p.proname = $1 OR p.proname = lower($1)
-		);
-	`, functionName).Scan(&exists)
+			JOIN pg_namespace n ON n.oid = p.pronamespace
+			WHERE p.proname = $1
+			  AND p.prokind = 'f'
+			  AND p.pronargs = 0
+			  AND p.prorettype = 'event_trigger'::regtype`
+	args := []any{parts[len(parts)-1]}
+	if len(parts) == 2 {
+		query += `
+			  AND n.nspname = $2`
+		args = append(args, parts[0])
+	} else if len(lookupSchemas) > 0 {
+		schemaPlaceholders := make([]string, 0, len(lookupSchemas))
+		for _, schemaName := range lookupSchemas {
+			if strings.TrimSpace(schemaName) == "" {
+				continue
+			}
+			schemaPlaceholders = append(schemaPlaceholders, fmt.Sprintf("$%d", len(args)+1))
+			args = append(args, schemaName)
+		}
+		if len(schemaPlaceholders) > 0 {
+			query += "\n\t\t\t  AND n.nspname IN (" + strings.Join(schemaPlaceholders, ", ") + ")"
+		}
+	} else {
+		identity := quoteQualifiedIdentifierPreservingCase(functionName) + "()"
+		query += `
+			  AND p.oid = to_regprocedure($2)::oid
+			  AND n.nspname = ANY (current_schemas(true))`
+		args = append(args, identity)
+	}
+	query += `
+		);`
+	var exists bool
+	err := dbtx.QueryRowContext(ctx, query, args...).Scan(&exists)
 	if err != nil {
 		return false, fmt.Errorf("checking event-trigger function %q: %w", functionName, err)
 	}
@@ -319,7 +368,7 @@ func GenerateCreateEventTriggerSQL(e *schema.EventTrigger) string {
 		}
 		fmt.Fprintf(&sb, " WHEN TAG IN (%s)", strings.Join(quoted, ", "))
 	}
-	fmt.Fprintf(&sb, " EXECUTE FUNCTION %s();", quoteIdentifier(e.Function))
+	fmt.Fprintf(&sb, " EXECUTE FUNCTION %s();", quoteQualifiedIdentifierPreservingCase(e.Function))
 	if !e.Enabled {
 		sb.WriteString("\n")
 		sb.WriteString(GenerateAlterEventTriggerEnabledSQL(e))
@@ -342,7 +391,7 @@ func GenerateAlterEventTriggerEnabledSQL(e *schema.EventTrigger) string {
 // drift renders ALTER EVENT TRIGGER ENABLE/DISABLE.
 func GenerateAlterEventTriggerSQL(want, old *schema.EventTrigger) string {
 	definitionDrift := old == nil || !strings.EqualFold(want.Event, old.Event) ||
-		!strings.EqualFold(want.Function, old.Function) ||
+		want.Function != old.Function ||
 		!slices.Equal(canonicalTagList(want.Tags), canonicalTagList(old.Tags))
 	if definitionDrift {
 		return strings.Join([]string{
@@ -397,11 +446,7 @@ func publishFlagString(p *schema.Publication) string {
 func quoteQualifiedList(names []string) []string {
 	out := make([]string, 0, len(names))
 	for _, n := range names {
-		parts := splitQualifiedIdentifier(n)
-		for i := range parts {
-			parts[i] = quoteIdentifierPart(parts[i])
-		}
-		out = append(out, strings.Join(parts, "."))
+		out = append(out, quoteQualifiedIdentifier(n))
 	}
 	return out
 }
@@ -430,15 +475,40 @@ func splitQualifiedIdentifier(name string) []string {
 }
 
 func quoteIdentifierPart(part string) string {
-	part = strings.TrimSpace(part)
-	if len(part) >= 2 && part[0] == '"' && part[len(part)-1] == '"' {
-		part = strings.ReplaceAll(part[1:len(part)-1], `""`, `"`)
+	return quoteIdentifier(decodeCatalogIdentifier(part))
+}
+
+func quoteQualifiedIdentifier(identifier string) string {
+	parts := splitQualifiedIdentifier(identifier)
+	for i, part := range parts {
+		parts[i] = quoteIdentifierPart(part)
 	}
-	return quoteIdentifier(part)
+	return strings.Join(parts, ".")
+}
+
+func quoteQualifiedIdentifierPreservingCase(identifier string) string {
+	parts := splitQualifiedIdentifier(identifier)
+	for i, part := range parts {
+		part = strings.TrimSpace(part)
+		if len(part) >= 2 && part[0] == '"' && part[len(part)-1] == '"' {
+			parts[i] = quoteIdentifierPart(part)
+		} else {
+			parts[i] = quoteIdentifier(part)
+		}
+	}
+	return strings.Join(parts, ".")
 }
 
 func quoteIdentifier(identifier string) string {
 	return `"` + strings.ReplaceAll(identifier, `"`, `""`) + `"`
+}
+
+func decodeCatalogIdentifier(identifier string) string {
+	identifier = strings.TrimSpace(identifier)
+	if len(identifier) >= 2 && identifier[0] == '"' && identifier[len(identifier)-1] == '"' {
+		return strings.ReplaceAll(identifier[1:len(identifier)-1], `""`, `"`)
+	}
+	return strings.ToLower(identifier)
 }
 
 func canonicalLiveIdentifier(identifier string) string {

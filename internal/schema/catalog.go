@@ -35,7 +35,8 @@ type EventTrigger struct {
 	Name  string   `json:"name"`
 	Event string   `json:"event"`          // e.g. ddl_command_start, ddl_command_end, sql_drop, table_rewrite
 	Tags  []string `json:"tags,omitempty"` // WHEN TAG IN (...) filter; empty = all tags
-	// Function is the event-trigger function name (unqualified).
+	// Function is the event-trigger function name; qualified and quoted
+	// routine identities are preserved where needed.
 	Function string `json:"function"`
 	// Enabled is the desired enabled state; ALTER EVENT TRIGGER
 	// ENABLE/DISABLE statements may override it in the unified input.
@@ -107,7 +108,7 @@ var (
 	// CREATE EVENT TRIGGER name ON event [WHEN TAG IN (...)] EXECUTE FUNCTION f().
 	// Captures: (1) name, (2) quoted-name contents when quoted, (3) event,
 	// (4) optional WHEN clause, (5) function.
-	createEventTriggerRe = regexp.MustCompile(`(?is)^CREATE\s+EVENT\s+TRIGGER\s+` + catalogIdentifierPattern + `\s+ON\s+([A-Za-z_][A-Za-z0-9_$]*)(?:\s+(WHEN\b.*?))?\s+EXECUTE\s+(?:FUNCTION|PROCEDURE)\s+(` + catalogIdentifierPartPattern + `)\s*\(\s*\)\s*$`)
+	createEventTriggerRe = regexp.MustCompile(`(?is)^CREATE\s+EVENT\s+TRIGGER\s+` + catalogIdentifierPattern + `\s+ON\s+([A-Za-z_][A-Za-z0-9_$]*)(?:\s+(WHEN\b.*?))?\s+EXECUTE\s+FUNCTION\s+(` + catalogIdentifierPartPattern + `(?:\s*\.\s*` + catalogIdentifierPartPattern + `)?)\s*\(\s*\)\s*$`)
 
 	alterPublicationRe        = regexp.MustCompile(`(?is)^ALTER\s+PUBLICATION\s+` + catalogIdentifierPattern + `\s+(.+)$`)
 	dropPublicationRe         = regexp.MustCompile(`(?is)^DROP\s+PUBLICATION\s+(?:IF\s+EXISTS\s+)?` + catalogIdentifierPattern + `(?:\s+(?:CASCADE|RESTRICT))?$`)
@@ -240,6 +241,28 @@ func decodeIdentifier(identifier string) string {
 		return strings.ReplaceAll(identifier[1:len(identifier)-1], `""`, `"`)
 	}
 	return strings.ToLower(identifier)
+}
+
+func decodeQualifiedIdentifier(identifier string) string {
+	parts := splitQualifiedIdentifier(identifier)
+	for i, part := range parts {
+		part = strings.TrimSpace(part)
+		if len(part) >= 2 && part[0] == '"' && part[len(part)-1] == '"' {
+			decoded := strings.ReplaceAll(part[1:len(part)-1], `""`, `"`)
+			if strings.Contains(decoded, ".") || decoded != strings.ToLower(decoded) {
+				// Keep a quoted dot-bearing component quoted so later
+				// qualified-name parsing cannot mistake it for another
+				// qualification level, and retain quoted case for exact
+				// routine preflight.
+				parts[i] = `"` + strings.ReplaceAll(decoded, `"`, `""`) + `"`
+			} else {
+				parts[i] = decoded
+			}
+			continue
+		}
+		parts[i] = strings.ToLower(part)
+	}
+	return strings.Join(parts, ".")
 }
 
 func upsertPublication(spec *CatalogSpec, publication *Publication) {
@@ -562,48 +585,37 @@ func hasOperations(spec *CatalogSpec) bool {
 	return spec != nil && len(spec.operations) > 0
 }
 
-// mergeCatalogOperationSpecs materializes both sources as one declarative
-// document. Declarations and drops are replayed in source order first, with
-// side-channel declarations applied last so they remain authoritative on
-// duplicate names. ALTER operations are replayed afterward, allowing an
-// ALTER in either source to target a CREATE supplied by the other source.
+// mergeCatalogOperationSpecs combines both statement streams deterministically.
+// CREATE declarations are seeded first so an ALTER in either source can target
+// a declaration supplied by the other source. The original operation order is
+// then replayed for each source (SchemaSQL before CatalogSQL); only duplicate
+// CREATE declarations from the authoritative side-channel are suppressed.
+// This preserves CREATE/ALTER/DROP order within a source while keeping
+// side-channel DROP operations last and therefore authoritative.
 func mergeCatalogOperationSpecs(schemaSpec, sideSpec *CatalogSpec, strict bool) (*CatalogSpec, error) {
 	out := &CatalogSpec{}
 
-	applyPhase := func(spec *CatalogSpec, include func(catalogOperation) bool) error {
-		if spec == nil {
-			return nil
-		}
-		var operations []catalogOperation
-		for _, operation := range spec.operations {
-			if include(operation) {
-				operations = append(operations, operation)
-			}
-		}
-		var err error
-		out, err = applyCatalogOperations(out, operations, strict)
-		return err
+	sideCreates := catalogCreateKeys(sideSpec)
+	initialSchemaCreates := filterCatalogCreates(schemaSpec, func(operation catalogOperation) bool {
+		return !sideCreates[catalogOperationKey(operation)]
+	})
+	initialSideCreates := filterCatalogCreates(sideSpec, nil)
+
+	var err error
+	out, err = applyCatalogOperations(out, initialSchemaCreates, false)
+	if err != nil {
+		return nil, err
+	}
+	out, err = applyCatalogOperations(out, initialSideCreates, false)
+	if err != nil {
+		return nil, err
 	}
 
-	// Preserve CREATE/DROP order within each source, then overlay the
-	// side-channel's declarations and explicit drops.
-	nonAlter := func(operation catalogOperation) bool {
-		return operation.action != catalogAlterOperation
-	}
-	if err := applyPhase(schemaSpec, nonAlter); err != nil {
+	schemaDrops := catalogActionKeys(schemaSpec, catalogDropOperation)
+	if err := replayCatalogOperations(&out, schemaSpec, false, sideCreates, schemaDrops, strict); err != nil {
 		return nil, err
 	}
-	if err := applyPhase(sideSpec, nonAlter); err != nil {
-		return nil, err
-	}
-	if err := applyPhase(schemaSpec, func(operation catalogOperation) bool {
-		return operation.action == catalogAlterOperation
-	}); err != nil {
-		return nil, err
-	}
-	if err := applyPhase(sideSpec, func(operation catalogOperation) bool {
-		return operation.action == catalogAlterOperation
-	}); err != nil {
+	if err := replayCatalogOperations(&out, sideSpec, true, sideCreates, schemaDrops, strict); err != nil {
 		return nil, err
 	}
 
@@ -622,6 +634,85 @@ func mergeCatalogOperationSpecs(schemaSpec, sideSpec *CatalogSpec, strict bool) 
 		return strings.Compare(CanonicalIdentifierKey(a.Name), CanonicalIdentifierKey(b.Name))
 	})
 	return out, nil
+}
+
+func catalogOperationKey(operation catalogOperation) string {
+	return fmt.Sprintf("%d:%s", operation.kind, CanonicalIdentifierKey(operation.name))
+}
+
+func catalogCreateKeys(spec *CatalogSpec) map[string]bool {
+	return catalogActionKeys(spec, catalogCreateOperation)
+}
+
+func catalogActionKeys(spec *CatalogSpec, action catalogOperationAction) map[string]bool {
+	out := make(map[string]bool)
+	if spec == nil {
+		return out
+	}
+	for _, operation := range spec.operations {
+		if operation.action == action {
+			out[catalogOperationKey(operation)] = true
+		}
+	}
+	return out
+}
+
+func filterCatalogCreates(spec *CatalogSpec, keep func(catalogOperation) bool) []catalogOperation {
+	if spec == nil {
+		return nil
+	}
+	out := make([]catalogOperation, 0, len(spec.operations))
+	for _, operation := range spec.operations {
+		if operation.action != catalogCreateOperation {
+			continue
+		}
+		if keep == nil || keep(operation) {
+			out = append(out, operation)
+		}
+	}
+	return out
+}
+
+func replayCatalogOperations(out **CatalogSpec, spec *CatalogSpec, sideChannel bool, sideCreates, schemaDrops map[string]bool, strict bool) error {
+	if spec == nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	for _, operation := range spec.operations {
+		key := catalogOperationKey(operation)
+		if operation.action == catalogCreateOperation {
+			skip := false
+			switch {
+			case !sideChannel && sideCreates[key]:
+				// CatalogSQL declarations replace duplicate SchemaSQL
+				// declarations and remain the only active base.
+				skip = true
+			case !seen[key]:
+				// The declaration was already seeded above. Replaying the
+				// first CREATE would reset changes made by the other source.
+				if sideChannel {
+					skip = !schemaDrops[key]
+				} else {
+					skip = true
+				}
+			}
+			if !skip {
+				var err error
+				*out, err = applyCatalogOperations(*out, []catalogOperation{operation}, strict)
+				if err != nil {
+					return err
+				}
+			}
+		} else {
+			var err error
+			*out, err = applyCatalogOperations(*out, []catalogOperation{operation}, strict)
+			if err != nil {
+				return err
+			}
+		}
+		seen[key] = true
+	}
+	return nil
 }
 
 func operationsOf(spec *CatalogSpec) []catalogOperation {
@@ -794,7 +885,7 @@ func parseEventTriggerStatement(stmt string) *EventTrigger {
 	e := &EventTrigger{
 		Name:     name,
 		Event:    strings.ToUpper(m[3]),
-		Function: decodeIdentifier(m[5]),
+		Function: decodeQualifiedIdentifier(m[5]),
 		Enabled:  true,
 	}
 	if whenClause := strings.TrimSpace(m[4]); whenClause != "" {
@@ -871,7 +962,7 @@ func ValidateCatalogSQL(sql string) error {
 		case strings.HasPrefix(upper, "CREATE EVENT TRIGGER"):
 			matches := createEventTriggerRe.FindStringSubmatch(trimmed)
 			if matches == nil || statementIdentifier(matches) == "" ||
-				!validCatalogIdentifierPart(matches[5]) {
+				!validQualifiedCatalogIdentifier(matches[5], 2) {
 				return fmt.Errorf("unsupported CREATE EVENT TRIGGER form in CatalogSQL (expected CREATE EVENT TRIGGER <name> ON <event> [WHEN TAG IN ('...')] EXECUTE FUNCTION <fn>()): %q", trimmed)
 			}
 			if !supportedEventTriggerEvents[strings.ToUpper(matches[3])] {
@@ -1048,6 +1139,19 @@ func validCatalogIdentifierPart(part string) bool {
 		return false
 	}
 	return decodeIdentifier(part) != ""
+}
+
+func validQualifiedCatalogIdentifier(identifier string, maxParts int) bool {
+	parts := splitQualifiedIdentifier(identifier)
+	if len(parts) == 0 || len(parts) > maxParts {
+		return false
+	}
+	for _, part := range parts {
+		if !validCatalogIdentifierPart(part) {
+			return false
+		}
+	}
+	return true
 }
 
 func splitIdentifierList(list string) ([]string, bool) {

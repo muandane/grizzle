@@ -611,7 +611,7 @@ func RenderChangeWithOpts(targetSchema string, c diff.Change, opts RenderOpts) p
 	case plan.ChangeCreateEventTrigger:
 		step.SQL = GenerateCreateEventTriggerSQL(c.EventTrigger) + "\n" + GenerateEventTriggerCommentSQL(c.EventTrigger.Name)
 	case plan.ChangeAlterEventTrigger:
-		step.SQL = GenerateAlterEventTriggerSQL(c.EventTrigger, c.OldEventTrigger)
+		step.SQL = GenerateAlterEventTriggerEnabledSQL(c.EventTrigger)
 	case plan.ChangeDropEventTrigger:
 		step.SQL = GenerateDropEventTriggerSQL(c.Table)
 	case plan.ChangeCreateTrigger:

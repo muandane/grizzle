@@ -71,8 +71,9 @@ func desiredRolesSpec(cfg PostgresExecConfig) (*schema.RolesSpec, error) {
 	if strings.TrimSpace(groups.RolesSQL) == "" && strings.TrimSpace(cfg.RolesSQL) == "" {
 		return nil, nil
 	}
-	return schema.MergeRolesSpecs(
+	return schema.MergeRolesSpecsForTarget(
 		schema.ParseRolesSQL(groups.RolesSQL),
 		schema.ParseRolesSQL(cfg.RolesSQL),
+		cfg.primarySchema(),
 	), nil
 }

@@ -20,9 +20,10 @@ type RoleACLGrant struct {
 // by the dialect layer (postgres.InspectLiveRoles) so this package stays free
 // of dialect imports.
 type RoleState struct {
-	// RoleNames maps lowercased role name -> catalog name (non-system roles).
+	// RoleNames maps canonical PostgreSQL role identity -> catalog name
+	// (non-system roles).
 	RoleNames map[string]string
-	// ManagedRoles are lowercased names of roles stamped with the
+	// ManagedRoles are canonical names of roles stamped with the
 	// grizzle-managed marker comment.
 	ManagedRoles map[string]bool
 	// Grants is the live ACL inventory.

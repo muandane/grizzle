@@ -34,8 +34,10 @@ type EventTriggerState struct {
 	// marker comment.
 	Managed bool
 
-	Event    string
-	Tags     []string
+	Event string
+	Tags  []string
+	// Function is the canonical schema-qualified routine identity, including
+	// identity arguments when inspected from PostgreSQL.
 	Function string
 	Enabled  bool
 }
@@ -309,7 +311,7 @@ func CatalogDiff(desired *schema.CatalogSpec, live *CatalogLiveState, targetSche
 			})
 			continue
 		}
-		if eventTriggerNeedsRecreate(e, liveE) {
+		if eventTriggerNeedsRecreate(e, liveE, targetSchema) {
 			changes = append(changes,
 				Change{
 					Type:         plan.ChangeDropEventTrigger,
@@ -325,10 +327,16 @@ func CatalogDiff(desired *schema.CatalogSpec, live *CatalogLiveState, targetSche
 			)
 		} else if e.Enabled != liveE.Enabled {
 			changes = append(changes, Change{
-				Type:            plan.ChangeAlterEventTrigger,
-				Table:           e.Name,
-				EventTrigger:    e,
-				OldEventTrigger: &schema.EventTrigger{Name: liveE.Name, Enabled: liveE.Enabled},
+				Type:         plan.ChangeAlterEventTrigger,
+				Table:        e.Name,
+				EventTrigger: e,
+				OldEventTrigger: &schema.EventTrigger{
+					Name:     liveE.Name,
+					Event:    liveE.Event,
+					Tags:     append([]string(nil), liveE.Tags...),
+					Function: liveE.Function,
+					Enabled:  liveE.Enabled,
+				},
 			})
 		}
 	}
@@ -390,11 +398,73 @@ func publicationNeedsRecreate(want *schema.Publication, live *PublicationState) 
 // eventTriggerNeedsRecreate reports whether the desired event-trigger
 // definition differs from the live one in a way that requires DROP+CREATE
 // (PostgreSQL has no ALTER EVENT TRIGGER for event/tags/function).
-func eventTriggerNeedsRecreate(want *schema.EventTrigger, live *EventTriggerState) bool {
-	if !strings.EqualFold(want.Event, live.Event) || want.Function != live.Function {
+func eventTriggerNeedsRecreate(want *schema.EventTrigger, live *EventTriggerState, targetSchema string) bool {
+	if !strings.EqualFold(want.Event, live.Event) ||
+		!eventTriggerFunctionsEqual(want.Function, live.Function, targetSchema) {
 		return true
 	}
 	return !sameStringSet(canonicalNameList(want.Tags), canonicalNameList(live.Tags))
+}
+
+func eventTriggerFunctionsEqual(want, live, targetSchema string) bool {
+	wantCanonical := canonicalEventTriggerFunction(want, targetSchema)
+	liveCanonical := canonicalEventTriggerFunction(live, "")
+	if wantCanonical == liveCanonical {
+		return true
+	}
+
+	// Older live snapshots and dialect adapters may provide an unqualified
+	// function name. Compare its exact routine component without treating a
+	// missing schema as a definition change.
+	liveName, liveArgs := splitFunctionIdentity(live)
+	liveParts := splitQualifiedIdentifier(liveName)
+	if len(liveParts) != 1 {
+		return false
+	}
+	wantName, wantArgs := splitFunctionIdentity(want)
+	wantParts := splitQualifiedIdentifier(wantName)
+	if len(wantParts) == 0 || strings.TrimSpace(liveArgs) != strings.TrimSpace(wantArgs) {
+		return false
+	}
+	return canonicalIdentifierPart(liveParts[0]) ==
+		canonicalIdentifierPart(wantParts[len(wantParts)-1])
+}
+
+func canonicalEventTriggerFunction(value, targetSchema string) string {
+	name, args := splitFunctionIdentity(value)
+	parts := splitQualifiedIdentifier(name)
+	if len(parts) == 1 && targetSchema != "" {
+		parts = append([]string{targetSchema}, parts...)
+	}
+	for i, part := range parts {
+		parts[i] = canonicalIdentifierPart(part)
+	}
+	return strings.Join(parts, ".") + "(" + strings.TrimSpace(args) + ")"
+}
+
+func splitFunctionIdentity(value string) (name, args string) {
+	value = strings.TrimSpace(value)
+	inQuote := false
+	for i := 0; i < len(value); i++ {
+		switch value[i] {
+		case '"':
+			if inQuote && i+1 < len(value) && value[i+1] == '"' {
+				i++
+				continue
+			}
+			inQuote = !inQuote
+		case '(':
+			if !inQuote {
+				name = strings.TrimSpace(value[:i])
+				args = strings.TrimSpace(value[i+1:])
+				if strings.HasSuffix(args, ")") {
+					args = strings.TrimSpace(args[:len(args)-1])
+				}
+				return name, args
+			}
+		}
+	}
+	return value, ""
 }
 
 // sortedMapKeysLivePubs returns deterministically ordered publication names.

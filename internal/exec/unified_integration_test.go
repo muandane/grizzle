@@ -5,6 +5,7 @@ package exec_test
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -114,6 +115,24 @@ func TestUnifiedSchemaSQL_Lifecycle(t *testing.T) {
 	}
 	if len(unifiedPlan.Steps) != 0 {
 		t.Fatalf("second unified plan must be a no-op, got %+v", unifiedPlan.Steps)
+	}
+
+	enabledCfg := cfg
+	enabledCfg.SchemaSQL = strings.ReplaceAll(enabledCfg.SchemaSQL,
+		fmt.Sprintf("ALTER EVENT TRIGGER %s DISABLE;", eventTriggerName), "")
+	enabledCfg.CatalogSQL = strings.ReplaceAll(enabledCfg.CatalogSQL,
+		fmt.Sprintf("ALTER EVENT TRIGGER %s DISABLE;", eventTriggerName), "")
+	for _, mode := range []string{"ALWAYS", "REPLICA"} {
+		if _, err := db.Exec(fmt.Sprintf(`ALTER EVENT TRIGGER %q ENABLE %s;`, eventTriggerName, mode)); err != nil {
+			t.Fatalf("enable event trigger %s: %v", mode, err)
+		}
+		enabledPlan, err := exec.PlanDiffPostgres(ctx, db, enabledCfg)
+		if err != nil {
+			t.Fatalf("enabled event trigger %s plan failed: %v", mode, err)
+		}
+		if len(enabledPlan.Steps) != 0 {
+			t.Fatalf("event trigger ENABLE %s should match desired enabled state, got %+v", mode, enabledPlan.Steps)
+		}
 	}
 
 	// Definition replacement is a destructive DROP+CREATE and must preserve

@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/muandane/grizzle/internal/diff"
+	"github.com/muandane/grizzle/internal/plan"
 	"github.com/muandane/grizzle/internal/schema"
 )
 
@@ -41,6 +43,18 @@ func TestGenerateCatalogSQL_EscapesQuotedIdentifiersAndTags(t *testing.T) {
 	}
 }
 
+func TestGenerateEventTriggerSQL_PreservesQualifiedQuotedFunction(t *testing.T) {
+	sql := GenerateCreateEventTriggerSQL(&schema.EventTrigger{
+		Name:     "audit",
+		Event:    "ddl_command_end",
+		Function: `"audit.schema"."Fn"`,
+		Enabled:  true,
+	})
+	if !strings.Contains(sql, `EXECUTE FUNCTION "audit.schema"."Fn"()`) {
+		t.Fatalf("qualified quoted function identity was not preserved: %s", sql)
+	}
+}
+
 func TestGenerateAlterEventTriggerSQL_DefinitionReplacementPreservesDisabled(t *testing.T) {
 	sql := GenerateAlterEventTriggerSQL(
 		&schema.EventTrigger{
@@ -59,6 +73,23 @@ func TestGenerateAlterEventTriggerSQL_DefinitionReplacementPreservesDisabled(t *
 	if !strings.Contains(sql, `CREATE EVENT TRIGGER "audit"`) ||
 		!strings.Contains(sql, `ALTER EVENT TRIGGER "audit" DISABLE;`) {
 		t.Fatalf("definition replacement must recreate disabled trigger: %s", sql)
+	}
+}
+
+func TestRenderAlterEventTrigger_OnlyChangesEnabledState(t *testing.T) {
+	step := RenderChange("public", diff.Change{
+		Type: plan.ChangeAlterEventTrigger,
+		EventTrigger: &schema.EventTrigger{
+			Name:    "audit",
+			Enabled: true,
+		},
+		OldEventTrigger: &schema.EventTrigger{
+			Name:    "audit",
+			Enabled: false,
+		},
+	})
+	if step.SQL != `ALTER EVENT TRIGGER "audit" ENABLE;` || step.Destructive {
+		t.Fatalf("enabled-state drift must render a non-destructive ALTER: %+v", step)
 	}
 }
 

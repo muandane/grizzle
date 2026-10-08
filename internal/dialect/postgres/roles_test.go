@@ -1,6 +1,11 @@
 package postgres
 
-import "testing"
+import (
+	"strings"
+	"testing"
+
+	"github.com/muandane/grizzle/internal/schema"
+)
 
 func TestCanonicalLiveGrantObject_FunctionSignature(t *testing.T) {
 	tests := []struct {
@@ -16,5 +21,41 @@ func TestCanonicalLiveGrantObject_FunctionSignature(t *testing.T) {
 				t.Fatalf("canonicalLiveGrantObject = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestPostgresIdentifierRenderingEscapesAndPreservesQualifiedNames(t *testing.T) {
+	if got, want := quoteIdentifier(`role"name`), `"role""name"`; got != want {
+		t.Fatalf("quoteIdentifier = %q, want %q", got, want)
+	}
+	if got, want := GenerateCreateRoleSQL(`role"name`), `CREATE ROLE "role""name" NOLOGIN;`; got != want {
+		t.Fatalf("role renderer = %q, want %q", got, want)
+	}
+	grantSQL := GenerateGrantSQL(&schema.Grant{
+		Grantee:    `"public"`,
+		ObjectKind: "TABLE",
+		ObjectName: `"schema.with.dot"."table""name"`,
+		Privileges: []string{"SELECT"},
+	})
+	if want := `GRANT SELECT ON TABLE "schema.with.dot"."table""name" TO "public";`; grantSQL != want {
+		t.Fatalf("quoted grant SQL = %q, want %q", grantSQL, want)
+	}
+	if got := canonicalLiveGrantObject("TABLE", `schema.with.dot.table"name`); got != `schema.with.dot."table""name"` {
+		t.Fatalf("unquoted dotted live object should be structurally qualified: %q", got)
+	}
+	if got := canonicalLiveGrantObject("TABLE", `"schema.with.dot"."table""name"`); got != `"schema.with.dot"."table""name"` {
+		t.Fatalf("quoted dotted live object = %q", got)
+	}
+}
+
+func TestGenerateGrantSQL_NormalizesUnquotedIdentifierCase(t *testing.T) {
+	sql := GenerateGrantSQL(&schema.Grant{
+		Grantee:    "app",
+		ObjectKind: "TABLE",
+		ObjectName: "Docs",
+		Privileges: []string{"SELECT"},
+	})
+	if !strings.Contains(sql, `ON TABLE "docs" TO "app"`) {
+		t.Fatalf("unquoted identifiers must follow PostgreSQL lower-case semantics: %s", sql)
 	}
 }
