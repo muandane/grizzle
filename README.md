@@ -69,7 +69,7 @@ func main() {
 }
 ```
 
-> **Need approval gates?** Instead of auto-syncing on boot, use `grizzle.PlanDiff(...)` to generate a migration plan, review the SQL, and run `grizzle.Apply(...)` with the matching plan hash.
+> **Need approval gates?** Instead of auto-syncing on boot, use `grizzle.PlanDiff(...)` to generate a migration plan, review the SQL, then `grizzle.Apply(..., grizzle.ApplyOpts{ExpectedHash: plan.Hash()})` so apply aborts if the live database drifted.
 
 ---
 
@@ -110,8 +110,8 @@ grizzle export --plan plan.json --format goose --out ./migrations
 * Tables, columns, enums, and domains.
 * Non-blocking operations: indexes via `CONCURRENTLY`, foreign keys via `NOT VALID` + `VALIDATE CONSTRAINT`.
 * Functions, procedures, triggers, views, materialized views, RLS policies, and extensions.
-* Staged migrations: column renames (`Options.Renames`) and expand/contract workflows.
-* Optional role/privilege and publication/event-trigger files (`--roles`, `--catalog`).
+* Staged migrations: explicit column renames (`Options.Renames` / `--rename`) and expand/contract (`Options.ExpandContract` / `--expand-contract`, with optional `--backfill`).
+* Optional role/privilege and publication/event-trigger SQL files (`--roles` / `RolesSQL`, `--catalog` / `CatalogSQL`).
 
 ### SQLite (3.35+)
 
@@ -134,8 +134,9 @@ grizzle export --plan plan.json --format goose --out ./migrations
 * [sqlite-embedded](examples/sqlite-embedded) — pure-Go SQLite setup
 * [sqlc-workflow](examples/sqlc-workflow) — single source of truth: share `schema.sql` between sqlc and Grizzle
 * [kubernetes-blueprint](examples/kubernetes-blueprint) — multi-replica startup coordination
-* [expand-contract](examples/expand-contract) — staged column rename
+* [expand-contract](examples/expand-contract) — expand / backfill / contract column rename
 * [roles-grants](examples/roles-grants) / [catalog-sync](examples/catalog-sync) — roles and publications via optional SQL files
+* [full-catalog](examples/full-catalog) — extensions, RLS, functions, triggers, and views in one `schema.sql`
 
 ## Documentation
 

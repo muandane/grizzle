@@ -2,7 +2,7 @@
 
 ## Overview
 
-Shows the optional `--catalog` / `Options.CatalogSQL` side-channel for publications and event triggers. Schema DDL (including the event-trigger function) stays in `schema.sql`; catalog objects live in `catalog.sql` and are never shadow-compiled.
+Shows the optional `--catalog` / `Options.CatalogSQL` file for publications and event triggers. Schema DDL (including the event-trigger function) stays in `schema.sql`; catalog objects live in `catalog.sql` and are applied after schema sync (they are not compiled in the shadow schema).
 
 ## Files
 
