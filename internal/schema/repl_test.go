@@ -62,8 +62,23 @@ func TestParseCatalogSQL_SubscriptionDefaults(t *testing.T) {
 		t.Fatal("expected subscription")
 	}
 	sub := spec.Subscriptions[0]
-	if !sub.Enabled || !sub.CopyData || sub.SlotName != "s" {
+	if !sub.Enabled || !sub.CopyData || sub.SlotName != "s" || sub.CreateSlot != nil {
 		t.Fatalf("defaults not applied: %+v", sub)
+	}
+}
+
+func TestParseCatalogSQL_CreateSlotFalseRoundTrip(t *testing.T) {
+	sql := `CREATE SUBSCRIPTION s CONNECTION 'host=x' PUBLICATION p WITH (create_slot = false, enabled = false);`
+	if err := ValidateCatalogSQL(sql); err != nil {
+		t.Fatalf("ValidateCatalogSQL: %v", err)
+	}
+	spec := ParseCatalogSQL(sql)
+	if len(spec.Subscriptions) != 1 {
+		t.Fatal("expected subscription")
+	}
+	sub := spec.Subscriptions[0]
+	if sub.CreateSlot == nil || *sub.CreateSlot {
+		t.Fatalf("CreateSlot = %v, want false", sub.CreateSlot)
 	}
 }
 

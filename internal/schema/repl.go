@@ -12,10 +12,11 @@ import (
 // in SchemaSQL or CatalogSQL. Subscriptions are database-catalog objects: they
 // bypass shadow compilation and are diffed against live pg_subscription state.
 //
-// CopyData mirrors WITH (copy_data = ...); when the WITH clause omits it,
-// PostgreSQL's default of true is adopted. Enabled likewise defaults to true
-// when omitted. CopyData is create-time only and is not diffed against live
-// state (pg_subscription does not persist it).
+// WITH defaults when omitted (matching PostgreSQL): Enabled=true,
+// CopyData=true, CreateSlot=true (nil pointer), SlotName=<subscription name>.
+// CopyData and CreateSlot are create-time only and are not diffed against live
+// state (pg_subscription does not persist them; existing subscriptions are
+// never altered for create_slot).
 type Subscription struct {
 	Name         string   `json:"name"`
 	ConnInfo     string   `json:"conninfo,omitempty"`
@@ -23,6 +24,9 @@ type Subscription struct {
 	Publications []string `json:"publications"` // sorted
 	Enabled      bool     `json:"enabled"`
 	CopyData     bool     `json:"copy_data"`
+	// CreateSlot mirrors WITH (create_slot = ...). nil means omitted (PG
+	// default true). Non-nil values are emitted on CREATE only.
+	CreateSlot *bool `json:"create_slot,omitempty"`
 }
 
 // ReplicationSlot represents a standalone logical replication slot declared
@@ -130,11 +134,11 @@ func applySubscriptionWithClause(sub *Subscription, clause string) bool {
 			}
 			sub.SlotName = name
 		case "create_slot":
-			// Accepted for CREATE rendering parity; not stored on IR because
-			// it is create-time only and has no live catalog counterpart.
-			if _, ok := parseSQLBool(value); !ok {
+			b, ok := parseSQLBool(value)
+			if !ok {
 				return false
 			}
+			sub.CreateSlot = &b
 		default:
 			return false
 		}
@@ -435,6 +439,10 @@ func cloneSubscription(s *Subscription) *Subscription {
 	}
 	out := *s
 	out.Publications = append([]string(nil), s.Publications...)
+	if s.CreateSlot != nil {
+		v := *s.CreateSlot
+		out.CreateSlot = &v
+	}
 	return &out
 }
 

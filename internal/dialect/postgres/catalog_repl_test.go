@@ -40,6 +40,30 @@ func TestGenerateSubscriptionSQL_RedactedAndDropKeepsRemoteSlot(t *testing.T) {
 	}
 }
 
+func TestGenerateSubscriptionSQL_CreateSlotFalseRoundTrip(t *testing.T) {
+	sql := `CREATE SUBSCRIPTION s CONNECTION 'host=x' PUBLICATION p WITH (create_slot = false);`
+	spec := schema.ParseCatalogSQL(sql)
+	if len(spec.Subscriptions) != 1 {
+		t.Fatal("expected subscription")
+	}
+	sub := spec.Subscriptions[0]
+	if sub.CreateSlot == nil || *sub.CreateSlot {
+		t.Fatalf("CreateSlot not parsed: %+v", sub)
+	}
+	got := GenerateCreateSubscriptionSQL(sub)
+	if !strings.Contains(got, "create_slot = false") {
+		t.Fatalf("CREATE SQL must emit create_slot = false, got: %s", got)
+	}
+	// Omitted create_slot must not emit the option (PG default true).
+	def := GenerateCreateSubscriptionSQL(&schema.Subscription{
+		Name: "s", ConnInfo: "host=x", Publications: []string{"p"},
+		Enabled: true, CopyData: true, SlotName: "s",
+	})
+	if strings.Contains(def, "create_slot") {
+		t.Fatalf("omitted create_slot must not appear in WITH: %s", def)
+	}
+}
+
 func TestGenerateReplicationSlotSQL(t *testing.T) {
 	create := GenerateCreateReplicationSlotSQL(&schema.ReplicationSlot{Name: "s", Plugin: "pgoutput"})
 	if create != "SELECT pg_create_logical_replication_slot('s', 'pgoutput');" {

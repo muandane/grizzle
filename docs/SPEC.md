@@ -269,7 +269,8 @@ CREATE PUBLICATION ins_only WITH (publish = 'insert');           -- defaults to 
 ALTER PUBLICATION docs_pub ADD TABLE audit;
 DROP PUBLICATION old_pub;
 CREATE SUBSCRIPTION docs_sub CONNECTION 'host=publisher dbname=pub' PUBLICATION docs_pub;
--- WITH defaults: enabled=true, copy_data=true, slot_name=<subscription name>
+-- WITH defaults: enabled=true, copy_data=true, create_slot=true, slot_name=<subscription name>
+-- create_slot / copy_data are create-time only (not altered on existing subscriptions)
 ALTER SUBSCRIPTION docs_sub CONNECTION 'host=publisher dbname=pub password=secret';
 ALTER SUBSCRIPTION docs_sub ENABLE;
 ALTER SUBSCRIPTION docs_sub SET PUBLICATION docs_pub, audit_pub;

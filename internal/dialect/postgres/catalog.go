@@ -598,6 +598,13 @@ func generateCreateSubscriptionSQL(s *schema.Subscription, redact bool) string {
 	if !s.CopyData {
 		withOpts = append(withOpts, "copy_data = false")
 	}
+	if s.CreateSlot != nil {
+		if *s.CreateSlot {
+			withOpts = append(withOpts, "create_slot = true")
+		} else {
+			withOpts = append(withOpts, "create_slot = false")
+		}
+	}
 	if s.SlotName != "" && schema.CanonicalIdentifierKey(s.SlotName) != schema.CanonicalIdentifierKey(s.Name) {
 		withOpts = append(withOpts, fmt.Sprintf("slot_name = %s", quoteIdentifier(s.SlotName)))
 	}
