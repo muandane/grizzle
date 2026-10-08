@@ -1,5 +1,10 @@
 name: "Update Changelog"
 
+# Keep-a-Changelog is maintained in-tree (see CHANGELOG.md). This workflow only
+# runs for final (non-prerelease) GitHub Releases and opens a PR when the bot
+# can actually create one. Prereleases must not dump release-note prose into
+# CHANGELOG — that path previously fired when a release was published before
+# --prerelease was set.
 on:
   release:
     types: [released]
@@ -10,6 +15,9 @@ jobs:
   update:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # Final releases only. The `released` event already excludes prereleases;
+    # keep an explicit guard against accidental republish edge cases.
+    if: ${{ !github.event.release.prerelease }}
     permissions:
       contents: write
       pull-requests: write
@@ -20,13 +28,29 @@ jobs:
         with:
           ref: main
 
+      - name: Skip when version already in CHANGELOG
+        id: skip
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          # Match Keep-a-Changelog headings like "## [v0.1.0]" or "## [0.1.0]".
+          ver="${TAG#v}"
+          if grep -Eq "^## \[?(v)?${ver}\]?" CHANGELOG.md; then
+            echo "CHANGELOG already documents ${TAG}; nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Update Changelog
+        if: steps.skip.outputs.skip != 'true'
         uses: stefanzweifel/changelog-updater-action@v1
         with:
-          latest-version: ${{ github.event.release.name }}
+          latest-version: ${{ github.event.release.tag_name }}
           release-notes: ${{ github.event.release.body }}
 
       - name: Create Pull Request
+        if: steps.skip.outputs.skip != 'true'
         uses: peter-evans/create-pull-request@v8
         with:
           branch: chore/update-changelog-${{ github.event.release.tag_name }}
