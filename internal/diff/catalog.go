@@ -504,7 +504,10 @@ func subscriptionHasDrift(want *schema.Subscription, live *SubscriptionState) bo
 	if want.Enabled != live.Enabled {
 		return true
 	}
-	if want.ConnInfo != live.ConnInfo {
+	// A redacted desired conninfo (plan artifact) cannot be compared with the
+	// live plaintext; conninfo drift is only evaluated for usable IR. Apply
+	// refuses redacted-only CONNECTION, so no unverifiable change is executed.
+	if schema.SubscriptionHasUsableConnInfo(want) && want.ConnInfo != live.ConnInfo {
 		return true
 	}
 	if want.SlotName != "" && live.SlotName != "" &&
