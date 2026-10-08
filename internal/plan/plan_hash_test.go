@@ -55,7 +55,7 @@ func TestPlan_Hash_Golden(t *testing.T) {
 		Renames:       map[string]string{"users_accounts": "users"},
 	}
 
-	const want = "fed488b287bc127c043ff6e746a7109f0c5f7589fd335b0a3e51064b2d20ed7e"
+	const want = "5535ef580cf9685c596b1ec84856498d732d77974a5e056e296f752849e0b825"
 	if got := p.Hash(); got != want {
 		t.Errorf("golden hash mismatch:\n got  %s\n want %s\nIf this change is intentional (hash format edit), update the golden value.", got, want)
 	}

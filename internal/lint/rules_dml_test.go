@@ -71,6 +71,11 @@ func TestNoDMLStatements_L009(t *testing.T) {
 			wantDiags: 3,
 			wantKind:  "DELETE",
 		},
+		{
+			name:      "logical slot SELECT exempt from L009",
+			sql:       "CREATE TABLE t (id bigint); SELECT pg_create_logical_replication_slot('s', 'pgoutput');",
+			wantDiags: 0,
+		},
 	}
 
 	for _, tt := range tests {

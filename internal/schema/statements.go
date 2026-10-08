@@ -24,7 +24,7 @@ type StatementGroups struct {
 
 var (
 	roleStatementRe    = regexp.MustCompile(`(?is)^(?:GRANT|REVOKE)\b|^CREATE\s+(?:ROLE|USER)\b|^ALTER\s+(?:ROLE|USER)\b|^DROP\s+(?:ROLE|USER)\b`)
-	catalogStatementRe = regexp.MustCompile(`(?is)^(?:CREATE|ALTER|DROP)\s+(?:PUBLICATION\b|EVENT\s+TRIGGER\b)`)
+	catalogStatementRe = regexp.MustCompile(`(?is)^(?:CREATE|ALTER|DROP)\s+(?:PUBLICATION\b|EVENT\s+TRIGGER\b|SUBSCRIPTION\b)|^SELECT\s+pg_(?:create_logical_replication_slot|drop_replication_slot)\s*\(`)
 )
 
 // SplitStatements splits SQL into top-level statements on unquoted semicolons,

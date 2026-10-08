@@ -44,19 +44,23 @@ type EventTrigger struct {
 	Enabled bool `json:"enabled"`
 }
 
-// CatalogSpec is the desired publication/event-trigger state parsed from a
-// unified schema or side-channel SQL file.
+// CatalogSpec is the desired publication/event-trigger/subscription/slot
+// state parsed from a unified schema or side-channel SQL file.
 type CatalogSpec struct {
-	Publications  []*Publication  `json:"publications"`
-	EventTriggers []*EventTrigger `json:"event_triggers"`
+	Publications     []*Publication     `json:"publications"`
+	EventTriggers    []*EventTrigger    `json:"event_triggers"`
+	Subscriptions    []*Subscription    `json:"subscriptions"`
+	ReplicationSlots []*ReplicationSlot `json:"replication_slots"`
 
-	droppedPublications   map[string]bool
-	droppedEventTriggers  map[string]bool
-	operations            []catalogOperation
-	hasCatalogStatements  bool
-	hasCreateStatements   bool
-	explicitDropsOnly     bool
-	suppressImplicitDrops bool
+	droppedPublications     map[string]bool
+	droppedEventTriggers    map[string]bool
+	droppedSubscriptions    map[string]bool
+	droppedReplicationSlots map[string]bool
+	operations              []catalogOperation
+	hasCatalogStatements    bool
+	hasCreateStatements     bool
+	explicitDropsOnly       bool
+	suppressImplicitDrops   bool
 }
 
 type catalogOperationKind uint8
@@ -64,6 +68,8 @@ type catalogOperationKind uint8
 const (
 	catalogPublicationOperation catalogOperationKind = iota
 	catalogEventTriggerOperation
+	catalogSubscriptionOperation
+	catalogReplicationSlotOperation
 )
 
 type catalogOperationAction uint8
@@ -75,12 +81,14 @@ const (
 )
 
 type catalogOperation struct {
-	kind         catalogOperationKind
-	action       catalogOperationAction
-	name         string
-	publication  *Publication
-	eventTrigger *EventTrigger
-	alterClause  string
+	kind            catalogOperationKind
+	action          catalogOperationAction
+	name            string
+	publication     *Publication
+	eventTrigger    *EventTrigger
+	subscription    *Subscription
+	replicationSlot *ReplicationSlot
+	alterClause     string
 }
 
 var (
@@ -134,11 +142,13 @@ var supportedEventTriggerEvents = map[string]bool{
 	"TABLE_REWRITE":     true,
 }
 
-// ParseCatalogSQL extracts managed publications and event triggers from a
-// CatalogSQL file. CREATE PUBLICATION without a WITH (publish = ...) clause
-// adopts the PostgreSQL defaults (all four DML operations). CREATE EVENT
-// TRIGGER without a WHEN TAG clause matches all tags; parsed triggers are
-// desired-enabled.
+// ParseCatalogSQL extracts managed publications, event triggers, subscriptions,
+// and logical replication slots from a CatalogSQL file. CREATE PUBLICATION
+// without a WITH (publish = ...) clause adopts the PostgreSQL defaults (all
+// four DML operations). CREATE EVENT TRIGGER without a WHEN TAG clause matches
+// all tags; parsed triggers are desired-enabled. CREATE SUBSCRIPTION without
+// WITH adopts PostgreSQL defaults (enabled=true, copy_data=true, slot_name=
+// subscription name).
 func ParseCatalogSQL(sql string) *CatalogSpec {
 	spec := &CatalogSpec{}
 	for _, stmt := range SplitStatements(sql) {
@@ -203,6 +213,56 @@ func ParseCatalogSQL(sql string) *CatalogSpec {
 			if name := statementIdentifier(dropEventTriggerRe.FindStringSubmatch(trimmed)); name != "" {
 				spec.operations = append(spec.operations, catalogOperation{
 					kind:   catalogEventTriggerOperation,
+					action: catalogDropOperation,
+					name:   name,
+				})
+				spec.hasCatalogStatements = true
+			}
+		case strings.HasPrefix(upper, "CREATE SUBSCRIPTION"):
+			if s := parseSubscriptionStatement(trimmed); s != nil {
+				spec.operations = append(spec.operations, catalogOperation{
+					kind:         catalogSubscriptionOperation,
+					action:       catalogCreateOperation,
+					name:         s.Name,
+					subscription: s,
+				})
+				spec.hasCatalogStatements = true
+				spec.hasCreateStatements = true
+			}
+		case strings.HasPrefix(upper, "ALTER SUBSCRIPTION"):
+			if matches := alterSubscriptionRe.FindStringSubmatch(trimmed); matches != nil {
+				spec.operations = append(spec.operations, catalogOperation{
+					kind:        catalogSubscriptionOperation,
+					action:      catalogAlterOperation,
+					name:        statementIdentifier(matches),
+					alterClause: strings.TrimSpace(matches[3]),
+				})
+				spec.hasCatalogStatements = true
+			}
+		case strings.HasPrefix(upper, "DROP SUBSCRIPTION"):
+			if name := statementIdentifier(dropSubscriptionRe.FindStringSubmatch(trimmed)); name != "" {
+				spec.operations = append(spec.operations, catalogOperation{
+					kind:   catalogSubscriptionOperation,
+					action: catalogDropOperation,
+					name:   name,
+				})
+				spec.hasCatalogStatements = true
+			}
+		case createLogicalSlotRe.MatchString(trimmed):
+			if slot := parseReplicationSlotCreate(trimmed); slot != nil {
+				spec.operations = append(spec.operations, catalogOperation{
+					kind:            catalogReplicationSlotOperation,
+					action:          catalogCreateOperation,
+					name:            slot.Name,
+					replicationSlot: slot,
+				})
+				spec.hasCatalogStatements = true
+				spec.hasCreateStatements = true
+			}
+		case dropLogicalSlotRe.MatchString(trimmed):
+			if name := parseReplicationSlotDropName(trimmed); name != "" {
+				spec.operations = append(spec.operations, catalogOperation{
+					kind:   catalogReplicationSlotOperation,
 					action: catalogDropOperation,
 					name:   name,
 				})
@@ -345,8 +405,16 @@ func applyCatalogOperations(base *CatalogSpec, operations []catalogOperation, st
 		for _, trigger := range base.EventTriggers {
 			upsertEventTrigger(out, cloneEventTrigger(trigger))
 		}
+		for _, sub := range base.Subscriptions {
+			upsertSubscription(out, cloneSubscription(sub))
+		}
+		for _, slot := range base.ReplicationSlots {
+			upsertReplicationSlot(out, cloneReplicationSlot(slot))
+		}
 		out.droppedPublications = cloneBoolMap(base.droppedPublications)
 		out.droppedEventTriggers = cloneBoolMap(base.droppedEventTriggers)
+		out.droppedSubscriptions = cloneBoolMap(base.droppedSubscriptions)
+		out.droppedReplicationSlots = cloneBoolMap(base.droppedReplicationSlots)
 	}
 	for _, operation := range operations {
 		switch operation.kind {
@@ -395,6 +463,41 @@ func applyCatalogOperations(base *CatalogSpec, operations []catalogOperation, st
 					out.droppedEventTriggers = make(map[string]bool)
 				}
 				out.droppedEventTriggers[CanonicalIdentifierKey(operation.name)] = true
+			}
+		case catalogSubscriptionOperation:
+			switch operation.action {
+			case catalogCreateOperation:
+				upsertSubscription(out, cloneSubscription(operation.subscription))
+				delete(out.droppedSubscriptions, CanonicalIdentifierKey(operation.name))
+			case catalogAlterOperation:
+				sub := findSubscription(out, operation.name)
+				if sub == nil {
+					if strict {
+						return nil, fmt.Errorf("ALTER SUBSCRIPTION %q requires a CREATE SUBSCRIPTION declaration in SchemaSQL or CatalogSQL", operation.name)
+					}
+					continue
+				}
+				if !applySubscriptionAlterClause(sub, operation.alterClause) && strict {
+					return nil, fmt.Errorf("unsupported ALTER SUBSCRIPTION form for %q: %q", operation.name, operation.alterClause)
+				}
+			case catalogDropOperation:
+				removeSubscription(out, operation.name)
+				if out.droppedSubscriptions == nil {
+					out.droppedSubscriptions = make(map[string]bool)
+				}
+				out.droppedSubscriptions[CanonicalIdentifierKey(operation.name)] = true
+			}
+		case catalogReplicationSlotOperation:
+			switch operation.action {
+			case catalogCreateOperation:
+				upsertReplicationSlot(out, cloneReplicationSlot(operation.replicationSlot))
+				delete(out.droppedReplicationSlots, CanonicalIdentifierKey(operation.name))
+			case catalogDropOperation:
+				removeReplicationSlot(out, operation.name)
+				if out.droppedReplicationSlots == nil {
+					out.droppedReplicationSlots = make(map[string]bool)
+				}
+				out.droppedReplicationSlots[CanonicalIdentifierKey(operation.name)] = true
 			}
 		}
 	}
@@ -673,20 +776,36 @@ func mergeCatalogSpecs(schemaSpec, sideSpec *CatalogSpec, strict bool) (*Catalog
 	}
 	out.hasCatalogStatements = hasCatalogStatements(schemaSpec) || hasCatalogStatements(sideSpec)
 	out.hasCreateStatements = hasCreateStatements(schemaSpec) || hasCreateStatements(sideSpec)
-	out.explicitDropsOnly = out.hasCatalogStatements &&
-		(len(out.Publications) == 0 && len(out.EventTriggers) == 0) &&
-		(len(out.droppedPublications) > 0 || len(out.droppedEventTriggers) > 0)
+	out.explicitDropsOnly = catalogExplicitDropsOnly(out)
 	out.suppressImplicitDrops = suppressImplicitDrops(schemaSpec) || suppressImplicitDrops(sideSpec)
 	if err := validateCatalogMembershipState(out); err != nil {
 		return nil, err
 	}
+	sortCatalogSpec(out)
+	return out, nil
+}
+
+func catalogExplicitDropsOnly(out *CatalogSpec) bool {
+	return out.hasCatalogStatements &&
+		len(out.Publications) == 0 && len(out.EventTriggers) == 0 &&
+		len(out.Subscriptions) == 0 && len(out.ReplicationSlots) == 0 &&
+		(len(out.droppedPublications) > 0 || len(out.droppedEventTriggers) > 0 ||
+			len(out.droppedSubscriptions) > 0 || len(out.droppedReplicationSlots) > 0)
+}
+
+func sortCatalogSpec(out *CatalogSpec) {
 	slices.SortFunc(out.Publications, func(a, b *Publication) int {
 		return strings.Compare(CanonicalIdentifierKey(a.Name), CanonicalIdentifierKey(b.Name))
 	})
 	slices.SortFunc(out.EventTriggers, func(a, b *EventTrigger) int {
 		return strings.Compare(CanonicalIdentifierKey(a.Name), CanonicalIdentifierKey(b.Name))
 	})
-	return out, nil
+	slices.SortFunc(out.Subscriptions, func(a, b *Subscription) int {
+		return strings.Compare(CanonicalIdentifierKey(a.Name), CanonicalIdentifierKey(b.Name))
+	})
+	slices.SortFunc(out.ReplicationSlots, func(a, b *ReplicationSlot) int {
+		return strings.Compare(CanonicalIdentifierKey(a.Name), CanonicalIdentifierKey(b.Name))
+	})
 }
 
 func hasOperations(spec *CatalogSpec) bool {
@@ -738,19 +857,12 @@ func mergeCatalogOperationSpecs(schemaSpec, sideSpec *CatalogSpec, strict bool) 
 		operationsOf(schemaSpec)...), operationsOf(sideSpec)...)
 	out.hasCatalogStatements = hasCatalogStatements(schemaSpec) || hasCatalogStatements(sideSpec)
 	out.hasCreateStatements = hasCreateStatements(schemaSpec) || hasCreateStatements(sideSpec)
-	out.explicitDropsOnly = out.hasCatalogStatements &&
-		len(out.Publications) == 0 && len(out.EventTriggers) == 0 &&
-		(len(out.droppedPublications) > 0 || len(out.droppedEventTriggers) > 0)
+	out.explicitDropsOnly = catalogExplicitDropsOnly(out)
 	out.suppressImplicitDrops = suppressImplicitDrops(schemaSpec) || suppressImplicitDrops(sideSpec)
 	if err := validateCatalogMembershipState(out); err != nil {
 		return nil, err
 	}
-	slices.SortFunc(out.Publications, func(a, b *Publication) int {
-		return strings.Compare(CanonicalIdentifierKey(a.Name), CanonicalIdentifierKey(b.Name))
-	})
-	slices.SortFunc(out.EventTriggers, func(a, b *EventTrigger) int {
-		return strings.Compare(CanonicalIdentifierKey(a.Name), CanonicalIdentifierKey(b.Name))
-	})
+	sortCatalogSpec(out)
 	return out, nil
 }
 
@@ -795,12 +907,23 @@ func replayCatalogOperations(out **CatalogSpec, spec *CatalogSpec, sideChannel b
 			// The base declaration was seeded before replay. Skip a repeated
 			// CREATE while the object still exists, but replay a CREATE that
 			// follows a DROP in the same source.
-			if operation.kind == catalogPublicationOperation {
+			switch operation.kind {
+			case catalogPublicationOperation:
 				if findPublication(*out, operation.name) != nil {
 					continue
 				}
-			} else if findEventTrigger(*out, operation.name) != nil {
-				continue
+			case catalogEventTriggerOperation:
+				if findEventTrigger(*out, operation.name) != nil {
+					continue
+				}
+			case catalogSubscriptionOperation:
+				if findSubscription(*out, operation.name) != nil {
+					continue
+				}
+			case catalogReplicationSlotOperation:
+				if findReplicationSlot(*out, operation.name) != nil {
+					continue
+				}
 			}
 		}
 		var err error
@@ -841,6 +964,12 @@ func overlayCatalogDeclarations(out, overlay *CatalogSpec) {
 	for name := range overlay.droppedEventTriggers {
 		deleteEventTrigger(out, name)
 	}
+	for name := range overlay.droppedSubscriptions {
+		deleteSubscription(out, name)
+	}
+	for name := range overlay.droppedReplicationSlots {
+		deleteReplicationSlot(out, name)
+	}
 	for _, publication := range overlay.Publications {
 		upsertPublication(out, clonePublication(publication))
 		delete(out.droppedPublications, CanonicalIdentifierKey(publication.Name))
@@ -848,6 +977,14 @@ func overlayCatalogDeclarations(out, overlay *CatalogSpec) {
 	for _, trigger := range overlay.EventTriggers {
 		upsertEventTrigger(out, cloneEventTrigger(trigger))
 		delete(out.droppedEventTriggers, CanonicalIdentifierKey(trigger.Name))
+	}
+	for _, sub := range overlay.Subscriptions {
+		upsertSubscription(out, cloneSubscription(sub))
+		delete(out.droppedSubscriptions, CanonicalIdentifierKey(sub.Name))
+	}
+	for _, slot := range overlay.ReplicationSlots {
+		upsertReplicationSlot(out, cloneReplicationSlot(slot))
+		delete(out.droppedReplicationSlots, CanonicalIdentifierKey(slot.Name))
 	}
 }
 
@@ -867,21 +1004,45 @@ func deleteEventTrigger(spec *CatalogSpec, name string) {
 	spec.droppedEventTriggers[CanonicalIdentifierKey(name)] = true
 }
 
+func deleteSubscription(spec *CatalogSpec, name string) {
+	removeSubscription(spec, name)
+	if spec.droppedSubscriptions == nil {
+		spec.droppedSubscriptions = make(map[string]bool)
+	}
+	spec.droppedSubscriptions[CanonicalIdentifierKey(name)] = true
+}
+
+func deleteReplicationSlot(spec *CatalogSpec, name string) {
+	removeReplicationSlot(spec, name)
+	if spec.droppedReplicationSlots == nil {
+		spec.droppedReplicationSlots = make(map[string]bool)
+	}
+	spec.droppedReplicationSlots[CanonicalIdentifierKey(name)] = true
+}
+
 func cloneCatalogSpec(spec *CatalogSpec) *CatalogSpec {
 	out := &CatalogSpec{
-		hasCatalogStatements:  spec.hasCatalogStatements,
-		hasCreateStatements:   spec.hasCreateStatements,
-		explicitDropsOnly:     spec.explicitDropsOnly,
-		suppressImplicitDrops: spec.suppressImplicitDrops,
-		operations:            append([]catalogOperation(nil), spec.operations...),
-		droppedPublications:   cloneBoolMap(spec.droppedPublications),
-		droppedEventTriggers:  cloneBoolMap(spec.droppedEventTriggers),
+		hasCatalogStatements:    spec.hasCatalogStatements,
+		hasCreateStatements:     spec.hasCreateStatements,
+		explicitDropsOnly:       spec.explicitDropsOnly,
+		suppressImplicitDrops:   spec.suppressImplicitDrops,
+		operations:              append([]catalogOperation(nil), spec.operations...),
+		droppedPublications:     cloneBoolMap(spec.droppedPublications),
+		droppedEventTriggers:    cloneBoolMap(spec.droppedEventTriggers),
+		droppedSubscriptions:    cloneBoolMap(spec.droppedSubscriptions),
+		droppedReplicationSlots: cloneBoolMap(spec.droppedReplicationSlots),
 	}
 	for _, publication := range spec.Publications {
 		upsertPublication(out, clonePublication(publication))
 	}
 	for _, trigger := range spec.EventTriggers {
 		upsertEventTrigger(out, cloneEventTrigger(trigger))
+	}
+	for _, sub := range spec.Subscriptions {
+		upsertSubscription(out, cloneSubscription(sub))
+	}
+	for _, slot := range spec.ReplicationSlots {
+		upsertReplicationSlot(out, cloneReplicationSlot(slot))
 	}
 	return out
 }
@@ -1034,8 +1195,9 @@ func (s *CatalogSpec) SuppressImplicitDrops() bool {
 }
 
 // ValidateCatalogSQL enforces the CatalogSQL statement contract. CREATE,
-// ALTER, and DROP publication/event-trigger statements are accepted; anything
-// else fails loudly instead of being silently ignored by the statement scan.
+// ALTER, and DROP publication/event-trigger/subscription statements and
+// logical-slot SELECT helpers are accepted; anything else fails loudly
+// instead of being silently ignored by the statement scan.
 func ValidateCatalogSQL(sql string) error {
 	for _, stmt := range SplitStatements(sql) {
 		trimmed := stripLeadingComments(stmt)
@@ -1091,8 +1253,38 @@ func ValidateCatalogSQL(sql string) error {
 			if matches == nil || !validStatementIdentifier(matches) {
 				return fmt.Errorf("unsupported DROP EVENT TRIGGER form in CatalogSQL: %q", trimmed)
 			}
+		case strings.HasPrefix(upper, "CREATE SUBSCRIPTION"):
+			matches := createSubscriptionRe.FindStringSubmatch(trimmed)
+			if matches == nil || !validStatementIdentifier(matches) {
+				return fmt.Errorf("unsupported CREATE SUBSCRIPTION form in CatalogSQL (expected CREATE SUBSCRIPTION <name> CONNECTION '...' PUBLICATION <pubs> [WITH (enabled|copy_data|slot_name|create_slot = ...)]): %q", trimmed)
+			}
+			if err := validateSubscriptionCreate(matches); err != nil {
+				return fmt.Errorf("unsupported CREATE SUBSCRIPTION form in CatalogSQL: %w: %q", err, trimmed)
+			}
+		case strings.HasPrefix(upper, "ALTER SUBSCRIPTION"):
+			matches := alterSubscriptionRe.FindStringSubmatch(trimmed)
+			if matches == nil || !validStatementIdentifier(matches) || !isSupportedSubscriptionAlter(matches[3]) {
+				return fmt.Errorf("unsupported ALTER SUBSCRIPTION form in CatalogSQL (supported: CONNECTION, ENABLE, DISABLE, SET PUBLICATION): %q", trimmed)
+			}
+		case strings.HasPrefix(upper, "DROP SUBSCRIPTION"):
+			matches := dropSubscriptionRe.FindStringSubmatch(trimmed)
+			if matches == nil || !validStatementIdentifier(matches) {
+				return fmt.Errorf("unsupported DROP SUBSCRIPTION form in CatalogSQL: %q", trimmed)
+			}
+		case createPhysicalSlotRe.MatchString(trimmed):
+			return fmt.Errorf("physical replication slots are not managed; only SELECT pg_create_logical_replication_slot(...) is accepted: %q", trimmed)
+		case createLogicalSlotRe.MatchString(trimmed):
+			if parseReplicationSlotCreate(trimmed) == nil {
+				return fmt.Errorf("unsupported logical slot create form in CatalogSQL (expected SELECT pg_create_logical_replication_slot('name', 'plugin'[, temporary])): %q", trimmed)
+			}
+		case dropLogicalSlotRe.MatchString(trimmed):
+			if parseReplicationSlotDropName(trimmed) == "" {
+				return fmt.Errorf("unsupported logical slot drop form in CatalogSQL (expected SELECT pg_drop_replication_slot('name')): %q", trimmed)
+			}
+		case strings.HasPrefix(upper, "SELECT"):
+			return fmt.Errorf("unsupported SELECT in CatalogSQL (only SELECT pg_create_logical_replication_slot / pg_drop_replication_slot are managed): %q", trimmed)
 		default:
-			return fmt.Errorf("unsupported statement in CatalogSQL (only CREATE/ALTER/DROP PUBLICATION and EVENT TRIGGER are managed): %q", trimmed)
+			return fmt.Errorf("unsupported statement in CatalogSQL (only CREATE/ALTER/DROP PUBLICATION, EVENT TRIGGER, SUBSCRIPTION, and SELECT pg_create_logical_replication_slot / pg_drop_replication_slot are managed): %q", trimmed)
 		}
 	}
 	return nil

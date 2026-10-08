@@ -42,11 +42,41 @@ type EventTriggerState struct {
 	Enabled  bool
 }
 
-// CatalogLiveState is the live publication/event-trigger state inspected
-// from the database catalogs.
+// SubscriptionState is the dialect-independent live subscription snapshot
+// consumed by CatalogDiff.
+type SubscriptionState struct {
+	Name string
+	// Managed marks a live subscription stamped with the grizzle-managed
+	// marker comment. Only managed live-only subscriptions are droppable.
+	Managed bool
+
+	ConnInfo     string
+	SlotName     string
+	Publications []string
+	Enabled      bool
+}
+
+// ReplicationSlotState is the dialect-independent live logical slot snapshot.
+// Replication slots do not support COMMENT ON; Managed is unused for sweep
+// decisions — live-only slots are never auto-dropped.
+type ReplicationSlotState struct {
+	Name      string
+	Plugin    string
+	Temporary bool
+	// ActivePID is non-nil when a backend holds the slot; drops are refused.
+	ActivePID *int
+	// OwnedBySubscription is true when this slot name matches a live
+	// subscription's subslotname; such slots are not managed separately.
+	OwnedBySubscription bool
+}
+
+// CatalogLiveState is the live publication/event-trigger/subscription/slot
+// state inspected from the database catalogs.
 type CatalogLiveState struct {
-	Publications  map[string]*PublicationState
-	EventTriggers map[string]*EventTriggerState
+	Publications     map[string]*PublicationState
+	EventTriggers    map[string]*EventTriggerState
+	Subscriptions    map[string]*SubscriptionState
+	ReplicationSlots map[string]*ReplicationSlotState
 }
 
 // canonicalNameList lowercases, trims, and deduplicates a name slice,
@@ -140,13 +170,16 @@ func splitQualifiedIdentifier(name string) []string {
 	return schema.ParseQualifiedIdentifier(name)
 }
 
-// CatalogDiff computes publication and event-trigger sync steps from the
-// desired CatalogSQL state and the live catalog state.
+// CatalogDiff computes publication, event-trigger, subscription, and
+// logical-slot sync steps from the desired CatalogSQL state and the live
+// catalog state.
 //
-// Destructive drops are narrow: live-only publications and event triggers
-// are dropped only when they carry the grizzle-managed marker comment
-// (operator-created catalog objects are never swept). Publications and
-// event triggers named in the desired state are always managed.
+// Destructive drops are narrow: live-only publications, event triggers, and
+// subscriptions are dropped only when they carry the grizzle-managed marker
+// comment (operator-created catalog objects are never swept). Standalone
+// logical slots never auto-sweep (COMMENT ON unsupported); drops require an
+// explicit pg_drop_replication_slot. Objects named in the desired state are
+// always managed.
 //
 // targetSchema qualifies unqualified table names in desired publications.
 func CatalogDiff(desired *schema.CatalogSpec, live *CatalogLiveState, targetSchema string) []Change {
@@ -316,7 +349,189 @@ func CatalogDiff(desired *schema.CatalogSpec, live *CatalogLiveState, targetSche
 		})
 	}
 
+	// --- Subscriptions ---
+	liveOnlySubs := make(map[string]bool, len(live.Subscriptions))
+	for name := range live.Subscriptions {
+		liveOnlySubs[name] = true
+	}
+
+	for _, s := range desired.Subscriptions {
+		key := schema.CanonicalIdentifierKey(s.Name)
+		liveS, exists := live.Subscriptions[key]
+		liveOnlySubs[key] = false
+		want := canonicalizeSubscription(s)
+		if !exists {
+			changes = append(changes, Change{
+				Type:         plan.ChangeCreateSubscription,
+				Table:        want.Name,
+				Subscription: want,
+			})
+			continue
+		}
+		if subscriptionHasDrift(want, liveS) {
+			changes = append(changes, Change{
+				Type:         plan.ChangeAlterSubscription,
+				Table:        want.Name,
+				Subscription: want,
+				OldSubscription: &schema.Subscription{
+					Name:         liveS.Name,
+					ConnInfo:     liveS.ConnInfo,
+					SlotName:     liveS.SlotName,
+					Publications: append([]string(nil), liveS.Publications...),
+					Enabled:      liveS.Enabled,
+					CopyData:     want.CopyData,
+				},
+			})
+		}
+	}
+
+	for _, name := range sortedMapKeysLiveSubs(live.Subscriptions) {
+		if desired.SubscriptionExplicitlyDropped(name) {
+			liveOnlySubs[name] = false
+			if live.Subscriptions[name].Managed {
+				changes = append(changes, Change{
+					Type:         plan.ChangeDropSubscription,
+					Table:        name,
+					Destructive:  true,
+					Subscription: &schema.Subscription{Name: name},
+				})
+			}
+			continue
+		}
+		if desired.ExplicitDropsOnly() {
+			continue
+		}
+		if desired.SuppressImplicitDrops() {
+			continue
+		}
+		if !liveOnlySubs[name] || !live.Subscriptions[name].Managed {
+			continue
+		}
+		changes = append(changes, Change{
+			Type:         plan.ChangeDropSubscription,
+			Table:        name,
+			Destructive:  true,
+			Subscription: &schema.Subscription{Name: name},
+		})
+	}
+
+	// --- Standalone logical replication slots ---
+	// Slots owned by subscriptions are ignored. Live-only slots are never
+	// swept (no COMMENT ON support); drops require an explicit drop statement.
+	subscriptionSlotNames := make(map[string]bool)
+	for _, sub := range desired.Subscriptions {
+		if sub.SlotName != "" {
+			subscriptionSlotNames[schema.CanonicalIdentifierKey(sub.SlotName)] = true
+		}
+	}
+	for _, liveSub := range live.Subscriptions {
+		if liveSub.SlotName != "" {
+			subscriptionSlotNames[schema.CanonicalIdentifierKey(liveSub.SlotName)] = true
+		}
+	}
+
+	liveOnlySlots := make(map[string]bool, len(live.ReplicationSlots))
+	for name, slot := range live.ReplicationSlots {
+		if slot.OwnedBySubscription || subscriptionSlotNames[name] {
+			continue
+		}
+		liveOnlySlots[name] = true
+	}
+
+	for _, slot := range desired.ReplicationSlots {
+		key := schema.CanonicalIdentifierKey(slot.Name)
+		if subscriptionSlotNames[key] {
+			continue
+		}
+		liveSlot, exists := live.ReplicationSlots[key]
+		liveOnlySlots[key] = false
+		if !exists || liveSlot.OwnedBySubscription {
+			changes = append(changes, Change{
+				Type:            plan.ChangeCreateReplicationSlot,
+				Table:           slot.Name,
+				ReplicationSlot: slot,
+			})
+		}
+	}
+
+	for _, name := range sortedMapKeysLiveSlots(live.ReplicationSlots) {
+		liveSlot := live.ReplicationSlots[name]
+		if liveSlot.OwnedBySubscription || subscriptionSlotNames[name] {
+			continue
+		}
+		if !desired.ReplicationSlotExplicitlyDropped(name) {
+			continue
+		}
+		if liveSlot.ActivePID != nil {
+			// Diff refuses active slots; apply path also checks.
+			continue
+		}
+		changes = append(changes, Change{
+			Type:            plan.ChangeDropReplicationSlot,
+			Table:           name,
+			Destructive:     true,
+			ReplicationSlot: &schema.ReplicationSlot{Name: name, Plugin: liveSlot.Plugin, Temporary: liveSlot.Temporary},
+		})
+	}
+
 	return changes
+}
+
+func canonicalizeSubscription(s *schema.Subscription) *schema.Subscription {
+	out := cloneSub(s)
+	pubs := make([]string, 0, len(out.Publications))
+	seen := make(map[string]bool, len(out.Publications))
+	for _, p := range out.Publications {
+		p = strings.ToLower(strings.TrimSpace(p))
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		pubs = append(pubs, p)
+	}
+	sort.Strings(pubs)
+	out.Publications = pubs
+	return out
+}
+
+func cloneSub(s *schema.Subscription) *schema.Subscription {
+	out := *s
+	out.Publications = append([]string(nil), s.Publications...)
+	return &out
+}
+
+func subscriptionHasDrift(want *schema.Subscription, live *SubscriptionState) bool {
+	if want.Enabled != live.Enabled {
+		return true
+	}
+	if want.ConnInfo != live.ConnInfo {
+		return true
+	}
+	if want.SlotName != "" && live.SlotName != "" &&
+		schema.CanonicalIdentifierKey(want.SlotName) != schema.CanonicalIdentifierKey(live.SlotName) {
+		// Slot rename is not managed via ALTER; treat as non-drift for now
+		// (create-time attribute). Conninfo/pubs/enabled are the managed surface.
+		_ = want.SlotName
+	}
+	return !sameStringSet(canonicalNameList(want.Publications), canonicalNameList(live.Publications))
+}
+
+func sortedMapKeysLiveSubs(m map[string]*SubscriptionState) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func sortedMapKeysLiveSlots(m map[string]*ReplicationSlotState) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // publicationHasDrift reports membership or publish-flag drift between the

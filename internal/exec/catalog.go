@@ -50,7 +50,12 @@ func diffCatalogSteps(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecCo
 		}
 	}
 
-	changes := diff.CatalogDiff(desired, live.CatalogState(), cfg.primarySchema())
+	liveState := live.CatalogState()
+	if err := refuseActiveSlotDrops(desired, liveState); err != nil {
+		return nil, err
+	}
+
+	changes := diff.CatalogDiff(desired, liveState, cfg.primarySchema())
 
 	steps := make([]plan.Step, 0, len(changes))
 	for _, c := range changes {
@@ -61,6 +66,23 @@ func diffCatalogSteps(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecCo
 	// global order, since the schema step list is already sorted.
 	plan.SortSteps(steps)
 	return steps, nil
+}
+
+// refuseActiveSlotDrops fails closed when an explicit slot drop targets a
+// slot whose active_pid is non-NULL.
+func refuseActiveSlotDrops(desired *schema.CatalogSpec, live *diff.CatalogLiveState) error {
+	if desired == nil || live == nil {
+		return nil
+	}
+	for name, slot := range live.ReplicationSlots {
+		if slot == nil || slot.ActivePID == nil {
+			continue
+		}
+		if desired.ReplicationSlotExplicitlyDropped(name) {
+			return fmt.Errorf("refusing to drop logical replication slot %q: active_pid=%d (slot is in use)", name, *slot.ActivePID)
+		}
+	}
+	return nil
 }
 
 func validateCatalogServerVersion(spec *schema.CatalogSpec, serverVersion int) error {

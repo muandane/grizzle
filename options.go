@@ -71,6 +71,19 @@ type Options struct {
 	// (CRITICAL) still requires AcceptHazards.
 	AllowDropEventTrigger bool
 
+	// AllowDropSubscription permits dropping a managed subscription that
+	// left CatalogSQL. Has no granular override; DROP_SUBSCRIPTION
+	// (CRITICAL) still requires AcceptHazards. Remote slots are kept
+	// (DISABLE + SET slot_name = NONE before DROP).
+	AllowDropSubscription bool
+
+	// AllowDropReplicationSlot permits dropping a standalone logical
+	// replication slot via explicit SELECT pg_drop_replication_slot.
+	// Live-only slots are never swept. DROP_REPLICATION_SLOT (CRITICAL)
+	// still requires AcceptHazards. Active slots (active_pid IS NOT NULL)
+	// are refused.
+	AllowDropReplicationSlot bool
+
 	// Granular drop overrides (nil inherits from AllowDrop):
 	AllowDropTable     *bool
 	AllowDropColumn    *bool
@@ -552,23 +565,27 @@ func resolveDropPolicy(opts Options) plan.DropPolicy {
 	allowDropRole := opts.AllowDrop || opts.AllowDropRole
 	allowDropPublication := opts.AllowDrop || opts.AllowDropPublication
 	allowDropEventTrigger := opts.AllowDrop || opts.AllowDropEventTrigger
+	allowDropSubscription := opts.AllowDrop || opts.AllowDropSubscription
+	allowDropReplicationSlot := opts.AllowDrop || opts.AllowDropReplicationSlot
 
 	return plan.DropPolicy{
-		AllowTable:            allowTable,
-		AllowColumn:           allowColumn,
-		AllowIndex:            allowIndex,
-		AllowFK:               allowFK,
-		AllowCheck:            allowCheck,
-		AllowExtension:        allowExtension,
-		AllowFunction:         allowFunction,
-		AllowPolicy:           allowPolicy,
-		AllowTrigger:          allowTrigger,
-		AllowView:             allowView,
-		AllowDomain:           allowDomain,
-		AllowRevoke:           allowRevoke,
-		AllowDropRole:         allowDropRole,
-		AllowDropPublication:  allowDropPublication,
-		AllowDropEventTrigger: allowDropEventTrigger,
+		AllowTable:               allowTable,
+		AllowColumn:              allowColumn,
+		AllowIndex:               allowIndex,
+		AllowFK:                  allowFK,
+		AllowCheck:               allowCheck,
+		AllowExtension:           allowExtension,
+		AllowFunction:            allowFunction,
+		AllowPolicy:              allowPolicy,
+		AllowTrigger:             allowTrigger,
+		AllowView:                allowView,
+		AllowDomain:              allowDomain,
+		AllowRevoke:              allowRevoke,
+		AllowDropRole:            allowDropRole,
+		AllowDropPublication:     allowDropPublication,
+		AllowDropEventTrigger:    allowDropEventTrigger,
+		AllowDropSubscription:    allowDropSubscription,
+		AllowDropReplicationSlot: allowDropReplicationSlot,
 	}
 }
 

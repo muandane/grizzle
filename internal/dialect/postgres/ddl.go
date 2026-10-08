@@ -620,6 +620,18 @@ func RenderChangeWithOpts(targetSchema string, c diff.Change, opts RenderOpts) p
 		step.SQL = GenerateAlterEventTriggerEnabledSQL(c.EventTrigger)
 	case plan.ChangeDropEventTrigger:
 		step.SQL = GenerateDropEventTriggerSQL(c.Table)
+	case plan.ChangeCreateSubscription:
+		step.SQL = GenerateCreateSubscriptionSQL(c.Subscription) + "\n" + GenerateSubscriptionCommentSQL(c.Subscription.Name)
+		step.NonTx = true // CREATE SUBSCRIPTION cannot run inside a transaction when create_slot=true
+	case plan.ChangeAlterSubscription:
+		step.SQL = GenerateAlterSubscriptionSQL(c.Subscription, c.OldSubscription)
+	case plan.ChangeDropSubscription:
+		step.SQL = GenerateDropSubscriptionSQL(c.Table)
+		step.NonTx = true // slot disassociation/drop may require non-transactional execution
+	case plan.ChangeCreateReplicationSlot:
+		step.SQL = GenerateCreateReplicationSlotSQL(c.ReplicationSlot)
+	case plan.ChangeDropReplicationSlot:
+		step.SQL = GenerateDropReplicationSlotSQL(c.Table)
 	case plan.ChangeCreateTrigger:
 		step.SQL = GenerateCreateTriggerSQL(c.Trigger)
 	case plan.ChangeDropTrigger:

@@ -113,7 +113,7 @@ func DryRunVerifyPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfi
 					return rollback(fmt.Errorf("dry-run verification failed at before_step hook %d: %w", stepIdx, err))
 				}
 			}
-			if err := execStepWithTracing(ctx, tx, s, false, cfg.Tracer, roleIRFromConfig(cfg)); err != nil {
+			if err := execStepWithTracing(ctx, tx, s, false, cfg.Tracer, roleIRFromConfig(cfg), subscriptionIRFromConfig(cfg)); err != nil {
 				return rollback(fmt.Errorf("dry-run verification failed at step %d: %w", stepIdx, err))
 			}
 			if cfg.ExecuteHooksInDryRun {

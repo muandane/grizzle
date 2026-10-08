@@ -79,15 +79,21 @@ const (
 	ChangeAlterRole   ChangeType = "ALTER_ROLE"
 	ChangeRoleComment ChangeType = "ROLE_COMMENT"
 	ChangeDropRole    ChangeType = "DROP_ROLE"
-	// CatalogSQL surface: publications and event triggers (statement-scan
-	// only, never shadow-compiled). Sorted after roles steps; event triggers
-	// come last because they fire on subsequent DDL.
-	ChangeCreatePublication  ChangeType = "CREATE_PUBLICATION"
-	ChangeAlterPublication   ChangeType = "ALTER_PUBLICATION"
-	ChangeDropPublication    ChangeType = "DROP_PUBLICATION"
-	ChangeCreateEventTrigger ChangeType = "CREATE_EVENT_TRIGGER"
-	ChangeAlterEventTrigger  ChangeType = "ALTER_EVENT_TRIGGER"
-	ChangeDropEventTrigger   ChangeType = "DROP_EVENT_TRIGGER"
+	// CatalogSQL surface: publications, event triggers, subscriptions, and
+	// logical replication slots (statement-scan only, never shadow-compiled).
+	// Sorted after roles steps; event triggers come last because they fire on
+	// subsequent DDL. Subscriptions sort after publications.
+	ChangeCreatePublication     ChangeType = "CREATE_PUBLICATION"
+	ChangeAlterPublication      ChangeType = "ALTER_PUBLICATION"
+	ChangeDropPublication       ChangeType = "DROP_PUBLICATION"
+	ChangeCreateSubscription    ChangeType = "CREATE_SUBSCRIPTION"
+	ChangeAlterSubscription     ChangeType = "ALTER_SUBSCRIPTION"
+	ChangeDropSubscription      ChangeType = "DROP_SUBSCRIPTION"
+	ChangeCreateReplicationSlot ChangeType = "CREATE_REPLICATION_SLOT"
+	ChangeDropReplicationSlot   ChangeType = "DROP_REPLICATION_SLOT"
+	ChangeCreateEventTrigger    ChangeType = "CREATE_EVENT_TRIGGER"
+	ChangeAlterEventTrigger     ChangeType = "ALTER_EVENT_TRIGGER"
+	ChangeDropEventTrigger      ChangeType = "DROP_EVENT_TRIGGER"
 )
 
 // Step represents a single atomic DDL migration statement.
@@ -148,8 +154,10 @@ type DropPolicy struct {
 	AllowRevoke    bool `json:"allow_revoke"`
 	AllowDropRole  bool `json:"allow_drop_role"`
 	// CatalogSQL surface gates.
-	AllowDropPublication  bool `json:"allow_drop_publication"`
-	AllowDropEventTrigger bool `json:"allow_drop_event_trigger"`
+	AllowDropPublication     bool `json:"allow_drop_publication"`
+	AllowDropEventTrigger    bool `json:"allow_drop_event_trigger"`
+	AllowDropSubscription    bool `json:"allow_drop_subscription"`
+	AllowDropReplicationSlot bool `json:"allow_drop_replication_slot"`
 }
 
 // IsAllowed checks if a given migration step is permitted by the policy.
@@ -197,6 +205,10 @@ func (p DropPolicy) IsAllowed(s Step) bool {
 		// replication-surface changes even though PostgreSQL renders them as
 		// ALTER PUBLICATION.
 		return p.AllowDropPublication
+	case ChangeDropSubscription:
+		return p.AllowDropSubscription
+	case ChangeDropReplicationSlot:
+		return p.AllowDropReplicationSlot
 	case ChangeDropEventTrigger:
 		return p.AllowDropEventTrigger
 	default:
@@ -275,27 +287,28 @@ func (p *Plan) Hash() string {
 	if p.ExpandContract {
 		write("expand_contract:true\n")
 	}
-	write("policy:%t,%t,%t,%t,%t,%t,%t,%t,%t,%t,%t,%t,%t,%t,%t\n",
+	write("policy:%t,%t,%t,%t,%t,%t,%t,%t,%t,%t,%t,%t,%t,%t,%t,%t,%t\n",
 		p.Policy.AllowTable, p.Policy.AllowColumn, p.Policy.AllowIndex,
 		p.Policy.AllowFK, p.Policy.AllowCheck,
 		p.Policy.AllowExtension, p.Policy.AllowFunction, p.Policy.AllowPolicy,
 		p.Policy.AllowTrigger, p.Policy.AllowView, p.Policy.AllowDomain,
 		p.Policy.AllowRevoke, p.Policy.AllowDropRole,
-		p.Policy.AllowDropPublication, p.Policy.AllowDropEventTrigger)
+		p.Policy.AllowDropPublication, p.Policy.AllowDropEventTrigger,
+		p.Policy.AllowDropSubscription, p.Policy.AllowDropReplicationSlot)
 	if p.NonConcurrentIndexes {
 		write("non_concurrent:true\n")
 	}
 	if p.SchemaSQL != "" {
-		// Redact password literals so Hash matches Document() storage and
-		// ParsePlanJSON round-trips without ErrPlanDrift. Secrets never enter
-		// the hash payload.
-		write("schema_sql:%s\n", schema.RedactRolePasswordsSQL(p.SchemaSQL))
+		// Redact password and subscription conninfo literals so Hash matches
+		// Document() storage and ParsePlanJSON round-trips without
+		// ErrPlanDrift. Secrets never enter the hash payload.
+		write("schema_sql:%s\n", schema.RedactSecretsSQL(p.SchemaSQL))
 	}
 	if p.RolesSQL != "" {
 		write("roles_sql:%s\n", schema.RedactRolePasswordsSQL(p.RolesSQL))
 	}
 	if p.CatalogSQL != "" {
-		write("catalog_sql:%s\n", p.CatalogSQL)
+		write("catalog_sql:%s\n", schema.RedactSubscriptionConnInfoSQL(p.CatalogSQL))
 	}
 
 	for i, s := range p.Steps {
@@ -346,7 +359,7 @@ func (p *Plan) Additions() int {
 		case ChangeCreateEnum, ChangeCreateTable, ChangeAddColumn, ChangeCreateIndex, ChangeAddFK, ChangeAddCheck,
 			ChangeCreateExtension, ChangeCreatePolicy, ChangeCreateFunction, ChangeCreateAggregate, ChangeCreateTrigger, ChangeCreateView,
 			ChangeEnableRLS, ChangeForceRLS, ChangeCreateDomain, ChangeCreateRole, ChangeGrant,
-			ChangeCreatePublication, ChangeCreateEventTrigger:
+			ChangeCreatePublication, ChangeCreateSubscription, ChangeCreateReplicationSlot, ChangeCreateEventTrigger:
 			count++
 		}
 	}
@@ -360,7 +373,7 @@ func (p *Plan) Modifications() int {
 		switch s.Type {
 		case ChangeAlterColumn, ChangeAlterEnum, ChangeRefreshMatView,
 			ChangeDisableRLS, ChangeNoForceRLS, ChangeAlterDomain, ChangeRevoke,
-			ChangeAlterRole, ChangeAlterPublication, ChangeAlterEventTrigger:
+			ChangeAlterRole, ChangeAlterPublication, ChangeAlterSubscription, ChangeAlterEventTrigger:
 			count++
 		}
 	}
@@ -375,7 +388,7 @@ func (p *Plan) Deletions() int {
 		case ChangeDropTable, ChangeDropColumn, ChangeDropIndex, ChangeDropFK, ChangeDropCheck,
 			ChangeDropExtension, ChangeDropPolicy, ChangeDropFunction, ChangeDropAggregate, ChangeDropTrigger, ChangeDropView,
 			ChangeDropDomain, ChangeDropDomainConstraint, ChangeDropDomainRetype, ChangeDropRole,
-			ChangeDropPublication, ChangeDropEventTrigger:
+			ChangeDropPublication, ChangeDropSubscription, ChangeDropReplicationSlot, ChangeDropEventTrigger:
 			count++
 		}
 	}
@@ -459,6 +472,13 @@ const (
 	HazardPasswordChange HazardCode = "PASSWORD_CHANGE"
 	// HazardDropPublication indicates dropping a managed publication.
 	HazardDropPublication HazardCode = "DROP_PUBLICATION"
+	// HazardDropSubscription indicates dropping a managed subscription.
+	HazardDropSubscription HazardCode = "DROP_SUBSCRIPTION"
+	// HazardDropReplicationSlot indicates dropping a managed logical slot.
+	HazardDropReplicationSlot HazardCode = "DROP_REPLICATION_SLOT"
+	// HazardSubscriptionConnInfo indicates a create/alter carrying a
+	// subscription connection string (redacted in Step.SQL).
+	HazardSubscriptionConnInfo HazardCode = "SUBSCRIPTION_CONNINFO"
 	// HazardDropEventTrigger indicates dropping a managed event trigger.
 	HazardDropEventTrigger HazardCode = "DROP_EVENT_TRIGGER"
 	// HazardEventTriggerSuperuser indicates event-trigger DDL may require
@@ -814,6 +834,33 @@ func stepHazards(s Step) []Hazard {
 			Type:        s.Type,
 			Table:       s.Table,
 			Description: fmt.Sprintf("Publication %q will be dropped; subscribers depending on it stop receiving changes", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeDropSubscription:
+		hazards = append(hazards, Hazard{
+			Code:        HazardDropSubscription,
+			Level:       HazardLevelCritical,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Subscription %q will be dropped (remote slot kept via slot_name = NONE); replication stops", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeDropReplicationSlot:
+		hazards = append(hazards, Hazard{
+			Code:        HazardDropReplicationSlot,
+			Level:       HazardLevelCritical,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Logical replication slot %q will be dropped", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeCreateSubscription, ChangeAlterSubscription:
+		hazards = append(hazards, Hazard{
+			Code:        HazardSubscriptionConnInfo,
+			Level:       HazardLevelWarning,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Subscription %q create/alter carries a connection string (redacted in Step.SQL / plan JSON)", s.Table),
 			SQL:         s.SQL,
 		})
 	case ChangeDropEventTrigger:

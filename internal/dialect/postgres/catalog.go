@@ -12,22 +12,28 @@ import (
 	"github.com/muandane/grizzle/internal/schema"
 )
 
-// LiveCatalog captures the publication/event-trigger state relevant to a
-// CatalogSQL diff.
+// LiveCatalog captures the publication/event-trigger/subscription/slot state
+// relevant to a CatalogSQL diff.
 type LiveCatalog struct {
 	// Publications maps canonical publication identity -> live state.
 	Publications map[string]*diff.PublicationState
 	// EventTriggers maps canonical event-trigger identity -> live state.
 	EventTriggers map[string]*diff.EventTriggerState
+	// Subscriptions maps canonical subscription identity -> live state.
+	Subscriptions map[string]*diff.SubscriptionState
+	// ReplicationSlots maps canonical logical slot identity -> live state.
+	ReplicationSlots map[string]*diff.ReplicationSlotState
 }
 
 // InspectLiveCatalog reads publications (with table membership and publish
-// flags) and event triggers (with event, tag filter, function, enabled
-// state) plus their grizzle-managed marker comments.
+// flags), event triggers, subscriptions, and logical replication slots plus
+// grizzle-managed marker comments where COMMENT ON is supported.
 func InspectLiveCatalog(ctx context.Context, dbtx dialect.DBTX) (*LiveCatalog, error) {
 	live := &LiveCatalog{
-		Publications:  make(map[string]*diff.PublicationState),
-		EventTriggers: make(map[string]*diff.EventTriggerState),
+		Publications:     make(map[string]*diff.PublicationState),
+		EventTriggers:    make(map[string]*diff.EventTriggerState),
+		Subscriptions:    make(map[string]*diff.SubscriptionState),
+		ReplicationSlots: make(map[string]*diff.ReplicationSlotState),
 	}
 
 	// 1. Publications: markers via obj_description (publications are normal
@@ -180,6 +186,84 @@ func InspectLiveCatalog(ctx context.Context, dbtx dialect.DBTX) (*LiveCatalog, e
 	if err != nil {
 		return nil, fmt.Errorf("scanning event triggers: %w", err)
 	}
+
+	// 4. Subscriptions in the current database with markers.
+	subRows, err := dbtx.QueryContext(ctx, `
+		SELECT s.subname,
+		       s.subconninfo,
+		       COALESCE(s.subslotname, ''),
+		       s.subpublications,
+		       s.subenabled,
+		       COALESCE(obj_description(s.oid, 'pg_subscription'), '') AS comment
+		FROM pg_subscription s
+		WHERE s.subdbid = (SELECT oid FROM pg_database WHERE datname = current_database());
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("inspecting subscriptions: %w", err)
+	}
+	defer func() { _ = subRows.Close() }()
+	subscriptionSlotNames := make(map[string]bool)
+	err = scanRows(subRows, func(scan func(...any) error) error {
+		var name, conninfo, slotName, comment string
+		var pubs []string
+		var enabled bool
+		if err := scan(&name, &conninfo, &slotName, &pubs, &enabled, &comment); err != nil {
+			return err
+		}
+		sortedPubs := append([]string(nil), pubs...)
+		slices.Sort(sortedPubs)
+		live.Subscriptions[schema.CanonicalIdentifierKey(name)] = &diff.SubscriptionState{
+			Name:         name,
+			Managed:      comment == schema.SubscriptionManagedComment,
+			ConnInfo:     conninfo,
+			SlotName:     slotName,
+			Publications: sortedPubs,
+			Enabled:      enabled,
+		}
+		if slotName != "" {
+			subscriptionSlotNames[schema.CanonicalIdentifierKey(slotName)] = true
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("scanning subscriptions: %w", err)
+	}
+
+	// 5. Standalone logical replication slots for the current database.
+	// Replication slots do not support COMMENT ON.
+	slotRows, err := dbtx.QueryContext(ctx, `
+		SELECT slot_name,
+		       COALESCE(plugin, ''),
+		       temporary,
+		       active_pid
+		FROM pg_replication_slots
+		WHERE database = current_database()
+		  AND slot_type = 'logical';
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("inspecting replication slots: %w", err)
+	}
+	defer func() { _ = slotRows.Close() }()
+	err = scanRows(slotRows, func(scan func(...any) error) error {
+		var name, plugin string
+		var temporary bool
+		var activePID *int
+		if err := scan(&name, &plugin, &temporary, &activePID); err != nil {
+			return err
+		}
+		key := schema.CanonicalIdentifierKey(name)
+		live.ReplicationSlots[key] = &diff.ReplicationSlotState{
+			Name:                name,
+			Plugin:              plugin,
+			Temporary:           temporary,
+			ActivePID:           activePID,
+			OwnedBySubscription: subscriptionSlotNames[key],
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("scanning replication slots: %w", err)
+	}
 	return live, nil
 }
 
@@ -201,11 +285,15 @@ func canonicalLiveFunctionIdentity(functionSchema, functionName, identityArgs st
 // diff.CatalogLiveState shape consumed by diff.CatalogDiff.
 func (l *LiveCatalog) CatalogState() *diff.CatalogLiveState {
 	state := &diff.CatalogLiveState{
-		Publications:  make(map[string]*diff.PublicationState, len(l.Publications)),
-		EventTriggers: make(map[string]*diff.EventTriggerState, len(l.EventTriggers)),
+		Publications:     make(map[string]*diff.PublicationState, len(l.Publications)),
+		EventTriggers:    make(map[string]*diff.EventTriggerState, len(l.EventTriggers)),
+		Subscriptions:    make(map[string]*diff.SubscriptionState, len(l.Subscriptions)),
+		ReplicationSlots: make(map[string]*diff.ReplicationSlotState, len(l.ReplicationSlots)),
 	}
 	maps.Copy(state.Publications, l.Publications)
 	maps.Copy(state.EventTriggers, l.EventTriggers)
+	maps.Copy(state.Subscriptions, l.Subscriptions)
+	maps.Copy(state.ReplicationSlots, l.ReplicationSlots)
 	return state
 }
 
@@ -479,6 +567,126 @@ func GenerateDropEventTriggerSQL(name string) string {
 // GenerateEventTriggerCommentSQL stamps the managed-event-trigger marker.
 func GenerateEventTriggerCommentSQL(name string) string {
 	return fmt.Sprintf("COMMENT ON EVENT TRIGGER %s IS '%s';", quoteIdentifier(name), schema.EventTriggerManagedComment)
+}
+
+// GenerateCreateSubscriptionSQL renders CREATE SUBSCRIPTION with a redacted
+// connection string suitable for Step.SQL / plan documents.
+func GenerateCreateSubscriptionSQL(s *schema.Subscription) string {
+	return generateCreateSubscriptionSQL(s, true)
+}
+
+// GenerateCreateSubscriptionApplySQL renders CREATE SUBSCRIPTION with the
+// plaintext connection string from IR for apply.
+func GenerateCreateSubscriptionApplySQL(s *schema.Subscription) string {
+	return generateCreateSubscriptionSQL(s, false)
+}
+
+func generateCreateSubscriptionSQL(s *schema.Subscription, redact bool) string {
+	conn := s.ConnInfo
+	if redact {
+		conn = schema.PasswordRedacted
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "CREATE SUBSCRIPTION %s CONNECTION '%s' PUBLICATION %s",
+		quoteIdentifier(s.Name),
+		escapeSQLString(conn),
+		strings.Join(quoteQualifiedList(s.Publications), ", "))
+	var withOpts []string
+	if !s.Enabled {
+		withOpts = append(withOpts, "enabled = false")
+	}
+	if !s.CopyData {
+		withOpts = append(withOpts, "copy_data = false")
+	}
+	if s.SlotName != "" && schema.CanonicalIdentifierKey(s.SlotName) != schema.CanonicalIdentifierKey(s.Name) {
+		withOpts = append(withOpts, fmt.Sprintf("slot_name = %s", quoteIdentifier(s.SlotName)))
+	}
+	if len(withOpts) > 0 {
+		fmt.Fprintf(&sb, " WITH (%s)", strings.Join(withOpts, ", "))
+	}
+	sb.WriteByte(';')
+	return sb.String()
+}
+
+// GenerateAlterSubscriptionSQL renders CONNECTION / ENABLE / DISABLE /
+// SET PUBLICATION drift for one subscription. Connection strings in the
+// returned SQL are redacted.
+func GenerateAlterSubscriptionSQL(want, old *schema.Subscription) string {
+	return generateAlterSubscriptionSQL(want, old, true)
+}
+
+// GenerateAlterSubscriptionApplySQL renders alter SQL with plaintext conninfo.
+func GenerateAlterSubscriptionApplySQL(want, old *schema.Subscription) string {
+	return generateAlterSubscriptionSQL(want, old, false)
+}
+
+func generateAlterSubscriptionSQL(want, old *schema.Subscription, redact bool) string {
+	var out []string
+	if old == nil || want.ConnInfo != old.ConnInfo {
+		conn := want.ConnInfo
+		if redact {
+			conn = schema.PasswordRedacted
+		}
+		out = append(out, fmt.Sprintf("ALTER SUBSCRIPTION %s CONNECTION '%s';",
+			quoteIdentifier(want.Name), escapeSQLString(conn)))
+	}
+	if old == nil || want.Enabled != old.Enabled {
+		if want.Enabled {
+			out = append(out, fmt.Sprintf("ALTER SUBSCRIPTION %s ENABLE;", quoteIdentifier(want.Name)))
+		} else {
+			out = append(out, fmt.Sprintf("ALTER SUBSCRIPTION %s DISABLE;", quoteIdentifier(want.Name)))
+		}
+	}
+	if old == nil || !slices.Equal(canonicalPubNameList(want.Publications), canonicalPubNameList(old.Publications)) {
+		out = append(out, fmt.Sprintf("ALTER SUBSCRIPTION %s SET PUBLICATION %s;",
+			quoteIdentifier(want.Name), strings.Join(quoteQualifiedList(want.Publications), ", ")))
+	}
+	return strings.Join(out, "\n")
+}
+
+func canonicalPubNameList(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, p := range in {
+		out = append(out, strings.ToLower(strings.TrimSpace(p)))
+	}
+	slices.Sort(out)
+	return out
+}
+
+// GenerateDropSubscriptionSQL renders a drop that keeps the remote replication
+// slot: DISABLE, disassociate slot_name, then DROP. Per PostgreSQL docs,
+// DROP SUBSCRIPTION alone drops the remote slot by default.
+func GenerateDropSubscriptionSQL(name string) string {
+	id := quoteIdentifier(name)
+	return strings.Join([]string{
+		fmt.Sprintf("ALTER SUBSCRIPTION %s DISABLE;", id),
+		fmt.Sprintf("ALTER SUBSCRIPTION %s SET (slot_name = NONE);", id),
+		fmt.Sprintf("DROP SUBSCRIPTION %s;", id),
+	}, "\n")
+}
+
+// GenerateSubscriptionCommentSQL stamps the managed-subscription marker.
+func GenerateSubscriptionCommentSQL(name string) string {
+	return fmt.Sprintf("COMMENT ON SUBSCRIPTION %s IS '%s';", quoteIdentifier(name), schema.SubscriptionManagedComment)
+}
+
+// GenerateCreateReplicationSlotSQL renders pg_create_logical_replication_slot.
+func GenerateCreateReplicationSlotSQL(s *schema.ReplicationSlot) string {
+	if s.Temporary {
+		return fmt.Sprintf("SELECT pg_create_logical_replication_slot('%s', '%s', true);",
+			escapeSQLString(s.Name), escapeSQLString(s.Plugin))
+	}
+	return fmt.Sprintf("SELECT pg_create_logical_replication_slot('%s', '%s');",
+		escapeSQLString(s.Name), escapeSQLString(s.Plugin))
+}
+
+// GenerateDropReplicationSlotSQL renders pg_drop_replication_slot.
+func GenerateDropReplicationSlotSQL(name string) string {
+	return fmt.Sprintf("SELECT pg_drop_replication_slot('%s');", escapeSQLString(name))
+}
+
+func escapeSQLString(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
 }
 
 // publishFlagString renders the comma-separated publish option list for the

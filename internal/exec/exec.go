@@ -294,17 +294,25 @@ func inspectPostgresSchemas(ctx context.Context, dbtx dialect.DBTX, schemas []st
 	return postgres.InspectSchemas(ctx, dbtx, schemas)
 }
 
-func execStepWithTracing(ctx context.Context, execer dialect.DBTX, s plan.Step, isNonTx bool, tracer Tracer, roleIR map[string]*schema.Role) error {
+func execStepWithTracing(ctx context.Context, execer dialect.DBTX, s plan.Step, isNonTx bool, tracer Tracer, roleIR map[string]*schema.Role, subIR map[string]*schema.Subscription) error {
 	var span Span
 	if tracer != nil {
 		_, span = tracer.Start(ctx, "grizzle.exec_step")
 		span.SetAttribute("step.type", string(s.Type))
 		span.SetAttribute("step.table", s.Table)
-		// Always attribute the redacted Step.SQL — never the materialized password form.
+		// Always attribute the redacted Step.SQL — never the materialized secret form.
 		span.SetAttribute("step.sql", s.SQL)
 		span.SetAttribute("step.non_tx", isNonTx)
 	}
 	sql, err := materializeRoleStepSQL(s, roleIR)
+	if err != nil {
+		if span != nil {
+			span.RecordError(err)
+			span.End()
+		}
+		return err
+	}
+	sql, err = materializeSubscriptionStepSQL(plan.Step{Type: s.Type, Table: s.Table, SQL: sql}, subIR)
 	if err != nil {
 		if span != nil {
 			span.RecordError(err)
@@ -666,6 +674,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig, b
 	// 7. Apply DDL statements split into transactional and non-transactional groups
 	groups := GroupSteps(steps)
 	roleIR := roleIRFromConfig(cfg)
+	subIR := subscriptionIRFromConfig(cfg)
 	stepIdx := 0
 	committedSteps := 0
 	// histErr captures a failed success-path history write: reported as a
@@ -705,7 +714,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig, b
 					recordFailureHistory(stepIdx, hookErr, false)
 					return committedSteps, hookErr
 				}
-				if err := execStepWithTracing(ctx, conn, s, true, cfg.Tracer, roleIR); err != nil {
+				if err := execStepWithTracing(ctx, conn, s, true, cfg.Tracer, roleIR, subIR); err != nil {
 					if logger != nil {
 						logger.ErrorContext(ctx, "grizzle: failed executing non-tx step", "step_index", stepIdx, "sql", s.SQL, "error", err)
 					}
@@ -754,7 +763,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig, b
 					recordFailureHistory(stepIdx, hookErr, false)
 					return committedSteps, hookErr
 				}
-				if err := execStepWithTracing(ctx, tx, s, false, cfg.Tracer, roleIR); err != nil {
+				if err := execStepWithTracing(ctx, tx, s, false, cfg.Tracer, roleIR, subIR); err != nil {
 					_ = tx.Rollback()
 					if logger != nil {
 						logger.ErrorContext(ctx, "grizzle: failed executing step in tx", "step_index", stepIdx, "sql", s.SQL, "error", err)
@@ -1362,6 +1371,14 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 			TargetSchema: primarySchema,
 		})
 	}
+	subIR := subscriptionIRFromConfig(cfg)
+	if len(subIR) == 0 && (p.CatalogSQL != "" || p.SchemaSQL != "") {
+		subIR = subscriptionIRFromConfig(PostgresExecConfig{
+			SchemaSQL:    p.SchemaSQL,
+			CatalogSQL:   p.CatalogSQL,
+			TargetSchema: primarySchema,
+		})
+	}
 	stepIdx := 0
 	committedSteps := 0
 	// histErr captures a failed success-path history write: reported as a
@@ -1399,7 +1416,7 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 					recordFailureHistory(stepIdx, hookErr, false)
 					return committedSteps, hookErr
 				}
-				if err := execStepWithTracing(ctx, conn, s, true, cfg.Tracer, roleIR); err != nil {
+				if err := execStepWithTracing(ctx, conn, s, true, cfg.Tracer, roleIR, subIR); err != nil {
 					if logger != nil {
 						logger.ErrorContext(ctx, "grizzle: failed executing non-tx step", "step_index", stepIdx, "sql", s.SQL, "error", err)
 					}
@@ -1447,7 +1464,7 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 					recordFailureHistory(stepIdx, hookErr, false)
 					return committedSteps, hookErr
 				}
-				if err := execStepWithTracing(ctx, tx, s, false, cfg.Tracer, roleIR); err != nil {
+				if err := execStepWithTracing(ctx, tx, s, false, cfg.Tracer, roleIR, subIR); err != nil {
 					_ = tx.Rollback()
 					if logger != nil {
 						logger.ErrorContext(ctx, "grizzle: failed executing step in tx", "step_index", stepIdx, "sql", s.SQL, "error", err)
