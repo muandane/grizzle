@@ -118,7 +118,7 @@ Ordered by expected impact; nothing here blocks the first release.
 - [x] **SQLite declarative CHECK constraints** — named and inline CHECK constraints are parsed from `sqlite_schema.sql`, emitted on create/rebuild, and diffed (check drift triggers a rebuild; removals gated by `AllowDropCheck` + `DROP_CHECK`).
 - [x] **Domain CHECK management** — domains are managed end-to-end: base type/nullability/default diffed from `pg_type` + `pg_constraint` (`conrelid = 0`), CHECK drift via `ALTER DOMAIN ADD/DROP CONSTRAINT`, drops gated by `AllowDropDomain` + `DROP_DOMAIN`.
 - [ ] **CLI backfill runner** — batched backfill is library-only (`Options.Backfill`); a CLI runner would need a durable batching contract.
-- [ ] **Multi-schema SQLite** — rejected today (`ErrUnsupportedMultiSchema`).
+- [x] **Multi-schema SQLite** — `SQLiteAttach` + `TargetSchemas`; per-schema diff/rebuild; shadow uses `:memory:` ATTACH (cross-DB FKs not validated).
 - [ ] **v1.0.0 API freeze** — remove `Experimental:` markers once rename mapping, staged plans, and backfill batching stabilize.
 
 ## Managed surface expansion (shipped)

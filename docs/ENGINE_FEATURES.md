@@ -206,10 +206,23 @@ opts := grizzle.Options{
 }
 ```
 
-The engine applies these rules:
+The engine applies these rules (PostgreSQL):
 1. **Search path configuration:** Shadow schemas mirror each declared schema namespace (`_grizzle_shadow_public`, `_grizzle_shadow_billing`). During shadow compilation, statements qualify target identifiers rewritten to their shadow counterparts without altering literals or comments.
 2. **Cross-schema foreign keys:** Tables in `billing` referencing primary keys in `identity` resolve correctly during relational dependency topological sorting (`identity.users` created before `billing.accounts`; reverse order on drop).
 3. **Lock identifiers:** The advisory lock hashing algorithm combines the database identifier with all declared schema names (`grizzle:<sorted_schemas>`) to prevent lock collisions across distinct applications sharing a database.
+
+SQLite multi-schema uses `ATTACH DATABASE` via `Options.SQLiteAttach`:
+
+```go
+opts := grizzle.Options{
+    Dialect:       grizzle.DialectSQLite,
+    TargetSchemas: []string{"main", "aux"},
+    SQLiteAttach:  map[string]string{"aux": "/path/to/aux.db"},
+    SchemaSQL:     schemaSQL, // e.g. CREATE TABLE main.t (...); CREATE TABLE aux.u (...);
+}
+```
+
+Shadow compilation attaches empty `:memory:` databases under the same names (never the live files). Diff and rebuild run per attached schema. Cross-database foreign keys are not enforced by SQLite and are not validated.
 
 ---
 
@@ -260,7 +273,7 @@ SQLite does not support altering column types, renaming foreign keys, or droppin
 2. **Batch data copying for large tables:** Copying large datasets in a single `INSERT INTO ... SELECT` statement inflates SQLite process and cursor memory. The engine performs chunked keyset copying (`WHERE rowid > ? ORDER BY rowid ASC LIMIT ?`) when table row count exceeds `SQLiteRebuildThreshold`.
    - **Global threshold design:** `SQLiteRebuildThreshold` (default 100,000) and `SQLiteRebuildBatchSize` (default 10,000) are configured globally in `Options` and `ApplyOpts` rather than per-table. This design keeps schema definitions clean and declarative while ensuring uniform memory bounds across all tables.
    - **Memory footprint bound:** Keyset batch copying bounds client process memory consumption and cursor retention during rebuild data copying. (Note: within an atomic SQLite rebuild transaction, on-disk WAL volume is invariant to chunk size because all copied rows dirty pages in the same transaction; keyset batching bounds memory only).
-   - **Multi-schema scope:** Multi-schema configurations (`TargetSchemas > 1`) are explicitly out of scope for SQLite and return typed error `ErrUnsupportedMultiSchema`, as SQLite operates with a single attached database per connection.
+   - **Multi-schema scope:** SQLite multi-schema is supported via `Options.SQLiteAttach` (schema name → filesystem path) and `TargetSchemas` listing `main` plus attached names. Sync ATTACHes on a pinned connection, diffs/rebuilds per schema, and DETACHes on cleanup. Shadow compilation attaches empty `:memory:` databases (not live files). Cross-database foreign keys are not enforced by SQLite and are not validated.
 3. **Savepoint isolation:** Wraps each table rebuild in an explicit `SAVEPOINT grizzle_rebuild`. If `PRAGMA foreign_key_check` discovers constraint violations, rolls back the savepoint and aborts migration before committing.
 
 ### Manual verification checklist

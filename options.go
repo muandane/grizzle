@@ -42,7 +42,14 @@ type Options struct {
 	TargetSchema string
 
 	// TargetSchemas specifies the database schemas to manage (defaults to [TargetSchema] or ["public"] for Postgres).
+	// For SQLite, entries other than "main" are ATTACH DATABASE schema names listed in SQLiteAttach.
 	TargetSchemas []string
+
+	// SQLiteAttach maps ATTACH DATABASE schema names to filesystem paths.
+	// Every TargetSchemas entry other than "main" must appear here; "main" is
+	// the primary database already open and must not be listed. Unknown keys,
+	// empty paths, and duplicate names are rejected. PostgreSQL ignores this field.
+	SQLiteAttach map[string]string
 
 	// ShadowSchema is the temporary schema name used for validation (defaults to "_grizzle_shadow").
 	ShadowSchema string
@@ -307,6 +314,13 @@ func WithTargetSchemas(schemas ...string) Option {
 	}
 }
 
+// WithSQLiteAttach sets the SQLite ATTACH DATABASE map (schema name → path).
+func WithSQLiteAttach(attach map[string]string) Option {
+	return func(o *Options) {
+		o.SQLiteAttach = attach
+	}
+}
+
 // WithAllowDrop sets the general drop permission.
 func WithAllowDrop(allow bool) Option {
 	return func(o *Options) {
@@ -428,8 +442,8 @@ func (o *Options) Validate() error {
 
 	switch o.Dialect {
 	case DialectSQLite:
-		if len(o.TargetSchemas) > 1 {
-			return ErrUnsupportedMultiSchema
+		if err := validateSQLiteAttach(o); err != nil {
+			return err
 		}
 		if strings.TrimSpace(o.RolesSQL) != "" {
 			return fmt.Errorf("%w: RolesSQL requires PostgreSQL; roles are not managed on SQLite", ErrInvalidOptions)
@@ -496,6 +510,61 @@ func validateOptionIdent(ident string) error {
 	}
 	if !optionIdentRegex.MatchString(ident) {
 		return fmt.Errorf("%w: identifier %q is not a valid SQL identifier", ErrInvalidOptions, ident)
+	}
+	return nil
+}
+
+// validateSQLiteAttach enforces TargetSchemas ↔ SQLiteAttach consistency for SQLite.
+func validateSQLiteAttach(o *Options) error {
+	targets := o.TargetSchemas
+	if len(targets) == 0 && o.TargetSchema != "" {
+		targets = []string{o.TargetSchema}
+	}
+
+	seenTarget := make(map[string]bool, len(targets))
+	for _, name := range targets {
+		if name == "" {
+			return fmt.Errorf("%w: TargetSchemas entry must not be empty", ErrInvalidOptions)
+		}
+		if err := validateOptionIdent(name); err != nil {
+			return err
+		}
+		if seenTarget[name] {
+			return fmt.Errorf("%w: duplicate TargetSchemas entry %q", ErrInvalidOptions, name)
+		}
+		seenTarget[name] = true
+	}
+
+	seenAttach := make(map[string]bool, len(o.SQLiteAttach))
+	for name, path := range o.SQLiteAttach {
+		if name == "" {
+			return fmt.Errorf("%w: SQLiteAttach key must not be empty", ErrInvalidOptions)
+		}
+		if name == "main" {
+			return fmt.Errorf("%w: SQLiteAttach must not include %q (primary database is already open)", ErrInvalidOptions, name)
+		}
+		if err := validateOptionIdent(name); err != nil {
+			return fmt.Errorf("%w: SQLiteAttach key: %w", ErrInvalidOptions, err)
+		}
+		if seenAttach[name] {
+			return fmt.Errorf("%w: duplicate SQLiteAttach key %q", ErrInvalidOptions, name)
+		}
+		seenAttach[name] = true
+		if strings.TrimSpace(path) == "" {
+			return fmt.Errorf("%w: SQLiteAttach[%q] path must not be empty", ErrInvalidOptions, name)
+		}
+		if !seenTarget[name] {
+			return fmt.Errorf("%w: SQLiteAttach key %q is not listed in TargetSchemas", ErrInvalidOptions, name)
+		}
+	}
+
+	for name := range seenTarget {
+		if name == "main" {
+			continue
+		}
+		if _, ok := o.SQLiteAttach[name]; !ok {
+			return fmt.Errorf("%w: TargetSchemas entry %q requires SQLiteAttach[%q] filesystem path", ErrInvalidOptions, name, name)
+		}
 	}
 	return nil
 }

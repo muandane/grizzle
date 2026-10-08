@@ -55,7 +55,14 @@ type Options struct {
     TargetSchema string
 
     // TargetSchemas specifies the database schemas to manage (defaults to [TargetSchema] or ["public"] for Postgres).
+    // For SQLite, entries other than "main" are ATTACH DATABASE names listed in SQLiteAttach.
     TargetSchemas []string
+
+    // SQLiteAttach maps ATTACH DATABASE schema names to filesystem paths.
+    // Every TargetSchemas entry other than "main" must appear here; "main" is
+    // the primary database already open and must not be listed. Unknown keys,
+    // empty paths, and duplicate names are rejected. Ignored on PostgreSQL.
+    SQLiteAttach map[string]string
 
     // ShadowSchema is the temporary schema name used for validation (defaults to "_grizzle_shadow").
     // Must use the reserved "_grizzle_shadow" prefix, be a valid identifier of at most 63 bytes,
@@ -576,7 +583,7 @@ var (
     ErrInvalidOptions          = errors.New("grizzle: invalid options")
     ErrStrictScope             = errors.New("grizzle: strict scope requires non-empty IncludeTables")
     ErrPartitionConversion     = errors.New("grizzle: in-place conversion between regular and partitioned table is unsupported")
-    ErrUnsupportedMultiSchema  = errors.New("grizzle: multi-schema configuration is unsupported on SQLite")
+    ErrUnsupportedMultiSchema  = errors.New("grizzle: multi-schema CompileSchema is unsupported for PostgreSQL")
     ErrPartitionKeyNotInUnique = errors.New("grizzle: primary key or unique constraint must include all partition key columns")
     ErrHistoryRecord           = errors.New("grizzle: migration succeeded but history record was not written") // non-fatal
 )

@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"fmt"
 	"maps"
+	"regexp"
 	"slices"
 	"strings"
 
@@ -12,6 +13,49 @@ import (
 	"github.com/muandane/grizzle/internal/schema"
 	"github.com/muandane/grizzle/internal/scope"
 )
+
+// needsSchemaQualify reports whether SQL identifiers must be schema-qualified
+// (attached databases other than the primary "main").
+func needsSchemaQualify(schemaName string) bool {
+	return schemaName != "" && schemaName != "main"
+}
+
+// tableRef returns a quoted table reference, schema-qualified when needed.
+func tableRef(schemaName, tableName string) string {
+	if !needsSchemaQualify(schemaName) {
+		return fmt.Sprintf("%q", tableName)
+	}
+	return fmt.Sprintf("%q.%q", schemaName, tableName)
+}
+
+// indexRef returns a quoted index reference, schema-qualified when needed.
+func indexRef(schemaName, indexName string) string {
+	if !needsSchemaQualify(schemaName) {
+		return fmt.Sprintf("%q", indexName)
+	}
+	return fmt.Sprintf("%q.%q", schemaName, indexName)
+}
+
+// sqliteCreateIndexRe captures the prefix through the index name so attached
+// schemas can rewrite unqualified CREATE INDEX DDL from sqlite_schema.
+var sqliteCreateIndexRe = regexp.MustCompile(`(?i)^(CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?)("(?:[^"]|"")*"|[^\s]+)`)
+
+// qualifyIndexDefinition rewrites CREATE INDEX DDL so the index name is
+// schema-qualified (CREATE INDEX aux.idx ON items(...)). Stored sqlite_schema
+// SQL is always unqualified; executing it without rewrite would target main.
+func qualifyIndexDefinition(schemaName, def string) string {
+	if !needsSchemaQualify(schemaName) {
+		return def
+	}
+	return sqliteCreateIndexRe.ReplaceAllStringFunc(def, func(match string) string {
+		parts := sqliteCreateIndexRe.FindStringSubmatch(match)
+		if len(parts) < 3 {
+			return match
+		}
+		name := strings.Trim(parts[2], `"`)
+		return parts[1] + fmt.Sprintf("%q.%q", schemaName, name)
+	})
+}
 
 // GenerateSQLiteCreateTable constructs a standard SQLite CREATE TABLE statement.
 func GenerateSQLiteCreateTable(tbl *schema.Table) string {
@@ -69,16 +113,21 @@ func GenerateSQLiteCreateTable(tbl *schema.Table) string {
 		lines = append(lines, fmt.Sprintf("  CONSTRAINT %q %s", name, tbl.Checks[name].Definition))
 	}
 
-	return fmt.Sprintf("CREATE TABLE %q (\n%s\n);", tbl.Name, strings.Join(lines, ",\n"))
+	return fmt.Sprintf("CREATE TABLE %s (\n%s\n);", tableRef(tbl.Schema, tbl.Name), strings.Join(lines, ",\n"))
 }
 
 // GenerateSQLiteRebuildPlan generates the standard 12-step atomic table replacement plan,
 // preserving and rebinding referencing views and triggers across table recreation.
 func GenerateSQLiteRebuildPlan(liveTable, desiredTable *schema.Table, refViews, refTriggers []*schema.UnmanagedObject) (string, bool) {
+	sch := desiredTable.Schema
+	if sch == "" {
+		sch = liveTable.Schema
+	}
 	tempTable := "_grizzle_new_" + desiredTable.Name
 
 	rebuiltTable := *desiredTable
 	rebuiltTable.Name = tempTable
+	rebuiltTable.Schema = sch
 	createTempSQL := GenerateSQLiteCreateTable(&rebuiltTable)
 
 	var commonCols []string
@@ -96,13 +145,14 @@ func GenerateSQLiteRebuildPlan(liveTable, desiredTable *schema.Table, refViews, 
 	slices.Sort(commonCols)
 
 	colList := strings.Join(commonCols, ", ")
-	copyDataSQL := fmt.Sprintf("INSERT INTO %q (%s) SELECT %s FROM %q;", tempTable, colList, colList, liveTable.Name)
+	copyDataSQL := fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM %s;",
+		tableRef(sch, tempTable), colList, colList, tableRef(sch, liveTable.Name))
 	if len(commonCols) == 0 {
 		copyDataSQL = ""
 	}
 
-	dropOldSQL := fmt.Sprintf("DROP TABLE %q;", liveTable.Name)
-	renameSQL := fmt.Sprintf("ALTER TABLE %q RENAME TO %q;", tempTable, liveTable.Name)
+	dropOldSQL := fmt.Sprintf("DROP TABLE %s;", tableRef(sch, liveTable.Name))
+	renameSQL := fmt.Sprintf("ALTER TABLE %s RENAME TO %q;", tableRef(sch, tempTable), liveTable.Name)
 
 	var statements []string
 	statements = append(statements, createTempSQL)
@@ -112,7 +162,7 @@ func GenerateSQLiteRebuildPlan(liveTable, desiredTable *schema.Table, refViews, 
 
 	// 1. Drop referencing views before dropping old table so SQLite ALTER TABLE ... RENAME does not fail on broken views
 	for _, v := range refViews {
-		statements = append(statements, fmt.Sprintf("DROP VIEW IF EXISTS %q;", v.Name))
+		statements = append(statements, fmt.Sprintf("DROP VIEW IF EXISTS %s;", indexRef(sch, v.Name)))
 	}
 
 	// 2. Drop old table and rename temp table
@@ -165,12 +215,23 @@ func checksDelta(live, desired map[string]*schema.CheckConstraint) (added, remov
 // Diff compares live and desired schemas and produces a sequenced list of SQLite steps.
 func Diff(live, desired *schema.Schema, filters scope.Filters) []plan.Step {
 	var steps []plan.Step
+	sch := desired.Name
+	if sch == "" {
+		sch = live.Name
+	}
+	stepSchema := ""
+	if needsSchemaQualify(sch) {
+		stepSchema = sch
+	}
 
 	// 1. Tables
 	tableNames := slices.Collect(maps.Keys(desired.Tables))
 	slices.Sort(tableNames)
 	for _, tblName := range tableNames {
 		dTable := desired.Tables[tblName]
+		if dTable.Schema == "" {
+			dTable.Schema = sch
+		}
 		if !scope.IsTableManaged(tblName, filters) {
 			continue
 		}
@@ -179,22 +240,27 @@ func Diff(live, desired *schema.Schema, filters scope.Filters) []plan.Step {
 			steps = append(steps, plan.Step{
 				Type:        plan.ChangeCreateTable,
 				Table:       tblName,
+				Schema:      stepSchema,
 				SQL:         GenerateSQLiteCreateTable(dTable),
 				Destructive: false,
 			})
 			for _, idx := range dTable.Indexes {
-				def := strings.TrimSpace(idx.Definition)
+				def := strings.TrimSpace(qualifyIndexDefinition(sch, idx.Definition))
 				if !strings.HasSuffix(def, ";") {
 					def += ";"
 				}
 				steps = append(steps, plan.Step{
 					Type:        plan.ChangeCreateIndex,
 					Table:       tblName,
+					Schema:      stepSchema,
 					SQL:         def,
 					Destructive: false,
 				})
 			}
 			continue
+		}
+		if lTable.Schema == "" {
+			lTable.Schema = sch
 		}
 
 		// Existing table: Check for explicit rename mappings or rebuild
@@ -238,18 +304,20 @@ func Diff(live, desired *schema.Schema, filters scope.Filters) []plan.Step {
 				steps = append(steps, plan.Step{
 					Type:        plan.ChangeRenameColumn,
 					Table:       tblName,
-					SQL:         fmt.Sprintf("ALTER TABLE %q RENAME COLUMN %q TO %q;", tblName, pair[0], pair[1]),
+					Schema:      stepSchema,
+					SQL:         fmt.Sprintf("ALTER TABLE %s RENAME COLUMN %q TO %q;", tableRef(sch, tblName), pair[0], pair[1]),
 					Destructive: false,
 				})
 			}
 			for _, idx := range dTable.Indexes {
-				def := strings.TrimSpace(idx.Definition)
+				def := strings.TrimSpace(qualifyIndexDefinition(sch, idx.Definition))
 				if !strings.HasSuffix(def, ";") {
 					def += ";"
 				}
 				steps = append(steps, plan.Step{
 					Type:        plan.ChangeCreateIndex,
 					Table:       tblName,
+					Schema:      stepSchema,
 					SQL:         def,
 					Destructive: false,
 				})
@@ -371,6 +439,7 @@ func Diff(live, desired *schema.Schema, filters scope.Filters) []plan.Step {
 			steps = append(steps, plan.Step{
 				Type:               changeType,
 				Table:              tblName,
+				Schema:             stepSchema,
 				SQL:                rebuildSQL,
 				Destructive:        isDestructive || destructive,
 				TypeNarrowed:       typeNarrowed,
@@ -381,13 +450,14 @@ func Diff(live, desired *schema.Schema, filters scope.Filters) []plan.Step {
 			})
 
 			for _, idx := range dTable.Indexes {
-				def := strings.TrimSpace(idx.Definition)
+				def := strings.TrimSpace(qualifyIndexDefinition(sch, idx.Definition))
 				if !strings.HasSuffix(def, ";") {
 					def += ";"
 				}
 				steps = append(steps, plan.Step{
 					Type:        plan.ChangeCreateIndex,
 					Table:       tblName,
+					Schema:      stepSchema,
 					SQL:         def,
 					Destructive: false,
 				})
@@ -414,7 +484,8 @@ func Diff(live, desired *schema.Schema, filters scope.Filters) []plan.Step {
 					steps = append(steps, plan.Step{
 						Type:             plan.ChangeAddColumn,
 						Table:            tblName,
-						SQL:              fmt.Sprintf("ALTER TABLE %q ADD COLUMN %s;", tblName, clause),
+						Schema:           stepSchema,
+						SQL:              fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s;", tableRef(sch, tblName), clause),
 						Destructive:      false,
 						ColumnNotNull:    dCol.Generated == nil && !dCol.IsNullable && (stagedExpandCols == nil || !stagedExpandCols[colName]),
 						ColumnHasDefault: dCol.DefaultValue != "",
@@ -425,13 +496,14 @@ func Diff(live, desired *schema.Schema, filters scope.Filters) []plan.Step {
 			for idxName, dIdx := range dTable.Indexes {
 				lIdx, inLive := lTable.Indexes[idxName]
 				if !inLive {
-					def := strings.TrimSpace(dIdx.Definition)
+					def := strings.TrimSpace(qualifyIndexDefinition(sch, dIdx.Definition))
 					if !strings.HasSuffix(def, ";") {
 						def += ";"
 					}
 					steps = append(steps, plan.Step{
 						Type:        plan.ChangeCreateIndex,
 						Table:       tblName,
+						Schema:      stepSchema,
 						SQL:         def,
 						Destructive: false,
 					})
@@ -439,16 +511,18 @@ func Diff(live, desired *schema.Schema, filters scope.Filters) []plan.Step {
 					steps = append(steps, plan.Step{
 						Type:        plan.ChangeDropIndex,
 						Table:       tblName,
-						SQL:         fmt.Sprintf("DROP INDEX IF EXISTS %q;", idxName),
+						Schema:      stepSchema,
+						SQL:         fmt.Sprintf("DROP INDEX IF EXISTS %s;", indexRef(sch, idxName)),
 						Destructive: true,
 					})
-					def := strings.TrimSpace(dIdx.Definition)
+					def := strings.TrimSpace(qualifyIndexDefinition(sch, dIdx.Definition))
 					if !strings.HasSuffix(def, ";") {
 						def += ";"
 					}
 					steps = append(steps, plan.Step{
 						Type:        plan.ChangeCreateIndex,
 						Table:       tblName,
+						Schema:      stepSchema,
 						SQL:         def,
 						Destructive: false,
 					})
@@ -460,7 +534,8 @@ func Diff(live, desired *schema.Schema, filters scope.Filters) []plan.Step {
 					steps = append(steps, plan.Step{
 						Type:        plan.ChangeDropIndex,
 						Table:       tblName,
-						SQL:         fmt.Sprintf("DROP INDEX IF EXISTS %q;", idxName),
+						Schema:      stepSchema,
+						SQL:         fmt.Sprintf("DROP INDEX IF EXISTS %s;", indexRef(sch, idxName)),
 						Destructive: true,
 					})
 				}
@@ -479,7 +554,8 @@ func Diff(live, desired *schema.Schema, filters scope.Filters) []plan.Step {
 			steps = append(steps, plan.Step{
 				Type:        plan.ChangeDropTable,
 				Table:       tblName,
-				SQL:         fmt.Sprintf("DROP TABLE %q;", tblName),
+				Schema:      stepSchema,
+				SQL:         fmt.Sprintf("DROP TABLE %s;", tableRef(sch, tblName)),
 				Destructive: true,
 			})
 		}

@@ -284,8 +284,17 @@ func prepareOptions(ctx context.Context, db *sql.DB, opts *Options) error {
 	switch opts.Dialect {
 	case DialectSQLite:
 		opts.TargetSchema = cmp.Or(opts.TargetSchema, "main")
-		if len(opts.TargetSchemas) == 0 {
+		if len(opts.TargetSchemas) > 0 {
+			slices.Sort(opts.TargetSchemas)
+			opts.TargetSchemas = slices.Compact(opts.TargetSchemas)
+			if opts.TargetSchema == "" || opts.TargetSchema == "main" {
+				opts.TargetSchema = opts.TargetSchemas[0]
+			}
+		} else if opts.TargetSchema != "" {
 			opts.TargetSchemas = []string{opts.TargetSchema}
+		} else {
+			opts.TargetSchema = "main"
+			opts.TargetSchemas = []string{"main"}
 		}
 		if opts.SQLiteRebuildThreshold == 0 {
 			opts.SQLiteRebuildThreshold = 100000
@@ -336,6 +345,9 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error {
 	if opts.Dialect == DialectSQLite {
 		syncErr = exec.SyncSQLite(ctx, db, exec.SQLiteExecConfig{
 			SchemaSQL:        opts.SchemaSQL,
+			TargetSchema:     opts.TargetSchema,
+			TargetSchemas:    opts.TargetSchemas,
+			SQLiteAttach:     opts.SQLiteAttach,
 			Filters:          filters,
 			Policy:           policy,
 			AcceptHazards:    opts.AcceptHazards,
@@ -452,12 +464,15 @@ func PlanDiff(ctx context.Context, db *sql.DB, opts Options) (*Plan, error) {
 
 	if opts.Dialect == DialectSQLite {
 		return exec.PlanDiffSQLite(ctx, db, exec.SQLiteExecConfig{
-			SchemaSQL: opts.SchemaSQL,
-			Filters:   filters,
-			Policy:    policy,
-			Logger:    opts.Logger,
-			Tracer:    opts.Tracer,
-			DryRun:    opts.DryRun,
+			SchemaSQL:     opts.SchemaSQL,
+			TargetSchema:  opts.TargetSchema,
+			TargetSchemas: opts.TargetSchemas,
+			SQLiteAttach:  opts.SQLiteAttach,
+			Filters:       filters,
+			Policy:        policy,
+			Logger:        opts.Logger,
+			Tracer:        opts.Tracer,
+			DryRun:        opts.DryRun,
 		})
 	}
 
@@ -516,6 +531,10 @@ type ApplyOpts struct {
 	// Defaults to 10000.
 	SQLiteRebuildBatchSize int
 
+	// SQLiteAttach maps ATTACH DATABASE schema names to filesystem paths for
+	// multi-schema SQLite Apply. Not carried in the plan artifact.
+	SQLiteAttach map[string]string
+
 	// LockNamespace specifies the application namespace string used for PostgreSQL advisory locking (defaults to "grizzle").
 	LockNamespace string
 
@@ -568,6 +587,7 @@ func optionsFromPlan(p *Plan, opts ApplyOpts) Options {
 		AfterStep:                opts.AfterStep,
 		SQLiteRebuildThreshold:   opts.SQLiteRebuildThreshold,
 		SQLiteRebuildBatchSize:   opts.SQLiteRebuildBatchSize,
+		SQLiteAttach:             opts.SQLiteAttach,
 		LockNamespace:            opts.LockNamespace,
 		LockTimeout:              p.LockTimeout,
 		StatementTimeout:         p.StatementTimeout,
@@ -607,6 +627,9 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 		if syncOpts.Dialect == DialectSQLite {
 			return exec.SyncSQLite(ctx, db, exec.SQLiteExecConfig{
 				SchemaSQL:        syncOpts.SchemaSQL,
+				TargetSchema:     syncOpts.TargetSchema,
+				TargetSchemas:    syncOpts.TargetSchemas,
+				SQLiteAttach:     syncOpts.SQLiteAttach,
 				Filters:          filters,
 				Policy:           policy,
 				AcceptHazards:    opts.AcceptHazards,
@@ -678,6 +701,9 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 	switch dialect {
 	case DialectSQLite:
 		return exec.ApplySQLite(ctx, db, p, exec.SQLiteExecConfig{
+			TargetSchema:     p.TargetSchema,
+			TargetSchemas:    p.TargetSchemas,
+			SQLiteAttach:     opts.SQLiteAttach,
 			Policy:           p.Policy,
 			AcceptHazards:    opts.AcceptHazards,
 			ExpectedHash:     opts.ExpectedHash,
@@ -812,7 +838,11 @@ func CompileSchema(ctx context.Context, db *sql.DB, opts Options) (*SchemaIR, er
 	}
 	switch opts.Dialect {
 	case DialectSQLite:
-		return exec.CompileSchemaSQLite(ctx, opts.SchemaSQL)
+		schemas := opts.TargetSchemas
+		if len(schemas) == 0 && opts.TargetSchema != "" {
+			schemas = []string{opts.TargetSchema}
+		}
+		return exec.CompileSchemaSQLite(ctx, opts.SchemaSQL, schemas...)
 	case DialectPostgres:
 		if len(opts.TargetSchemas) > 1 {
 			return nil, ErrUnsupportedMultiSchema
@@ -910,6 +940,9 @@ func DryRunVerify(ctx context.Context, db *sql.DB, opts Options) (*DryRunResult,
 	if opts.Dialect == DialectSQLite {
 		return exec.DryRunVerifySQLite(ctx, db, exec.SQLiteExecConfig{
 			SchemaSQL:            opts.SchemaSQL,
+			TargetSchema:         opts.TargetSchema,
+			TargetSchemas:        opts.TargetSchemas,
+			SQLiteAttach:         opts.SQLiteAttach,
 			Filters:              filters,
 			Policy:               policy,
 			AcceptHazards:        opts.AcceptHazards,

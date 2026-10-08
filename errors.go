@@ -46,7 +46,8 @@ var (
 	// ErrPartitionConversion is returned when attempting to convert a regular table to a partitioned table or vice versa in-place.
 	ErrPartitionConversion = plan.ErrPartitionConversion
 
-	// ErrUnsupportedMultiSchema is returned when multiple schemas are configured on SQLite.
+	// ErrUnsupportedMultiSchema is returned when CompileSchema cannot compile
+	// multiple PostgreSQL schemas in one shadow (SQLite multi-schema uses ATTACH).
 	ErrUnsupportedMultiSchema = plan.ErrUnsupportedMultiSchema
 
 	// ErrPartitionKeyNotInUnique is returned when a primary key or unique constraint on a partitioned table does not include all partition key columns.

@@ -3,7 +3,6 @@ package grizzle_test
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -506,22 +505,85 @@ func TestMultiSchema_CircularCrossSchemaFKs(t *testing.T) {
 	}
 }
 
-func TestMultiSchema_SQLiteTypedError(t *testing.T) {
-	db, err := sql.Open("sqlite", ":memory:")
+func TestMultiSchema_SQLiteAttachRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	mainPath := dir + "/main.db"
+	auxPath := dir + "/aux.db"
+
+	// Ensure aux file exists so ATTACH opens a real database file.
+	auxDB, err := sql.Open("sqlite", auxPath)
+	if err != nil {
+		t.Fatalf("open aux: %v", err)
+	}
+	if err := auxDB.Close(); err != nil {
+		t.Fatalf("close aux: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", mainPath)
 	if err != nil {
 		t.Fatalf("failed to open sqlite: %v", err)
 	}
 	defer func() { _ = db.Close() }()
 
-	err = grizzle.Sync(context.Background(), db, grizzle.Options{
+	schemaSQL := `
+		CREATE TABLE main.items (
+			id INTEGER PRIMARY KEY,
+			name TEXT NOT NULL
+		);
+		CREATE TABLE aux.accounts (
+			id INTEGER PRIMARY KEY,
+			balance INTEGER NOT NULL DEFAULT 0
+		);
+	`
+	opts := grizzle.Options{
 		Dialect:       grizzle.DialectSQLite,
 		TargetSchemas: []string{"main", "aux"},
-		SchemaSQL:     "CREATE TABLE main.items (id INT);",
-	})
-	if err == nil {
-		t.Fatalf("expected error configuring multiple schemas on SQLite, got nil")
+		SQLiteAttach:  map[string]string{"aux": auxPath},
+		SchemaSQL:     schemaSQL,
 	}
-	if !errors.Is(err, grizzle.ErrUnsupportedMultiSchema) {
-		t.Fatalf("expected ErrUnsupportedMultiSchema, got: %v", err)
+	ctx := context.Background()
+
+	if err := grizzle.Sync(ctx, db, opts); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+
+	// Verify tables landed in the expected databases.
+	var mainCount, auxCount int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM main.sqlite_schema WHERE type='table' AND name='items'`).Scan(&mainCount); err != nil {
+		t.Fatalf("query main: %v", err)
+	}
+	if mainCount != 1 {
+		t.Fatalf("expected items in main, count=%d", mainCount)
+	}
+	// ATTACH on a fresh pool connection to inspect aux.
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("conn: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.ExecContext(ctx, `ATTACH DATABASE ? AS aux`, auxPath); err != nil {
+		t.Fatalf("attach aux: %v", err)
+	}
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM aux.sqlite_schema WHERE type='table' AND name='accounts'`).Scan(&auxCount); err != nil {
+		t.Fatalf("query aux: %v", err)
+	}
+	if auxCount != 1 {
+		t.Fatalf("expected accounts in aux, count=%d", auxCount)
+	}
+	_, _ = conn.ExecContext(ctx, `DETACH DATABASE aux`)
+
+	// Second Sync must be a no-op.
+	p, err := grizzle.PlanDiff(ctx, db, opts)
+	if err != nil {
+		t.Fatalf("PlanDiff failed: %v", err)
+	}
+	if len(p.Steps) != 0 {
+		for i, s := range p.Steps {
+			t.Logf("unexpected step %d: %s (%s)", i, s.Type, s.SQL)
+		}
+		t.Fatalf("expected 0 diff steps on second sync, got %d", len(p.Steps))
+	}
+	if err := grizzle.Sync(ctx, db, opts); err != nil {
+		t.Fatalf("second Sync failed: %v", err)
 	}
 }

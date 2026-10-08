@@ -11,19 +11,49 @@ import (
 	"github.com/muandane/grizzle/internal/schema"
 )
 
-// Inspect extracts the complete relational schema from an SQLite database connection.
+// Inspect extracts the complete relational schema from the primary ("main")
+// SQLite database on the connection.
 func Inspect(ctx context.Context, dbtx dialect.DBTX) (*schema.Schema, error) {
+	return InspectSchema(ctx, dbtx, "main")
+}
+
+// InspectSchemas inspects each named schema (including attached databases) and
+// returns a map keyed by schema name.
+func InspectSchemas(ctx context.Context, dbtx dialect.DBTX, schemas []string) (map[string]*schema.Schema, error) {
+	out := make(map[string]*schema.Schema, len(schemas))
+	for _, name := range schemas {
+		s, err := InspectSchema(ctx, dbtx, name)
+		if err != nil {
+			return nil, err
+		}
+		out[name] = s
+	}
+	return out, nil
+}
+
+// InspectSchema extracts the relational schema from a named SQLite schema
+// (e.g. "main" or an ATTACH DATABASE name). Catalog reads use
+// schema.sqlite_schema and PRAGMA schema.table_xinfo.
+func InspectSchema(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema.Schema, error) {
+	if schemaName == "" {
+		schemaName = "main"
+	}
 	s := &schema.Schema{
-		Name:      "main",
+		Name:      schemaName,
 		Tables:    make(map[string]*schema.Table),
 		Enums:     make(map[string]*schema.Enum),
 		Unmanaged: make(map[string]*schema.UnmanagedObject),
 	}
 
+	catalog := fmt.Sprintf("%q.sqlite_schema", schemaName)
+
 	// 1. Get Table names and DDL SQL
-	tblRows, err := dbtx.QueryContext(ctx, "SELECT name, sql FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_grizzle_%' ORDER BY name;")
+	tblRows, err := dbtx.QueryContext(ctx, fmt.Sprintf(
+		"SELECT name, sql FROM %s WHERE type='table' AND name NOT LIKE 'sqlite_%%' AND name NOT LIKE '_grizzle_%%' ORDER BY name;",
+		catalog,
+	))
 	if err != nil {
-		return nil, fmt.Errorf("sqlite: querying tables: %w", err)
+		return nil, fmt.Errorf("sqlite: querying tables in schema %q: %w", schemaName, err)
 	}
 	defer func() { _ = tblRows.Close() }()
 
@@ -44,6 +74,7 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX) (*schema.Schema, error) {
 
 	for _, tblName := range tableNames {
 		tbl := &schema.Table{
+			Schema:      schemaName,
 			Name:        tblName,
 			Columns:     make(map[string]*schema.Column),
 			Indexes:     make(map[string]*schema.Index),
@@ -58,10 +89,10 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX) (*schema.Schema, error) {
 		// parse through this same path, keeping comparisons symmetric.
 		tbl.Checks = parseSQLiteChecks(tblName, tableDDL)
 
-		// 2. Query columns using PRAGMA table_xinfo (includes generated columns and hidden flag)
-		colRows, err := dbtx.QueryContext(ctx, fmt.Sprintf("PRAGMA table_xinfo(%q);", tblName))
+		// 2. Query columns using PRAGMA schema.table_xinfo
+		colRows, err := dbtx.QueryContext(ctx, fmt.Sprintf("PRAGMA %q.table_xinfo(%q);", schemaName, tblName))
 		if err != nil {
-			return nil, fmt.Errorf("sqlite: querying columns for %q: %w", tblName, err)
+			return nil, fmt.Errorf("sqlite: querying columns for %q.%q: %w", schemaName, tblName, err)
 		}
 
 		var pkCols []string
@@ -125,10 +156,10 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX) (*schema.Schema, error) {
 			}
 		}
 
-		// 3. Query Foreign Keys using PRAGMA foreign_key_list
-		fkRows, err := dbtx.QueryContext(ctx, fmt.Sprintf("PRAGMA foreign_key_list(%q);", tblName))
+		// 3. Query Foreign Keys using PRAGMA schema.foreign_key_list
+		fkRows, err := dbtx.QueryContext(ctx, fmt.Sprintf("PRAGMA %q.foreign_key_list(%q);", schemaName, tblName))
 		if err != nil {
-			return nil, fmt.Errorf("sqlite: querying foreign keys for %q: %w", tblName, err)
+			return nil, fmt.Errorf("sqlite: querying foreign keys for %q.%q: %w", schemaName, tblName, err)
 		}
 
 		type fkGroup struct {
@@ -188,9 +219,9 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX) (*schema.Schema, error) {
 			}
 		}
 
-		// 4. Query Indexes using PRAGMA index_list for structural uniqueness
+		// 4. Query Indexes using PRAGMA schema.index_list for structural uniqueness
 		uniqueMap := make(map[string]bool)
-		idxListRows, err := dbtx.QueryContext(ctx, fmt.Sprintf("PRAGMA index_list(%q);", tblName))
+		idxListRows, err := dbtx.QueryContext(ctx, fmt.Sprintf("PRAGMA %q.index_list(%q);", schemaName, tblName))
 		if err == nil {
 			for idxListRows.Next() {
 				var (
@@ -207,9 +238,12 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX) (*schema.Schema, error) {
 			_ = idxListRows.Close()
 		}
 
-		idxRows, err := dbtx.QueryContext(ctx, "SELECT name, sql FROM sqlite_schema WHERE type='index' AND sql IS NOT NULL AND tbl_name = $1 AND name NOT LIKE 'sqlite_%';", tblName)
+		idxRows, err := dbtx.QueryContext(ctx, fmt.Sprintf(
+			"SELECT name, sql FROM %s WHERE type='index' AND sql IS NOT NULL AND tbl_name = $1 AND name NOT LIKE 'sqlite_%%'",
+			catalog,
+		), tblName)
 		if err != nil {
-			return nil, fmt.Errorf("sqlite: querying indexes for %q: %w", tblName, err)
+			return nil, fmt.Errorf("sqlite: querying indexes for %q.%q: %w", schemaName, tblName, err)
 		}
 
 		for idxRows.Next() {
@@ -229,7 +263,10 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX) (*schema.Schema, error) {
 	}
 
 	// 5. Query Triggers
-	trigRows, err := dbtx.QueryContext(ctx, "SELECT name, tbl_name, sql FROM sqlite_schema WHERE type='trigger' AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%';")
+	trigRows, err := dbtx.QueryContext(ctx, fmt.Sprintf(
+		"SELECT name, tbl_name, sql FROM %s WHERE type='trigger' AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%%'",
+		catalog,
+	))
 	if err == nil {
 		for trigRows.Next() {
 			var name, tblName, sqlDef string
@@ -249,7 +286,10 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX) (*schema.Schema, error) {
 	}
 
 	// 6. Query Views
-	viewRows, err := dbtx.QueryContext(ctx, "SELECT name, sql FROM sqlite_schema WHERE type='view' AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%';")
+	viewRows, err := dbtx.QueryContext(ctx, fmt.Sprintf(
+		"SELECT name, sql FROM %s WHERE type='view' AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%%'",
+		catalog,
+	))
 	if err == nil {
 		for viewRows.Next() {
 			var name, sqlDef string
