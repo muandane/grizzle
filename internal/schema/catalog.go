@@ -538,15 +538,120 @@ func canonicalCatalogMemberKey(name string) string {
 // optional CatalogSQL side-channel. The explicit side-channel replaces
 // SchemaSQL publications or event triggers with the same name.
 func MergeCatalogSpecs(schemaSpec, sideSpec *CatalogSpec) *CatalogSpec {
-	out, _ := mergeCatalogSpecs(schemaSpec, sideSpec, false)
+	return MergeCatalogSpecsForTarget(schemaSpec, sideSpec, "")
+}
+
+// MergeCatalogSpecsForTarget combines catalog desired state while resolving
+// unqualified publication table names against targetSchema before operations
+// are replayed. This keeps CREATE, ALTER, DROP, and live catalog identities
+// on the same canonical path.
+func MergeCatalogSpecsForTarget(schemaSpec, sideSpec *CatalogSpec, targetSchema string) *CatalogSpec {
+	out, _ := mergeCatalogSpecs(
+		normalizeCatalogSpecForTarget(schemaSpec, targetSchema),
+		normalizeCatalogSpecForTarget(sideSpec, targetSchema),
+		false,
+	)
 	return out
 }
 
 // ValidateCatalogSpecMerge verifies that ALTER statements have a declaration
 // to modify after SchemaSQL and CatalogSQL overlays are applied.
 func ValidateCatalogSpecMerge(schemaSpec, sideSpec *CatalogSpec) error {
-	_, err := mergeCatalogSpecs(schemaSpec, sideSpec, true)
+	return ValidateCatalogSpecMergeForTarget(schemaSpec, sideSpec, "")
+}
+
+// ValidateCatalogSpecMergeForTarget validates the combined catalog contract
+// after resolving unqualified publication table names against targetSchema.
+func ValidateCatalogSpecMergeForTarget(schemaSpec, sideSpec *CatalogSpec, targetSchema string) error {
+	_, err := mergeCatalogSpecs(
+		normalizeCatalogSpecForTarget(schemaSpec, targetSchema),
+		normalizeCatalogSpecForTarget(sideSpec, targetSchema),
+		true,
+	)
 	return err
+}
+
+func normalizeCatalogSpecForTarget(spec *CatalogSpec, targetSchema string) *CatalogSpec {
+	if spec == nil {
+		return nil
+	}
+	out := cloneCatalogSpec(spec)
+	for i, publication := range out.Publications {
+		out.Publications[i] = normalizePublicationForTarget(publication, targetSchema)
+	}
+	for i, operation := range out.operations {
+		if operation.publication != nil {
+			operation.publication = normalizePublicationForTarget(operation.publication, targetSchema)
+		}
+		if operation.kind == catalogPublicationOperation && operation.action == catalogAlterOperation {
+			operation.alterClause = normalizePublicationAlterClause(operation.alterClause, targetSchema)
+		}
+		out.operations[i] = operation
+	}
+	return out
+}
+
+func normalizePublicationForTarget(publication *Publication, targetSchema string) *Publication {
+	if publication == nil {
+		return nil
+	}
+	out := clonePublication(publication)
+	for i, table := range out.Tables {
+		out.Tables[i] = CanonicalQualifiedIdentifier(table, targetSchema)
+	}
+	for i, schemaName := range out.Schemas {
+		parts := ParseQualifiedIdentifier(schemaName)
+		if len(parts) == 1 {
+			out.Schemas[i] = CanonicalIdentifierPart(parts[0])
+		}
+	}
+	return out
+}
+
+func normalizePublicationAlterClause(clause, targetSchema string) string {
+	clause = strings.TrimSpace(clause)
+	switch {
+	case publicationSetAllRe.MatchString(clause):
+		return "SET ALL TABLES"
+	case publicationSetSchemasRe.MatchString(clause):
+		return "SET TABLES IN SCHEMA " +
+			normalizeCatalogIdentifierList(publicationSetSchemasRe.FindStringSubmatch(clause)[1], false, targetSchema)
+	case publicationSetTablesRe.MatchString(clause):
+		return "SET TABLE " +
+			normalizeCatalogIdentifierList(publicationSetTablesRe.FindStringSubmatch(clause)[1], true, targetSchema)
+	case publicationAddSchemasRe.MatchString(clause):
+		return "ADD TABLES IN SCHEMA " +
+			normalizeCatalogIdentifierList(publicationAddSchemasRe.FindStringSubmatch(clause)[1], false, targetSchema)
+	case publicationDropSchemasRe.MatchString(clause):
+		return "DROP TABLES IN SCHEMA " +
+			normalizeCatalogIdentifierList(publicationDropSchemasRe.FindStringSubmatch(clause)[1], false, targetSchema)
+	case publicationAddTablesRe.MatchString(clause):
+		return "ADD TABLE " +
+			normalizeCatalogIdentifierList(publicationAddTablesRe.FindStringSubmatch(clause)[1], true, targetSchema)
+	case publicationDropTablesRe.MatchString(clause):
+		return "DROP TABLE " +
+			normalizeCatalogIdentifierList(publicationDropTablesRe.FindStringSubmatch(clause)[1], true, targetSchema)
+	default:
+		return clause
+	}
+}
+
+func normalizeCatalogIdentifierList(list string, qualified bool, targetSchema string) string {
+	items, ok := splitIdentifierList(list)
+	if !ok {
+		return list
+	}
+	for i, item := range items {
+		if qualified {
+			items[i] = CanonicalQualifiedIdentifier(item, targetSchema)
+			continue
+		}
+		parts := ParseQualifiedIdentifier(item)
+		if len(parts) == 1 {
+			items[i] = CanonicalIdentifierPart(parts[0])
+		}
+	}
+	return strings.Join(items, ", ")
 }
 
 func mergeCatalogSpecs(schemaSpec, sideSpec *CatalogSpec, strict bool) (*CatalogSpec, error) {
@@ -573,6 +678,9 @@ func mergeCatalogSpecs(schemaSpec, sideSpec *CatalogSpec, strict bool) (*Catalog
 		(len(out.Publications) == 0 && len(out.EventTriggers) == 0) &&
 		(len(out.droppedPublications) > 0 || len(out.droppedEventTriggers) > 0)
 	out.suppressImplicitDrops = suppressImplicitDrops(schemaSpec) || suppressImplicitDrops(sideSpec)
+	if err := validateCatalogMembershipState(out); err != nil {
+		return nil, err
+	}
 	slices.SortFunc(out.Publications, func(a, b *Publication) int {
 		return strings.Compare(CanonicalIdentifierKey(a.Name), CanonicalIdentifierKey(b.Name))
 	})
@@ -635,6 +743,9 @@ func mergeCatalogOperationSpecs(schemaSpec, sideSpec *CatalogSpec, strict bool) 
 		len(out.Publications) == 0 && len(out.EventTriggers) == 0 &&
 		(len(out.droppedPublications) > 0 || len(out.droppedEventTriggers) > 0)
 	out.suppressImplicitDrops = suppressImplicitDrops(schemaSpec) || suppressImplicitDrops(sideSpec)
+	if err := validateCatalogMembershipState(out); err != nil {
+		return nil, err
+	}
 	slices.SortFunc(out.Publications, func(a, b *Publication) int {
 		return strings.Compare(CanonicalIdentifierKey(a.Name), CanonicalIdentifierKey(b.Name))
 	})
@@ -642,6 +753,15 @@ func mergeCatalogOperationSpecs(schemaSpec, sideSpec *CatalogSpec, strict bool) 
 		return strings.Compare(CanonicalIdentifierKey(a.Name), CanonicalIdentifierKey(b.Name))
 	})
 	return out, nil
+}
+
+func validateCatalogMembershipState(spec *CatalogSpec) error {
+	for _, publication := range spec.Publications {
+		if publication.AllTables && (len(publication.Tables) > 0 || len(publication.Schemas) > 0) {
+			return fmt.Errorf("publication %q cannot combine FOR ALL TABLES with explicit table or schema membership", publication.Name)
+		}
+	}
+	return nil
 }
 
 func catalogOperationKey(operation catalogOperation) string {

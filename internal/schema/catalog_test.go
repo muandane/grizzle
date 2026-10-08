@@ -277,6 +277,37 @@ func TestMergeCatalogSpecs_OverlaysThenAppliesOperations(t *testing.T) {
 	}
 }
 
+func TestMergeCatalogSpecsForTarget_QualifiesPublicationOperations(t *testing.T) {
+	schemaSpec := ParseCatalogSQL(`
+		CREATE PUBLICATION docs_pub FOR TABLE docs;
+	`)
+	sideSpec := ParseCatalogSQL(`
+		ALTER PUBLICATION docs_pub ADD TABLE audit;
+		ALTER PUBLICATION docs_pub DROP TABLE docs;
+	`)
+	if err := ValidateCatalogSpecMergeForTarget(schemaSpec, sideSpec, "billing"); err != nil {
+		t.Fatalf("target-aware catalog overlay should validate: %v", err)
+	}
+	merged := MergeCatalogSpecsForTarget(schemaSpec, sideSpec, "billing")
+	if len(merged.Publications) != 1 || len(merged.Publications[0].Tables) != 1 ||
+		merged.Publications[0].Tables[0] != "billing.audit" {
+		t.Fatalf("publication operations must resolve against target schema before replay: %+v", merged.Publications)
+	}
+}
+
+func TestValidateCatalogSpecMerge_RejectsMixedAllTablesState(t *testing.T) {
+	spec := &CatalogSpec{
+		Publications: []*Publication{{
+			Name:      "docs_pub",
+			AllTables: true,
+			Tables:    []string{"public.docs"},
+		}},
+	}
+	if err := ValidateCatalogSpecMerge(spec, nil); err == nil {
+		t.Fatal("FOR ALL TABLES plus explicit membership must be rejected")
+	}
+}
+
 func TestMergeCatalogSpecs_ExplicitDropDoesNotSweep(t *testing.T) {
 	merged := MergeCatalogSpecs(nil, ParseCatalogSQL(`DROP PUBLICATION docs_pub;`))
 	if !merged.ExplicitDropsOnly() || !merged.PublicationExplicitlyDropped("docs_pub") {

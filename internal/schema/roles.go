@@ -16,11 +16,12 @@ type Role struct {
 // Grant represents a desired privilege grant scanned from SchemaSQL or
 // RolesSQL.
 type Grant struct {
-	Grantee     string   `json:"grantee"`     // role name or PUBLIC
-	ObjectKind  string   `json:"object_kind"` // TABLE, SEQUENCE, DATABASE, SCHEMA, FUNCTION
-	ObjectName  string   `json:"object_name"` // as scanned; schema-qualified where applicable
-	Privileges  []string `json:"privileges"`  // SELECT, INSERT, ... or kind-specific ALL expansion
-	GrantOption bool     `json:"grant_option,omitempty"`
+	Grantee            string   `json:"grantee"`     // role name or PUBLIC
+	ObjectKind         string   `json:"object_kind"` // TABLE, SEQUENCE, DATABASE, SCHEMA, FUNCTION
+	ObjectName         string   `json:"object_name"` // as scanned; schema-qualified where applicable
+	Privileges         []string `json:"privileges"`  // SELECT, INSERT, ... or kind-specific ALL expansion
+	GrantOption        bool     `json:"grant_option,omitempty"`
+	ExplicitPrivileges []string `json:"-"`
 }
 
 // RolesSpec is the desired role/privilege state parsed from a unified schema
@@ -36,7 +37,7 @@ var (
 	// createRoleRe captures the name from a CREATE ROLE/USER declaration.
 	createRoleRe          = regexp.MustCompile(`(?i)^CREATE\s+(?:ROLE|USER)\s+` + catalogIdentifierPattern)
 	createRoleStatementRe = regexp.MustCompile(`(?is)^CREATE\s+(?:ROLE|USER)\s+` + catalogIdentifierPattern + `(?:\s+(?:WITH\s+)?NOLOGIN)?$`)
-	rolePasswordRe        = regexp.MustCompile(`(?i)\s+(?:WITH\s+)?(?:ENCRYPTED\s+)?PASSWORD\b`)
+	rolePasswordClauseRe  = regexp.MustCompile(`(?is)^\s+(?:WITH\s+)?(?:ENCRYPTED\s+)?PASSWORD\b`)
 
 	// grantRe matches GRANT privilege[, ...] ON [TABLE|SEQUENCE|DATABASE|SCHEMA|FUNCTION]
 	// object[, ...] TO grantee[, ...] [WITH GRANT OPTION]. The object slot
@@ -345,22 +346,118 @@ func MergeRolesSpecsForTarget(schemaSpec, sideSpec *RolesSpec, targetSchema stri
 	if sideSpec != nil {
 		applyRevokes(out, sideSpec.revokes, targetSchema)
 	}
+	if schemaSpec != nil {
+		out.revokes = append(out.revokes, schemaSpec.revokes...)
+	}
+	if sideSpec != nil {
+		out.revokes = append(out.revokes, sideSpec.revokes...)
+	}
 	return out
+}
+
+// ValidateRolesSpecScope rejects ACL object names that InspectLiveRoles does
+// not inventory. Keeping this contract explicit prevents valid-looking
+// grants from becoming invisible desired state and drifting forever.
+func ValidateRolesSpecScope(spec *RolesSpec, targetSchemas []string, currentDatabase string) error {
+	if spec == nil {
+		return nil
+	}
+	targets := make(map[string]bool, len(targetSchemas))
+	for _, targetSchema := range targetSchemas {
+		targets[CanonicalTargetIdentifier(targetSchema)] = true
+	}
+	currentDatabase = CanonicalTargetIdentifier(currentDatabase)
+	for _, grant := range spec.Grants {
+		kind := strings.ToUpper(strings.TrimSpace(grant.ObjectKind))
+		parts := grantObjectNameParts(kind, grant.ObjectName)
+		if len(parts) == 0 {
+			return fmt.Errorf("%s grant has an empty object name", kind)
+		}
+		var objectSchema string
+		switch kind {
+		case "TABLE", "SEQUENCE", "FUNCTION":
+			if len(parts) > 2 {
+				return fmt.Errorf("%s grant object %q has too many qualification levels", kind, grant.ObjectName)
+			}
+			if len(parts) == 2 {
+				objectSchema = CanonicalIdentifierPart(parts[0])
+			} else if len(targetSchemas) == 0 {
+				return fmt.Errorf("%s grant object %q is unqualified but no target schema is configured", kind, grant.ObjectName)
+			} else {
+				objectSchema = CanonicalTargetIdentifier(targetSchemas[0])
+			}
+			if !targets[objectSchema] {
+				return fmt.Errorf("%s grant object %q is outside the configured target schemas", kind, grant.ObjectName)
+			}
+		case "SCHEMA":
+			if len(parts) != 1 {
+				return fmt.Errorf("SCHEMA grant object %q must be an unqualified schema name", grant.ObjectName)
+			}
+			objectSchema = CanonicalIdentifierPart(parts[0])
+			if !targets[objectSchema] {
+				return fmt.Errorf("SCHEMA grant object %q is outside the configured target schemas", grant.ObjectName)
+			}
+		case "DATABASE":
+			if len(parts) != 1 {
+				return fmt.Errorf("DATABASE grant object %q must be an unqualified database name", grant.ObjectName)
+			}
+			if currentDatabase == "" || CanonicalIdentifierPart(parts[0]) != currentDatabase {
+				return fmt.Errorf("DATABASE grant object %q is outside the current database ACL scope", grant.ObjectName)
+			}
+		default:
+			return fmt.Errorf("unsupported ACL object kind %q", grant.ObjectKind)
+		}
+	}
+	return nil
+}
+
+func grantObjectNameParts(kind, object string) []string {
+	if kind == "FUNCTION" {
+		object = functionObjectName(object)
+	}
+	return splitQualifiedIdentifier(object)
+}
+
+func functionObjectName(object string) string {
+	inQuote := false
+	for i := 0; i < len(object); i++ {
+		switch object[i] {
+		case '"':
+			if inQuote && i+1 < len(object) && object[i+1] == '"' {
+				i++
+				continue
+			}
+			inQuote = !inQuote
+		case '(':
+			if !inQuote {
+				return strings.TrimSpace(object[:i])
+			}
+		}
+	}
+	return strings.TrimSpace(object)
 }
 
 // FilterRolePrivilegesForServer removes privileges that are not understood by
 // the connected PostgreSQL version. MAINTAIN was added in PostgreSQL 17 and
-// is included in ALL TABLE expansion, but omitting it on older servers keeps
-// the generated SQL valid while preserving the same desired contract.
-func FilterRolePrivilegesForServer(spec *RolesSpec, serverVersion int) *RolesSpec {
+// is included in ALL TABLE expansion, but an explicit MAINTAIN request must
+// fail rather than being silently discarded.
+func FilterRolePrivilegesForServer(spec *RolesSpec, serverVersion int) (*RolesSpec, error) {
 	if spec == nil || serverVersion == 0 || serverVersion >= 170000 {
-		return spec
+		return spec, nil
+	}
+	for _, revoke := range spec.revokes {
+		if containsFold(revoke.ExplicitPrivileges, "MAINTAIN") {
+			return nil, fmt.Errorf("MAINTAIN is supported only by PostgreSQL 17 or later")
+		}
 	}
 	filteredGrants := spec.Grants[:0]
 	for _, grant := range spec.Grants {
 		filtered := grant.Privileges[:0]
 		for _, privilege := range grant.Privileges {
 			if strings.EqualFold(privilege, "MAINTAIN") {
+				if containsFold(grant.ExplicitPrivileges, "MAINTAIN") {
+					return nil, fmt.Errorf("MAINTAIN is supported only by PostgreSQL 17 or later")
+				}
 				continue
 			}
 			filtered = append(filtered, privilege)
@@ -371,7 +468,7 @@ func FilterRolePrivilegesForServer(spec *RolesSpec, serverVersion int) *RolesSpe
 		}
 	}
 	spec.Grants = filteredGrants
-	return spec
+	return spec, nil
 }
 
 func mergeGrantSpecs(schemaSpec, sideSpec *RolesSpec, targetSchema string) []*Grant {
@@ -422,6 +519,11 @@ func mergeGrant(a, b *Grant) *Grant {
 			out.Privileges = append(out.Privileges, privilege)
 		}
 	}
+	for _, privilege := range b.ExplicitPrivileges {
+		if !containsFold(out.ExplicitPrivileges, privilege) {
+			out.ExplicitPrivileges = append(out.ExplicitPrivileges, privilege)
+		}
+	}
 	out.GrantOption = out.GrantOption || b.GrantOption
 	return out
 }
@@ -431,11 +533,12 @@ func cloneGrant(g *Grant) *Grant {
 		return nil
 	}
 	return &Grant{
-		Grantee:     g.Grantee,
-		ObjectKind:  g.ObjectKind,
-		ObjectName:  g.ObjectName,
-		Privileges:  slicesCloneStrings(g.Privileges),
-		GrantOption: g.GrantOption,
+		Grantee:            g.Grantee,
+		ObjectKind:         g.ObjectKind,
+		ObjectName:         g.ObjectName,
+		Privileges:         slicesCloneStrings(g.Privileges),
+		GrantOption:        g.GrantOption,
+		ExplicitPrivileges: slicesCloneStrings(g.ExplicitPrivileges),
 	}
 }
 
@@ -456,6 +559,7 @@ func parseGrantStatement(stmt string) []*Grant {
 	grantOption := strings.TrimSpace(m[5]) != ""
 
 	privileges := expandPrivileges(privList, kind)
+	explicitPrivileges := explicitPrivileges(privList)
 	if len(privileges) == 0 || len(objectList) == 0 || len(granteeList) == 0 {
 		return nil
 	}
@@ -468,11 +572,12 @@ func parseGrantStatement(stmt string) []*Grant {
 				continue
 			}
 			out = append(out, &Grant{
-				Grantee:     grantee,
-				ObjectKind:  kind,
-				ObjectName:  object,
-				Privileges:  slicesCloneStrings(privileges),
-				GrantOption: grantOption,
+				Grantee:            grantee,
+				ObjectKind:         kind,
+				ObjectName:         object,
+				Privileges:         slicesCloneStrings(privileges),
+				GrantOption:        grantOption,
+				ExplicitPrivileges: slicesCloneStrings(explicitPrivileges),
 			})
 		}
 	}
@@ -497,6 +602,7 @@ func parseRevokeStatement(stmt string) []*Grant {
 	grantOption := strings.TrimSpace(m[1]) != ""
 
 	privileges := expandPrivileges(privList, kind)
+	explicitPrivileges := explicitPrivileges(privList)
 	if len(privileges) == 0 || len(objectList) == 0 || len(granteeList) == 0 {
 		return nil
 	}
@@ -509,11 +615,12 @@ func parseRevokeStatement(stmt string) []*Grant {
 				continue
 			}
 			out = append(out, &Grant{
-				Grantee:     grantee,
-				ObjectKind:  kind,
-				ObjectName:  object,
-				Privileges:  slicesCloneStrings(privileges),
-				GrantOption: grantOption,
+				Grantee:            grantee,
+				ObjectKind:         kind,
+				ObjectName:         object,
+				Privileges:         slicesCloneStrings(privileges),
+				GrantOption:        grantOption,
+				ExplicitPrivileges: slicesCloneStrings(explicitPrivileges),
 			})
 		}
 	}
@@ -529,6 +636,18 @@ func expandPrivileges(privList, kind string) []string {
 			continue
 		}
 		privileges = append(privileges, pu)
+	}
+	return dedupeStrings(privileges)
+}
+
+func explicitPrivileges(privList string) []string {
+	var privileges []string
+	for _, privilege := range splitList(privList) {
+		upper := strings.ToUpper(strings.TrimSpace(privilege))
+		if upper == "ALL" || upper == "ALL PRIVILEGES" || upper == "" {
+			continue
+		}
+		privileges = append(privileges, upper)
 	}
 	return dedupeStrings(privileges)
 }
@@ -563,6 +682,13 @@ func applyRevokes(spec *RolesSpec, revokes []*Grant, targetSchema string) {
 				}
 			}
 			grant.Privileges = remaining
+			explicitRemaining := grant.ExplicitPrivileges[:0]
+			for _, privilege := range grant.ExplicitPrivileges {
+				if !containsFold(revoke.Privileges, privilege) {
+					explicitRemaining = append(explicitRemaining, privilege)
+				}
+			}
+			grant.ExplicitPrivileges = explicitRemaining
 			if len(grant.Privileges) > 0 {
 				kept = append(kept, grant)
 			}
@@ -822,7 +948,7 @@ func ValidateRolesSQL(sql string) error {
 				return fmt.Errorf("role configuration is not supported yet in PR1; ALTER ROLE/USER is reserved for PR2: %q", trimmed)
 			case strings.HasPrefix(upper, "DROP ROLE"), strings.HasPrefix(upper, "DROP USER"):
 				return fmt.Errorf("DROP ROLE/USER is not supported in the declarative role contract: %q", trimmed)
-			case rolePasswordRe.MatchString(trimmed):
+			case rolePasswordClause(trimmed):
 				return fmt.Errorf("passworded roles are not supported yet in PR1: %q", trimmed)
 			case createRoleStatementRe.FindStringSubmatch(trimmed) == nil:
 				return fmt.Errorf("unsupported role declaration in RolesSQL (only CREATE ROLE/USER [NOLOGIN] is supported): %q", trimmed)
@@ -855,6 +981,14 @@ func ValidateRolesSQL(sql string) error {
 		}
 	}
 	return nil
+}
+
+func rolePasswordClause(statement string) bool {
+	match := createRoleRe.FindString(statement)
+	if match == "" {
+		return false
+	}
+	return rolePasswordClauseRe.MatchString(statement[len(match):])
 }
 
 // FormatGrantKey is a stable display key for grant records.

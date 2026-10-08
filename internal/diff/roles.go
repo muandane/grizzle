@@ -118,12 +118,21 @@ func RolesDiff(desired *schema.RolesSpec, live *RoleState, targetSchema string) 
 			changes = append(changes, grantChange(plan.ChangeGrant, dg))
 			continue
 		}
-		if missing := missingPrivileges(dg.Privileges, lg.Privileges); len(missing) > 0 {
+		missing := missingPrivileges(dg.Privileges, lg.Privileges)
+		missingOptions := missingPrivileges(optionSubset(dg), lg.GrantOptions)
+		if len(missing) > 0 {
 			g := *dg
 			g.Privileges = missing
+			// A privilege that is absent entirely can be granted with its
+			// desired option in one statement. Emitting a plain GRANT first
+			// creates redundant overlap and complicates approval review.
+			g.GrantOption = dg.GrantOption
 			changes = append(changes, grantChange(plan.ChangeGrant, &g))
 		}
-		if missingOptions := missingPrivileges(optionSubset(dg), lg.GrantOptions); len(missingOptions) > 0 {
+		if len(missingOptions) > 0 {
+			missingOptions = subtractPrivileges(missingOptions, missing)
+		}
+		if len(missingOptions) > 0 {
 			// Re-grant with option: GRANT ... WITH GRANT OPTION is additive
 			// for privileges already held.
 			g := *dg
@@ -225,17 +234,23 @@ func indexDesiredGrants(spec *schema.RolesSpec, targetSchema string) map[string]
 		existing, ok := out[key]
 		if !ok {
 			out[key] = &schema.Grant{
-				Grantee:     g.Grantee,
-				ObjectKind:  g.ObjectKind,
-				ObjectName:  g.ObjectName,
-				Privileges:  slices.Clone(g.Privileges),
-				GrantOption: g.GrantOption,
+				Grantee:            g.Grantee,
+				ObjectKind:         g.ObjectKind,
+				ObjectName:         g.ObjectName,
+				Privileges:         slices.Clone(g.Privileges),
+				GrantOption:        g.GrantOption,
+				ExplicitPrivileges: slices.Clone(g.ExplicitPrivileges),
 			}
 			continue
 		}
 		for _, p := range g.Privileges {
 			if !slices.Contains(existing.Privileges, p) {
 				existing.Privileges = append(existing.Privileges, p)
+			}
+		}
+		for _, privilege := range g.ExplicitPrivileges {
+			if !slices.Contains(existing.ExplicitPrivileges, privilege) {
+				existing.ExplicitPrivileges = append(existing.ExplicitPrivileges, privilege)
 			}
 		}
 		existing.GrantOption = existing.GrantOption || g.GrantOption
@@ -282,6 +297,16 @@ func missingPrivileges(desired []string, live []string) []string {
 	for _, p := range desired {
 		if !slices.Contains(live, p) {
 			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func subtractPrivileges(values, remove []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if !slices.Contains(remove, value) {
+			out = append(out, value)
 		}
 	}
 	return out

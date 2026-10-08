@@ -26,7 +26,21 @@ func diffRolesSteps(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConf
 	if desired == nil {
 		return nil, nil
 	}
-	desired = schema.FilterRolePrivilegesForServer(desired, serverVersion)
+	var currentDatabase string
+	if err := dbtx.QueryRowContext(ctx, `SELECT current_database();`).Scan(&currentDatabase); err != nil {
+		return nil, fmt.Errorf("%w: current database: %w", plan.ErrInspectionFailed, err)
+	}
+	if err := schema.ValidateRolesSpecScope(desired, cfg.targetSchemas(), currentDatabase); err != nil {
+		return nil, fmt.Errorf("validating role grant scope: %w", err)
+	}
+	_, shadowMap := eventTriggerFunctionLookup(cfg)
+	if err := postgres.ValidateFunctionGrantTargets(ctx, dbtx, desired, cfg.primarySchema(), shadowMap); err != nil {
+		return nil, fmt.Errorf("validating function grant targets: %w", err)
+	}
+	desired, err = schema.FilterRolePrivilegesForServer(desired, serverVersion)
+	if err != nil {
+		return nil, fmt.Errorf("validating role privileges: %w", err)
+	}
 
 	live, err := postgres.InspectLiveRoles(ctx, dbtx, cfg.targetSchemas())
 	if err != nil {
@@ -46,7 +60,14 @@ func diffRolesSteps(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConf
 			return nil, fmt.Errorf("%w: %w", plan.ErrInspectionFailed, err)
 		}
 		if owns {
-			return nil, fmt.Errorf("role %q owns objects; transfer ownership or remove the role from the desired state before syncing roles", c.Table)
+			return nil, fmt.Errorf("role %q has catalog ownership or dependency; transfer ownership or remove the role from the desired state before syncing roles", c.Table)
+		}
+		unhandledACL, err := postgres.RoleHasUnhandledACLs(ctx, dbtx, c.Table, cfg.targetSchemas())
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", plan.ErrInspectionFailed, err)
+		}
+		if unhandledACL {
+			return nil, fmt.Errorf("role %q has ACL dependencies outside the managed role scope; revoke or transfer them before dropping the role", c.Table)
 		}
 	}
 

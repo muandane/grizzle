@@ -201,6 +201,65 @@ func InspectLiveRoles(ctx context.Context, dbtx dialect.DBTX, targetSchemas []st
 	return live, nil
 }
 
+// ValidateFunctionGrantTargets rejects FUNCTION grants that cannot be
+// represented by the inspected ACL contract. PostgreSQL distinguishes
+// functions from procedures and aggregates even though all have pg_proc
+// rows; only prokind='f' is valid for GRANT ... ON FUNCTION.
+func ValidateFunctionGrantTargets(ctx context.Context, dbtx dialect.DBTX, spec *schema.RolesSpec, targetSchema string, shadowMap map[string]string) error {
+	if spec == nil {
+		return nil
+	}
+	for _, grant := range spec.Grants {
+		if !strings.EqualFold(grant.ObjectKind, "FUNCTION") {
+			continue
+		}
+		canonical := schema.CanonicalGrantObject("FUNCTION", grant.ObjectName, targetSchema)
+		name, suffix, ok := splitFunctionObject(canonical)
+		if !ok || !strings.HasSuffix(suffix, ")") {
+			return fmt.Errorf("FUNCTION grant target %q has an invalid identity", grant.ObjectName)
+		}
+		parts := schema.ParseQualifiedIdentifier(name)
+		if len(parts) != 2 {
+			return fmt.Errorf("FUNCTION grant target %q must resolve to a schema-qualified function", grant.ObjectName)
+		}
+		argsText := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(suffix, "("), ")"))
+		if len(argsText) == 0 && suffix != "()" {
+			return fmt.Errorf("FUNCTION grant target %q has an invalid argument list", grant.ObjectName)
+		}
+		schemaName := decodeCatalogIdentifier(parts[0])
+		functionName := decodeCatalogIdentifier(parts[1])
+		candidateSchemas := []string{schemaName}
+		if shadowSchema, ok := shadowSchemaForTarget(shadowMap, schemaName); ok {
+			candidateSchemas = []string{shadowSchema, schemaName}
+		}
+		placeholders := make([]string, 0, len(candidateSchemas))
+		args := make([]any, 0, len(candidateSchemas)+3)
+		args = append(args, functionName, argsText)
+		for i, candidateSchema := range candidateSchemas {
+			placeholders = append(placeholders, fmt.Sprintf("$%d", i+3))
+			args = append(args, candidateSchema)
+		}
+		var exists bool
+		err := dbtx.QueryRowContext(ctx, fmt.Sprintf(`
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_proc p
+				JOIN pg_namespace n ON n.oid = p.pronamespace
+				WHERE p.proname = $1
+				  AND p.prokind = 'f'
+				  AND pg_get_function_identity_arguments(p.oid) = $2
+				  AND n.nspname IN (%s)
+			);`, strings.Join(placeholders, ", ")), args...).Scan(&exists)
+		if err != nil {
+			return fmt.Errorf("checking FUNCTION grant target %q: %w", grant.ObjectName, err)
+		}
+		if !exists {
+			return fmt.Errorf("FUNCTION grant target %q is not an existing ordinary function in the managed schemas", grant.ObjectName)
+		}
+	}
+	return nil
+}
+
 func roleManagedComment(comment string) bool {
 	return comment == schema.RoleManagedComment
 }
@@ -301,9 +360,10 @@ func canonicalLiveGrantObjectParts(kind string, parts []string, functionArgs str
 	return object
 }
 
-// RoleOwnsObjects reports whether the named role owns any cluster object
-// that makes DROP ROLE unsafe (databases, schemas, tables, sequences,
-// functions, types, languages, or publications).
+// RoleOwnsObjects reports whether the named role owns any catalog object or
+// dependency that makes DROP ROLE unsafe. The check is intentionally
+// conservative: default ACLs, memberships, and ownership in catalogs not
+// managed by Grizzle all refuse the drop.
 func RoleOwnsObjects(ctx context.Context, dbtx dialect.DBTX, roleName string) (bool, error) {
 	var owns bool
 	err := dbtx.QueryRowContext(ctx, `
@@ -314,7 +374,18 @@ func RoleOwnsObjects(ctx context.Context, dbtx dialect.DBTX, roleName string) (b
 			(SELECT count(*) FROM pg_type        WHERE typowner = r.oid) +
 			(SELECT count(*) FROM pg_proc        WHERE proowner = r.oid) +
 			(SELECT count(*) FROM pg_language    WHERE lanowner = r.oid) +
-			(SELECT count(*) FROM pg_publication WHERE pubowner = r.oid)
+			(SELECT count(*) FROM pg_publication WHERE pubowner = r.oid) +
+			(SELECT count(*) FROM pg_default_acl  WHERE defaclrole = r.oid) +
+			(SELECT count(*) FROM pg_auth_members WHERE roleid = r.oid OR member = r.oid) +
+			(SELECT count(*) FROM pg_extension    WHERE extowner = r.oid) +
+			(SELECT count(*) FROM pg_foreign_data_wrapper WHERE fdwowner = r.oid) +
+			(SELECT count(*) FROM pg_foreign_server WHERE srvowner = r.oid) +
+			(SELECT count(*) FROM pg_event_trigger WHERE evtowner = r.oid) +
+			(SELECT count(*) FROM pg_subscription WHERE subowner = r.oid) +
+			(SELECT count(*) FROM pg_tablespace WHERE spcowner = r.oid) +
+			(SELECT count(*) FROM pg_collation WHERE collowner = r.oid) +
+			(SELECT count(*) FROM pg_conversion WHERE conowner = r.oid) +
+			(SELECT count(*) FROM pg_largeobject_metadata WHERE lomowner = r.oid)
 		) > 0
 		FROM pg_roles r WHERE r.rolname = $1;
 	`, roleName).Scan(&owns)
@@ -322,6 +393,74 @@ func RoleOwnsObjects(ctx context.Context, dbtx dialect.DBTX, roleName string) (b
 		return false, fmt.Errorf("checking ownership for role %q: %w", roleName, err)
 	}
 	return owns, nil
+}
+
+// RoleHasUnhandledACLs reports ACL entries that the RolesSQL inspector does
+// not reconcile for a managed role. In-scope relation/function/schema/current
+// database ACLs are deliberately excluded because RolesDiff emits revokes
+// for those entries before DROP ROLE. Everything else is a conservative
+// refusal rather than a DROP ROLE that may fail after schema steps.
+func RoleHasUnhandledACLs(ctx context.Context, dbtx dialect.DBTX, roleName string, targetSchemas []string) (bool, error) {
+	schemaArgs := make([]any, 0, len(targetSchemas))
+	schemaPlaceholders := make([]string, 0, len(targetSchemas))
+	for i, targetSchema := range targetSchemas {
+		schemaPlaceholders = append(schemaPlaceholders, fmt.Sprintf("$%d", i+2))
+		schemaArgs = append(schemaArgs, targetSchema)
+	}
+	schemaFilter := "TRUE"
+	if len(schemaPlaceholders) > 0 {
+		schemaFilter = "n.nspname NOT IN (" + strings.Join(schemaPlaceholders, ", ") + ")"
+	}
+	query := fmt.Sprintf(`
+		SELECT EXISTS (
+			SELECT 1
+			FROM pg_roles r
+			WHERE r.rolname = $1
+			  AND (
+				EXISTS (
+					SELECT 1
+					FROM pg_class c
+					JOIN pg_namespace n ON n.oid = c.relnamespace
+					CROSS JOIN LATERAL aclexplode(c.relacl) a
+					WHERE a.grantee = r.oid
+					  AND %s
+				)
+				OR EXISTS (
+					SELECT 1
+					FROM pg_proc p
+					JOIN pg_namespace n ON n.oid = p.pronamespace
+					CROSS JOIN LATERAL aclexplode(p.proacl) a
+					WHERE a.grantee = r.oid
+					  AND (%s OR p.prokind <> 'f')
+				)
+				OR EXISTS (
+					SELECT 1
+					FROM pg_namespace n
+					CROSS JOIN LATERAL aclexplode(n.nspacl) a
+					WHERE a.grantee = r.oid
+					  AND %s
+				)
+				OR EXISTS (
+					SELECT 1
+					FROM pg_database d
+					CROSS JOIN LATERAL aclexplode(d.datacl) a
+					WHERE a.grantee = r.oid
+					  AND d.datname <> current_database()
+				)
+				OR EXISTS (
+					SELECT 1
+					FROM pg_default_acl d
+					CROSS JOIN LATERAL aclexplode(d.defaclacl) a
+					WHERE a.grantee = r.oid
+				)
+			)
+		);`, schemaFilter, schemaFilter, schemaFilter)
+	args := append([]any{roleName}, schemaArgs...)
+	var hasACL bool
+	if err := dbtx.QueryRowContext(ctx, query, args...).Scan(&hasACL); err != nil {
+		return false, fmt.Errorf("checking unhandled ACLs for role %q: %w", roleName, err)
+	}
+	return hasACL, nil
 }
 
 // GenerateCreateRoleSQL renders the NOLOGIN group role Grizzle manages.

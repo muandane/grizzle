@@ -232,6 +232,11 @@ func EventTriggerFunctionExists(ctx context.Context, dbtx dialect.DBTX, function
 // in its corresponding shadow schema, matching RewriteShadowSQL and the
 // schema diff's target/shadow mapping.
 func EventTriggerFunctionExistsWithShadowMap(ctx context.Context, dbtx dialect.DBTX, functionName string, shadowMap map[string]string, lookupSchemas ...string) (bool, error) {
+	originalParts := splitQualifiedIdentifier(strings.TrimSpace(functionName))
+	originalSchema := ""
+	if len(originalParts) == 2 {
+		originalSchema = decodeCatalogIdentifier(originalParts[0])
+	}
 	if len(shadowMap) > 0 {
 		functionName = mapQualifiedFunctionSchema(functionName, shadowMap)
 	}
@@ -247,40 +252,54 @@ func EventTriggerFunctionExistsWithShadowMap(ctx context.Context, dbtx dialect.D
 	}
 
 	query := `
-		SELECT EXISTS (
-			SELECT 1
+		SELECT COALESCE((
+			SELECT p.prokind = 'f'
+			       AND p.prorettype = 'event_trigger'::regtype
 			FROM pg_proc p
 			JOIN pg_namespace n ON n.oid = p.pronamespace
 			WHERE p.proname = $1
-			  AND p.prokind = 'f'
 			  AND p.pronargs = 0
-			  AND p.prorettype = 'event_trigger'::regtype`
+`
 	args := []any{parts[len(parts)-1]}
 	if len(parts) == 2 {
-		query += `
-			  AND n.nspname = $2`
-		args = append(args, parts[0])
+		candidateSchemas := []string{parts[0]}
+		if originalSchema != "" && originalSchema != parts[0] {
+			candidateSchemas = append(candidateSchemas, originalSchema)
+		}
+		schemaPlaceholders := make([]string, 0, len(candidateSchemas))
+		orderCases := make([]string, 0, len(candidateSchemas))
+		for _, schemaName := range candidateSchemas {
+			schemaPlaceholders = append(schemaPlaceholders, fmt.Sprintf("$%d", len(args)+1))
+			args = append(args, schemaName)
+			orderCases = append(orderCases, fmt.Sprintf("WHEN $%d THEN %d", len(args), len(orderCases)+1))
+		}
+		query += "\n\t\t\t  AND n.nspname IN (" + strings.Join(schemaPlaceholders, ", ") + ")" +
+			"\n\t\t\tORDER BY CASE n.nspname " + strings.Join(orderCases, " ") + " END\n\t\t\tLIMIT 1"
 	} else if len(lookupSchemas) > 0 {
 		schemaPlaceholders := make([]string, 0, len(lookupSchemas))
+		orderCases := make([]string, 0, len(lookupSchemas))
 		for _, schemaName := range lookupSchemas {
 			if strings.TrimSpace(schemaName) == "" {
 				continue
 			}
 			schemaPlaceholders = append(schemaPlaceholders, fmt.Sprintf("$%d", len(args)+1))
 			args = append(args, schemaName)
+			orderCases = append(orderCases, fmt.Sprintf("WHEN $%d THEN %d", len(args), len(orderCases)+1))
 		}
 		if len(schemaPlaceholders) > 0 {
-			query += "\n\t\t\t  AND n.nspname IN (" + strings.Join(schemaPlaceholders, ", ") + ")"
+			query += "\n\t\t\t  AND n.nspname IN (" + strings.Join(schemaPlaceholders, ", ") + ")" +
+				"\n\t\t\tORDER BY CASE n.nspname " + strings.Join(orderCases, " ") + " END\n\t\t\tLIMIT 1"
+		} else {
+			query += "\n\t\t\tLIMIT 1"
 		}
 	} else {
-		identity := quoteQualifiedIdentifierPreservingCase(functionName) + "()"
 		query += `
-			  AND p.oid = to_regprocedure($2)::oid
-			  AND n.nspname = ANY (current_schemas(true))`
-		args = append(args, identity)
+			  AND n.nspname = ANY (current_schemas(true))
+			ORDER BY array_position(current_schemas(true), n.nspname)
+			LIMIT 1`
 	}
 	query += `
-		);`
+		), false);`
 	var exists bool
 	err := dbtx.QueryRowContext(ctx, query, args...).Scan(&exists)
 	if err != nil {
@@ -295,11 +314,20 @@ func mapQualifiedFunctionSchema(functionName string, shadowMap map[string]string
 		return functionName
 	}
 	targetSchema := decodeCatalogIdentifier(parts[0])
-	shadowSchema, ok := shadowMap[targetSchema]
+	shadowSchema, ok := shadowSchemaForTarget(shadowMap, targetSchema)
 	if !ok {
 		return functionName
 	}
 	return quoteIdentifier(shadowSchema) + "." + parts[1]
+}
+
+func shadowSchemaForTarget(shadowMap map[string]string, targetSchema string) (string, bool) {
+	for configuredSchema, shadowSchema := range shadowMap {
+		if configuredSchema == targetSchema || decodeCatalogIdentifier(configuredSchema) == targetSchema {
+			return shadowSchema, true
+		}
+	}
+	return "", false
 }
 
 // GenerateCreatePublicationSQL renders the desired publication.
@@ -317,6 +345,11 @@ func GenerateCreatePublicationSQL(p *schema.Publication) string {
 		sb.WriteString(strings.Join(quoteQualifiedList(p.Schemas), ", "))
 	}
 	fmt.Fprintf(&sb, " WITH (publish = '%s');", publishFlagString(p))
+	if !p.AllTables && len(p.Tables) > 0 && len(p.Schemas) > 0 {
+		fmt.Fprintf(&sb, "\nALTER PUBLICATION %s ADD TABLES IN SCHEMA %s;",
+			quoteIdentifier(p.Name),
+			strings.Join(quoteQualifiedList(p.Schemas), ", "))
+	}
 	return sb.String()
 }
 

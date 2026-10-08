@@ -94,6 +94,26 @@ func TestRolesDiff_PublicLiveOnlyGrantUntouched(t *testing.T) {
 	}
 }
 
+func TestRolesDiff_ExplicitRevokeCannotTouchPublicOrUnmanaged(t *testing.T) {
+	desired := roleSpec(t, `
+		REVOKE SELECT ON docs FROM PUBLIC;
+		REVOKE SELECT ON docs FROM legacy;
+	`)
+	live := &diff.RoleState{
+		RoleNames: map[string]string{
+			"legacy": "legacy",
+		},
+		ManagedRoles: map[string]bool{},
+		Grants: []*diff.RoleACLGrant{
+			{Grantee: "PUBLIC", ObjectKind: "TABLE", ObjectName: "public.docs", Privileges: []string{"SELECT"}},
+			{Grantee: "legacy", ObjectKind: "TABLE", ObjectName: "public.docs", Privileges: []string{"SELECT"}},
+		},
+	}
+	if changes := diff.RolesDiff(desired, live, "public"); len(changes) != 0 {
+		t.Fatalf("explicit REVOKE must not mutate PUBLIC or unmanaged grantees: %+v", changes)
+	}
+}
+
 func TestRolesDiff_GrantOptionDrift(t *testing.T) {
 	// Desired adds WITH GRANT OPTION: re-grant.
 	desired := roleSpec(t, `GRANT SELECT ON docs TO app_read WITH GRANT OPTION;`)
@@ -121,6 +141,33 @@ func TestRolesDiff_GrantOptionDrift(t *testing.T) {
 	changes2 := diff.RolesDiff(desired2, live2, "public")
 	if len(changes2) != 1 || changes2[0].Type != plan.ChangeRevoke || !changes2[0].Grant.GrantOption {
 		t.Fatalf("unwanted option must revoke the delegation only, got %+v", changes2)
+	}
+}
+
+func TestRolesDiff_CombinesMissingPrivilegeAndGrantOption(t *testing.T) {
+	desired := roleSpec(t, `GRANT SELECT, INSERT ON docs TO app_read WITH GRANT OPTION;`)
+	live := &diff.RoleState{
+		RoleNames:    map[string]string{"app_read": "app_read"},
+		ManagedRoles: map[string]bool{"app_read": true},
+		Grants: []*diff.RoleACLGrant{{
+			Grantee:    "app_read",
+			ObjectKind: "TABLE",
+			ObjectName: "public.docs",
+			Privileges: []string{"SELECT"},
+		}},
+	}
+	changes := diff.RolesDiff(desired, live, "public")
+	if len(changes) != 2 {
+		t.Fatalf("expected one base grant and one option grant without overlap: %+v", changes)
+	}
+	for _, change := range changes {
+		if change.Type != plan.ChangeGrant || !change.Grant.GrantOption {
+			t.Fatalf("every newly granted privilege should carry its desired option: %+v", changes)
+		}
+		if len(change.Grant.Privileges) != 1 ||
+			(change.Grant.Privileges[0] != "SELECT" && change.Grant.Privileges[0] != "INSERT") {
+			t.Fatalf("unexpected grant partition: %+v", changes)
+		}
 	}
 }
 

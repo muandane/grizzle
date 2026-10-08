@@ -25,6 +25,8 @@ type Document struct {
 	Renames        map[string]string `json:"renames,omitzero"`
 	ExpandContract bool              `json:"expand_contract,omitzero"`
 	SchemaSQL      string            `json:"schema_sql,omitzero"`
+	RolesSQL       string            `json:"roles_sql,omitzero"`
+	CatalogSQL     string            `json:"catalog_sql,omitzero"`
 
 	// Approval-sensitive execution semantics that affect generated SQL.
 	NonConcurrentIndexes bool `json:"non_concurrent_indexes,omitempty"`
@@ -58,6 +60,8 @@ func (p *Plan) Document() Document {
 		Renames:              p.Renames,
 		ExpandContract:       p.ExpandContract,
 		SchemaSQL:            p.SchemaSQL,
+		RolesSQL:             p.RolesSQL,
+		CatalogSQL:           p.CatalogSQL,
 		NonConcurrentIndexes: p.NonConcurrentIndexes,
 		LockTimeoutNs:        int64(p.LockTimeout / time.Nanosecond),
 		StatementTimeoutNs:   int64(p.StatementTimeout / time.Nanosecond),
@@ -84,6 +88,8 @@ func ParsePlanJSON(data []byte) (*Plan, string, error) {
 			Renames:              doc.Renames,
 			ExpandContract:       doc.ExpandContract,
 			SchemaSQL:            doc.SchemaSQL,
+			RolesSQL:             doc.RolesSQL,
+			CatalogSQL:           doc.CatalogSQL,
 			LockTimeout:          time.Duration(doc.LockTimeoutNs),
 			StatementTimeout:     time.Duration(doc.StatementTimeoutNs),
 			NonConcurrentIndexes: doc.NonConcurrentIndexes,

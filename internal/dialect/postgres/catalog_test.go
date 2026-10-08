@@ -43,6 +43,18 @@ func TestGenerateCatalogSQL_EscapesQuotedIdentifiersAndTags(t *testing.T) {
 	}
 }
 
+func TestGenerateCreatePublicationSQL_MixedMembershipConverges(t *testing.T) {
+	sql := GenerateCreatePublicationSQL(&schema.Publication{
+		Name:    "docs_pub",
+		Tables:  []string{"public.docs"},
+		Schemas: []string{"analytics"},
+	})
+	if !strings.Contains(sql, `CREATE PUBLICATION "docs_pub" FOR TABLE "public"."docs"`) ||
+		!strings.Contains(sql, `ALTER PUBLICATION "docs_pub" ADD TABLES IN SCHEMA "analytics";`) {
+		t.Fatalf("mixed publication membership must use valid CREATE plus ALTER SQL: %s", sql)
+	}
+}
+
 func TestGenerateCatalogSQL_DoublesMaliciousIdentifierQuotes(t *testing.T) {
 	publicationSQL := GenerateCreatePublicationSQL(&schema.Publication{
 		Name:   `pub"; DROP PUBLICATION other; --`,

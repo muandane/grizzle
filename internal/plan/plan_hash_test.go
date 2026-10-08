@@ -71,6 +71,8 @@ func TestPlan_Hash_ApprovalSensitiveFields(t *testing.T) {
 		ExcludeTables: []string{"audit"},
 		Renames:       map[string]string{"a": "b"},
 		SchemaSQL:     "CREATE TABLE users (id INT);",
+		RolesSQL:      "CREATE ROLE app_read;",
+		CatalogSQL:    "CREATE PUBLICATION docs FOR TABLE users;",
 		Steps: []plan.Step{
 			{Type: plan.ChangeAddColumn, Table: "users", SQL: `ALTER TABLE "public"."users" ADD COLUMN name TEXT;`},
 		},
@@ -90,6 +92,8 @@ func TestPlan_Hash_ApprovalSensitiveFields(t *testing.T) {
 		{"expand_contract", func(p *plan.Plan) { p.ExpandContract = true }},
 		{"non_concurrent", func(p *plan.Plan) { p.NonConcurrentIndexes = true }},
 		{"schema_sql", func(p *plan.Plan) { p.SchemaSQL = "CREATE TABLE users (id BIGINT);" }},
+		{"roles_sql", func(p *plan.Plan) { p.RolesSQL = "CREATE ROLE app_write;" }},
+		{"catalog_sql", func(p *plan.Plan) { p.CatalogSQL = "CREATE PUBLICATION docs FOR ALL TABLES;" }},
 		{"step_sql", func(p *plan.Plan) { p.Steps[0].SQL = `ALTER TABLE "public"."users" ADD COLUMN age INT;` }},
 	}
 	for _, tc := range cases {
@@ -116,6 +120,8 @@ func TestPlan_Document_OmitsLockAndShadow(t *testing.T) {
 		TargetSchema: "public",
 		Steps:        []plan.Step{{Type: plan.ChangeAddColumn, Table: "users", SQL: "ALTER TABLE users ADD COLUMN x INT;"}},
 		SchemaSQL:    "CREATE TABLE users (id INT, x INT);",
+		RolesSQL:     "CREATE ROLE app_read;",
+		CatalogSQL:   "CREATE PUBLICATION docs FOR TABLE users;",
 	}
 	data, err := p.ToJSON()
 	if err != nil {
@@ -133,5 +139,9 @@ func TestPlan_Document_OmitsLockAndShadow(t *testing.T) {
 	}
 	if hash != p.Hash() || parsed.Hash() != p.Hash() {
 		t.Fatalf("round-trip hash mismatch: envelope=%s parsed=%s want=%s", hash, parsed.Hash(), p.Hash())
+	}
+	if parsed.RolesSQL != p.RolesSQL || parsed.CatalogSQL != p.CatalogSQL {
+		t.Fatalf("side-channel SQL did not round-trip: roles=%q/%q catalog=%q/%q",
+			parsed.RolesSQL, p.RolesSQL, parsed.CatalogSQL, p.CatalogSQL)
 	}
 }

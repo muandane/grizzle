@@ -12,8 +12,8 @@ func TestEventTriggerFunctionLookupUsesAllShadowSchemas(t *testing.T) {
 	}
 	if len(lookup) != 5 ||
 		lookup[0] != shadowMap["public"] ||
-		lookup[1] != shadowMap["Billing"] ||
-		lookup[2] != "public" ||
+		lookup[1] != "public" ||
+		lookup[2] != shadowMap["Billing"] ||
 		lookup[3] != "Billing" ||
 		lookup[4] != "public" {
 		t.Fatalf("unexpected event-trigger lookup order: %v", lookup)

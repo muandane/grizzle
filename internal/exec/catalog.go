@@ -73,10 +73,10 @@ func desiredCatalogSpec(cfg PostgresExecConfig) (*schema.CatalogSpec, error) {
 	}
 	schemaSpec := schema.ParseCatalogSQL(groups.CatalogSQL)
 	sideSpec := schema.ParseCatalogSQL(cfg.CatalogSQL)
-	if err := schema.ValidateCatalogSpecMerge(schemaSpec, sideSpec); err != nil {
+	if err := schema.ValidateCatalogSpecMergeForTarget(schemaSpec, sideSpec, cfg.primarySchema()); err != nil {
 		return nil, fmt.Errorf("validating catalog statement bases: %w", err)
 	}
-	return schema.MergeCatalogSpecs(schemaSpec, sideSpec), nil
+	return schema.MergeCatalogSpecsForTarget(schemaSpec, sideSpec, cfg.primarySchema()), nil
 }
 
 // eventTriggerFunctionLookup returns every shadow and target namespace that
@@ -98,9 +98,12 @@ func eventTriggerFunctionLookup(cfg PostgresExecConfig) ([]string, map[string]st
 		shadowMap = postgres.ComputeShadowSchemas(cfg.ShadowSchema, targetSchemas)
 		for _, targetSchema := range targetSchemas {
 			lookup = append(lookup, shadowMap[targetSchema])
+			lookup = append(lookup, targetSchema)
 		}
 	}
-	lookup = append(lookup, targetSchemas...)
+	if len(targetSchemas) == 1 {
+		lookup = append(lookup, targetSchemas[0])
+	}
 	lookup = append(lookup, "public")
 	return lookup, shadowMap
 }

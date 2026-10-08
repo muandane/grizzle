@@ -15,6 +15,13 @@ func CanonicalIdentifierPart(identifier string) string {
 	return canonicalGrantIdentifierPart(identifier)
 }
 
+// CanonicalTargetIdentifier returns the canonical SQL identity token for a
+// configured catalog identity. Configuration values are catalog names rather
+// than SQL source tokens, so mixed-case values remain quoted.
+func CanonicalTargetIdentifier(identifier string) string {
+	return canonicalTargetIdentifierPart(identifier)
+}
+
 // CanonicalQualifiedIdentifier returns the canonical identity for a qualified
 // SQL identifier. An unqualified name is resolved against targetSchema when
 // targetSchema is non-empty.

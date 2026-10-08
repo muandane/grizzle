@@ -98,6 +98,7 @@ func TestValidateRolesSQL_RejectsUnsupportedRoleForms(t *testing.T) {
 	}{
 		{`ALTER ROLE app_read SET search_path = public;`, "role configuration is not supported yet"},
 		{`CREATE ROLE app_read PASSWORD 'secret';`, "passworded roles are not supported yet"},
+		{`CREATE ROLE password;`, ""},
 		{`DROP ROLE app_read;`, "DROP ROLE/USER is not supported"},
 		{`REVOKE GRANT OPTION FOR SELECT ON docs FROM app_read;`, "per-privilege grant-option revocation"},
 		{`GRANT app_read TO app_writer WITH ADMIN OPTION;`, "unsupported GRANT form"},
@@ -115,6 +116,12 @@ func TestValidateRolesSQL_RejectsUnsupportedRoleForms(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.message, func(t *testing.T) {
 			err := ValidateRolesSQL(tt.sql)
+			if tt.message == "" {
+				if err != nil {
+					t.Fatalf("valid role identifier %q was rejected: %v", tt.sql, err)
+				}
+				return
+			}
 			if err == nil || !strings.Contains(err.Error(), tt.message) {
 				t.Fatalf("ValidateRolesSQL(%q) = %v, want error containing %q", tt.sql, err, tt.message)
 			}
@@ -263,18 +270,47 @@ func TestValidateRolesSQL_RejectsOverlengthIdentifiers(t *testing.T) {
 	}
 }
 
+func TestValidateRolesSpecScope_RejectsUninspectedObjects(t *testing.T) {
+	spec := ParseRolesSQL(`
+		GRANT SELECT ON TABLE other.docs TO app;
+		GRANT USAGE ON SCHEMA other TO app;
+		GRANT CONNECT ON DATABASE other_db TO app;
+	`)
+	if err := ValidateRolesSpecScope(spec, []string{"public"}, "app_db"); err == nil {
+		t.Fatal("ACL objects outside the inspected target/current-database scopes must be rejected")
+	}
+	if err := ValidateRolesSpecScope(ParseRolesSQL(`GRANT CONNECT ON DATABASE app_db TO app;`), []string{"public"}, "app_db"); err != nil {
+		t.Fatalf("current database ACL should be accepted: %v", err)
+	}
+	if err := ValidateRolesSpecScope(ParseRolesSQL(`GRANT SELECT ON TABLE "Mixed"."docs" TO app;`), []string{"Mixed"}, "app_db"); err != nil {
+		t.Fatalf("quoted target schema should be accepted: %v", err)
+	}
+}
+
 func TestFilterRolePrivilegesForServer_Maintain(t *testing.T) {
 	spec := ParseRolesSQL(`GRANT ALL ON TABLE docs TO app;`)
 	if len(spec.Grants) != 1 || !containsFold(spec.Grants[0].Privileges, "MAINTAIN") {
 		t.Fatalf("ALL TABLE must include MAINTAIN in the desired expansion: %+v", spec.Grants)
 	}
-	FilterRolePrivilegesForServer(spec, 160000)
+	if _, err := FilterRolePrivilegesForServer(spec, 160000); err != nil {
+		t.Fatalf("ALL expansion should remain compatible on PostgreSQL 16: %v", err)
+	}
 	if containsFold(spec.Grants[0].Privileges, "MAINTAIN") {
 		t.Fatal("MAINTAIN must be omitted for PostgreSQL versions before 17")
 	}
 	spec = ParseRolesSQL(`GRANT ALL ON TABLE docs TO app;`)
-	FilterRolePrivilegesForServer(spec, 170000)
+	if _, err := FilterRolePrivilegesForServer(spec, 170000); err != nil {
+		t.Fatalf("MAINTAIN should be accepted on PostgreSQL 17: %v", err)
+	}
 	if !containsFold(spec.Grants[0].Privileges, "MAINTAIN") {
 		t.Fatal("MAINTAIN must remain on PostgreSQL 17+")
+	}
+	explicit := ParseRolesSQL(`GRANT MAINTAIN ON TABLE docs TO app;`)
+	if _, err := FilterRolePrivilegesForServer(explicit, 160000); err == nil {
+		t.Fatal("explicit MAINTAIN must be rejected before PostgreSQL 17")
+	}
+	explicitRevoke := ParseRolesSQL(`REVOKE MAINTAIN ON TABLE docs FROM app;`)
+	if _, err := FilterRolePrivilegesForServer(explicitRevoke, 160000); err == nil {
+		t.Fatal("explicit MAINTAIN revoke must be rejected before PostgreSQL 17")
 	}
 }
