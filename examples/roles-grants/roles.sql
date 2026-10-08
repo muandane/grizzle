@@ -22,22 +22,22 @@
 --     SEQUENCE: USAGE/SELECT/UPDATE, DATABASE: CONNECT/CREATE/TEMPORARY,
 --     SCHEMA: USAGE/CREATE, FUNCTION: EXECUTE).
 
-CREATE ROLE app_read;
-CREATE ROLE app_writer;
+CREATE ROLE grizzle_example_read;
+CREATE ROLE grizzle_example_writer;
 
 -- Read-only access to the docs table.
-GRANT SELECT ON docs TO app_read;
+GRANT SELECT ON docs TO grizzle_example_read;
 
 -- Full row CRUD on docs, plus the sequence backing its primary key.
-GRANT SELECT, INSERT, UPDATE, DELETE ON docs TO app_writer;
-GRANT USAGE ON SEQUENCE docs_id_seq TO app_writer;
+GRANT SELECT, INSERT, UPDATE, DELETE ON docs TO grizzle_example_writer;
+GRANT USAGE ON SEQUENCE docs_id_seq TO grizzle_example_writer;
 
 -- Schema and database level access.
-GRANT USAGE ON SCHEMA public TO app_read, app_writer;
-GRANT CONNECT ON DATABASE app TO app_read, app_writer;
+GRANT USAGE ON SCHEMA public TO grizzle_example_read, grizzle_example_writer;
+GRANT CONNECT ON DATABASE app TO grizzle_example_read, grizzle_example_writer;
 
 -- Function execution.
-GRANT EXECUTE ON FUNCTION notify_event() TO app_writer;
+GRANT EXECUTE ON FUNCTION notify_event() TO grizzle_example_writer;
 
 -- A grant WITH GRANT OPTION lets the grantee re-grant the privilege;
 -- revoking it renders REVOKE GRANT OPTION FOR ...

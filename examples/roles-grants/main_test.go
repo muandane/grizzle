@@ -47,7 +47,7 @@ func TestExample_RolesGrants(t *testing.T) {
 // so revoke them first with DROP OWNED. Errors are ignored: a missing role is
 // the expected clean state.
 func dropExampleRoles(db *sql.DB) {
-	for _, role := range []string{"app_read", "app_writer"} {
+	for _, role := range []string{"grizzle_example_read", "grizzle_example_writer"} {
 		_, _ = db.Exec(`DROP OWNED BY ` + role)
 		_, _ = db.Exec(`DROP ROLE IF EXISTS ` + role)
 	}

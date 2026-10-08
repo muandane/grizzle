@@ -23,13 +23,14 @@ func TestRoles_FunctionGrantRejectsProcedure(t *testing.T) {
 	db := testutil.TestDatabase(t)
 	ctx := context.Background()
 	schemaName := fmt.Sprintf("test_role_fn_%d", time.Now().UnixNano())
+	roleName := fmt.Sprintf("fn_grant_role_%d", time.Now().UnixNano())
 	cfg := exec.PostgresExecConfig{
 		TargetSchema: schemaName,
 		SchemaSQL: fmt.Sprintf(`
 			CREATE PROCEDURE proc_only()
 			LANGUAGE plpgsql AS $$ BEGIN NULL; END; $$;
 		`),
-		RolesSQL: `CREATE ROLE fn_grant_role; GRANT EXECUTE ON FUNCTION proc_only() TO fn_grant_role;`,
+		RolesSQL: fmt.Sprintf(`CREATE ROLE %q; GRANT EXECUTE ON FUNCTION proc_only() TO %q;`, roleName, roleName),
 		Filters:  scope.Filters{},
 		Policy:   plan.DropPolicy{},
 	}
@@ -163,19 +164,25 @@ func TestRoles_Lifecycle(t *testing.T) {
 	ctx := context.Background()
 
 	schema := fmt.Sprintf("test_roles_%d", time.Now().UnixNano())
+	roleName := fmt.Sprintf("app_read_%d", time.Now().UnixNano())
+	operatorRole := fmt.Sprintf("operator_role_%d", time.Now().UnixNano())
 	_, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema))
 	if err != nil {
 		t.Fatalf("failed creating test schema: %v", err)
 	}
-	defer func() { _, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schema)) }()
+	defer func() {
+		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schema))
+		_, _ = db.Exec(fmt.Sprintf("DROP ROLE IF EXISTS %q;", roleName))
+		_, _ = db.Exec(fmt.Sprintf("DROP ROLE IF EXISTS %q;", operatorRole))
+	}()
 
 	rolesSpec := func(grantExtra string) string {
 		return fmt.Sprintf(`
-			CREATE ROLE app_read;
-			GRANT SELECT ON docs TO app_read;
-			GRANT EXECUTE ON FUNCTION touch_ts() TO app_read;
+			CREATE ROLE %q;
+			GRANT SELECT ON docs TO %q;
+			GRANT EXECUTE ON FUNCTION touch_ts() TO %q;
 			%s
-		`, grantExtra)
+		`, roleName, roleName, roleName, grantExtra)
 	}
 
 	newCfg := func(rolesSQL string) exec.PostgresExecConfig {
@@ -198,7 +205,7 @@ func TestRoles_Lifecycle(t *testing.T) {
 	}
 	var rolSuper, rolCanLogin bool
 	if err := db.QueryRow(fmt.Sprintf(
-		`SELECT rolsuper, rolcanlogin FROM pg_roles WHERE rolname = 'app_read';`,
+		`SELECT rolsuper, rolcanlogin FROM pg_roles WHERE rolname = %s;`, quoteLiteral(roleName),
 	)).Scan(&rolSuper, &rolCanLogin); err != nil {
 		t.Fatalf("query role: %v", err)
 	}
@@ -209,9 +216,9 @@ func TestRoles_Lifecycle(t *testing.T) {
 		t.Fatalf("managed roles must not be superuser")
 	}
 	var marker string
-	if err := db.QueryRow(
-		`SELECT COALESCE((SELECT description FROM pg_shdescription d WHERE d.objoid = r.oid AND d.classoid = 'pg_authid'::regclass), '') FROM pg_roles r WHERE rolname = 'app_read';`,
-	).Scan(&marker); err != nil {
+	if err := db.QueryRow(fmt.Sprintf(
+		`SELECT COALESCE((SELECT description FROM pg_shdescription d WHERE d.objoid = r.oid AND d.classoid = 'pg_authid'::regclass), '') FROM pg_roles r WHERE rolname = %s;`, quoteLiteral(roleName),
+	)).Scan(&marker); err != nil {
 		t.Fatalf("query role marker: %v", err)
 	}
 	if marker == "" {
@@ -219,12 +226,12 @@ func TestRoles_Lifecycle(t *testing.T) {
 	}
 	var grants int
 	if err := db.QueryRow(fmt.Sprintf(
-		`SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace JOIN aclexplode(c.relacl) a ON true WHERE n.nspname = '%s' AND c.relname = 'docs' AND a.grantee = (SELECT oid FROM pg_roles WHERE rolname = 'app_read') AND a.privilege_type = 'SELECT';`, schema,
+		`SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace JOIN aclexplode(c.relacl) a ON true WHERE n.nspname = '%s' AND c.relname = 'docs' AND a.grantee = (SELECT oid FROM pg_roles WHERE rolname = %s) AND a.privilege_type = 'SELECT';`, schema, quoteLiteral(roleName),
 	)).Scan(&grants); err != nil {
 		t.Fatalf("query grant: %v", err)
 	}
 	if grants != 1 {
-		t.Fatalf("expected SELECT grant on docs for app_read, count = %d", grants)
+		t.Fatalf("expected SELECT grant on docs for %s, count = %d", roleName, grants)
 	}
 	if err := db.QueryRow(fmt.Sprintf(`
 		SELECT count(*)
@@ -233,13 +240,13 @@ func TestRoles_Lifecycle(t *testing.T) {
 		JOIN aclexplode(p.proacl) a ON true
 		WHERE n.nspname = '%s'
 		  AND p.proname = 'touch_ts'
-		  AND a.grantee = (SELECT oid FROM pg_roles WHERE rolname = 'app_read')
+		  AND a.grantee = (SELECT oid FROM pg_roles WHERE rolname = %s)
 		  AND a.privilege_type = 'EXECUTE';
-	`, schema)).Scan(&grants); err != nil {
+	`, schema, quoteLiteral(roleName))).Scan(&grants); err != nil {
 		t.Fatalf("query function grant: %v", err)
 	}
 	if grants != 1 {
-		t.Fatalf("expected EXECUTE grant on touch_ts for app_read, count = %d", grants)
+		t.Fatalf("expected EXECUTE grant on touch_ts for %s, count = %d", roleName, grants)
 	}
 
 	// 2. Second sync: no-op.
@@ -252,7 +259,7 @@ func TestRoles_Lifecycle(t *testing.T) {
 	}
 
 	// 3. Grant removal from RolesSQL: REVOKE behind the gate.
-	p2, err := exec.PlanDiffPostgres(ctx, db, newCfg(`CREATE ROLE app_read;`))
+	p2, err := exec.PlanDiffPostgres(ctx, db, newCfg(fmt.Sprintf(`CREATE ROLE %q;`, roleName)))
 	if err != nil {
 		t.Fatalf("revoke plan: %v", err)
 	}
@@ -264,7 +271,7 @@ func TestRoles_Lifecycle(t *testing.T) {
 			t.Fatalf("expected only destructive REVOKEs, got %+v", p2.Steps)
 		}
 	}
-	if err := exec.SyncPostgres(ctx, db, newCfg(`CREATE ROLE app_read;`)); err == nil {
+	if err := exec.SyncPostgres(ctx, db, newCfg(fmt.Sprintf(`CREATE ROLE %q;`, roleName))); err == nil {
 		t.Fatalf("revoke must fail with default policy (AllowRevoke=false)")
 	} else {
 		var dve *plan.DestructiveViolationError
@@ -272,14 +279,14 @@ func TestRoles_Lifecycle(t *testing.T) {
 			t.Fatalf("expected destructive violation, got: %v", err)
 		}
 	}
-	revokeCfg := newCfg(`CREATE ROLE app_read;`)
+	revokeCfg := newCfg(fmt.Sprintf(`CREATE ROLE %q;`, roleName))
 	revokeCfg.Policy = plan.DropPolicy{AllowRevoke: true}
 	revokeCfg.AcceptHazards = []plan.HazardCode{plan.HazardRevokePrivilege}
 	if err := exec.SyncPostgres(ctx, db, revokeCfg); err != nil {
 		t.Fatalf("allowed revoke sync: %v", err)
 	}
 	if err := db.QueryRow(fmt.Sprintf(
-		`SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace JOIN aclexplode(c.relacl) a ON true WHERE n.nspname = '%s' AND c.relname = 'docs' AND a.grantee = (SELECT oid FROM pg_roles WHERE rolname = 'app_read');`, schema,
+		`SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace JOIN aclexplode(c.relacl) a ON true WHERE n.nspname = '%s' AND c.relname = 'docs' AND a.grantee = (SELECT oid FROM pg_roles WHERE rolname = %s);`, schema, quoteLiteral(roleName),
 	)).Scan(&grants); err != nil {
 		t.Fatalf("query grants after revoke: %v", err)
 	}
@@ -288,7 +295,7 @@ func TestRoles_Lifecycle(t *testing.T) {
 	}
 
 	// Reintroduce an ACL dependency so DROP ROLE must revoke it first.
-	if _, err := db.Exec(fmt.Sprintf(`GRANT UPDATE ON TABLE "%s"."docs" TO "app_read";`, schema)); err != nil {
+	if _, err := db.Exec(fmt.Sprintf(`GRANT UPDATE ON TABLE "%s"."docs" TO %s;`, schema, quoteIdent(roleName))); err != nil {
 		t.Fatalf("regrant role ACL before drop: %v", err)
 	}
 
@@ -322,10 +329,9 @@ func TestRoles_Lifecycle(t *testing.T) {
 
 	// 5. Operator-created roles are never swept: create one, sync with an
 	// empty spec, and assert it survives.
-	if _, err := db.Exec(`CREATE ROLE operator_role;`); err != nil {
+	if _, err := db.Exec(fmt.Sprintf(`CREATE ROLE %q;`, operatorRole)); err != nil {
 		t.Fatalf("create operator role: %v", err)
 	}
-	defer func() { _, _ = db.Exec(`DROP ROLE IF EXISTS operator_role;`) }()
 	allowDropCfg := newCfg("-- empty desired roles state\n")
 	allowDropCfg.Policy = plan.DropPolicy{AllowDropRole: true, AllowRevoke: true}
 	allowDropCfg.AcceptHazards = []plan.HazardCode{plan.HazardDropRole, plan.HazardRevokePrivilege}
@@ -333,14 +339,14 @@ func TestRoles_Lifecycle(t *testing.T) {
 		t.Fatalf("allowed drop sync: %v", err)
 	}
 	var operatorKept int
-	if err := db.QueryRow(`SELECT count(*) FROM pg_roles WHERE rolname = 'operator_role';`).Scan(&operatorKept); err != nil {
+	if err := db.QueryRow(fmt.Sprintf(`SELECT count(*) FROM pg_roles WHERE rolname = %s;`, quoteLiteral(operatorRole))).Scan(&operatorKept); err != nil {
 		t.Fatalf("query operator role: %v", err)
 	}
 	if operatorKept != 1 {
 		t.Fatalf("operator role must survive sync")
 	}
 	var managedDropped int
-	if err := db.QueryRow(`SELECT count(*) FROM pg_roles WHERE rolname = 'app_read';`).Scan(&managedDropped); err != nil {
+	if err := db.QueryRow(fmt.Sprintf(`SELECT count(*) FROM pg_roles WHERE rolname = %s;`, quoteLiteral(roleName))).Scan(&managedDropped); err != nil {
 		t.Fatalf("query dropped role: %v", err)
 	}
 	if managedDropped != 0 {
@@ -477,4 +483,12 @@ func TestRoles_LoginPasswordConfigDrift(t *testing.T) {
 	if !sawPW {
 		t.Fatalf("password drift must emit ALTER_ROLE PASSWORD, got %+v", p3.Steps)
 	}
+}
+
+func quoteLiteral(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+func quoteIdent(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
