@@ -29,17 +29,13 @@ spec:
             - name: http
               containerPort: 8080
           env:
+            # Passed to your app; Grizzle itself only uses Options you set in code.
+            # The CLI also accepts DATABASE_URL or GRIZZLE_DSN.
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: db-credentials
                   key: database-url
-            - name: GRIZZLE_LOCK_TIMEOUT
-              value: "10s"
-            - name: GRIZZLE_STATEMENT_TIMEOUT
-              value: "2m"
-            - name: GRIZZLE_STRICT_SCOPE
-              value: "true"
           resources:
             requests:
               cpu: "250m"

@@ -2,7 +2,7 @@
 
 ## Overview
 
-Shows the optional `--roles` / `Options.RolesSQL` side-channel: schema DDL stays in `schema.sql`, while `CREATE ROLE` and `GRANT` statements live in `roles.sql` and are diffed against live ACLs after schema sync.
+Shows the optional `--roles` / `Options.RolesSQL` file: schema DDL stays in `schema.sql`, while `CREATE ROLE` and `GRANT` statements live in `roles.sql` and are diffed against live ACLs after schema sync.
 
 ## Files
 
@@ -24,6 +24,6 @@ grizzle apply --dsn "$DATABASE_URL" --schema schema.sql --roles roles.sql
 go test -tags integration ./...
 ```
 
-Uncomment and rename the `GRANT CONNECT ON DATABASE …` line in `roles.sql` if you want database-level grants (cluster-scoped; must match the DSN database name).
+`roles.sql` uses placeholder names `public` (schema) and `app` (database) for the CLI default. The example `main.go` rewrites those two grants to the connected `PG_SCHEMA` / `current_database()` before calling `Sync`, because Grizzle rejects `SCHEMA`/`DATABASE` grants outside the current target.
 
-See [docs/SPEC.md](../../docs/SPEC.md) §2.2 (RolesSQL contract) and [examples/catalog-sync](../catalog-sync) for the catalog overlay.
+See [docs/SPEC.md](../../docs/SPEC.md) §2.2 (RolesSQL contract) and [examples/catalog-sync](../catalog-sync) for publications and event triggers.
