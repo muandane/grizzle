@@ -5,12 +5,18 @@
   env = {
     DATABASE_URL = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable";
     POSTGRES_DSN = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable";
-    GOTOOLCHAIN = lib.mkForce "auto";
+    # Stay on the devenv/local Go toolchain. "auto" can pull a mismatched
+    # toolchain that disagrees with languages.go's GOROOT.
+    GOTOOLCHAIN = lib.mkForce "local";
   };
 
   # Go Language Support
   languages.go = {
     enable = true;
+    # Pin to the same minor as go.mod so GOROOT matches the `go` on PATH.
+    # Without this, nixpkgs' default Go can lag go.mod and golangci-lint
+    # typecheck fails with "version does not match go tool version".
+    package = pkgs.go_1_27;
   };
 
   # Packages needed for development, linting, and database interaction
@@ -125,12 +131,19 @@
 
     "test-integration".exec = ''
       echo "Running integration tests..."
-      out=$(go test -tags integration -race -count=1 -v ./...)
-      echo "$out"
-      pass_count=$(echo "$out" | grep -c "^--- PASS" || true)
+      # -p 1 matches CI: packages share one Postgres and cluster-global
+      # roles/slots must not race across packages.
+      set -o pipefail
+      go test -tags integration -race -count=1 -p 1 -v ./... | tee /tmp/grizzle-integration.log
+      pass_count=$(grep -c "^--- PASS" /tmp/grizzle-integration.log || true)
+      fail_count=$(grep -c "^--- FAIL" /tmp/grizzle-integration.log || true)
       echo "Executed passing integration tests: $pass_count"
       if [ "$pass_count" -eq 0 ]; then
         echo "Error: No integration tests were executed! Run 'devenv up' first to start PostgreSQL."
+        exit 1
+      fi
+      if [ "$fail_count" -ne 0 ]; then
+        echo "Error: $fail_count integration test(s) failed."
         exit 1
       fi
     '';
@@ -162,8 +175,20 @@
 
   # Enter shell greeting & checks
   enterShell = ''
+    # Prefer the languages.go toolchain over any host Go that may shadow it
+    # on PATH (e.g. Homebrew). A mismatched GOROOT/binary pair breaks
+    # golangci-lint typecheck with "version does not match go tool version".
+    if [ -n "''${GOROOT:-}" ] && [ -x "$GOROOT/bin/go" ]; then
+      export PATH="$GOROOT/bin:$PATH"
+    else
+      unset GOROOT
+      export GOROOT="$(go env GOROOT)"
+      export PATH="$GOROOT/bin:$PATH"
+    fi
+
     echo "🐻 Grizzle Development Environment (Nix + devenv)"
     echo "• Go version:       $(go version)"
+    echo "• GOROOT:           $GOROOT"
     echo "• PostgreSQL tools: $(psql --version)"
     echo "• Database URL:     $DATABASE_URL"
     echo ""
