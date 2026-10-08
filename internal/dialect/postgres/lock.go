@@ -13,6 +13,11 @@ import (
 	"github.com/muandane/grizzle/internal/plan"
 )
 
+// lockPollMaxBackoff caps the advisory-lock polling backoff well below the retry
+// campaign ceiling: migrators must grab the lock promptly once it is released,
+// while still cutting poll QPS ~10x versus the fixed 20ms ticker.
+const lockPollMaxBackoff = 250 * time.Millisecond
+
 // GenerateLockID produces a deterministic 64-bit integer hash from a schema identifier.
 func GenerateLockID(schema string) int64 {
 	h := fnv.New64a()
@@ -51,7 +56,7 @@ func AcquireSessionAdvisoryLock(ctx context.Context, dbtx dialect.DBTX, lockID i
 			return nil
 		}
 
-		timer := time.NewTimer(backoff.Compute(attempt, nil))
+		timer := time.NewTimer(backoff.ComputeWithMax(attempt, nil, lockPollMaxBackoff))
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -97,7 +102,7 @@ func AcquireSessionAdvisoryLock2(ctx context.Context, dbtx dialect.DBTX, key1, k
 			return nil
 		}
 
-		timer := time.NewTimer(backoff.Compute(attempt, nil))
+		timer := time.NewTimer(backoff.ComputeWithMax(attempt, nil, lockPollMaxBackoff))
 		select {
 		case <-ctx.Done():
 			timer.Stop()
