@@ -271,12 +271,23 @@ func TestUnmanaged_PostgresIntegration(t *testing.T) {
 		t.Fatalf("setup failed: %v", err)
 	}
 
-	// 2. Desired schema drops email
+	// 2. Desired schema drops balance. The trigger, trigger function, and
+	// both views are declared unchanged so they survive the diff; the
+	// surviving managed trigger on accounts carries the dependency hazard
+	// (its function body may reference any dropped column).
 	desiredSQL := `
 		CREATE TABLE accounts (
 			id INT PRIMARY KEY,
-			balance NUMERIC
+			email TEXT
 		);
+		CREATE FUNCTION trg_noop_fn() RETURNS trigger AS $$
+		BEGIN
+			RETURN NEW;
+		END;
+		$$ LANGUAGE plpgsql;
+		CREATE TRIGGER trg_audit BEFORE INSERT ON accounts FOR EACH ROW EXECUTE FUNCTION trg_noop_fn();
+		CREATE VIEW v_account_emails AS SELECT id, email FROM accounts;
+		CREATE VIEW v_unrelated AS SELECT 1 AS num;
 	`
 
 	opts := grizzle.Options{
@@ -348,23 +359,30 @@ func TestUnmanaged_FunctionDependency_PostgresIntegration(t *testing.T) {
 		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schemaPrefix))
 	}()
 
-	// 1. Setup: managed table + two unmanaged functions referencing it.
-	//    f_atomic uses a SQL-standard body (BEGIN ATOMIC, PG14+): PostgreSQL
-	//    records exact table AND column dependencies in pg_depend.
-	//    f_string uses a quoted plpgsql body: no pg_depend entries exist, so
-	//    Grizzle must discover the dependency by scanning the source text.
+	// 1. Setup: managed table + two unmanaged window functions referencing it.
+	//    Functions, procedures, and aggregates are managed as of A2
+	//    (Schema.Routines), so window functions (prokind 'w') exercise the
+	//    unmanaged-dependency protection. w_atomic_ref uses a SQL-standard
+	//    body (BEGIN ATOMIC, PG14+): PostgreSQL records exact table AND
+	//    column dependencies in pg_depend. w_string_ref uses a quoted plpgsql
+	//    body: no pg_depend entries exist, so Grizzle must discover the
+	//    dependency by scanning the source text.
 	//nolint:gosec // G201: test constructs setup DDL with randomized schema prefix
 	setupSQL := fmt.Sprintf(`
 		SET search_path TO %q;
 		CREATE TABLE orders (id INT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'new');
-		CREATE FUNCTION f_atomic_ref() RETURNS text LANGUAGE SQL BEGIN ATOMIC
+		CREATE FUNCTION w_atomic_ref() RETURNS text LANGUAGE SQL WINDOW BEGIN ATOMIC
 			SELECT status FROM orders WHERE id = 1;
 		END;
-		CREATE FUNCTION f_string_ref() RETURNS text AS $$
+		CREATE FUNCTION w_string_ref() RETURNS text LANGUAGE plpgsql WINDOW AS $$
+		DECLARE
+			res TEXT;
 		BEGIN
-			RETURN (SELECT status FROM orders WHERE id = 2);
+			SELECT status INTO res FROM orders WHERE id = 2;
+			RAISE NOTICE '%%', res;
+			RETURN res;
 		END;
-		$$ LANGUAGE plpgsql;
+		$$;
 	`, schemaPrefix)
 	if _, err := db.Exec(setupSQL); err != nil {
 		t.Fatalf("setup failed: %v", err)
@@ -393,7 +411,7 @@ func TestUnmanaged_FunctionDependency_PostgresIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Inspect failed: %v", err)
 	}
-	for _, fnName := range []string{"f_atomic_ref", "f_string_ref"} {
+	for _, fnName := range []string{"w_atomic_ref", "w_string_ref"} {
 		obj, ok := ir.Unmanaged["function:"+fnName]
 		if !ok {
 			t.Fatalf("expected unmanaged function %s to be introspected, got: %v", fnName, ir.Unmanaged)

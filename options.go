@@ -5,11 +5,13 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/muandane/grizzle/internal/exec"
 	"github.com/muandane/grizzle/internal/plan"
+	"github.com/muandane/grizzle/internal/schema"
 	"github.com/muandane/grizzle/internal/scope"
 )
 
@@ -30,7 +32,9 @@ type Options struct {
 	// Dialect explicitly defines the database engine (DialectPostgres or DialectSQLite).
 	Dialect Dialect
 
-	// SchemaSQL contains the complete DDL representing the desired state.
+	// SchemaSQL contains the complete desired state. PostgreSQL role and
+	// catalog statements may share this file; they bypass shadow compilation
+	// and are merged with the optional side-channel files.
 	SchemaSQL string
 
 	// TargetSchema is the schema to manage (defaults to "public" for Postgres, "main" for SQLite).
@@ -47,12 +51,38 @@ type Options struct {
 	// Defaults to false for zero data loss.
 	AllowDrop bool
 
+	// AllowRevoke permits privilege revocation when a grant in RolesSQL is
+	// removed (access loss). Has no granular override; REVOKE_PRIVILEGE
+	// (CRITICAL) still requires AcceptHazards.
+	AllowRevoke bool
+
+	// AllowDropRole permits dropping a managed role that left RolesSQL.
+	// Has no granular override; DROP_ROLE (CRITICAL) still requires
+	// AcceptHazards.
+	AllowDropRole bool
+
+	// AllowDropPublication permits dropping a managed publication that
+	// left CatalogSQL. Has no granular override; DROP_PUBLICATION
+	// (CRITICAL) still requires AcceptHazards.
+	AllowDropPublication bool
+
+	// AllowDropEventTrigger permits dropping a managed event trigger that
+	// left CatalogSQL. Has no granular override; DROP_EVENT_TRIGGER
+	// (CRITICAL) still requires AcceptHazards.
+	AllowDropEventTrigger bool
+
 	// Granular drop overrides (nil inherits from AllowDrop):
-	AllowDropTable  *bool
-	AllowDropColumn *bool
-	AllowDropIndex  *bool
-	AllowDropFK     *bool
-	AllowDropCheck  *bool
+	AllowDropTable     *bool
+	AllowDropColumn    *bool
+	AllowDropIndex     *bool
+	AllowDropFK        *bool
+	AllowDropCheck     *bool
+	AllowDropExtension *bool
+	AllowDropFunction  *bool
+	AllowDropPolicy    *bool
+	AllowDropTrigger   *bool
+	AllowDropView      *bool
+	AllowDropDomain    *bool
 
 	// ExcludeTables defines table names or glob patterns (e.g. "spatial_ref_sys", "asynq_*")
 	// that Grizzle will never manage, alter, or drop.
@@ -159,6 +189,24 @@ type Options struct {
 	// SeedForce re-runs the seed even when the same seed hash was already
 	// applied.
 	SeedForce bool
+
+	// RolesSQL optionally supplies desired roles and privilege grants
+	// alongside SchemaSQL. Duplicate role/grant identities in this explicit
+	// side-channel override entries extracted from SchemaSQL. Role statements
+	// are never shadow-compiled, and schema DDL is not valid here. Managed
+	// roles are NOLOGIN group roles; passwords are never managed. PostgreSQL
+	// only — ignored on SQLite.
+	RolesSQL string
+
+	// CatalogSQL optionally supplies desired cluster-catalog objects alongside
+	// SchemaSQL. Duplicate publication/event-trigger names in this explicit
+	// side-channel override entries extracted from SchemaSQL. Catalog
+	// statements are never shadow-compiled or run inside the shadow
+	// transaction, and schema DDL is not valid here. Drops are narrow — only
+	// marker-stamped (grizzle-managed) objects are considered. Event triggers
+	// reference functions that must exist in SchemaSQL or as live objects.
+	// PostgreSQL only — rejected on SQLite.
+	CatalogSQL string
 
 	// SQLiteRebuildThreshold defines the row count threshold above which SQLite table rebuilds
 	// chunk data copying by keyset to prevent journal memory exhaustion.
@@ -328,7 +376,12 @@ func WithSQLiteRebuildBatching(threshold, batchSize int) Option {
 	}
 }
 
-// Validate checks whether the options are consistent and valid.
+// Validate is the canonical pure validation entry point for Options.
+// It checks SchemaSQL, strict scope, dialect value, target/shadow identifiers,
+// timeout and retry bounds, SQLite rebuild parameters, and multi-schema SQLite
+// rejection. Dialect-specific checks are skipped while Dialect is DialectAuto
+// (prepareOptions detects the dialect then re-validates). Defaults are applied
+// by prepareOptions after Validate succeeds — Validate never mutates Options.
 func (o *Options) Validate() error {
 	if strings.TrimSpace(o.SchemaSQL) == "" {
 		return ErrEmptySchema
@@ -338,10 +391,97 @@ func (o *Options) Validate() error {
 	}
 	switch o.Dialect {
 	case DialectAuto, DialectPostgres, DialectSQLite:
-		return nil
 	default:
 		return fmt.Errorf("grizzle: unsupported dialect %q", o.Dialect)
 	}
+	if o.LockTimeout < 0 {
+		return fmt.Errorf("%w: LockTimeout must be non-negative", ErrInvalidOptions)
+	}
+	if o.StatementTimeout < 0 {
+		return fmt.Errorf("%w: StatementTimeout must be non-negative", ErrInvalidOptions)
+	}
+	if o.MaxRetries < 0 {
+		return fmt.Errorf("%w: MaxRetries must be non-negative", ErrInvalidOptions)
+	}
+	if o.SQLiteRebuildThreshold < 0 {
+		return fmt.Errorf("%w: SQLiteRebuildThreshold must be non-negative", ErrInvalidOptions)
+	}
+	if o.SQLiteRebuildBatchSize < 0 {
+		return fmt.Errorf("%w: SQLiteRebuildBatchSize must be non-negative", ErrInvalidOptions)
+	}
+
+	switch o.Dialect {
+	case DialectSQLite:
+		if len(o.TargetSchemas) > 1 {
+			return ErrUnsupportedMultiSchema
+		}
+		if strings.TrimSpace(o.RolesSQL) != "" {
+			return fmt.Errorf("%w: RolesSQL requires PostgreSQL; roles are not managed on SQLite", ErrInvalidOptions)
+		}
+		if strings.TrimSpace(o.CatalogSQL) != "" {
+			return fmt.Errorf("%w: CatalogSQL requires PostgreSQL; publications and event triggers are not managed on SQLite", ErrInvalidOptions)
+		}
+	case DialectPostgres:
+		idents := append([]string{}, o.TargetSchemas...)
+		if o.TargetSchema != "" {
+			idents = append(idents, o.TargetSchema)
+		}
+		if o.LockNamespace != "" {
+			idents = append(idents, o.LockNamespace)
+		}
+		for _, id := range idents {
+			if err := validateOptionIdent(id); err != nil {
+				return err
+			}
+		}
+		if o.ShadowSchema != "" && o.ShadowSchema != "_grizzle_shadow" {
+			if len(o.ShadowSchema) > 63 {
+				return fmt.Errorf("%w: shadow schema %q exceeds 63 bytes (PostgreSQL identifier limit)", ErrInvalidOptions, o.ShadowSchema)
+			}
+			if err := validateOptionIdent(o.ShadowSchema); err != nil {
+				return fmt.Errorf("%w: shadow schema %q is not a valid SQL identifier", ErrInvalidOptions, o.ShadowSchema)
+			}
+		}
+		groups := schema.ExtractStatements(o.SchemaSQL)
+		if err := schema.ValidateRolesSQL(groups.RolesSQL); err != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidOptions, err)
+		}
+		if err := schema.ValidateCatalogSQL(groups.CatalogSQL); err != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidOptions, err)
+		}
+		if strings.TrimSpace(o.RolesSQL) != "" {
+			if err := schema.ValidateRolesSQL(o.RolesSQL); err != nil {
+				return fmt.Errorf("%w: %w", ErrInvalidOptions, err)
+			}
+		}
+		if strings.TrimSpace(o.CatalogSQL) != "" {
+			if err := schema.ValidateCatalogSQL(o.CatalogSQL); err != nil {
+				return fmt.Errorf("%w: %w", ErrInvalidOptions, err)
+			}
+		}
+		if err := schema.ValidateCatalogSpecMerge(
+			schema.ParseCatalogSQL(groups.CatalogSQL),
+			schema.ParseCatalogSQL(o.CatalogSQL),
+		); err != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidOptions, err)
+		}
+	}
+	return nil
+}
+
+var optionIdentRegex = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+
+func validateOptionIdent(ident string) error {
+	if ident == "" {
+		return nil
+	}
+	if len(ident) > 63 {
+		return fmt.Errorf("%w: identifier %q exceeds 63 bytes", ErrInvalidOptions, ident)
+	}
+	if !optionIdentRegex.MatchString(ident) {
+		return fmt.Errorf("%w: identifier %q is not a valid SQL identifier", ErrInvalidOptions, ident)
+	}
+	return nil
 }
 
 // resolveDropPolicy extracts the effective fine-grained drop policy from Options.
@@ -371,12 +511,61 @@ func resolveDropPolicy(opts Options) plan.DropPolicy {
 		allowCheck = *opts.AllowDropCheck
 	}
 
+	allowExtension := opts.AllowDrop
+	if opts.AllowDropExtension != nil {
+		allowExtension = *opts.AllowDropExtension
+	}
+
+	allowFunction := opts.AllowDrop
+	if opts.AllowDropFunction != nil {
+		allowFunction = *opts.AllowDropFunction
+	}
+
+	allowPolicy := opts.AllowDrop
+	if opts.AllowDropPolicy != nil {
+		allowPolicy = *opts.AllowDropPolicy
+	}
+
+	allowTrigger := opts.AllowDrop
+	if opts.AllowDropTrigger != nil {
+		allowTrigger = *opts.AllowDropTrigger
+	}
+
+	allowView := opts.AllowDrop
+	if opts.AllowDropView != nil {
+		allowView = *opts.AllowDropView
+	}
+
+	allowDomain := opts.AllowDrop
+	if opts.AllowDropDomain != nil {
+		allowDomain = *opts.AllowDropDomain
+	}
+
+	// Privilege-loss gates follow the same blanket-override rule as every
+	// other drop gate: they can also be set directly on Options so a plan
+	// artifact's recorded policy round-trips through optionsFromPlan.
+	// CRITICAL hazards still apply.
+	allowRevoke := opts.AllowDrop || opts.AllowRevoke
+	allowDropRole := opts.AllowDrop || opts.AllowDropRole
+	allowDropPublication := opts.AllowDrop || opts.AllowDropPublication
+	allowDropEventTrigger := opts.AllowDrop || opts.AllowDropEventTrigger
+
 	return plan.DropPolicy{
-		AllowTable:  allowTable,
-		AllowColumn: allowColumn,
-		AllowIndex:  allowIndex,
-		AllowFK:     allowFK,
-		AllowCheck:  allowCheck,
+		AllowTable:            allowTable,
+		AllowColumn:           allowColumn,
+		AllowIndex:            allowIndex,
+		AllowFK:               allowFK,
+		AllowCheck:            allowCheck,
+		AllowExtension:        allowExtension,
+		AllowFunction:         allowFunction,
+		AllowPolicy:           allowPolicy,
+		AllowTrigger:          allowTrigger,
+		AllowView:             allowView,
+		AllowDomain:           allowDomain,
+		AllowRevoke:           allowRevoke,
+		AllowDropRole:         allowDropRole,
+		AllowDropPublication:  allowDropPublication,
+		AllowDropEventTrigger: allowDropEventTrigger,
 	}
 }
 

@@ -500,7 +500,7 @@ func TestMultiSchema_CircularCrossSchemaFKs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PlanDiff static drop failed: %v", err)
 	}
-	const goldenCircularDropHash = "297c08ffded2b2a01104c0679da2e071a699f189ba1d2896f77aec1fda2d2032"
+	const goldenCircularDropHash = "a1d6725512d17779358410cd6fb5ba22fea3a9bc3b9b20e079163b00b529f767"
 	if staticDropPlan.Hash() != goldenCircularDropHash {
 		t.Errorf("circular FK drop plan golden hash mismatch:\ngot:  %s\nwant: %s", staticDropPlan.Hash(), goldenCircularDropHash)
 	}

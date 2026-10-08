@@ -251,6 +251,17 @@ func NormalizeDefinitionWithMappings(def string, mappings map[string]string, cur
 		head = strings.ReplaceAll(head, ","+s+".", ",")
 		head = strings.ReplaceAll(head, ",\""+s+"\".", ",")
 
+		// Strip schema from routine references. pg_get_functiondef and
+		// pg_get_triggerdef qualify routine names depending on the session
+		// search_path, so live and shadow inspections can disagree. Only the
+		// first occurrence is rewritten: the canonical pg_get_*def header
+		// (CREATE ... FUNCTION / EXECUTE FUNCTION), never string literals in
+		// routine bodies.
+		head = strings.Replace(head, " FUNCTION "+s+".", " FUNCTION ", 1)
+		head = strings.Replace(head, ` FUNCTION "`+s+`".`, ` FUNCTION "`, 1)
+		head = strings.Replace(head, " PROCEDURE "+s+".", " PROCEDURE ", 1)
+		head = strings.Replace(head, ` PROCEDURE "`+s+`".`, ` PROCEDURE "`, 1)
+
 		// Normalize type casts "::<schema>." in predicate and header
 		if hasPred {
 			pred = strings.ReplaceAll(pred, "::"+s+".", "::")

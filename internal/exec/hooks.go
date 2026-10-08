@@ -2,6 +2,8 @@ package exec
 
 import (
 	"context"
+	"fmt"
+	"runtime/debug"
 
 	"github.com/muandane/grizzle/internal/dialect"
 	"github.com/muandane/grizzle/internal/plan"
@@ -36,34 +38,64 @@ type StepHook func(ctx HookContext) error
 // Hooks must be idempotent for the same reason as StepHook.
 type SyncHook func(ctx context.Context, dbtx dialect.DBTX) error
 
-// callBeforeStep invokes the BeforeStep hook if set.
-func callBeforeStep(hook StepHook, hc HookContext) error {
+// recoverHookPanic converts a panic escaping a user hook into an error that
+// carries the goroutine stack, so a faulty hook cannot crash the host process.
+func recoverHookPanic(panicResult any) error {
+	return fmt.Errorf("grizzle: hook panicked: %v\n%s", panicResult, debug.Stack())
+}
+
+// callBeforeStep invokes the BeforeStep hook if set. Hook panics are recovered
+// and returned as errors.
+func callBeforeStep(hook StepHook, hc HookContext) (err error) {
 	if hook == nil {
 		return nil
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = recoverHookPanic(r)
+		}
+	}()
 	return hook(hc)
 }
 
-// callAfterStep invokes the AfterStep hook if set.
-func callAfterStep(hook StepHook, hc HookContext) error {
+// callAfterStep invokes the AfterStep hook if set. Hook panics are recovered
+// and returned as errors.
+func callAfterStep(hook StepHook, hc HookContext) (err error) {
 	if hook == nil {
 		return nil
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = recoverHookPanic(r)
+		}
+	}()
 	return hook(hc)
 }
 
-// callBeforeSync invokes the BeforeSync hook if set.
-func callBeforeSync(hook SyncHook, ctx context.Context, dbtx dialect.DBTX) error {
+// callBeforeSync invokes the BeforeSync hook if set. Hook panics are recovered
+// and returned as errors.
+func callBeforeSync(hook SyncHook, ctx context.Context, dbtx dialect.DBTX) (err error) {
 	if hook == nil {
 		return nil
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = recoverHookPanic(r)
+		}
+	}()
 	return hook(ctx, dbtx)
 }
 
-// callAfterSync invokes the AfterSync hook if set.
-func callAfterSync(hook SyncHook, ctx context.Context, dbtx dialect.DBTX) error {
+// callAfterSync invokes the AfterSync hook if set. Hook panics are recovered
+// and returned as errors.
+func callAfterSync(hook SyncHook, ctx context.Context, dbtx dialect.DBTX) (err error) {
 	if hook == nil {
 		return nil
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = recoverHookPanic(r)
+		}
+	}()
 	return hook(ctx, dbtx)
 }

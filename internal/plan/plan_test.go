@@ -62,6 +62,28 @@ func TestPlan_Hazards(t *testing.T) {
 	}
 }
 
+func TestPlan_PublicationNarrowingRequiresDropPolicyAndHazard(t *testing.T) {
+	p := &plan.Plan{Steps: []plan.Step{{
+		Type:        plan.ChangeAlterPublication,
+		Table:       "docs_pub",
+		SQL:         `ALTER PUBLICATION "docs_pub" DROP TABLE "public"."archive";`,
+		Destructive: true,
+	}}}
+	if p.Policy.IsAllowed(p.Steps[0]) {
+		t.Fatal("destructive ALTER_PUBLICATION must require AllowDropPublication")
+	}
+	p.Policy.AllowDropPublication = true
+	if !p.Policy.IsAllowed(p.Steps[0]) {
+		t.Fatal("AllowDropPublication should permit destructive publication ALTER")
+	}
+	if err := p.ValidateHazards(nil); err == nil {
+		t.Fatal("publication narrowing must require DROP_PUBLICATION hazard acceptance")
+	}
+	if err := p.ValidateHazards([]plan.HazardCode{plan.HazardDropPublication}); err != nil {
+		t.Fatalf("accepted DROP_PUBLICATION hazard should pass: %v", err)
+	}
+}
+
 func TestPlan_Format(t *testing.T) {
 	p := &plan.Plan{
 		TargetSchema: "public",
@@ -77,6 +99,43 @@ func TestPlan_Format(t *testing.T) {
 	out := buf.String()
 	if !strings.Contains(out, "CREATE TABLE users ();") {
 		t.Errorf("Format missing step SQL: %s", out)
+	}
+}
+
+func TestPlan_GeneratedRewrite_RequiresAcceptHazards(t *testing.T) {
+	p := &plan.Plan{
+		Steps: []plan.Step{{
+			Type:               plan.ChangeAlterColumn,
+			Table:              "products",
+			SQL:                "ALTER TABLE products DROP COLUMN tax; ALTER TABLE products ADD COLUMN tax numeric GENERATED ALWAYS AS (price * 0.2) STORED;",
+			IsGeneratedRewrite: true,
+		}},
+	}
+	err := p.ValidateHazards(nil)
+	if err == nil {
+		t.Fatal("expected ValidateHazards to block GENERATED_REWRITE without acceptance")
+	}
+	var he *plan.HazardError
+	if !errors.As(err, &he) {
+		t.Fatalf("expected HazardError, got %T: %v", err, err)
+	}
+	found := false
+	for _, h := range he.Hazards {
+		if h.Code == plan.HazardGeneratedRewrite && h.Level == plan.HazardLevelCritical {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected CRITICAL GENERATED_REWRITE in HazardError, got %+v", he.Hazards)
+	}
+	if err := p.ValidateHazards([]plan.HazardCode{plan.HazardGeneratedRewrite}); err != nil {
+		t.Fatalf("accepted GENERATED_REWRITE should pass: %v", err)
+	}
+	// Hash stable across hazard analysis (hazards are derived, not hashed).
+	h1 := p.Hash()
+	_ = p.Hazards()
+	if p.Hash() != h1 {
+		t.Fatal("Hazards() must not change plan hash")
 	}
 }
 

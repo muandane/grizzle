@@ -3,11 +3,13 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"regexp"
 	"strings"
 
 	"github.com/muandane/grizzle/internal/dialect"
 	"github.com/muandane/grizzle/internal/plan"
+	"github.com/muandane/grizzle/internal/schema"
 )
 
 var validIdentRegex = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
@@ -47,14 +49,33 @@ func RunShadowDDL(ctx context.Context, dbtx dialect.DBTX, shadowSchema, targetSc
 		return fmt.Errorf("failed setting search_path to %q: %w", shadowSchema, err)
 	}
 
-	if _, err := dbtx.ExecContext(ctx, schemaSQL); err != nil {
-		if immErr := wrapImmutableIndexError(err, schemaSQL); immErr != err {
-			return fmt.Errorf("schema compilation in shadow schema failed: %w", immErr)
+	// Strip CREATE EXTENSION from the main DDL body, then best-effort install
+	// into the shadow schema so extension-provided types (citext, etc.) resolve
+	// during compile. Failures are ignored per statement (privilege / already
+	// installed); the desired Extensions IR comes from statement parsing.
+	cleanedSQL, extStmts := schema.StripExtensionStatements(schemaSQL)
+	for _, extStmt := range extStmts {
+		rewritten := rewriteExtensionSchema(extStmt, shadowSchema)
+		_, _ = dbtx.ExecContext(ctx, rewritten)
+	}
+
+	ddlSQL := cleanedSQL
+	if strings.TrimSpace(ddlSQL) == "" {
+		ddlSQL = schemaSQL // no extensions stripped; run original
+		if len(extStmts) > 0 {
+			ddlSQL = "" // schema was extension-only
 		}
-		if partErr := wrapPartitionShadowError(err); partErr != err {
-			return fmt.Errorf("schema compilation in shadow schema failed: %w", partErr)
+	}
+	if strings.TrimSpace(ddlSQL) != "" {
+		if _, err := dbtx.ExecContext(ctx, ddlSQL); err != nil {
+			if immErr := wrapImmutableIndexError(err, schemaSQL); immErr != err {
+				return fmt.Errorf("schema compilation in shadow schema failed: %w", immErr)
+			}
+			if partErr := wrapPartitionShadowError(err); partErr != err {
+				return fmt.Errorf("schema compilation in shadow schema failed: %w", partErr)
+			}
+			return fmt.Errorf("schema compilation in shadow schema failed: %w", err)
 		}
-		return fmt.Errorf("schema compilation in shadow schema failed: %w", err)
 	}
 
 	restorePathSQL := fmt.Sprintf("SET LOCAL search_path TO %q, public;", targetSchema)
@@ -78,7 +99,11 @@ func DropShadowSchema(ctx context.Context, dbtx dialect.DBTX, shadowSchema strin
 }
 
 // ComputeShadowSchemas returns a mapping from each target schema to its mirroring shadow schema.
-// Single schema "public" defaults to "_grizzle_shadow" for backward compatibility.
+// Names are bounded to PostgreSQL's 63-byte identifier limit. When truncation
+// would collide, a deterministic FNV-1a suffix keyed on the full target name
+// disambiguates. Single schema "public" with the default prefix stays
+// "_grizzle_shadow" for backward compatibility when the prefix is exactly that
+// default (unique per-run prefixes always include the target disambiguator).
 func ComputeShadowSchemas(shadowPrefix string, targetSchemas []string) map[string]string {
 	prefix := shadowPrefix
 	if prefix == "" {
@@ -89,10 +114,44 @@ func ComputeShadowSchemas(shadowPrefix string, targetSchemas []string) map[strin
 		m[targetSchemas[0]] = "_grizzle_shadow"
 		return m
 	}
+	used := make(map[string]string, len(targetSchemas))
 	for _, s := range targetSchemas {
-		m[s] = prefix + "_" + s
+		name := boundShadowName(prefix, s)
+		if other, ok := used[name]; ok && other != s {
+			// Extremely unlikely with FNV suffix; force a second suffix pass.
+			name = boundShadowName(prefix+"_"+fmt.Sprintf("%08x", fnv32a(prefix+s)), s)
+		}
+		used[name] = s
+		m[s] = name
 	}
 	return m
+}
+
+const pgMaxIdentLen = 63
+
+func fnv32a(s string) uint32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(s))
+	return h.Sum32()
+}
+
+// boundShadowName builds prefix_target truncated to 63 bytes with a
+// deterministic hash suffix when truncation is required.
+func boundShadowName(prefix, target string) string {
+	name := prefix + "_" + target
+	if len(name) <= pgMaxIdentLen {
+		return name
+	}
+	suffix := fmt.Sprintf("_%08x", fnv32a(target))
+	baseBudget := pgMaxIdentLen - len(suffix)
+	if baseBudget < 1 {
+		return suffix[1:] // unreachable for normal prefixes; keep identifier-shaped
+	}
+	base := prefix + "_" + target
+	if len(base) > baseBudget {
+		base = base[:baseBudget]
+	}
+	return base + suffix
 }
 
 // SetupShadowSchemas creates clean, isolated temporary shadow schemas for DDL compilation.
@@ -143,15 +202,28 @@ func RunMultiShadowDDL(ctx context.Context, dbtx dialect.DBTX, shadowMap map[str
 		return fmt.Errorf("failed setting multi-schema shadow search_path: %w", err)
 	}
 
-	rewrittenSQL := RewriteShadowSQL(schemaSQL, shadowMap)
-	if _, err := dbtx.ExecContext(ctx, rewrittenSQL); err != nil {
-		if immErr := wrapImmutableIndexError(err, schemaSQL); immErr != err {
-			return fmt.Errorf("schema compilation in shadow schema failed: %w", immErr)
+	cleanedSQL, extStmts := schema.StripExtensionStatements(schemaSQL)
+	primaryShadow := shadowQuoted[0]
+	// Best-effort install extensions into the first shadow schema.
+	for _, extStmt := range extStmts {
+		rewritten := rewriteExtensionSchema(RewriteShadowSQL(extStmt, shadowMap), strings.Trim(primaryShadow, `"`))
+		_, _ = dbtx.ExecContext(ctx, rewritten)
+	}
+	ddlSQL := cleanedSQL
+	if strings.TrimSpace(ddlSQL) == "" && len(extStmts) == 0 {
+		ddlSQL = schemaSQL
+	}
+	if strings.TrimSpace(ddlSQL) != "" {
+		rewrittenSQL := RewriteShadowSQL(ddlSQL, shadowMap)
+		if _, err := dbtx.ExecContext(ctx, rewrittenSQL); err != nil {
+			if immErr := wrapImmutableIndexError(err, schemaSQL); immErr != err {
+				return fmt.Errorf("schema compilation in shadow schema failed: %w", immErr)
+			}
+			if partErr := wrapPartitionShadowError(err); partErr != err {
+				return fmt.Errorf("schema compilation in shadow schema failed: %w", partErr)
+			}
+			return fmt.Errorf("schema compilation in shadow schema failed: %w", err)
 		}
-		if partErr := wrapPartitionShadowError(err); partErr != err {
-			return fmt.Errorf("schema compilation in shadow schema failed: %w", partErr)
-		}
-		return fmt.Errorf("schema compilation in shadow schema failed: %w", err)
 	}
 
 	restorePathSQL := fmt.Sprintf("SET LOCAL search_path TO %s, public;", strings.Join(targetQuoted, ", "))
@@ -357,6 +429,19 @@ func RewriteShadowSQL(sqlStr string, shadowMap map[string]string) string {
 	}
 
 	return b.String()
+}
+
+// rewriteExtensionSchema forces WITH SCHEMA to the shadow schema so
+// extension objects land in the compile sandbox when possible.
+func rewriteExtensionSchema(stmt, shadowSchema string) string {
+	upper := strings.ToUpper(stmt)
+	if strings.Contains(upper, "WITH SCHEMA") {
+		// Replace existing WITH SCHEMA clause target.
+		re := regexp.MustCompile(`(?i)WITH\s+SCHEMA\s+("[^"]+"|[a-zA-Z_][\w$]*)`)
+		return re.ReplaceAllString(stmt, "WITH SCHEMA "+quoteIdentifier(shadowSchema))
+	}
+	trimmed := strings.TrimRight(strings.TrimSpace(stmt), ";")
+	return trimmed + " WITH SCHEMA " + quoteIdentifier(shadowSchema)
 }
 
 func wrapPartitionShadowError(err error) error {

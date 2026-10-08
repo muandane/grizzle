@@ -5,6 +5,7 @@
   env = {
     DATABASE_URL = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable";
     POSTGRES_DSN = "postgres://127.0.0.1:5432/grizzle_test?sslmode=disable";
+    GOTOOLCHAIN = lib.mkForce "auto";
   };
 
   # Go Language Support

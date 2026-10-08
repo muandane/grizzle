@@ -62,6 +62,12 @@ var (
 	// ErrSeedFailed is returned when seed SQL execution fails; the seed
 	// transaction is rolled back and the schema is left intact.
 	ErrSeedFailed = errors.New("grizzle: seed execution failed")
+
+	// ErrHistoryRecord is returned when the migration itself succeeded but
+	// the grizzle_history record could not be written. It is non-fatal in
+	// the sense that the schema changes are committed; callers may treat it
+	// as advisory via errors.Is and re-record or alert.
+	ErrHistoryRecord = errors.New("grizzle: migration succeeded but history record was not written")
 )
 
 // HazardError reports all critical hazards that were not explicitly accepted.

@@ -7,6 +7,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"time"
 )
 
 // ChangeType describes the category of a schema mutation.
@@ -31,6 +32,59 @@ const (
 	ChangeValidateConstraint ChangeType = "VALIDATE_CONSTRAINT"
 	ChangeAttachPartition    ChangeType = "ATTACH_PARTITION"
 	ChangeDetachPartition    ChangeType = "DETACH_PARTITION"
+	ChangeCreateExtension    ChangeType = "CREATE_EXTENSION"
+	ChangeDropExtension      ChangeType = "DROP_EXTENSION"
+	ChangeEnableRLS          ChangeType = "ENABLE_RLS"
+	ChangeDisableRLS         ChangeType = "DISABLE_RLS"
+	ChangeForceRLS           ChangeType = "FORCE_RLS"
+	ChangeNoForceRLS         ChangeType = "NO_FORCE_RLS"
+	ChangeCreatePolicy       ChangeType = "CREATE_POLICY"
+	ChangeDropPolicy         ChangeType = "DROP_POLICY"
+	ChangeCreateFunction     ChangeType = "CREATE_FUNCTION"
+	ChangeDropFunction       ChangeType = "DROP_FUNCTION"
+	// ChangeCreateAggregate / ChangeDropAggregate exist only for plan sort
+	// ordering: aggregates must be created after and dropped before their
+	// support functions (pg_depend makes the reverse order fail). Gates and
+	// hazards remain shared with functions (AllowFunction / DROP_FUNCTION).
+	ChangeCreateAggregate ChangeType = "CREATE_AGGREGATE"
+	ChangeDropAggregate   ChangeType = "DROP_AGGREGATE"
+	// ChangeCreateDomain / ChangeAlterDomain / ChangeDropDomainConstraint /
+	// ChangeDropDomain manage PostgreSQL domains. ALTER_DOMAIN adds a domain
+	// constraint; dropping a constraint is its own type so plan sorting runs
+	// it before the replacement ADD (same-name constraint redefinition).
+	// ChangeDropDomainRetype is the drop half of a base-type/nullability/
+	// default rebuild: it must run before the replacement CREATE_DOMAIN
+	// (same name), so it sorts early — unlike a live-only DROP_DOMAIN, which
+	// must wait until dependent tables have been dropped.
+	ChangeCreateDomain         ChangeType = "CREATE_DOMAIN"
+	ChangeAlterDomain          ChangeType = "ALTER_DOMAIN"
+	ChangeDropDomainConstraint ChangeType = "DROP_DOMAIN_CONSTRAINT"
+	ChangeDropDomain           ChangeType = "DROP_DOMAIN"
+	ChangeDropDomainRetype     ChangeType = "DROP_DOMAIN_RETYPE"
+	ChangeCreateTrigger        ChangeType = "CREATE_TRIGGER"
+	ChangeDropTrigger          ChangeType = "DROP_TRIGGER"
+	ChangeCreateView           ChangeType = "CREATE_VIEW"
+	ChangeDropView             ChangeType = "DROP_VIEW"
+	ChangeRefreshMatView       ChangeType = "REFRESH_MATVIEW"
+	ChangeCommentTable         ChangeType = "COMMENT_TABLE"
+	ChangeCommentColumn        ChangeType = "COMMENT_COLUMN"
+	// RolesSQL surface: managed NOLOGIN roles and object privilege grants.
+	// GRANT/REVOKE steps sort after all schema DDL; CREATE_ROLE precedes the
+	// grants that reference the role.
+	ChangeGrant       ChangeType = "GRANT"
+	ChangeRevoke      ChangeType = "REVOKE"
+	ChangeCreateRole  ChangeType = "CREATE_ROLE"
+	ChangeRoleComment ChangeType = "ROLE_COMMENT"
+	ChangeDropRole    ChangeType = "DROP_ROLE"
+	// CatalogSQL surface: publications and event triggers (statement-scan
+	// only, never shadow-compiled). Sorted after roles steps; event triggers
+	// come last because they fire on subsequent DDL.
+	ChangeCreatePublication  ChangeType = "CREATE_PUBLICATION"
+	ChangeAlterPublication   ChangeType = "ALTER_PUBLICATION"
+	ChangeDropPublication    ChangeType = "DROP_PUBLICATION"
+	ChangeCreateEventTrigger ChangeType = "CREATE_EVENT_TRIGGER"
+	ChangeAlterEventTrigger  ChangeType = "ALTER_EVENT_TRIGGER"
+	ChangeDropEventTrigger   ChangeType = "DROP_EVENT_TRIGGER"
 )
 
 // Step represents a single atomic DDL migration statement.
@@ -66,15 +120,33 @@ type Step struct {
 	// constraint (as opposed to a foreign key). Used for hazard classification
 	// (CHECK validate runs a full table scan under SHARE UPDATE EXCLUSIVE).
 	ValidatesCheck bool `json:"validates_check,omitzero"`
+
+	// Replace marks a CREATE_VIEW step rendered as CREATE OR REPLACE VIEW.
+	Replace bool `json:"replace,omitzero"`
+
+	// OldComment carries the previous COMMENT ON value for comment steps so
+	// migration export can restore it on rollback.
+	OldComment string `json:"old_comment,omitzero"`
 }
 
 // DropPolicy defines fine-grained permissions for destructive operations.
 type DropPolicy struct {
-	AllowTable  bool `json:"allow_table"`
-	AllowColumn bool `json:"allow_column"`
-	AllowIndex  bool `json:"allow_index"`
-	AllowFK     bool `json:"allow_fk"`
-	AllowCheck  bool `json:"allow_check"`
+	AllowTable     bool `json:"allow_table"`
+	AllowColumn    bool `json:"allow_column"`
+	AllowIndex     bool `json:"allow_index"`
+	AllowFK        bool `json:"allow_fk"`
+	AllowCheck     bool `json:"allow_check"`
+	AllowExtension bool `json:"allow_extension"`
+	AllowFunction  bool `json:"allow_function"`
+	AllowPolicy    bool `json:"allow_policy"`
+	AllowTrigger   bool `json:"allow_trigger"`
+	AllowView      bool `json:"allow_view"`
+	AllowDomain    bool `json:"allow_domain"`
+	AllowRevoke    bool `json:"allow_revoke"`
+	AllowDropRole  bool `json:"allow_drop_role"`
+	// CatalogSQL surface gates.
+	AllowDropPublication  bool `json:"allow_drop_publication"`
+	AllowDropEventTrigger bool `json:"allow_drop_event_trigger"`
 }
 
 // IsAllowed checks if a given migration step is permitted by the policy.
@@ -95,6 +167,35 @@ func (p DropPolicy) IsAllowed(s Step) bool {
 		return p.AllowCheck
 	case ChangeAlterColumn:
 		return p.AllowColumn
+	case ChangeDropExtension:
+		return p.AllowExtension
+	case ChangeDropFunction, ChangeDropAggregate:
+		// Aggregates share the function drop gate: both are managed routines
+		// with the same replacement semantics (no CREATE OR REPLACE).
+		return p.AllowFunction
+	case ChangeDropPolicy:
+		return p.AllowPolicy
+	case ChangeDropTrigger:
+		return p.AllowTrigger
+	case ChangeDropView:
+		return p.AllowView
+	case ChangeDropDomain, ChangeDropDomainConstraint, ChangeDropDomainRetype:
+		// Dropping a domain (or a domain constraint) removes validation and
+		// can strand columns typed by the domain; a single gate covers all.
+		return p.AllowDomain
+	case ChangeRevoke:
+		return p.AllowRevoke
+	case ChangeDropRole:
+		return p.AllowDropRole
+	case ChangeDropPublication:
+		return p.AllowDropPublication
+	case ChangeAlterPublication:
+		// Membership removals and publish-flag reductions are destructive
+		// replication-surface changes even though PostgreSQL renders them as
+		// ALTER PUBLICATION.
+		return p.AllowDropPublication
+	case ChangeDropEventTrigger:
+		return p.AllowDropEventTrigger
 	default:
 		return false
 	}
@@ -111,6 +212,29 @@ type Plan struct {
 	Renames        map[string]string `json:"renames,omitzero"`
 	ExpandContract bool              `json:"expand_contract,omitzero"`
 	SchemaSQL      string            `json:"schema_sql,omitzero"`
+	// RolesSQL is the desired roles/grants file (side-channel contract, never
+	// shadow-compiled). Approval-sensitive: participates in Hash() when
+	// non-empty.
+	RolesSQL string `json:"roles_sql,omitzero"`
+	// CatalogSQL is the desired publications/event-triggers file
+	// (side-channel contract, never shadow-compiled). Approval-sensitive:
+	// participates in Hash() when non-empty.
+	CatalogSQL string `json:"catalog_sql,omitzero"`
+
+	// NonConcurrentIndexes affects generated SQL (CONCURRENTLY vs
+	// transactional CREATE INDEX) and is therefore approval-sensitive:
+	// it participates in Hash().
+	NonConcurrentIndexes bool `json:"non_concurrent_indexes,omitempty"`
+
+	// Operational timeouts persisted so direct apply can reproduce the
+	// timeout posture used at plan time. Bounded by ValidateExecutionFields;
+	// they do NOT participate in Hash() because they cannot change executed
+	// SQL or destructive policy. Lock identity and shadow schema names are
+	// never persisted: LockID is derived at apply from trusted target
+	// identity, LockNamespace is an ApplyOpts runtime option, and shadow
+	// schemas are generated ephemerally at apply time.
+	LockTimeout      time.Duration `json:"lock_timeout_ns,omitempty"`
+	StatementTimeout time.Duration `json:"statement_timeout_ns,omitempty"`
 }
 
 // Hash computes a deterministic SHA-256 hex digest of the canonical step list and scope.
@@ -126,16 +250,14 @@ func (p *Plan) Hash() string {
 		_, _ = fmt.Fprintf(h, format, args...)
 	}
 
-	schema := p.TargetSchema
-	if len(p.TargetSchemas) > 1 {
+	write("schema:%s\n", p.TargetSchema)
+	if len(p.TargetSchemas) > 0 {
 		schemas := slices.Clone(p.TargetSchemas)
 		slices.Sort(schemas)
 		schemas = slices.Compact(schemas)
-		schema = schemas[0]
-		write("schema:%s\n", schema)
-		write("schemas:%s\n", strings.Join(schemas, ","))
-	} else {
-		write("schema:%s\n", schema)
+		if len(schemas) > 0 {
+			write("schemas:%s\n", strings.Join(schemas, ","))
+		}
 	}
 	write("includes:%s\n", strings.Join(includes, ","))
 	write("excludes:%s\n", strings.Join(excludes, ","))
@@ -149,6 +271,25 @@ func (p *Plan) Hash() string {
 	}
 	if p.ExpandContract {
 		write("expand_contract:true\n")
+	}
+	write("policy:%t,%t,%t,%t,%t,%t,%t,%t,%t,%t,%t,%t,%t,%t,%t\n",
+		p.Policy.AllowTable, p.Policy.AllowColumn, p.Policy.AllowIndex,
+		p.Policy.AllowFK, p.Policy.AllowCheck,
+		p.Policy.AllowExtension, p.Policy.AllowFunction, p.Policy.AllowPolicy,
+		p.Policy.AllowTrigger, p.Policy.AllowView, p.Policy.AllowDomain,
+		p.Policy.AllowRevoke, p.Policy.AllowDropRole,
+		p.Policy.AllowDropPublication, p.Policy.AllowDropEventTrigger)
+	if p.NonConcurrentIndexes {
+		write("non_concurrent:true\n")
+	}
+	if p.SchemaSQL != "" {
+		write("schema_sql:%s\n", p.SchemaSQL)
+	}
+	if p.RolesSQL != "" {
+		write("roles_sql:%s\n", p.RolesSQL)
+	}
+	if p.CatalogSQL != "" {
+		write("catalog_sql:%s\n", p.CatalogSQL)
 	}
 
 	for i, s := range p.Steps {
@@ -196,7 +337,10 @@ func (p *Plan) Additions() int {
 	count := 0
 	for _, s := range p.Steps {
 		switch s.Type {
-		case ChangeCreateEnum, ChangeCreateTable, ChangeAddColumn, ChangeCreateIndex, ChangeAddFK, ChangeAddCheck:
+		case ChangeCreateEnum, ChangeCreateTable, ChangeAddColumn, ChangeCreateIndex, ChangeAddFK, ChangeAddCheck,
+			ChangeCreateExtension, ChangeCreatePolicy, ChangeCreateFunction, ChangeCreateAggregate, ChangeCreateTrigger, ChangeCreateView,
+			ChangeEnableRLS, ChangeForceRLS, ChangeCreateDomain, ChangeCreateRole, ChangeGrant,
+			ChangeCreatePublication, ChangeCreateEventTrigger:
 			count++
 		}
 	}
@@ -208,7 +352,9 @@ func (p *Plan) Modifications() int {
 	count := 0
 	for _, s := range p.Steps {
 		switch s.Type {
-		case ChangeAlterColumn, ChangeAlterEnum:
+		case ChangeAlterColumn, ChangeAlterEnum, ChangeRefreshMatView,
+			ChangeDisableRLS, ChangeNoForceRLS, ChangeAlterDomain, ChangeRevoke,
+			ChangeAlterPublication, ChangeAlterEventTrigger:
 			count++
 		}
 	}
@@ -220,7 +366,10 @@ func (p *Plan) Deletions() int {
 	count := 0
 	for _, s := range p.Steps {
 		switch s.Type {
-		case ChangeDropTable, ChangeDropColumn, ChangeDropIndex, ChangeDropFK, ChangeDropCheck:
+		case ChangeDropTable, ChangeDropColumn, ChangeDropIndex, ChangeDropFK, ChangeDropCheck,
+			ChangeDropExtension, ChangeDropPolicy, ChangeDropFunction, ChangeDropAggregate, ChangeDropTrigger, ChangeDropView,
+			ChangeDropDomain, ChangeDropDomainConstraint, ChangeDropDomainRetype, ChangeDropRole,
+			ChangeDropPublication, ChangeDropEventTrigger:
 			count++
 		}
 	}
@@ -276,6 +425,42 @@ const (
 	HazardPartitionAttachScan HazardCode = "PARTITION_ATTACH_SCAN"
 	// HazardPartitionPendingDetach indicates an interrupted pending-detach state requiring finalization.
 	HazardPartitionPendingDetach HazardCode = "PARTITION_PENDING_DETACH"
+	// HazardExtensionPrivilege indicates CREATE EXTENSION may require elevated privileges.
+	HazardExtensionPrivilege HazardCode = "EXTENSION_PRIVILEGE"
+	// HazardDropExtension indicates dropping a PostgreSQL extension.
+	HazardDropExtension HazardCode = "DROP_EXTENSION"
+	// HazardDropPolicy indicates dropping a row-level security policy.
+	HazardDropPolicy HazardCode = "DROP_POLICY"
+	// HazardRLSEnable indicates enabling RLS may lock out roles without matching policies.
+	HazardRLSEnable HazardCode = "RLS_ENABLE"
+	// HazardDropFunction indicates dropping a function or procedure.
+	HazardDropFunction HazardCode = "DROP_FUNCTION"
+	// HazardSecurityDefiner indicates a SECURITY DEFINER routine without an explicit search_path.
+	HazardSecurityDefiner HazardCode = "SECURITY_DEFINER"
+	// HazardDropTrigger indicates dropping a trigger.
+	HazardDropTrigger HazardCode = "DROP_TRIGGER"
+	// HazardDropView indicates dropping a view or materialized view.
+	HazardDropView HazardCode = "DROP_VIEW"
+	// HazardDropDomain indicates dropping a domain or a domain CHECK constraint.
+	HazardDropDomain HazardCode = "DROP_DOMAIN"
+	// HazardRevokePrivilege indicates a privilege is being revoked (access loss).
+	HazardRevokePrivilege HazardCode = "REVOKE_PRIVILEGE"
+	// HazardDropRole indicates dropping a Grizzle-managed role.
+	HazardDropRole HazardCode = "DROP_ROLE"
+	// HazardGrantPublic indicates privileges are granted to PUBLIC (ambient access).
+	HazardGrantPublic HazardCode = "GRANT_PUBLIC"
+	// HazardDropPublication indicates dropping a managed publication.
+	HazardDropPublication HazardCode = "DROP_PUBLICATION"
+	// HazardDropEventTrigger indicates dropping a managed event trigger.
+	HazardDropEventTrigger HazardCode = "DROP_EVENT_TRIGGER"
+	// HazardEventTriggerSuperuser indicates event-trigger DDL may require
+	// superuser or elevated privileges.
+	HazardEventTriggerSuperuser HazardCode = "EVENT_TRIGGER_SUPERUSER"
+	// HazardPublicationAllTables indicates a publication publishes every
+	// table in the database (ambient replication surface).
+	HazardPublicationAllTables HazardCode = "PUBLICATION_ALL_TABLES"
+	// HazardCommentClear indicates an existing COMMENT is being replaced or cleared.
+	HazardCommentClear HazardCode = "COMMENT_CLEAR"
 )
 
 // HazardLevel indicates the operational or data-loss severity of a migration step.
@@ -326,12 +511,15 @@ func stepHazards(s Step) []Hazard {
 		})
 	}
 	if s.IsGeneratedRewrite {
+		// CRITICAL: generated-column rewrites are rendered as DROP COLUMN +
+		// ADD COLUMN (PostgreSQL) or full table rebuild (SQLite), so they are
+		// materially destructive and must be explicitly accepted.
 		hazards = append(hazards, Hazard{
 			Code:        HazardGeneratedRewrite,
-			Level:       HazardLevelWarning,
+			Level:       HazardLevelCritical,
 			Type:        s.Type,
 			Table:       s.Table,
-			Description: fmt.Sprintf("Generated column on table %q expression modified; requires table rewrite", s.Table),
+			Description: fmt.Sprintf("Generated column on table %q expression modified; requires destructive rewrite (drop/recreate column or table rebuild)", s.Table),
 			SQL:         s.SQL,
 		})
 	}
@@ -464,6 +652,198 @@ func stepHazards(s Step) []Hazard {
 				Type:        s.Type,
 				Table:       s.Table,
 				Description: fmt.Sprintf("Validating check constraint on table %q runs a full table scan under SHARE UPDATE EXCLUSIVE lock", s.Table),
+				SQL:         s.SQL,
+			})
+		}
+	case ChangeCreateExtension:
+		hazards = append(hazards, Hazard{
+			Code:        HazardExtensionPrivilege,
+			Level:       HazardLevelWarning,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Creating extension %q may require superuser or CREATE privilege on the database", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeDropExtension:
+		hazards = append(hazards, Hazard{
+			Code:        HazardDropExtension,
+			Level:       HazardLevelCritical,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Extension %q will be dropped along with objects it owns", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeEnableRLS, ChangeForceRLS:
+		hazards = append(hazards, Hazard{
+			Code:        HazardRLSEnable,
+			Level:       HazardLevelWarning,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Enabling RLS on table %q can lock out roles that lack matching policies", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeDropPolicy:
+		hazards = append(hazards, Hazard{
+			Code:        HazardDropPolicy,
+			Level:       HazardLevelCritical,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Row-level security policy on table %q will be dropped", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeDropFunction, ChangeDropAggregate:
+		hazards = append(hazards, Hazard{
+			Code:        HazardDropFunction,
+			Level:       HazardLevelCritical,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Function/procedure/aggregate %q will be dropped", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeCreateFunction, ChangeCreateAggregate:
+		if strings.Contains(strings.ToUpper(s.SQL), "SECURITY DEFINER") &&
+			!strings.Contains(strings.ToLower(s.SQL), "search_path") {
+			hazards = append(hazards, Hazard{
+				Code:        HazardSecurityDefiner,
+				Level:       HazardLevelWarning,
+				Type:        s.Type,
+				Table:       s.Table,
+				Description: fmt.Sprintf("SECURITY DEFINER routine %q has no explicit search_path; set search_path to avoid privilege escalation via schema shadowing", s.Table),
+				SQL:         s.SQL,
+			})
+		}
+	case ChangeDropTrigger:
+		hazards = append(hazards, Hazard{
+			Code:        HazardDropTrigger,
+			Level:       HazardLevelCritical,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Trigger on table %q will be dropped", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeDropView:
+		hazards = append(hazards, Hazard{
+			Code:        HazardDropView,
+			Level:       HazardLevelCritical,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("View %q will be dropped", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeDropDomain, ChangeDropDomainRetype:
+		hazards = append(hazards, Hazard{
+			Code:        HazardDropDomain,
+			Level:       HazardLevelCritical,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Domain %q will be dropped; columns typed by it must be migrated first", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeDropDomainConstraint:
+		hazards = append(hazards, Hazard{
+			Code:        HazardDropDomain,
+			Level:       HazardLevelCritical,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("CHECK constraint on domain %q will be dropped; existing values will no longer be validated", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeCommentTable, ChangeCommentColumn:
+		if s.OldComment != "" {
+			hazards = append(hazards, Hazard{
+				Code:        HazardCommentClear,
+				Level:       HazardLevelNotice,
+				Type:        s.Type,
+				Table:       s.Table,
+				Description: fmt.Sprintf("Existing comment on %q will be replaced or cleared", s.Table),
+				SQL:         s.SQL,
+			})
+		}
+	case ChangeRevoke:
+		hazards = append(hazards, Hazard{
+			Code:        HazardRevokePrivilege,
+			Level:       HazardLevelCritical,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Privileges on %q will be revoked; roles relying on them lose access", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeDropRole:
+		hazards = append(hazards, Hazard{
+			Code:        HazardDropRole,
+			Level:       HazardLevelCritical,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Role %q will be dropped; memberships and privileges it holds are removed", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeGrant:
+		if strings.EqualFold(s.Table, "PUBLIC") || strings.Contains(strings.ToUpper(s.SQL), "TO PUBLIC") {
+			hazards = append(hazards, Hazard{
+				Code:        HazardGrantPublic,
+				Level:       HazardLevelWarning,
+				Type:        s.Type,
+				Table:       s.Table,
+				Description: fmt.Sprintf("Privileges on %q will be granted to PUBLIC, making them available to every role", s.Table),
+				SQL:         s.SQL,
+			})
+		}
+	case ChangeDropPublication:
+		hazards = append(hazards, Hazard{
+			Code:        HazardDropPublication,
+			Level:       HazardLevelCritical,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Publication %q will be dropped; subscribers depending on it stop receiving changes", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeDropEventTrigger:
+		hazards = append(hazards, Hazard{
+			Code:        HazardDropEventTrigger,
+			Level:       HazardLevelCritical,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Event trigger %q will be dropped; its DDL auditing/enforcement stops firing", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeAlterPublication:
+		if s.Destructive {
+			hazards = append(hazards, Hazard{
+				Code:        HazardDropPublication,
+				Level:       HazardLevelCritical,
+				Type:        s.Type,
+				Table:       s.Table,
+				Description: fmt.Sprintf("Publication %q will be narrowed; subscribers may stop receiving the removed replication surface", s.Table),
+				SQL:         s.SQL,
+			})
+		}
+		if strings.Contains(strings.ToUpper(s.SQL), "SET ALL TABLES") || strings.Contains(strings.ToUpper(s.SQL), "FOR ALL TABLES") {
+			hazards = append(hazards, Hazard{
+				Code:        HazardPublicationAllTables,
+				Level:       HazardLevelNotice,
+				Type:        s.Type,
+				Table:       s.Table,
+				Description: fmt.Sprintf("Publication %q publishes ALL tables, including future ones", s.Table),
+				SQL:         s.SQL,
+			})
+		}
+	case ChangeCreateEventTrigger, ChangeAlterEventTrigger:
+		hazards = append(hazards, Hazard{
+			Code:        HazardEventTriggerSuperuser,
+			Level:       HazardLevelWarning,
+			Type:        s.Type,
+			Table:       s.Table,
+			Description: fmt.Sprintf("Event trigger %q DDL may require superuser or elevated privileges", s.Table),
+			SQL:         s.SQL,
+		})
+	case ChangeCreatePublication:
+		if strings.Contains(strings.ToUpper(s.SQL), "SET ALL TABLES") || strings.Contains(strings.ToUpper(s.SQL), "FOR ALL TABLES") {
+			hazards = append(hazards, Hazard{
+				Code:        HazardPublicationAllTables,
+				Level:       HazardLevelNotice,
+				Type:        s.Type,
+				Table:       s.Table,
+				Description: fmt.Sprintf("Publication %q publishes ALL tables, including future ones", s.Table),
 				SQL:         s.SQL,
 			})
 		}

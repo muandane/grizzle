@@ -4,8 +4,11 @@ import (
 	"cmp"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"io"
+	"log/slog"
+	"reflect"
 	"slices"
 	"strings"
 	"time"
@@ -16,6 +19,7 @@ import (
 	"github.com/muandane/grizzle/internal/lint"
 	"github.com/muandane/grizzle/internal/plan"
 	"github.com/muandane/grizzle/internal/schema"
+	"github.com/muandane/grizzle/internal/scope"
 )
 
 // Plan is the complete migration plan containing sequenced steps, policy, and hashes.
@@ -110,6 +114,21 @@ const (
 	ChangeRenameColumn       = plan.ChangeRenameColumn
 	ChangeAttachPartition    = plan.ChangeAttachPartition
 	ChangeDetachPartition    = plan.ChangeDetachPartition
+	ChangeCreateExtension    = plan.ChangeCreateExtension
+	ChangeDropExtension      = plan.ChangeDropExtension
+	ChangeEnableRLS          = plan.ChangeEnableRLS
+	ChangeDisableRLS         = plan.ChangeDisableRLS
+	ChangeForceRLS           = plan.ChangeForceRLS
+	ChangeNoForceRLS         = plan.ChangeNoForceRLS
+	ChangeCreatePolicy       = plan.ChangeCreatePolicy
+	ChangeDropPolicy         = plan.ChangeDropPolicy
+	ChangeCreateFunction     = plan.ChangeCreateFunction
+	ChangeDropFunction       = plan.ChangeDropFunction
+	ChangeCreateTrigger      = plan.ChangeCreateTrigger
+	ChangeDropTrigger        = plan.ChangeDropTrigger
+	ChangeCreateView         = plan.ChangeCreateView
+	ChangeDropView           = plan.ChangeDropView
+	ChangeRefreshMatView     = plan.ChangeRefreshMatView
 )
 
 // HazardCode constants
@@ -128,10 +147,34 @@ const (
 	HazardGeneratedRewrite       = plan.HazardGeneratedRewrite
 	HazardPartitionAttachScan    = plan.HazardPartitionAttachScan
 	HazardPartitionPendingDetach = plan.HazardPartitionPendingDetach
+	HazardExtensionPrivilege     = plan.HazardExtensionPrivilege
+	HazardDropExtension          = plan.HazardDropExtension
+	HazardRLSEnable              = plan.HazardRLSEnable
+	HazardDropPolicy             = plan.HazardDropPolicy
+	HazardDropFunction           = plan.HazardDropFunction
+	HazardSecurityDefiner        = plan.HazardSecurityDefiner
+	HazardDropTrigger            = plan.HazardDropTrigger
+	HazardDropView               = plan.HazardDropView
+	HazardDropDomain             = plan.HazardDropDomain
 )
 
 // UnmanagedObject represents an unmanaged database object detected during introspection.
 type UnmanagedObject = schema.UnmanagedObject
+
+// ExtensionIR represents the intermediate representation of a PostgreSQL extension.
+type ExtensionIR = schema.Extension
+
+// RoutineIR represents the intermediate representation of a function or procedure.
+type RoutineIR = schema.Routine
+
+// ViewIR represents the intermediate representation of a view or materialized view.
+type ViewIR = schema.View
+
+// PolicyIR represents the intermediate representation of a row-level security policy.
+type PolicyIR = schema.Policy
+
+// TriggerIR represents the intermediate representation of a trigger.
+type TriggerIR = schema.Trigger
 
 // UnmanagedKind represents the category of an unmanaged database object.
 type UnmanagedKind = schema.UnmanagedKind
@@ -168,21 +211,48 @@ func GenerateLockID(dbName, schemaName string) int64 {
 	return postgres.GenerateLockID(dbName + ":" + schemaName)
 }
 
+// detectDialectFromDriver maps a database/sql driver's concrete type to a
+// Grizzle dialect by matching the driver's package path (via reflection), not
+// the %T type string, which omits package paths and misclassifies wrapper
+// drivers. Pointer indirection is stripped. Returns DialectAuto when the
+// driver type is unknown (wrappers such as otelsql/sqlx), letting the caller
+// fall back to probe queries.
+func detectDialectFromDriver(drv driver.Driver) Dialect {
+	if drv == nil {
+		return DialectAuto
+	}
+	t := reflect.TypeOf(drv)
+	for t != nil && t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t == nil || t.Name() == "" {
+		return DialectAuto
+	}
+	name := strings.ToLower(t.PkgPath() + "." + t.Name())
+	switch {
+	case strings.Contains(name, "github.com/jackc/pgx"),
+		strings.Contains(name, "github.com/lib/pq"):
+		return DialectPostgres
+	case strings.Contains(name, "modernc.org/sqlite"),
+		strings.Contains(name, "github.com/mattn/go-sqlite3"):
+		return DialectSQLite
+	default:
+		return DialectAuto
+	}
+}
+
 func detectDialect(ctx context.Context, db *sql.DB) (Dialect, error) {
 	if db == nil {
 		return "", fmt.Errorf("grizzle: database connection is nil")
 	}
 
-	if drv := db.Driver(); drv != nil {
-		drvName := strings.ToLower(fmt.Sprintf("%T", drv))
-		switch {
-		case strings.Contains(drvName, "sqlite"):
-			return DialectSQLite, nil
-		case strings.Contains(drvName, "pgx"), strings.Contains(drvName, "pq"), strings.Contains(drvName, "postgres"):
-			return DialectPostgres, nil
-		}
+	if d := detectDialectFromDriver(db.Driver()); d != DialectAuto {
+		return d, nil
 	}
 
+	// Wrapper drivers (otel/sqlx etc.) hide the underlying driver type; probe
+	// the engine with a single query each. These are expected to fail on the
+	// wrong engine and produce no log noise.
 	var sqliteVer string
 	if err := db.QueryRowContext(ctx, "SELECT sqlite_version()").Scan(&sqliteVer); err == nil {
 		return DialectSQLite, nil
@@ -193,15 +263,12 @@ func detectDialect(ctx context.Context, db *sql.DB) (Dialect, error) {
 		return DialectPostgres, nil
 	}
 
-	return "", fmt.Errorf("grizzle: unable to detect database dialect, please set Options.Dialect explicitly")
+	return "", fmt.Errorf("grizzle: unable to detect database dialect from driver %T, please set Options.Dialect explicitly", db.Driver())
 }
 
 func prepareOptions(ctx context.Context, db *sql.DB, opts *Options) error {
-	if strings.TrimSpace(opts.SchemaSQL) == "" {
-		return ErrEmptySchema
-	}
-	if opts.StrictScope && len(opts.IncludeTables) == 0 {
-		return ErrStrictScope
+	if err := opts.Validate(); err != nil {
+		return err
 	}
 	if opts.Dialect == DialectAuto {
 		d, err := detectDialect(ctx, db)
@@ -209,12 +276,13 @@ func prepareOptions(ctx context.Context, db *sql.DB, opts *Options) error {
 			return err
 		}
 		opts.Dialect = d
+		// Re-validate dialect-specific constraints now that dialect is known.
+		if err := opts.Validate(); err != nil {
+			return err
+		}
 	}
 	switch opts.Dialect {
 	case DialectSQLite:
-		if len(opts.TargetSchemas) > 1 {
-			return ErrUnsupportedMultiSchema
-		}
 		opts.TargetSchema = cmp.Or(opts.TargetSchema, "main")
 		if len(opts.TargetSchemas) == 0 {
 			opts.TargetSchemas = []string{opts.TargetSchema}
@@ -246,9 +314,7 @@ func prepareOptions(ctx context.Context, db *sql.DB, opts *Options) error {
 		if opts.StatementTimeout <= 0 {
 			opts.StatementTimeout = exec.DefaultStatementTimeout
 		}
-		if opts.MaxRetries < 0 {
-			opts.MaxRetries = 0
-		} else if opts.MaxRetries == 0 {
+		if opts.MaxRetries == 0 {
 			opts.MaxRetries = exec.DefaultMaxRetries
 		}
 	default:
@@ -290,6 +356,8 @@ func Sync(ctx context.Context, db *sql.DB, opts Options) error {
 			TargetSchemas:        opts.TargetSchemas,
 			ShadowSchema:         opts.ShadowSchema,
 			SchemaSQL:            opts.SchemaSQL,
+			RolesSQL:             opts.RolesSQL,
+			CatalogSQL:           opts.CatalogSQL,
 			LockNamespace:        opts.LockNamespace,
 			LockID:               opts.LockID,
 			Filters:              filters,
@@ -398,6 +466,8 @@ func PlanDiff(ctx context.Context, db *sql.DB, opts Options) (*Plan, error) {
 		TargetSchemas:        opts.TargetSchemas,
 		ShadowSchema:         opts.ShadowSchema,
 		SchemaSQL:            opts.SchemaSQL,
+		RolesSQL:             opts.RolesSQL,
+		CatalogSQL:           opts.CatalogSQL,
 		LockNamespace:        opts.LockNamespace,
 		LockID:               opts.LockID,
 		Filters:              filters,
@@ -449,8 +519,60 @@ type ApplyOpts struct {
 	// LockNamespace specifies the application namespace string used for PostgreSQL advisory locking (defaults to "grizzle").
 	LockNamespace string
 
+	// Logger receives structured migration logs during Apply (defaults to no logging).
+	// The plan artifact cannot carry a logger, so it is supplied here.
+	Logger *slog.Logger
+
 	// Tracer specifies an optional tracer for observing plan application.
 	Tracer Tracer
+}
+
+// optionsFromPlan maps every approval-relevant plan field into Options.
+// Lock identity and shadow schema names are never taken from the artifact:
+// LockNamespace comes from ApplyOpts (defaulted in prepareOptions), LockID
+// stays 0 so exec derives per-schema advisory locks from trusted target
+// identity, and ShadowSchema is generated ephemerally at apply time.
+func optionsFromPlan(p *Plan, opts ApplyOpts) Options {
+	return Options{
+		SchemaSQL:              p.SchemaSQL,
+		RolesSQL:               p.RolesSQL,
+		CatalogSQL:             p.CatalogSQL,
+		TargetSchema:           p.TargetSchema,
+		TargetSchemas:          p.TargetSchemas,
+		IncludeTables:          p.IncludeTables,
+		ExcludeTables:          p.ExcludeTables,
+		Renames:                p.Renames,
+		ExpandContract:         p.ExpandContract,
+		AllowDropTable:         &p.Policy.AllowTable,
+		AllowDropColumn:        &p.Policy.AllowColumn,
+		AllowDropIndex:         &p.Policy.AllowIndex,
+		AllowDropFK:            &p.Policy.AllowFK,
+		AllowDropCheck:         &p.Policy.AllowCheck,
+		AllowDropExtension:     &p.Policy.AllowExtension,
+		AllowDropFunction:      &p.Policy.AllowFunction,
+		AllowDropPolicy:        &p.Policy.AllowPolicy,
+		AllowDropTrigger:       &p.Policy.AllowTrigger,
+		AllowDropView:          &p.Policy.AllowView,
+		AllowDropDomain:        &p.Policy.AllowDomain,
+		AllowRevoke:            p.Policy.AllowRevoke,
+		AllowDropRole:          p.Policy.AllowDropRole,
+		AllowDropPublication:   p.Policy.AllowDropPublication,
+		AllowDropEventTrigger:  p.Policy.AllowDropEventTrigger,
+		AcceptHazards:          opts.AcceptHazards,
+		Backfill:               opts.Backfill,
+		BeforeSync:             opts.BeforeSync,
+		AfterSync:              opts.AfterSync,
+		BeforeStep:             opts.BeforeStep,
+		AfterStep:              opts.AfterStep,
+		SQLiteRebuildThreshold: opts.SQLiteRebuildThreshold,
+		SQLiteRebuildBatchSize: opts.SQLiteRebuildBatchSize,
+		LockNamespace:          opts.LockNamespace,
+		LockTimeout:            p.LockTimeout,
+		StatementTimeout:       p.StatementTimeout,
+		NonConcurrentIndexes:   p.NonConcurrentIndexes,
+		Logger:                 opts.Logger,
+		Tracer:                 opts.Tracer,
+	}
 }
 
 // Apply applies an approved migration plan to the database.
@@ -466,31 +588,14 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 		return fmt.Errorf("%w: plan hash %q does not match expected hash %q", ErrPlanDrift, p.Hash(), opts.ExpectedHash)
 	}
 
+	// Operational fields come from an untrusted artifact (plan.json): reject
+	// values that could corrupt execution before any connection is touched.
+	if err := p.ValidateExecutionFields(); err != nil {
+		return err
+	}
+
 	if p.SchemaSQL != "" {
-		syncOpts := Options{
-			SchemaSQL:              p.SchemaSQL,
-			TargetSchema:           p.TargetSchema,
-			TargetSchemas:          p.TargetSchemas,
-			IncludeTables:          p.IncludeTables,
-			ExcludeTables:          p.ExcludeTables,
-			Renames:                p.Renames,
-			ExpandContract:         p.ExpandContract,
-			AllowDropTable:         &p.Policy.AllowTable,
-			AllowDropColumn:        &p.Policy.AllowColumn,
-			AllowDropIndex:         &p.Policy.AllowIndex,
-			AllowDropFK:            &p.Policy.AllowFK,
-			AllowDropCheck:         &p.Policy.AllowCheck,
-			AcceptHazards:          opts.AcceptHazards,
-			Backfill:               opts.Backfill,
-			BeforeSync:             opts.BeforeSync,
-			AfterSync:              opts.AfterSync,
-			BeforeStep:             opts.BeforeStep,
-			AfterStep:              opts.AfterStep,
-			SQLiteRebuildThreshold: opts.SQLiteRebuildThreshold,
-			SQLiteRebuildBatchSize: opts.SQLiteRebuildBatchSize,
-			LockNamespace:          opts.LockNamespace,
-			Tracer:                 opts.Tracer,
-		}
+		syncOpts := optionsFromPlan(p, opts)
 		if err := prepareOptions(ctx, db, &syncOpts); err != nil {
 			return err
 		}
@@ -522,6 +627,8 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 			TargetSchemas:        syncOpts.TargetSchemas,
 			ShadowSchema:         syncOpts.ShadowSchema,
 			SchemaSQL:            syncOpts.SchemaSQL,
+			RolesSQL:             syncOpts.RolesSQL,
+			CatalogSQL:           syncOpts.CatalogSQL,
 			LockNamespace:        syncOpts.LockNamespace,
 			LockID:               syncOpts.LockID,
 			Filters:              filters,
@@ -540,7 +647,27 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 		})
 	}
 
-	// Direct execution fallback if SchemaSQL was not retained
+	// Direct execution fallback if SchemaSQL was not retained: the recorded
+	// steps run as-is. Enforce the plan's recorded scope (IncludeTables /
+	// ExcludeTables) against every table-scoped step first — enum steps carry
+	// the enum name in Table, not a table name, so they are skipped.
+	planFilters := scope.Filters{Includes: p.IncludeTables, Excludes: p.ExcludeTables}
+	for _, s := range p.Steps {
+		// Schema-scoped steps carry non-table names in Table (enum/extension/
+		// function/view names); skip table scope checks for them.
+		switch s.Type {
+		case plan.ChangeCreateEnum, plan.ChangeAlterEnum,
+			plan.ChangeCreateExtension, plan.ChangeDropExtension,
+			plan.ChangeCreateFunction, plan.ChangeDropFunction,
+			plan.ChangeCreateView, plan.ChangeDropView:
+			continue
+		}
+		if !scope.IsTableManaged(s.Table, planFilters) {
+			return fmt.Errorf("%w: plan step [%s on %q] is outside the plan's recorded scope (include_tables=%v, exclude_tables=%v)",
+				ErrInvalidOptions, s.Type, s.Table, p.IncludeTables, p.ExcludeTables)
+		}
+	}
+
 	dialect, err := detectDialect(ctx, db)
 	if err != nil {
 		return err
@@ -553,6 +680,7 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 			AcceptHazards:    opts.AcceptHazards,
 			ExpectedHash:     opts.ExpectedHash,
 			Tracer:           opts.Tracer,
+			Logger:           opts.Logger,
 			Backfill:         toExecBackfill(opts.Backfill),
 			BeforeSync:       opts.BeforeSync,
 			AfterSync:        opts.AfterSync,
@@ -567,23 +695,24 @@ func Apply(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) error {
 			targetSchemas = []string{cmp.Or(p.TargetSchema, "public")}
 		}
 		targetSchema := targetSchemas[0]
-		lockNs := cmp.Or(opts.LockNamespace, "grizzle")
 		return exec.ApplyPostgres(ctx, db, p, exec.PostgresExecConfig{
-			TargetSchema:     targetSchema,
-			TargetSchemas:    targetSchemas,
-			LockNamespace:    lockNs,
-			Policy:           p.Policy,
-			AcceptHazards:    opts.AcceptHazards,
-			ExpectedHash:     opts.ExpectedHash,
-			Tracer:           opts.Tracer,
-			LockTimeout:      exec.DefaultLockTimeout,
-			StatementTimeout: exec.DefaultStatementTimeout,
-			MaxRetries:       exec.DefaultMaxRetries,
-			Backfill:         toExecBackfill(opts.Backfill),
-			BeforeSync:       opts.BeforeSync,
-			AfterSync:        opts.AfterSync,
-			BeforeStep:       opts.BeforeStep,
-			AfterStep:        opts.AfterStep,
+			TargetSchema:         targetSchema,
+			TargetSchemas:        targetSchemas,
+			LockNamespace:        cmp.Or(opts.LockNamespace, "grizzle"),
+			Policy:               p.Policy,
+			AcceptHazards:        opts.AcceptHazards,
+			ExpectedHash:         opts.ExpectedHash,
+			Tracer:               opts.Tracer,
+			Logger:               opts.Logger,
+			NonConcurrentIndexes: p.NonConcurrentIndexes,
+			LockTimeout:          cmp.Or(p.LockTimeout, exec.DefaultLockTimeout),
+			StatementTimeout:     cmp.Or(p.StatementTimeout, exec.DefaultStatementTimeout),
+			MaxRetries:           exec.DefaultMaxRetries,
+			Backfill:             toExecBackfill(opts.Backfill),
+			BeforeSync:           opts.BeforeSync,
+			AfterSync:            opts.AfterSync,
+			BeforeStep:           opts.BeforeStep,
+			AfterStep:            opts.AfterStep,
 		})
 	default:
 		return fmt.Errorf("grizzle: unsupported dialect %q", dialect)
@@ -720,6 +849,46 @@ func LintHasErrors(diags []LintDiagnostic) bool {
 // DryRunResult reports the outcome of a live dry-run verification.
 type DryRunResult = exec.DryRunResult
 
+// DryRunVerifyPlan performs a live dry-run of an approved plan artifact.
+// It verifies the artifact hash against ExpectedHash, honors every
+// plan-carried intent field (target schemas, scope, policy, execution
+// semantics), and checks that a re-diff of the live database against the
+// artifact's SchemaSQL still produces the same plan hash — so a tampered
+// or drifted artifact cannot silently verify a different migration.
+// Runtime-only options (logger, tracer, hazards, lock namespace) come from opts.
+func DryRunVerifyPlan(ctx context.Context, db *sql.DB, p *Plan, opts ApplyOpts) (*DryRunResult, error) {
+	if p == nil {
+		return nil, fmt.Errorf("grizzle: plan cannot be nil")
+	}
+	if db == nil {
+		return nil, fmt.Errorf("grizzle: database connection is nil")
+	}
+	if opts.ExpectedHash != "" && p.Hash() != opts.ExpectedHash {
+		return nil, fmt.Errorf("%w: plan hash %q does not match expected hash %q", ErrPlanDrift, p.Hash(), opts.ExpectedHash)
+	}
+	if err := p.ValidateExecutionFields(); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(p.SchemaSQL) == "" {
+		return nil, fmt.Errorf("grizzle: plan has no embedded schema SQL; dry-run of approved plans requires SchemaSQL")
+	}
+
+	do := optionsFromPlan(p, opts)
+	// Verify approved steps: re-diff from artifact options; recomputed hash
+	// must match the approved plan so we never verify a silently regenerated
+	// migration with different semantics.
+	recomputed, err := PlanDiff(ctx, db, do)
+	if err != nil {
+		return nil, err
+	}
+	if recomputed.Hash() != p.Hash() {
+		return nil, fmt.Errorf("%w: recomputed plan hash %q does not match approved plan hash %q",
+			ErrPlanDrift, recomputed.Hash(), p.Hash())
+	}
+
+	return DryRunVerify(ctx, db, do)
+}
+
 // DryRunVerify executes a live dry-run rollback against the target database:
 // the planned DDL runs against real data inside transactions that are
 // unconditionally rolled back, so constraints, casts, and check expressions
@@ -755,6 +924,8 @@ func DryRunVerify(ctx context.Context, db *sql.DB, opts Options) (*DryRunResult,
 		TargetSchemas:        opts.TargetSchemas,
 		ShadowSchema:         opts.ShadowSchema,
 		SchemaSQL:            opts.SchemaSQL,
+		RolesSQL:             opts.RolesSQL,
+		CatalogSQL:           opts.CatalogSQL,
 		LockNamespace:        opts.LockNamespace,
 		LockID:               opts.LockID,
 		Filters:              filters,

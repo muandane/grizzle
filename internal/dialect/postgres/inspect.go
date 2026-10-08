@@ -11,14 +11,82 @@ import (
 	"github.com/muandane/grizzle/internal/schema"
 )
 
+// polCmdName converts pg_policy.polcmd to its SQL keyword.
+func polCmdName(cmd string) string {
+	switch cmd {
+	case "r":
+		return "SELECT"
+	case "a":
+		return "INSERT"
+	case "w":
+		return "UPDATE"
+	case "d":
+		return "DELETE"
+	default:
+		return "ALL"
+	}
+}
+
+// pinSearchPath pins search_path to pg_catalog for the remainder of the
+// current transaction so pg_get_*def / pg_get_expr emit fully qualified,
+// search-path-independent definitions. It is a no-op when dbtx is not inside
+// a transaction (e.g. direct *sql.DB inspection, where the statement-scoped
+// pin is impossible and the session path is whatever the pool provides).
+// Call unpinSearchPath after the pin-affected queries to restore the
+// transaction path.
+func pinSearchPath(ctx context.Context, dbtx dialect.DBTX) {
+	_, _ = dbtx.ExecContext(ctx, "SAVEPOINT grizzle_inspect_pin; SET LOCAL search_path TO pg_catalog;")
+}
+
+// unpinSearchPath reverts the pinned path (ROLLBACK TO SAVEPOINT undoes the
+// SET LOCAL effect) and discards the savepoint (RELEASE).
+func unpinSearchPath(ctx context.Context, dbtx dialect.DBTX) {
+	_, _ = dbtx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT grizzle_inspect_pin; RELEASE SAVEPOINT grizzle_inspect_pin;")
+}
+
 // Inspect reads the relational state of the specified schema directly from pg_catalog.
 func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema.Schema, error) {
 	s := &schema.Schema{
-		Name:      schemaName,
-		Tables:    make(map[string]*schema.Table),
-		Enums:     make(map[string]*schema.Enum),
-		Unmanaged: make(map[string]*schema.UnmanagedObject),
+		Name:       schemaName,
+		Tables:     make(map[string]*schema.Table),
+		Enums:      make(map[string]*schema.Enum),
+		Extensions: make(map[string]*schema.Extension),
+		Routines:   make(map[string]*schema.Routine),
+		Views:      make(map[string]*schema.View),
+		Unmanaged:  make(map[string]*schema.UnmanagedObject),
 	}
+
+	// 0. Inspect Extensions (database-wide; keyed by lowercased name)
+	extQuery := `
+		SELECT
+			e.extname AS ext_name,
+			COALESCE(n.nspname, '') AS ext_schema,
+			COALESCE(e.extversion, '') AS ext_version
+		FROM pg_extension e
+		LEFT JOIN pg_namespace n ON n.oid = e.extnamespace
+		ORDER BY e.extname;
+	`
+	extRows, err := dbtx.QueryContext(ctx, extQuery)
+	if err != nil {
+		return nil, fmt.Errorf("inspecting extensions: %w", err)
+	}
+	defer func() { _ = extRows.Close() }()
+	for extRows.Next() {
+		var name, extSchema, version string
+		if err := extRows.Scan(&name, &extSchema, &version); err != nil {
+			return nil, fmt.Errorf("scanning extension: %w", err)
+		}
+		key := strings.ToLower(name)
+		s.Extensions[key] = &schema.Extension{
+			Name:    key,
+			Schema:  extSchema,
+			Version: version,
+		}
+	}
+	if err := extRows.Err(); err != nil {
+		return nil, err
+	}
+	_ = extRows.Close()
 
 	// 1. Inspect Custom ENUM Types
 	enumQuery := `
@@ -64,7 +132,8 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 			COALESCE(pg_get_expr(d.adbin, d.adrelid), '') AS column_default,
 			a.attnum AS ordinal_position,
 			a.attidentity AS identity_type,
-			a.attgenerated AS generated_type
+			a.attgenerated AS generated_type,
+			COALESCE(col_description(c.oid, a.attnum), '') AS column_comment
 		FROM pg_attribute a
 		JOIN pg_class c ON c.oid = a.attrelid
 		JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -92,9 +161,10 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 			position      int
 			identityType  string
 			generatedType string
+			colComment    string
 		)
 
-		if err := rows.Scan(&tableName, &colName, &rawType, &isNullable, &rawDefault, &position, &identityType, &generatedType); err != nil {
+		if err := rows.Scan(&tableName, &colName, &rawType, &isNullable, &rawDefault, &position, &identityType, &generatedType, &colComment); err != nil {
 			return nil, fmt.Errorf("scanning column data in schema %q: %w", schemaName, err)
 		}
 
@@ -120,6 +190,7 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 			IsNullable:   isNullable,
 			DefaultValue: schema.NormalizeDefault(rawDefault),
 			Position:     position,
+			Comment:      colComment,
 		}
 
 		switch strings.TrimSpace(generatedType) {
@@ -152,6 +223,36 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 		return nil, err
 	}
 	_ = rows.Close()
+
+	// 2a.1 Table comments (obj_description on pg_class).
+	tableCommentQuery := `
+		SELECT c.relname, COALESCE(obj_description(c.oid, 'pg_class'), '')
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1
+		  AND c.relkind IN ('r', 'p')
+		ORDER BY c.relname;
+	`
+	commentRows, err := dbtx.QueryContext(ctx, tableCommentQuery, schemaName)
+	if err != nil {
+		return nil, fmt.Errorf("inspecting table comments in schema %q: %w", schemaName, err)
+	}
+	for commentRows.Next() {
+		var tblName, comment string
+		if err := commentRows.Scan(&tblName, &comment); err != nil {
+			_ = commentRows.Close()
+			return nil, fmt.Errorf("scanning table comment in schema %q: %w", schemaName, err)
+		}
+		tbl, exists := s.Tables[tblName]
+		if !exists {
+			continue
+		}
+		tbl.Comment = comment
+	}
+	if err := commentRows.Err(); err != nil {
+		return nil, err
+	}
+	_ = commentRows.Close()
 
 	// 2b. Inspect Partitioned Tables
 	partQuery := `
@@ -276,6 +377,155 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 		return nil, err
 	}
 	_ = inhRows.Close()
+
+	// 2d. Inspect RLS flags
+	rlsQuery := `
+		SELECT
+			c.relname AS table_name,
+			c.relrowsecurity AS rls_enabled,
+			c.relforcerowsecurity AS rls_forced
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1
+		  AND c.relkind IN ('r', 'p')
+		ORDER BY c.relname;
+	`
+	rlsRows, err := dbtx.QueryContext(ctx, rlsQuery, schemaName)
+	if err != nil {
+		return nil, fmt.Errorf("inspecting RLS flags in schema %q: %w", schemaName, err)
+	}
+	defer func() { _ = rlsRows.Close() }()
+	for rlsRows.Next() {
+		var tblName string
+		var rlsEnabled, rlsForced bool
+		if err := rlsRows.Scan(&tblName, &rlsEnabled, &rlsForced); err != nil {
+			return nil, fmt.Errorf("scanning RLS flags in schema %q: %w", schemaName, err)
+		}
+		if tbl, exists := s.Tables[tblName]; exists {
+			tbl.RLSEnabled = rlsEnabled
+			tbl.RLSForced = rlsForced
+		}
+	}
+	if err := rlsRows.Err(); err != nil {
+		return nil, err
+	}
+	_ = rlsRows.Close()
+
+	// 2e. Inspect row-level security policies. pg_get_expr renders schema
+	// references per the session search_path, so live and shadow inspections
+	// can disagree; pin search_path to pg_catalog for all pg_get_*def-based
+	// queries from here to the end of Inspect (see pinSearchPath).
+	pinSearchPath(ctx, dbtx)
+	defer unpinSearchPath(ctx, dbtx)
+
+	policyQuery := `
+		SELECT
+			c.relname AS table_name,
+			p.polname AS policy_name,
+			p.polcmd AS cmd,
+			p.polpermissive AS permissive,
+			COALESCE(pg_get_expr(p.polqual, p.polrelid), '') AS using_expr,
+			COALESCE(pg_get_expr(p.polwithcheck, p.polrelid), '') AS with_check_expr,
+			COALESCE((
+				SELECT string_agg(CASE WHEN r = 0 THEN 'public' ELSE COALESCE(a.rolname, r::text) END, ',' ORDER BY r)
+				FROM unnest(p.polroles) AS r
+				LEFT JOIN pg_authid a ON a.oid = r
+			), '') AS roles
+		FROM pg_policy p
+		JOIN pg_class c ON c.oid = p.polrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1
+		ORDER BY c.relname, p.polname;
+	`
+	policyRows, err := dbtx.QueryContext(ctx, policyQuery, schemaName)
+	if err != nil {
+		return nil, fmt.Errorf("inspecting policies in schema %q: %w", schemaName, err)
+	}
+	defer func() { _ = policyRows.Close() }()
+	for policyRows.Next() {
+		var (
+			tblName    string
+			policyName string
+			cmd        string
+			permissive bool
+			usingExpr  string
+			withCheck  string
+			rolesCSV   string
+		)
+		if err := policyRows.Scan(&tblName, &policyName, &cmd, &permissive, &usingExpr, &withCheck, &rolesCSV); err != nil {
+			return nil, fmt.Errorf("scanning policy in schema %q: %w", schemaName, err)
+		}
+		tbl, exists := s.Tables[tblName]
+		if !exists {
+			continue
+		}
+		if tbl.Policies == nil {
+			tbl.Policies = make(map[string]*schema.Policy)
+		}
+		var roles []string
+		if rolesCSV != "" {
+			for r := range strings.SplitSeq(rolesCSV, ",") {
+				if r = strings.TrimSpace(r); r != "" {
+					roles = append(roles, r)
+				}
+			}
+		}
+		tbl.Policies[policyName] = &schema.Policy{
+			Name:       policyName,
+			Cmd:        polCmdName(cmd),
+			Roles:      roles,
+			Using:      usingExpr,
+			WithCheck:  withCheck,
+			Permissive: permissive,
+		}
+	}
+	if err := policyRows.Err(); err != nil {
+		return nil, err
+	}
+	_ = policyRows.Close()
+
+	// 2f. Inspect triggers on tables (managed surface). pg_get_triggerdef
+	// gives the canonical definition; the ON <table> reference inside it is
+	// schema-qualified and unmapped by the diff normalize step for shadow
+	// introspection.
+	triggerQuery := `
+		SELECT
+			c.relname AS table_name,
+			t.tgname AS trigger_name,
+			pg_get_triggerdef(t.oid) AS definition
+		FROM pg_trigger t
+		JOIN pg_class c ON c.oid = t.tgrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1
+		  AND NOT t.tgisinternal
+		ORDER BY c.relname, t.tgname;
+	`
+	triggerRows, err := dbtx.QueryContext(ctx, triggerQuery, schemaName)
+	if err != nil {
+		return nil, fmt.Errorf("inspecting triggers in schema %q: %w", schemaName, err)
+	}
+	defer func() { _ = triggerRows.Close() }()
+	for triggerRows.Next() {
+		var tblName, triggerName, definition string
+		if err := triggerRows.Scan(&tblName, &triggerName, &definition); err != nil {
+			return nil, fmt.Errorf("scanning trigger in schema %q: %w", schemaName, err)
+		}
+		tbl, exists := s.Tables[tblName]
+		if !exists {
+			continue
+		}
+		if tbl.Triggers == nil {
+			tbl.Triggers = make(map[string]*schema.Trigger)
+		}
+		tbl.Triggers[triggerName] = &schema.Trigger{
+			Name:       triggerName,
+			Definition: definition,
+		}
+	}
+	if err := triggerRows.Err(); err != nil {
+		return nil, err
+	}
+	_ = triggerRows.Close()
 
 	// 3. Inspect Primary Keys
 	pkQuery := `
@@ -481,12 +731,20 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 	}
 	_ = checkRows.Close()
 
-	// 6. Inspect Unmanaged Objects
-	// 6a. Views and Materialized Views
+	// 6. Inspect Views
+	// 6a. Views and Materialized Views (managed surface). pg_get_viewdef is
+	// the canonical definition; schema-qualified references inside it are
+	// unmapped by the diff normalize step for shadow introspection.
 	viewQuery := `
 		SELECT
 			c.relname AS view_name,
-			c.relkind AS view_kind
+			c.relkind AS view_kind,
+			pg_get_viewdef(c.oid) AS definition,
+			COALESCE((
+				SELECT string_agg(a.attname, ',' ORDER BY a.attnum)
+				FROM pg_attribute a
+				WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+			), '') AS columns_csv
 		FROM pg_class c
 		JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE n.nspname = $1
@@ -500,118 +758,177 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 	defer func() { _ = viewRows.Close() }()
 
 	for viewRows.Next() {
-		var viewName, viewKind string
-		if err := viewRows.Scan(&viewName, &viewKind); err != nil {
+		var viewName, viewKind, definition, columnsCSV string
+		if err := viewRows.Scan(&viewName, &viewKind, &definition, &columnsCSV); err != nil {
 			return nil, fmt.Errorf("scanning view in schema %q: %w", schemaName, err)
 		}
-		kind := schema.UnmanagedView
-		if viewKind == "m" {
-			kind = schema.UnmanagedMaterialized
+		if s.Views == nil {
+			s.Views = make(map[string]*schema.View)
 		}
-		s.Unmanaged[viewName] = &schema.UnmanagedObject{
-			Name: viewName,
-			Kind: kind,
+		v := &schema.View{
+			Name:       viewName,
+			IsMatView:  viewKind == "m",
+			Definition: definition,
 		}
+		if columnsCSV != "" {
+			v.Columns = strings.Split(columnsCSV, ",")
+		}
+		s.Views[viewName] = v
 	}
 	if err := viewRows.Err(); err != nil {
 		return nil, err
 	}
 	_ = viewRows.Close()
 
-	// 6b. View Column Dependencies from pg_depend
-	viewDepQuery := `
-		SELECT
-			c.relname AS view_name,
-			dep_c.relname AS referenced_table,
-			COALESCE(a.attname, '') AS referenced_column
-		FROM pg_class c
-		JOIN pg_namespace n ON n.oid = c.relnamespace
-		JOIN pg_rewrite r ON r.ev_class = c.oid
-		JOIN pg_depend d ON d.objid = r.oid AND d.classid = 'pg_rewrite'::regclass AND d.refclassid = 'pg_class'::regclass
-		JOIN pg_class dep_c ON dep_c.oid = d.refobjid
-		LEFT JOIN pg_attribute a ON a.attrelid = dep_c.oid AND a.attnum = d.refobjsubid AND NOT a.attisdropped
-		WHERE n.nspname = $1
-		  AND c.relkind IN ('v', 'm')
-		  AND dep_c.relkind IN ('r', 'p')
-		  AND dep_c.relname != c.relname
-		ORDER BY c.relname, dep_c.relname, a.attname;
-	`
-	depRows, err := dbtx.QueryContext(ctx, viewDepQuery, schemaName)
-	if err != nil {
-		return nil, fmt.Errorf("inspecting view dependencies in schema %q: %w", schemaName, err)
-	}
-	defer func() { _ = depRows.Close() }()
+	// 6b. View column dependencies: managed views are folded into column-drop
+	// protection by diff.findSurvivingViewDeps using the canonical view
+	// definition; no unmanaged registration is needed.
 
-	for depRows.Next() {
-		var viewName, refTable, refCol string
-		if err := depRows.Scan(&viewName, &refTable, &refCol); err != nil {
-			return nil, fmt.Errorf("scanning view dependency: %w", err)
+	// 6c. Triggers on managed tables are collected in 2f (Table.Triggers).
+	// Triggers are part of the managed surface as of Phase 1; no unmanaged
+	// trigger registration is needed here.
+
+	// 6d.0 Managed aggregates (prokind = 'a'). pg_get_functiondef does not
+	// support aggregates, so the definition is reconstructed from
+	// pg_aggregate catalog fields into a canonical CREATE AGGREGATE
+	// statement. regprocedure::text references honor the pinned search_path,
+	// keeping output deterministic across live and shadow introspection; the
+	// diff normalize step unmaps shadow-schema qualifications.
+	aggregateQuery := `
+		SELECT
+			p.proname AS agg_name,
+			pg_get_function_identity_arguments(p.oid) AS identity_args,
+			format_type(a.aggtranstype, NULL) AS state_type,
+			a.aggtransfn::regprocedure::text AS sfunc,
+			COALESCE(NULLIF(a.aggfinalfn::regprocedure::text, '-'), '') AS finalfunc,
+			COALESCE(NULLIF(a.aggcombinefn::regprocedure::text, '-'), '') AS combinefunc,
+			COALESCE(NULLIF(a.aggserialfn::regprocedure::text, '-'), '') AS serialfunc,
+			COALESCE(NULLIF(a.aggdeserialfn::regprocedure::text, '-'), '') AS deserialfunc,
+			COALESCE(a.agginitval, '') AS initcond,
+			CASE p.proparallel WHEN 's' THEN 'SAFE' WHEN 'r' THEN 'RESTRICTED' ELSE 'UNSAFE' END AS parallel
+		FROM pg_proc p
+		JOIN pg_aggregate a ON a.aggfnoid = p.oid
+		JOIN pg_namespace n ON n.oid = p.pronamespace
+		WHERE n.nspname = $1
+		  AND p.prokind = 'a'
+		  AND a.aggkind = 'n'
+		  AND NOT EXISTS (
+		      SELECT 1 FROM pg_depend d
+		      WHERE d.objid = p.oid AND d.deptype = 'e'
+		  )
+		ORDER BY p.proname, identity_args;
+	`
+	aggRows, err := dbtx.QueryContext(ctx, aggregateQuery, schemaName)
+	if err != nil {
+		return nil, fmt.Errorf("inspecting aggregates in schema %q: %w", schemaName, err)
+	}
+	for aggRows.Next() {
+		var name, identityArgs, stype, sfunc, parallel string
+		var finalfunc, combinefunc, serialfunc, deserialfunc, initcond string
+		if err := aggRows.Scan(&name, &identityArgs, &stype, &sfunc, &finalfunc, &combinefunc, &serialfunc, &deserialfunc, &initcond, &parallel); err != nil {
+			_ = aggRows.Close()
+			return nil, fmt.Errorf("scanning aggregate in schema %q: %w", schemaName, err)
 		}
-		if obj, ok := s.Unmanaged[viewName]; ok {
-			obj.DependsOn = append(obj.DependsOn, schema.DependencyRef{
-				Table:  refTable,
-				Column: refCol,
-			})
+		if s.Routines == nil {
+			s.Routines = make(map[string]*schema.Routine)
+		}
+		s.Routines[schema.RoutineKey(name, identityArgs)] = &schema.Routine{
+			Name:         name,
+			Kind:         "AGGREGATE",
+			IdentityArgs: identityArgs,
+			Definition:   reconstructAggregateDefinition(name, identityArgs, stype, sfunc, finalfunc, combinefunc, serialfunc, deserialfunc, initcond, parallel),
 		}
 	}
-	if err := depRows.Err(); err != nil {
+	if err := aggRows.Err(); err != nil {
 		return nil, err
 	}
-	_ = depRows.Close()
+	_ = aggRows.Close()
 
-	// 6c. Triggers on Tables
-	trgQuery := `
+	// 6d. Managed routines. Functions AND procedures are managed: desired
+	// side comes from the shadow compile, keyed by name + identity args
+	// (pg_get_functiondef is the canonical definition for both). Aggregates
+	// are managed separately in 6d.0 via pg_aggregate reconstruction.
+	routineQuery := `
 		SELECT
-			t.tgname AS trigger_name,
-			c.relname AS table_name
-		FROM pg_trigger t
-		JOIN pg_class c ON c.oid = t.tgrelid
-		JOIN pg_namespace n ON n.oid = c.relnamespace
+			p.proname AS routine_name,
+			pg_get_function_identity_arguments(p.oid) AS identity_args,
+			COALESCE(pg_get_function_result(p.oid), '') AS return_type,
+			l.lanname AS language,
+			CASE p.provolatile WHEN 'i' THEN 'IMMUTABLE' WHEN 's' THEN 'STABLE' ELSE 'VOLATILE' END AS volatility,
+			p.prosecdef AS security_definer,
+			pg_get_functiondef(p.oid) AS definition,
+			p.prokind AS routine_kind
+		FROM pg_proc p
+		JOIN pg_namespace n ON n.oid = p.pronamespace
+		JOIN pg_language l ON l.oid = p.prolang
 		WHERE n.nspname = $1
-		  AND NOT t.tgisinternal
-		ORDER BY t.tgname;
+		  AND p.prokind IN ('f', 'p')
+		  AND NOT EXISTS (
+		      SELECT 1 FROM pg_depend d
+		      WHERE d.objid = p.oid AND d.deptype = 'e'
+		  )
+		ORDER BY p.proname, identity_args;
 	`
-	trgRows, err := dbtx.QueryContext(ctx, trgQuery, schemaName)
+	routineRows, err := dbtx.QueryContext(ctx, routineQuery, schemaName)
 	if err != nil {
-		return nil, fmt.Errorf("inspecting triggers in schema %q: %w", schemaName, err)
+		return nil, fmt.Errorf("inspecting routines in schema %q: %w", schemaName, err)
 	}
-	defer func() { _ = trgRows.Close() }()
-
-	for trgRows.Next() {
-		var trgName, tblName string
-		if err := trgRows.Scan(&trgName, &tblName); err != nil {
-			return nil, fmt.Errorf("scanning trigger in schema %q: %w", schemaName, err)
+	for routineRows.Next() {
+		var name, identityArgs, returnType, lang, volatility, definition, routineKind string
+		var securityDefiner bool
+		if err := routineRows.Scan(&name, &identityArgs, &returnType, &lang, &volatility, &securityDefiner, &definition, &routineKind); err != nil {
+			_ = routineRows.Close()
+			return nil, fmt.Errorf("scanning routine in schema %q: %w", schemaName, err)
 		}
-		key := "trigger:" + tblName + "." + trgName
-		s.Unmanaged[key] = &schema.UnmanagedObject{
-			Name:  trgName,
-			Kind:  schema.UnmanagedTrigger,
-			Table: tblName,
-			DependsOn: []schema.DependencyRef{
-				{Table: tblName},
-			},
+		kind := "FUNCTION"
+		if routineKind == "p" {
+			kind = "PROCEDURE"
+		}
+		if s.Routines == nil {
+			s.Routines = make(map[string]*schema.Routine)
+		}
+		s.Routines[schema.RoutineKey(name, identityArgs)] = &schema.Routine{
+			Name:            name,
+			Kind:            kind,
+			IdentityArgs:    identityArgs,
+			ReturnType:      returnType,
+			Language:        lang,
+			Volatility:      volatility,
+			SecurityDefiner: securityDefiner,
+			Definition:      definition,
 		}
 	}
-	if err := trgRows.Err(); err != nil {
+	if err := routineRows.Err(); err != nil {
+		_ = routineRows.Close()
 		return nil, err
 	}
-	_ = trgRows.Close()
+	_ = routineRows.Close()
 
-	// 6d. Stored Functions and Procedures
-	procQuery := `
+	// 6d.1 Unmanaged window functions (functions, procedures, and aggregates
+	// are managed above; prokind 'w' is user-defined window functions).
+	// Ordered-set / hypothetical aggregates (aggkind <> 'n') are excluded in
+	// 6d.0 and would also remain protected — register them here too.
+	unmanagedProcQuery := `
 		SELECT
 			p.proname AS proc_name,
 			COALESCE(p.prosrc, '') AS source
 		FROM pg_proc p
 		JOIN pg_namespace n ON n.oid = p.pronamespace
 		WHERE n.nspname = $1
+		  AND (
+		      p.prokind = 'w'
+		      OR (p.prokind = 'a' AND EXISTS (
+		          SELECT 1 FROM pg_aggregate a
+		          WHERE a.aggfnoid = p.oid AND a.aggkind <> 'n'
+		      ))
+		  )
 		  AND NOT EXISTS (
 		      SELECT 1 FROM pg_depend d
 		      WHERE d.objid = p.oid AND d.deptype = 'e'
 		  )
 		ORDER BY p.proname;
 	`
-	procRows, err := dbtx.QueryContext(ctx, procQuery, schemaName)
+	procRows, err := dbtx.QueryContext(ctx, unmanagedProcQuery, schemaName)
 	if err != nil {
 		return nil, fmt.Errorf("inspecting procedures in schema %q: %w", schemaName, err)
 	}
@@ -761,14 +1078,23 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 	}
 	_ = seqRows.Close()
 
-	// 6f. Domains
+	// 6f. Managed domains. Desired side comes from the shadow compile of
+	// SchemaSQL (CREATE DOMAIN compiles in the shadow schema); base type,
+	// nullability, default, and CHECK constraints are diffed declaratively.
 	domainQuery := `
 		SELECT
-			t.typname AS domain_name
+			t.typname AS domain_name,
+			format_type(t.typbasetype, t.typtypmod) AS base_type,
+			t.typnotnull AS not_null,
+			COALESCE(pg_get_expr(t.typdefaultbin, 0), '') AS default_expr
 		FROM pg_type t
 		JOIN pg_namespace n ON n.oid = t.typnamespace
 		WHERE n.nspname = $1
 		  AND t.typtype = 'd'
+		  AND NOT EXISTS (
+		      SELECT 1 FROM pg_depend d
+		      WHERE d.objid = t.oid AND d.deptype = 'e'
+		  )
 		ORDER BY t.typname;
 	`
 	domainRows, err := dbtx.QueryContext(ctx, domainQuery, schemaName)
@@ -777,21 +1103,103 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 	}
 	defer func() { _ = domainRows.Close() }()
 
+	var domainNames []string
 	for domainRows.Next() {
-		var domainName string
-		if err := domainRows.Scan(&domainName); err != nil {
+		var domainName, baseType, defaultExpr string
+		var notNull bool
+		if err := domainRows.Scan(&domainName, &baseType, &notNull, &defaultExpr); err != nil {
 			return nil, fmt.Errorf("scanning domain in schema %q: %w", schemaName, err)
 		}
-		s.Unmanaged["domain:"+domainName] = &schema.UnmanagedObject{
-			Name: domainName,
-			Kind: schema.UnmanagedDomain,
+		if s.Domains == nil {
+			s.Domains = make(map[string]*schema.Domain)
 		}
+		s.Domains[domainName] = &schema.Domain{
+			Name:       domainName,
+			BaseType:   baseType,
+			IsNullable: !notNull,
+			Default:    defaultExpr,
+		}
+		domainNames = append(domainNames, domainName)
 	}
 	if err := domainRows.Err(); err != nil {
 		return nil, err
 	}
+	_ = domainRows.Close()
+
+	// 6f.1 Domain CHECK constraints (conrelid = 0, contypid = domain type).
+	if len(domainNames) > 0 {
+		domainCheckQuery := `
+			SELECT
+				t.typname AS domain_name,
+				con.conname AS constraint_name,
+				pg_get_constraintdef(con.oid) AS constraint_def
+			FROM pg_constraint con
+			JOIN pg_type t ON t.oid = con.contypid
+			JOIN pg_namespace n ON n.oid = t.typnamespace
+			WHERE n.nspname = $1
+			  AND con.conrelid = 0
+			ORDER BY t.typname, con.conname;
+		`
+		dCheckRows, err := dbtx.QueryContext(ctx, domainCheckQuery, schemaName)
+		if err != nil {
+			return nil, fmt.Errorf("inspecting domain constraints in schema %q: %w", schemaName, err)
+		}
+		for dCheckRows.Next() {
+			var domainName, conName, conDef string
+			if err := dCheckRows.Scan(&domainName, &conName, &conDef); err != nil {
+				_ = dCheckRows.Close()
+				return nil, fmt.Errorf("scanning domain constraint in schema %q: %w", schemaName, err)
+			}
+			if d := s.Domains[domainName]; d != nil {
+				d.Checks = append(d.Checks, &schema.CheckConstraint{
+					Name:       conName,
+					TableName:  domainName,
+					Definition: conDef,
+					IsValid:    true,
+				})
+			}
+		}
+		if err := dCheckRows.Err(); err != nil {
+			_ = dCheckRows.Close()
+			return nil, err
+		}
+		_ = dCheckRows.Close()
+	}
 
 	return s, nil
+}
+
+// reconstructAggregateDefinition rebuilds a canonical CREATE AGGREGATE
+// statement from pg_aggregate catalog fields. regprocedure arguments are
+// already rendered as "schema.func(argtypes)" (or unqualified when the
+// function resolves through the pinned search_path). regtype state types are
+// rendered similarly. Empty optional fields are omitted.
+func reconstructAggregateDefinition(name, identityArgs, stype, sfunc, finalfunc, combinefunc, serialfunc, deserialfunc, initcond, parallel string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "CREATE AGGREGATE %s(%s) (\n", name, identityArgs)
+	parts := []string{
+		fmt.Sprintf("    SFUNC = %s", sfunc),
+		fmt.Sprintf("    STYPE = %s", stype),
+	}
+	if finalfunc != "" {
+		parts = append(parts, fmt.Sprintf("    FINALFUNC = %s", finalfunc))
+	}
+	if combinefunc != "" {
+		parts = append(parts, fmt.Sprintf("    COMBINEFUNC = %s", combinefunc))
+	}
+	if serialfunc != "" {
+		parts = append(parts, fmt.Sprintf("    SERIALFUNC = %s", serialfunc))
+	}
+	if deserialfunc != "" {
+		parts = append(parts, fmt.Sprintf("    DESERIALFUNC = %s", deserialfunc))
+	}
+	if initcond != "" {
+		parts = append(parts, fmt.Sprintf("    INITCOND = '%s'", initcond))
+	}
+	parts = append(parts, fmt.Sprintf("    PARALLEL = %s", parallel))
+	b.WriteString(strings.Join(parts, ",\n"))
+	b.WriteString("\n);")
+	return b.String()
 }
 
 // InspectSchemas reads the relational states across all specified schema names.

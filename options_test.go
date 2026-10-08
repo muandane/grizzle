@@ -128,6 +128,26 @@ func TestOptions_Validate(t *testing.T) {
 	if err := o4.Validate(); err != nil {
 		t.Errorf("expected valid options to pass, got: %v", err)
 	}
+
+	o5 := grizzle.Options{
+		SchemaSQL: `
+			CREATE TABLE docs (id INT);
+			CREATE ROLE app_read;
+			CREATE PUBLICATION docs_pub FOR TABLE docs;
+		`,
+		Dialect: grizzle.DialectPostgres,
+	}
+	if err := o5.Validate(); err != nil {
+		t.Errorf("mixed unified SchemaSQL should validate without treating tables as side-channel SQL: %v", err)
+	}
+
+	o6 := grizzle.Options{
+		SchemaSQL: "CREATE ROLE;",
+		Dialect:   grizzle.DialectPostgres,
+	}
+	if err := o6.Validate(); !errors.Is(err, grizzle.ErrInvalidOptions) {
+		t.Errorf("malformed extracted role statement should be invalid options, got: %v", err)
+	}
 }
 
 func TestApply_EdgeCases(t *testing.T) {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/user"
+	"strings"
 	"time"
 
 	"github.com/muandane/grizzle/internal/dialect"
@@ -170,7 +171,10 @@ func RecordProgress(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaN
 
 	var errMsg string
 	if execErr != nil {
-		errMsg = execErr.Error()
+		// Hook panics carry a full debug.Stack() in the error text; keep the
+		// first line only so grizzle_history stays readable. The complete
+		// stack is returned to the caller and logged.
+		errMsg, _, _ = strings.Cut(execErr.Error(), "\n")
 	}
 
 	return Insert(ctx, dbtx, dialectName, schemaName, Record{

@@ -1,6 +1,7 @@
 package plan
 
 import (
+	"cmp"
 	"slices"
 	"strings"
 )
@@ -15,25 +16,66 @@ func tableKey(schemaName, tableName string) string {
 // SortSteps applies topological ordering so dependent DDL operations execute in the correct relational sequence.
 // Cross-schema foreign keys and intra-schema foreign keys are topologically sorted:
 // referenced tables precede referencing tables on creation; reverse on drop.
+//
+// Ordering is phase-first (by ChangeType priority), then Kahn topological
+// ordering within the CREATE_TABLE and DROP_TABLE phases. Dependency cycles
+// (legal when FKs are deferred to ADD_FK) are emitted as a deterministically
+// sorted strongly-connected remainder — never via a comparator that can
+// violate the sort contract.
 func SortSteps(steps []Step) {
 	priority := map[ChangeType]int{
-		ChangeDropFK:             10,  // 1. Drop old foreign keys first (unlocks referenced tables)
-		ChangeDropCheck:          15,  // 1b. Drop obsolete check constraints before redefining them
-		ChangeDropIndex:          20,  // 2. Drop obsolete indexes
-		ChangeDetachPartition:    25,  // 2b. Detach partitions before modifying or dropping them
-		ChangeCreateEnum:         30,  // 3. Create new enum types before tables use them
-		ChangeAlterEnum:          35,  // 4. Add new enum values before tables insert/alter
-		ChangeCreateTable:        40,  // 5. Create bare tables (PKs included, FKs deferred; parent tables before partitions)
-		ChangeAttachPartition:    42,  // 5a. Attach existing tables to partitioned tables
-		ChangeRenameColumn:       45,  // 5b. Rename columns before adding or altering other columns
-		ChangeAddColumn:          50,  // 6. Add new columns
-		ChangeAlterColumn:        60,  // 7. Modify column types, nullability, defaults
-		ChangeCreateIndex:        70,  // 8. Build new indexes
-		ChangeAddFK:              80,  // 9. Add foreign keys (NOT VALID) now that all tables and columns exist
-		ChangeAddCheck:           82,  // 9b. Add check constraints (NOT VALID) after all tables and columns exist
-		ChangeValidateConstraint: 85,  // 10. Validate foreign keys and check constraints
-		ChangeDropColumn:         90,  // 11. Drop columns (if allowed)
-		ChangeDropTable:          100, // 12. Drop tables (if allowed)
+		ChangeDropFK:               10, // 1. Drop old foreign keys first (unlocks referenced tables)
+		ChangeDropCheck:            15, // 1b. Drop obsolete check constraints before redefining them
+		ChangeDropIndex:            20, // 2. Drop obsolete indexes
+		ChangeDetachPartition:      25, // 2b. Detach partitions before modifying or dropping them
+		ChangeDropPolicy:           26, // 2c. Drop policies before recreating
+		ChangeDropTrigger:          27, // 2d. Drop triggers before column/table drops or function replaces
+		ChangeDropAggregate:        28, // 2e'. Drop aggregates before their support functions (pg_depend)
+		ChangeDropDomainRetype:     28, // 2e''. Drop rebuilt domains before the replacement CREATE_DOMAIN
+		ChangeDropView:             28, // 2e. Drop views before underlying table drops
+		ChangeDropFunction:         29, // 2f. Drop functions after dependents
+		ChangeDropExtension:        29, // 2g. Drop extensions last among early drops
+		ChangeCreateExtension:      5,  // 0. Extensions before enums/tables (provides types)
+		ChangeCreateEnum:           30, // 3. Create new enum types before tables use them
+		ChangeAlterEnum:            35, // 4. Add new enum values before tables insert/alter
+		ChangeCreateDomain:         36, // 4b. Create domains before tables/columns use them
+		ChangeCreateTable:          40, // 5. Create bare tables (PKs included, FKs deferred; parent tables before partitions)
+		ChangeAttachPartition:      42, // 5a. Attach existing tables to partitioned tables
+		ChangeRenameColumn:         45, // 5b. Rename columns before adding or altering other columns
+		ChangeCreateFunction:       48, // 5c. Functions before triggers/views that call them
+		ChangeCreateAggregate:      49, // 5c'. Aggregates after their support functions (pg_depend)
+		ChangeAddColumn:            50, // 6. Add new columns
+		ChangeAlterColumn:          60, // 7. Modify column types, nullability, defaults
+		ChangeCreateIndex:          70, // 8. Build new indexes
+		ChangeAddFK:                80, // 9. Add foreign keys (NOT VALID) now that all tables and columns exist
+		ChangeAddCheck:             82, // 9b. Add check constraints (NOT VALID) after all tables and columns exist
+		ChangeDropDomainConstraint: 84, // 9c. Drop domain constraints before replacements are added
+		ChangeValidateConstraint:   85, // 10. Validate foreign keys and check constraints
+		ChangeAlterDomain:          87, // 10b'. Alter domains (add constraints) after tables exist
+		ChangeEnableRLS:            86, // 10a. Enable RLS before creating policies
+		ChangeForceRLS:             86,
+		ChangeDisableRLS:           86,
+		ChangeNoForceRLS:           86,
+		ChangeCreatePolicy:         87, // 10b. Policies after RLS enabled
+		ChangeCreateTrigger:        88, // 10c. Triggers after functions and columns
+		ChangeCommentTable:         89, // 10c'. Comments after all objects exist
+		ChangeCommentColumn:        89,
+		ChangeCreateView:           95,  // 10d. Views after tables/functions
+		ChangeRefreshMatView:       96,  // 10e. Refresh matviews after create
+		ChangeDropColumn:           90,  // 11. Drop columns (if allowed)
+		ChangeDropTable:            100, // 12. Drop tables (if allowed)
+		ChangeDropDomain:           101, // 13. Drop domains after dependent tables/columns are gone
+		ChangeCreateRole:           119, // 14. Create roles before grants reference them
+		ChangeRoleComment:          120, // 14b. Stamp managed-role markers
+		ChangeGrant:                121, // 15. Grants after all schema objects and roles exist
+		ChangeRevoke:               122, // 16. Revokes after grants (replacement flows)
+		ChangeDropRole:             123, // 17. Drop roles last, after their grants are gone
+		ChangeDropPublication:      129, // 18. Publication replacement/removal before creates
+		ChangeCreatePublication:    130, // 19. Publications after schema objects exist
+		ChangeAlterPublication:     131, // 20. Publication drift after creation
+		ChangeDropEventTrigger:     132, // 21. Event-trigger replacement/removal before creates
+		ChangeCreateEventTrigger:   133, // 22. Event triggers last: they fire on subsequent DDL
+		ChangeAlterEventTrigger:    134, // 23. Event-trigger enabled-state drift
 	}
 
 	// Build relational dependency graph: referencingTable -> referencedTable
@@ -72,7 +114,7 @@ func SortSteps(steps []Step) {
 		}
 	}
 
-	// Compute transitive dependencies
+	// Compute transitive dependencies (Warshall — correct as-is; do not rewrite).
 	for k := range deps {
 		for i := range deps {
 			if deps[i][k] {
@@ -83,62 +125,12 @@ func SortSteps(steps []Step) {
 		}
 	}
 
-	isDep := func(child, parent string) bool {
-		if deps[child] != nil && deps[child][parent] {
-			return true
-		}
-		return false
-	}
-
+	// Phase-stable sort first.
 	slices.SortStableFunc(steps, func(a, b Step) int {
 		pDiff := priority[a.Type] - priority[b.Type]
 		if pDiff != 0 {
 			return pDiff
 		}
-
-		aKey := tableKey(a.Schema, a.Table)
-		bKey := tableKey(b.Schema, b.Table)
-
-		if a.Type == ChangeCreateTable && b.Type == ChangeCreateTable {
-			// Partition hierarchy: parent table before child partition
-			if a.ParentTable == "" && b.ParentTable != "" && (b.ParentTable == a.Table || b.ParentTable == aKey) {
-				return -1
-			}
-			if b.ParentTable == "" && a.ParentTable != "" && (a.ParentTable == b.Table || a.ParentTable == bKey) {
-				return 1
-			}
-
-			// FK dependency: referenced table before referencing table
-			// If a depends on b (a references b), b must precede a -> return 1
-			if isDep(aKey, bKey) || isDep(a.Table, bKey) || isDep(aKey, b.Table) || isDep(a.Table, b.Table) {
-				return 1
-			}
-			// If b depends on a (b references a), a must precede b -> return -1
-			if isDep(bKey, aKey) || isDep(b.Table, aKey) || isDep(bKey, a.Table) || isDep(b.Table, a.Table) {
-				return -1
-			}
-		}
-
-		if a.Type == ChangeDropTable && b.Type == ChangeDropTable {
-			// Partition hierarchy: child partition before parent table
-			if a.ParentTable == "" && b.ParentTable != "" && (b.ParentTable == a.Table || b.ParentTable == aKey) {
-				return 1
-			}
-			if b.ParentTable == "" && a.ParentTable != "" && (a.ParentTable == b.Table || a.ParentTable == bKey) {
-				return -1
-			}
-
-			// FK dependency: referencing table must be dropped BEFORE referenced table
-			// If a depends on b (a references b), a must be dropped before b -> return -1
-			if isDep(aKey, bKey) || isDep(a.Table, bKey) || isDep(aKey, b.Table) || isDep(a.Table, b.Table) {
-				return -1
-			}
-			// If b depends on a (b references a), b must be dropped before a -> return 1
-			if isDep(bKey, aKey) || isDep(b.Table, aKey) || isDep(bKey, a.Table) || isDep(b.Table, a.Table) {
-				return 1
-			}
-		}
-
 		if a.Schema != b.Schema {
 			return strings.Compare(a.Schema, b.Schema)
 		}
@@ -147,4 +139,145 @@ func SortSteps(steps []Step) {
 		}
 		return strings.Compare(a.SQL, b.SQL)
 	})
+
+	// Within CREATE_TABLE / DROP_TABLE phases, apply Kahn topological order.
+	reorderPhase(steps, ChangeCreateTable, deps, false)
+	reorderPhase(steps, ChangeDropTable, deps, true)
+}
+
+// reorderPhase rewrites the contiguous run of steps of the given type in place
+// using Kahn's algorithm over the table dependency graph. reverse=true inverts
+// edges (referencing before referenced) for DROP_TABLE. Cycles are emitted as
+// a lexically sorted remainder so ordering stays deterministic.
+func reorderPhase(steps []Step, typ ChangeType, deps map[string]map[string]bool, reverse bool) {
+	start, end := -1, -1
+	for i, s := range steps {
+		if s.Type == typ {
+			if start < 0 {
+				start = i
+			}
+			end = i + 1
+		} else if start >= 0 {
+			break
+		}
+	}
+	if start < 0 || end-start <= 1 {
+		return
+	}
+
+	phase := steps[start:end]
+	keys := make([]string, len(phase))
+	keySet := make(map[string]bool, len(phase))
+	for i, s := range phase {
+		k := tableKey(s.Schema, s.Table)
+		keys[i] = k
+		keySet[k] = true
+	}
+
+	// Build adjacency among keys present in this phase.
+	// Forward (create): edge parent -> child means parent must precede child
+	// (child depends on parent). Reverse (drop): edge child -> parent.
+	adj := make(map[string][]string)
+	indeg := make(map[string]int, len(keySet))
+	for k := range keySet {
+		indeg[k] = 0
+	}
+	addEdge := func(from, to string) {
+		if from == to || !keySet[from] || !keySet[to] {
+			return
+		}
+		if slices.Contains(adj[from], to) {
+			return
+		}
+		adj[from] = append(adj[from], to)
+		indeg[to]++
+	}
+	for child, parents := range deps {
+		if !keySet[child] {
+			continue
+		}
+		for parent := range parents {
+			if !keySet[parent] {
+				continue
+			}
+			if reverse {
+				addEdge(child, parent) // drop referencing before referenced
+			} else {
+				addEdge(parent, child) // create referenced before referencing
+			}
+		}
+	}
+
+	// Ready queue: zero-indegree keys, sorted for determinism.
+	ready := make([]string, 0, len(keySet))
+	for k, d := range indeg {
+		if d == 0 {
+			ready = append(ready, k)
+		}
+	}
+	slices.Sort(ready)
+
+	order := make([]string, 0, len(keySet))
+	for len(ready) > 0 {
+		k := ready[0]
+		ready = ready[1:]
+		order = append(order, k)
+		var newly []string
+		for _, to := range adj[k] {
+			indeg[to]--
+			if indeg[to] == 0 {
+				newly = append(newly, to)
+			}
+		}
+		slices.Sort(newly)
+		ready = append(ready, newly...)
+		slices.Sort(ready)
+	}
+
+	// Cycle remainder: emit remaining keys in lexical order.
+	if len(order) < len(keySet) {
+		var rem []string
+		for k, d := range indeg {
+			if d > 0 {
+				rem = append(rem, k)
+			}
+		}
+		slices.Sort(rem)
+		order = append(order, rem...)
+	}
+
+	// Stable group steps by key in Kahn order, preserving relative order
+	// among steps that share a key (shouldn't normally happen).
+	byKey := make(map[string][]Step, len(keySet))
+	for _, s := range phase {
+		k := tableKey(s.Schema, s.Table)
+		byKey[k] = append(byKey[k], s)
+	}
+	out := make([]Step, 0, len(phase))
+	for _, k := range order {
+		out = append(out, byKey[k]...)
+	}
+	// Defensive: any leftover (should be empty)
+	if len(out) < len(phase) {
+		seen := make(map[string]bool, len(order))
+		for _, k := range order {
+			seen[k] = true
+		}
+		var leftover []Step
+		for _, s := range phase {
+			k := tableKey(s.Schema, s.Table)
+			if !seen[k] {
+				leftover = append(leftover, s)
+			}
+		}
+		slices.SortStableFunc(leftover, func(a, b Step) int {
+			return cmp.Or(
+				strings.Compare(a.Schema, b.Schema),
+				strings.Compare(a.Table, b.Table),
+				strings.Compare(a.SQL, b.SQL),
+			)
+		})
+		out = append(out, leftover...)
+	}
+	copy(steps[start:end], out)
 }

@@ -26,8 +26,23 @@ type Change struct {
 	OldEnum           *schema.Enum
 	EnumValue         string
 	TableData         *schema.Table
+	Extension         *schema.Extension
+	Policy            *schema.Policy
+	Routine           *schema.Routine
+	Domain            *schema.Domain
+	OldDomain         *schema.Domain
+	Role              *schema.Role
+	Grant             *schema.Grant
+	Publication       *schema.Publication
+	OldPublication    *schema.Publication
+	EventTrigger      *schema.EventTrigger
+	OldEventTrigger   *schema.EventTrigger
+	Trigger           *schema.Trigger
+	View              *schema.View
+	Replace           bool
 	Destructive       bool
 	IsRenameCandidate bool
+	OldComment        string
 
 	// Structural flags for hazard analysis
 	ColumnNotNull    bool
@@ -67,6 +82,28 @@ func DiffWithMappings(live, desired *schema.Schema, targetSchema, shadowSchema s
 
 	normalize := func(def string) string {
 		return schema.NormalizeDefinitionWithMappings(def, schemaMappings, targetSchema)
+	}
+
+	// 0. Extensions Diff (desired Extensions are injected from SchemaSQL parse).
+	// Create missing desired extensions only. Live-only extensions are never
+	// auto-dropped: they are database-wide and may be owned by other tools.
+	// DROP_EXTENSION is reserved for an explicit AllowDropExtension path that
+	// requires the extension to have been removed from SchemaSQL while still
+	// appearing in a caller-supplied managed set — not implemented as a
+	// blanket live-minus-desired sweep.
+	dExtNames := slices.Collect(maps.Keys(desired.Extensions))
+	slices.Sort(dExtNames)
+	for _, dName := range dExtNames {
+		dExt := desired.Extensions[dName]
+		if _, exists := live.Extensions[dName]; !exists {
+			changes = append(changes, Change{
+				Type:        plan.ChangeCreateExtension,
+				Schema:      targetSchema,
+				Table:       dName,
+				Extension:   dExt,
+				Destructive: false,
+			})
+		}
 	}
 
 	// 1. Custom ENUM Types Diff
@@ -175,6 +212,48 @@ func DiffWithMappings(live, desired *schema.Schema, targetSchema, shadowSchema s
 					Check:       &checkCopy,
 					Destructive: false,
 				})
+			}
+
+			// New table: emit RLS flags and policy creation steps (policies
+			// cannot be declared inline in CREATE TABLE).
+			changes = append(changes, diffRLSFlags(targetSchema, tblName, nil, dTable)...)
+			for _, dPol := range sortedPolicies(dTable) {
+				polCopy := *dPol
+				changes = append(changes, Change{
+					Type:        plan.ChangeCreatePolicy,
+					Schema:      targetSchema,
+					Table:       tblName,
+					Policy:      &polCopy,
+					Destructive: false,
+				})
+			}
+			// New table: emit trigger creation (sorted after functions).
+			for _, dTrg := range sortedTriggers(dTable) {
+				trgCopy := *dTrg
+				trgCopy.Definition = normalize(dTrg.Definition)
+				changes = append(changes, Change{
+					Type:        plan.ChangeCreateTrigger,
+					Schema:      targetSchema,
+					Table:       tblName,
+					Trigger:     &trgCopy,
+					Destructive: false,
+				})
+			}
+			// New table: comments are separate statements (COMMENT ON), emitted
+			// after the objects they describe.
+			changes = append(changes, commentChanges(targetSchema, tblName, dTable.Comment, "", nil, nil)...)
+			for _, dColName := range sortedColumnNamesOf(dTable) {
+				dCol := dTable.Columns[dColName]
+				if dCol.Comment != "" {
+					colCopy := *dCol
+					changes = append(changes, Change{
+						Type:        plan.ChangeCommentColumn,
+						Schema:      targetSchema,
+						Table:       tblName,
+						Column:      &colCopy,
+						Destructive: false,
+					})
+				}
 			}
 			continue
 		}
@@ -387,8 +466,27 @@ func DiffWithMappings(live, desired *schema.Schema, targetSchema, shadowSchema s
 					OldColumn:         lCol,
 					Destructive:       true,
 					IsRenameCandidate: isAmbiguousCandidate,
-					UnmanagedDeps:     findUnmanagedDeps(live.Unmanaged, tblName, colName),
+					UnmanagedDeps: slices.Concat(
+						findUnmanagedDeps(live.Unmanaged, tblName, colName),
+						findSurvivingTriggerDeps(lTable, dTable, normalize),
+					),
 				})
+			}
+
+			// Comment drift: table-level plus per-column (existing columns;
+			// added columns with comments emit their own step).
+			changes = append(changes, commentChanges(targetSchema, tblName, dTable.Comment, lTable.Comment, dTable, lTable)...)
+			for _, colName := range addedKeys {
+				if dCol := addedCols[colName]; dCol.Comment != "" {
+					colCopy := *dCol
+					changes = append(changes, Change{
+						Type:        plan.ChangeCommentColumn,
+						Schema:      targetSchema,
+						Table:       tblName,
+						Column:      &colCopy,
+						Destructive: false,
+					})
+				}
 			}
 		}
 
@@ -574,6 +672,105 @@ func DiffWithMappings(live, desired *schema.Schema, targetSchema, shadowSchema s
 				})
 			}
 		}
+
+		// RLS flags diff
+		changes = append(changes, diffRLSFlags(targetSchema, tblName, lTable, dTable)...)
+
+		// Policies diff: add / replace (drop+create) / drop.
+		for _, dPol := range sortedPolicies(dTable) {
+			polCopy := *dPol
+			polCopy.Using = normalize(dPol.Using)
+			polCopy.WithCheck = normalize(dPol.WithCheck)
+			lPol, inLive := lTable.Policies[dPol.Name]
+			if !inLive {
+				changes = append(changes, Change{
+					Type:        plan.ChangeCreatePolicy,
+					Schema:      targetSchema,
+					Table:       tblName,
+					Policy:      &polCopy,
+					Destructive: false,
+				})
+				continue
+			}
+			if !policiesEqual(lPol, dPol, normalize) {
+				changes = append(changes, Change{
+					Type:        plan.ChangeDropPolicy,
+					Schema:      targetSchema,
+					Table:       tblName,
+					Policy:      lPol,
+					Destructive: true,
+				})
+				changes = append(changes, Change{
+					Type:        plan.ChangeCreatePolicy,
+					Schema:      targetSchema,
+					Table:       tblName,
+					Policy:      &polCopy,
+					Destructive: false,
+				})
+			}
+		}
+		for polName, lPol := range lTable.Policies {
+			if _, inDesired := dTable.Policies[polName]; !inDesired {
+				changes = append(changes, Change{
+					Type:        plan.ChangeDropPolicy,
+					Schema:      targetSchema,
+					Table:       tblName,
+					Policy:      lPol,
+					Destructive: true,
+				})
+			}
+		}
+
+		// Triggers diff: create missing, DROP + CREATE when the canonical
+		// definition drifts (Postgres has no CREATE OR REPLACE TRIGGER),
+		// drop live-only triggers behind AllowDropTrigger.
+		for _, dTrg := range sortedTriggers(dTable) {
+			dDef := normalize(dTrg.Definition)
+			trgCopy := *dTrg
+			trgCopy.Definition = dDef
+			lTrg, inLive := lTable.Triggers[dTrg.Name]
+			if !inLive {
+				changes = append(changes, Change{
+					Type:        plan.ChangeCreateTrigger,
+					Schema:      targetSchema,
+					Table:       tblName,
+					Trigger:     &trgCopy,
+					Destructive: false,
+				})
+				continue
+			}
+			if normalize(lTrg.Definition) != dDef {
+				lTrgCopy := *lTrg
+				lTrgCopy.Definition = normalize(lTrg.Definition)
+				changes = append(changes, Change{
+					Type:        plan.ChangeDropTrigger,
+					Schema:      targetSchema,
+					Table:       tblName,
+					Trigger:     &lTrgCopy,
+					Destructive: true,
+				})
+				changes = append(changes, Change{
+					Type:        plan.ChangeCreateTrigger,
+					Schema:      targetSchema,
+					Table:       tblName,
+					Trigger:     &trgCopy,
+					Destructive: false,
+				})
+			}
+		}
+		for trgName, lTrg := range lTable.Triggers {
+			if _, inDesired := dTable.Triggers[trgName]; !inDesired {
+				lTrgCopy := *lTrg
+				lTrgCopy.Definition = normalize(lTrg.Definition)
+				changes = append(changes, Change{
+					Type:        plan.ChangeDropTrigger,
+					Schema:      targetSchema,
+					Table:       tblName,
+					Trigger:     &lTrgCopy,
+					Destructive: true,
+				})
+			}
+		}
 	}
 
 	// 3. Detect dropped tables
@@ -619,7 +816,540 @@ func DiffWithMappings(live, desired *schema.Schema, targetSchema, shadowSchema s
 		}
 	}
 
+	// 4. Routine (function) diff: create missing, CREATE OR REPLACE on body
+	// drift, DROP + CREATE on signature change, drop live-only behind
+	// AllowDropFunction.
+	changes = append(changes, diffRoutines(live, desired, targetSchema, normalize)...)
+
+	// 4b. Domain diff: create missing, DROP + CREATE on base type/nullability/
+	// default drift, ALTER DOMAIN ADD/DROP CONSTRAINT on CHECK drift, drop
+	// live-only behind AllowDomain.
+	changes = append(changes, diffDomains(live, desired, targetSchema, normalize)...)
+
+	// 5. Views diff: create missing, CREATE OR REPLACE on append-columns-only
+	// drift, DROP + CREATE otherwise, drop live-only behind AllowDropView.
+	changes = append(changes, diffViews(live, desired, targetSchema, normalize)...)
+
 	return changes, nil
+}
+
+// commentChanges emits COMMENT drift steps: table comment and column
+// comments on columns present in both live and desired. A comment is set
+// when desired is non-empty; it is cleared (IS NULL) when desired is empty
+// but live carries one. OldComment enables reversal in migration exports.
+func commentChanges(targetSchema, tblName, dComment, lComment string, dTable, lTable *schema.Table) []Change {
+	var changes []Change
+	if dComment != lComment {
+		changes = append(changes, Change{
+			Type:        plan.ChangeCommentTable,
+			Schema:      targetSchema,
+			Table:       tblName,
+			TableData:   &schema.Table{Name: tblName, Comment: dComment},
+			OldComment:  lComment,
+			Destructive: false,
+		})
+	}
+	if dTable == nil || lTable == nil {
+		return changes
+	}
+	for _, colName := range sortedColumnNamesOf(dTable) {
+		dCol := dTable.Columns[colName]
+		lCol, exists := lTable.Columns[colName]
+		if !exists || dCol.Comment == (lCol.Comment) {
+			continue
+		}
+		colCopy := *dCol
+		changes = append(changes, Change{
+			Type:        plan.ChangeCommentColumn,
+			Schema:      targetSchema,
+			Table:       tblName,
+			Column:      &colCopy,
+			OldComment:  lCol.Comment,
+			Destructive: false,
+		})
+	}
+	return changes
+}
+
+// sortedColumnNamesOf returns a table's column names in deterministic order.
+func sortedColumnNamesOf(t *schema.Table) []string {
+	names := slices.Collect(maps.Keys(t.Columns))
+	slices.Sort(names)
+	return names
+}
+
+// appendOnlyColumns reports whether desired view columns extend the live
+// column list as a strict in-order prefix — the only drift Postgres accepts
+// via CREATE OR REPLACE VIEW.
+func appendOnlyColumns(liveCols, desiredCols []string) bool {
+	if len(desiredCols) < len(liveCols) {
+		return false
+	}
+	for i, c := range liveCols {
+		if desiredCols[i] != c {
+			return false
+		}
+	}
+	return true
+}
+
+// diffViews emits view changes. Regular views drift via CREATE OR REPLACE
+// when columns are only appended; materialized views and column-shrinking
+// changes require a destructive DROP + CREATE (plus REFRESH for matviews).
+func diffViews(live, desired *schema.Schema, targetSchema string, normalize func(string) string) []Change {
+	var changes []Change
+	for _, dName := range sortedViewNames(desired) {
+		dView := desired.Views[dName]
+		dCopy := *dView
+		dCopy.Definition = normalize(dView.Definition)
+		lView, exists := live.Views[dName]
+		if !exists {
+			changes = append(changes, Change{
+				Type:        plan.ChangeCreateView,
+				Schema:      targetSchema,
+				Table:       dName,
+				View:        &dCopy,
+				Destructive: false,
+			})
+			if dView.IsMatView {
+				changes = append(changes, Change{
+					Type:        plan.ChangeRefreshMatView,
+					Schema:      targetSchema,
+					Table:       dName,
+					View:        &dCopy,
+					Destructive: false,
+				})
+			}
+			continue
+		}
+		lNorm := normalize(lView.Definition)
+		if lNorm == dCopy.Definition && lView.IsMatView == dView.IsMatView {
+			continue
+		}
+		replaceInPlace := !lView.IsMatView && !dView.IsMatView && appendOnlyColumns(lView.Columns, dView.Columns)
+		if !replaceInPlace {
+			lCopy := *lView
+			lCopy.Definition = lNorm
+			changes = append(changes, Change{
+				Type:        plan.ChangeDropView,
+				Schema:      targetSchema,
+				Table:       dName,
+				View:        &lCopy,
+				Destructive: true,
+			})
+		}
+		changes = append(changes, Change{
+			Type:        plan.ChangeCreateView,
+			Schema:      targetSchema,
+			Table:       dName,
+			View:        &dCopy,
+			Replace:     replaceInPlace,
+			Destructive: false,
+		})
+		if dView.IsMatView {
+			changes = append(changes, Change{
+				Type:        plan.ChangeRefreshMatView,
+				Schema:      targetSchema,
+				Table:       dName,
+				View:        &dCopy,
+				Destructive: false,
+			})
+		}
+	}
+	for _, lName := range sortedViewNames(live) {
+		if _, inDesired := desired.Views[lName]; !inDesired {
+			lView := live.Views[lName]
+			lCopy := *lView
+			lCopy.Definition = normalize(lView.Definition)
+			changes = append(changes, Change{
+				Type:        plan.ChangeDropView,
+				Schema:      targetSchema,
+				Table:       lName,
+				View:        &lCopy,
+				Destructive: true,
+			})
+		}
+	}
+	return changes
+}
+
+// sortedViewNames returns a schema's view names in deterministic order.
+func sortedViewNames(s *schema.Schema) []string {
+	if s == nil {
+		return nil
+	}
+	names := slices.Collect(maps.Keys(s.Views))
+	slices.Sort(names)
+	return names
+}
+
+// routineDef returns a shadow-unmapped copy of a desired routine.
+func routineDef(r *schema.Routine, normalize func(string) string) *schema.Routine {
+	copied := *r
+	copied.IdentityArgs = normalize(r.IdentityArgs)
+	copied.ReturnType = normalize(r.ReturnType)
+	copied.Definition = normalize(r.Definition)
+	return &copied
+}
+
+// diffRoutines emits routine changes. pg_get_functiondef always renders
+// CREATE OR REPLACE, so function/procedure body/volatility/security drift
+// replaces in place; identity-args, return-type, kind, or language drift
+// cannot be replaced (Postgres restriction) and requires a destructive
+// DROP + CREATE. Aggregates (reconstructed CREATE AGGREGATE) have no
+// CREATE OR REPLACE, so any body drift is DROP + CREATE.
+func diffRoutines(live, desired *schema.Schema, targetSchema string, normalize func(string) string) []Change {
+	var changes []Change
+	for _, dR := range sortedRoutines(desired) {
+		dCopy := routineDef(dR, normalize)
+		lR, exists := live.Routines[schema.RoutineKey(dR.Name, dR.IdentityArgs)]
+		if !exists {
+			changes = append(changes, Change{
+				Type:        routineCreateType(dR.Kind),
+				Schema:      targetSchema,
+				Table:       dR.Name,
+				Routine:     dCopy,
+				Destructive: false,
+			})
+			continue
+		}
+		if lR.IdentityArgs != dCopy.IdentityArgs ||
+			lR.ReturnType != dCopy.ReturnType ||
+			lR.Kind != dR.Kind || lR.Language != dR.Language {
+			lCopy := *lR
+			lCopy.IdentityArgs = normalize(lR.IdentityArgs)
+			changes = append(changes, Change{
+				Type:        routineDropType(lR.Kind),
+				Schema:      targetSchema,
+				Table:       lR.Name,
+				Routine:     &lCopy,
+				Destructive: true,
+			})
+			changes = append(changes, Change{
+				Type:        routineCreateType(dR.Kind),
+				Schema:      targetSchema,
+				Table:       dR.Name,
+				Routine:     dCopy,
+				Destructive: false,
+			})
+			continue
+		}
+		if normalize(lR.Definition) != dCopy.Definition {
+			if dR.Kind == "AGGREGATE" {
+				// Aggregates have no CREATE OR REPLACE: any drift is DROP + CREATE.
+				lCopy := *lR
+				lCopy.IdentityArgs = normalize(lR.IdentityArgs)
+				changes = append(changes, Change{
+					Type:        routineDropType(lR.Kind),
+					Schema:      targetSchema,
+					Table:       lR.Name,
+					Routine:     &lCopy,
+					Destructive: true,
+				})
+			}
+			changes = append(changes, Change{
+				Type:        routineCreateType(dR.Kind),
+				Schema:      targetSchema,
+				Table:       dR.Name,
+				Routine:     dCopy,
+				Destructive: false,
+			})
+		}
+	}
+	for _, lR := range sortedRoutines(live) {
+		if _, inDesired := desired.Routines[schema.RoutineKey(lR.Name, lR.IdentityArgs)]; !inDesired {
+			lCopy := *lR
+			lCopy.IdentityArgs = normalize(lR.IdentityArgs)
+			changes = append(changes, Change{
+				Type:        routineDropType(lR.Kind),
+				Schema:      targetSchema,
+				Table:       lR.Name,
+				Routine:     &lCopy,
+				Destructive: true,
+			})
+		}
+	}
+	return changes
+}
+
+// routineCreateType / routineDropType route aggregates to their dedicated
+// change types so plan sorting places aggregate creation after support
+// functions and aggregate drops before support functions. Functions and
+// procedures share the base types.
+func routineCreateType(kind string) plan.ChangeType {
+	if kind == "AGGREGATE" {
+		return plan.ChangeCreateAggregate
+	}
+	return plan.ChangeCreateFunction
+}
+
+func routineDropType(kind string) plan.ChangeType {
+	if kind == "AGGREGATE" {
+		return plan.ChangeDropAggregate
+	}
+	return plan.ChangeDropFunction
+}
+
+// diffDomains compares live and desired managed domains. Base type,
+// nullability, or default drift is DROP + CREATE (Postgres cannot alter a
+// domain's base type). CHECK drift becomes ALTER DOMAIN ADD/DROP CONSTRAINT.
+// Live-only domains are dropped behind AllowDomain.
+func diffDomains(live, desired *schema.Schema, targetSchema string, normalize func(string) string) []Change {
+	var changes []Change
+	for _, dDom := range sortedDomains(desired) {
+		dCopy := domainDef(dDom, normalize)
+		lDom, exists := live.Domains[dDom.Name]
+		if !exists {
+			changes = append(changes, Change{
+				Type:        plan.ChangeCreateDomain,
+				Schema:      targetSchema,
+				Table:       dDom.Name,
+				Domain:      dCopy,
+				Destructive: false,
+			})
+			continue
+		}
+
+		baseDrift := normalize(lDom.BaseType) != dCopy.BaseType ||
+			lDom.IsNullable != dCopy.IsNullable ||
+			normalize(lDom.Default) != dCopy.Default
+		if baseDrift {
+			// ALTER DOMAIN cannot change the base type; rebuild the domain.
+			// The retype drop is its own change type so sorting places it
+			// before the replacement CREATE_DOMAIN (same name), while a
+			// live-only DROP_DOMAIN waits for dependent table drops.
+			lCopy := domainDef(lDom, normalize)
+			changes = append(changes, Change{
+				Type:        plan.ChangeDropDomainRetype,
+				Schema:      targetSchema,
+				Table:       lDom.Name,
+				Domain:      lCopy,
+				Destructive: true,
+			})
+			changes = append(changes, Change{
+				Type:        plan.ChangeCreateDomain,
+				Schema:      targetSchema,
+				Table:       dDom.Name,
+				Domain:      dCopy,
+				Destructive: false,
+			})
+			continue
+		}
+
+		// CHECK drift: adds are non-destructive; removals and same-name
+		// redefinitions are gated (validation is lost mid-flight).
+		lChecks := make(map[string]*schema.CheckConstraint, len(lDom.Checks))
+		for _, c := range lDom.Checks {
+			lChecks[c.Name] = c
+		}
+		dChecks := make(map[string]*schema.CheckConstraint, len(dCopy.Checks))
+		for _, c := range dCopy.Checks {
+			dChecks[c.Name] = c
+		}
+		for _, c := range dCopy.Checks {
+			lc, exists := lChecks[c.Name]
+			if exists && normalize(lc.Definition) == normalize(c.Definition) {
+				continue
+			}
+			if exists {
+				lcCopy := *lc
+				changes = append(changes, Change{
+					Type:        plan.ChangeDropDomainConstraint,
+					Schema:      targetSchema,
+					Table:       dDom.Name,
+					Check:       &lcCopy,
+					Destructive: true,
+				})
+			}
+			cCopy := *c
+			changes = append(changes, Change{
+				Type:        plan.ChangeAlterDomain,
+				Schema:      targetSchema,
+				Table:       dDom.Name,
+				Check:       &cCopy,
+				Destructive: false,
+			})
+		}
+		for _, lc := range lDom.Checks {
+			if _, inDesired := dChecks[lc.Name]; !inDesired {
+				lcCopy := *lc
+				changes = append(changes, Change{
+					Type:        plan.ChangeDropDomainConstraint,
+					Schema:      targetSchema,
+					Table:       lDom.Name,
+					Check:       &lcCopy,
+					Destructive: true,
+				})
+			}
+		}
+	}
+	for _, lDom := range sortedDomains(live) {
+		if _, inDesired := desired.Domains[lDom.Name]; !inDesired {
+			lCopy := domainDef(lDom, normalize)
+			changes = append(changes, Change{
+				Type:        plan.ChangeDropDomain,
+				Schema:      targetSchema,
+				Table:       lDom.Name,
+				Domain:      lCopy,
+				Destructive: true,
+			})
+		}
+	}
+	return changes
+}
+
+// domainDef normalizes a domain's textual fields through the shadow→target
+// schema mapping.
+func domainDef(d *schema.Domain, normalize func(string) string) *schema.Domain {
+	copyD := *d
+	copyD.BaseType = normalize(d.BaseType)
+	copyD.Default = normalize(d.Default)
+	if len(d.Checks) > 0 {
+		checks := make([]*schema.CheckConstraint, 0, len(d.Checks))
+		for _, c := range d.Checks {
+			cCopy := *c
+			cCopy.Definition = normalize(c.Definition)
+			checks = append(checks, &cCopy)
+		}
+		copyD.Checks = checks
+	}
+	return &copyD
+}
+
+// sortedDomains returns a schema's domains in deterministic key order.
+func sortedDomains(s *schema.Schema) []*schema.Domain {
+	if s == nil || len(s.Domains) == 0 {
+		return nil
+	}
+	keys := slices.Collect(maps.Keys(s.Domains))
+	slices.Sort(keys)
+	out := make([]*schema.Domain, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, s.Domains[k])
+	}
+	return out
+}
+
+// sortedRoutines returns a schema's routines in deterministic key order.
+func sortedRoutines(s *schema.Schema) []*schema.Routine {
+	if s == nil || len(s.Routines) == 0 {
+		return nil
+	}
+	keys := slices.Collect(maps.Keys(s.Routines))
+	slices.Sort(keys)
+	out := make([]*schema.Routine, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, s.Routines[k])
+	}
+	return out
+}
+
+// sortedPolicies returns a table's desired policies in deterministic order.
+func sortedPolicies(t *schema.Table) []*schema.Policy {
+	if t == nil || len(t.Policies) == 0 {
+		return nil
+	}
+	names := slices.Collect(maps.Keys(t.Policies))
+	slices.Sort(names)
+	out := make([]*schema.Policy, 0, len(names))
+	for _, n := range names {
+		out = append(out, t.Policies[n])
+	}
+	return out
+}
+
+// diffRLSFlags emits RLS enable/disable/force steps between live and desired
+// tables. A nil live table means the table is new: emit only desired-on flags.
+func diffRLSFlags(targetSchema, tblName string, lTable, dTable *schema.Table) []Change {
+	if dTable == nil {
+		return nil
+	}
+	var changes []Change
+	emit := func(typ plan.ChangeType) {
+		changes = append(changes, Change{
+			Type:        typ,
+			Schema:      targetSchema,
+			Table:       tblName,
+			Destructive: false,
+		})
+	}
+	liveEnabled, liveForced := false, false
+	if lTable != nil {
+		liveEnabled, liveForced = lTable.RLSEnabled, lTable.RLSForced
+	}
+	switch {
+	case dTable.RLSEnabled && !liveEnabled:
+		emit(plan.ChangeEnableRLS)
+	case !dTable.RLSEnabled && liveEnabled:
+		emit(plan.ChangeDisableRLS)
+	}
+	switch {
+	case dTable.RLSForced && !liveForced:
+		emit(plan.ChangeForceRLS)
+	case !dTable.RLSForced && liveForced:
+		emit(plan.ChangeNoForceRLS)
+	}
+	return changes
+}
+
+// policiesEqual compares live and desired policies with normalized
+// expressions, so whitespace/cast drift does not produce replace churn.
+func policiesEqual(l, d *schema.Policy, normalize func(string) string) bool {
+	if l == nil || d == nil {
+		return l == d
+	}
+	if l.Cmd != d.Cmd || l.Permissive != d.Permissive {
+		return false
+	}
+	lRoles := slices.Clone(l.Roles)
+	dRoles := slices.Clone(d.Roles)
+	slices.Sort(lRoles)
+	slices.Sort(dRoles)
+	if !slices.Equal(lRoles, dRoles) {
+		return false
+	}
+	if normalize(l.Using) != normalize(d.Using) {
+		return false
+	}
+	return normalize(l.WithCheck) == normalize(d.WithCheck)
+}
+
+// findSurvivingTriggerDeps lists managed triggers that survive the diff
+// (present with an identical canonical definition in the desired table).
+// Trigger definitions rarely name columns — the referenced columns live in
+// the executed function's body — so any surviving trigger on the table is
+// treated as dependent on every dropped column of that table, mirroring the
+// table-level dependency of the pre-Phase-1 unmanaged trigger registration.
+// Triggers being dropped or replaced are excluded: their DROP step sorts
+// before the column drop, so the dependency is resolved first.
+func findSurvivingTriggerDeps(lTable, dTable *schema.Table, normalize func(string) string) []string {
+	if lTable == nil || dTable == nil {
+		return nil
+	}
+	var deps []string
+	for name, lTrg := range lTable.Triggers {
+		dTrg, survives := dTable.Triggers[name]
+		if !survives || normalize(lTrg.Definition) != normalize(dTrg.Definition) {
+			continue
+		}
+		deps = append(deps, fmt.Sprintf("%s:%s", schema.UnmanagedTrigger, name))
+	}
+	slices.Sort(deps)
+	return deps
+}
+
+// sortedTriggers returns a table's triggers in deterministic name order.
+func sortedTriggers(t *schema.Table) []*schema.Trigger {
+	if t == nil || len(t.Triggers) == 0 {
+		return nil
+	}
+	names := slices.Collect(maps.Keys(t.Triggers))
+	slices.Sort(names)
+	out := make([]*schema.Trigger, 0, len(names))
+	for _, n := range names {
+		out = append(out, t.Triggers[n])
+	}
+	return out
 }
 
 func findUnmanagedDeps(unmanaged map[string]*schema.UnmanagedObject, table, column string) []string {

@@ -221,11 +221,13 @@ func TestConcurrency_LockTimeoutRetryAndConcurrent(t *testing.T) {
 	`
 
 	cfg := exec.PostgresExecConfig{
-		TargetSchema:     schema,
-		ShadowSchema:     fmt.Sprintf("%s_shadow_retry", schema),
-		SchemaSQL:        desiredSQL,
-		LockID:           postgres.GenerateLockID(schema),
-		LockTimeout:      60 * time.Millisecond,
+		TargetSchema: schema,
+		ShadowSchema: fmt.Sprintf("%s_shadow_retry", schema),
+		SchemaSQL:    desiredSQL,
+		LockID:       postgres.GenerateLockID(schema),
+		// LockTimeout bounds the TOTAL advisory-lock wait across retries;
+		// holder releases at 150ms, so the budget must exceed that.
+		LockTimeout:      1 * time.Second,
 		StatementTimeout: 10 * time.Second,
 		MaxRetries:       5,
 	}

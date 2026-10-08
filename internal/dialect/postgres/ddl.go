@@ -267,6 +267,215 @@ func GenerateAttachPartitionSQL(targetSchema, parentTable, childTable, bounds st
 	return fmt.Sprintf("ALTER TABLE %q.%q ATTACH PARTITION %q.%q %s;", targetSchema, parentTable, targetSchema, childTable, b)
 }
 
+// GenerateCreateExtensionSQL constructs a CREATE EXTENSION IF NOT EXISTS statement.
+func GenerateCreateExtensionSQL(ext *schema.Extension) string {
+	if ext == nil || ext.Name == "" {
+		return ""
+	}
+	if ext.Schema != "" {
+		return fmt.Sprintf("CREATE EXTENSION IF NOT EXISTS %q WITH SCHEMA %q;", ext.Name, ext.Schema)
+	}
+	return fmt.Sprintf("CREATE EXTENSION IF NOT EXISTS %q;", ext.Name)
+}
+
+// GenerateRLSSQL constructs an ALTER TABLE ... [ENABLE|DISABLE|FORCE|NO FORCE] ROW LEVEL SECURITY statement.
+func GenerateRLSSQL(targetSchema, tableName string, typ plan.ChangeType) string {
+	var action string
+	switch typ {
+	case plan.ChangeEnableRLS:
+		action = "ENABLE"
+	case plan.ChangeDisableRLS:
+		action = "DISABLE"
+	case plan.ChangeForceRLS:
+		action = "FORCE"
+	case plan.ChangeNoForceRLS:
+		action = "NO FORCE"
+	default:
+		return ""
+	}
+	return fmt.Sprintf("ALTER TABLE %q.%q %s ROW LEVEL SECURITY;", targetSchema, tableName, action)
+}
+
+// GenerateCreatePolicySQL constructs a CREATE POLICY statement.
+func GenerateCreatePolicySQL(targetSchema, tableName string, p *schema.Policy) string {
+	if p == nil || p.Name == "" {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "CREATE POLICY %q ON %q.%q", p.Name, targetSchema, tableName)
+	if !p.Permissive {
+		b.WriteString(" AS RESTRICTIVE")
+	}
+	if p.Cmd != "" && p.Cmd != "ALL" {
+		b.WriteString(" FOR " + p.Cmd)
+	}
+	if len(p.Roles) > 0 {
+		quoted := make([]string, 0, len(p.Roles))
+		for _, r := range p.Roles {
+			quoted = append(quoted, fmt.Sprintf("%q", r))
+		}
+		b.WriteString(" TO " + strings.Join(quoted, ", "))
+	}
+	if strings.TrimSpace(p.Using) != "" {
+		b.WriteString(" USING (" + strings.TrimSpace(p.Using) + ")")
+	}
+	if strings.TrimSpace(p.WithCheck) != "" {
+		b.WriteString(" WITH CHECK (" + strings.TrimSpace(p.WithCheck) + ")")
+	}
+	b.WriteString(";")
+	return b.String()
+}
+
+// GenerateDropPolicySQL constructs a DROP POLICY statement.
+func GenerateDropPolicySQL(targetSchema, tableName, policyName string) string {
+	return fmt.Sprintf("DROP POLICY IF EXISTS %q ON %q.%q;", policyName, targetSchema, tableName)
+}
+
+// GenerateCreateFunctionSQL returns the canonical CREATE OR REPLACE FUNCTION
+// statement produced by pg_get_functiondef (schema names already unmapped by
+// the diff stage).
+func GenerateCreateFunctionSQL(r *schema.Routine) string {
+	if r == nil {
+		return ""
+	}
+	def := strings.TrimSpace(r.Definition)
+	if def == "" {
+		return ""
+	}
+	if !strings.HasSuffix(def, ";") {
+		def += ";"
+	}
+	return def
+}
+
+// GenerateDropFunctionSQL constructs a DROP FUNCTION/PROCEDURE/AGGREGATE
+// statement using the routine's identity arguments, which uniquely identify it
+// (including overloads) without default values.
+func GenerateDropFunctionSQL(targetSchema string, r *schema.Routine) string {
+	if r == nil {
+		return ""
+	}
+	kind := "FUNCTION"
+	switch {
+	case strings.EqualFold(r.Kind, "PROCEDURE"):
+		kind = "PROCEDURE"
+	case strings.EqualFold(r.Kind, "AGGREGATE"):
+		kind = "AGGREGATE"
+	}
+	return fmt.Sprintf("DROP %s IF EXISTS %q.%q(%s);", kind, targetSchema, r.Name, r.IdentityArgs)
+}
+
+// GenerateCreateDomainSQL renders CREATE DOMAIN from inspected IR. BaseType
+// and Default are already normalized (shadow schema unmapped) by the diff
+// stage; constraint definitions are canonical pg_get_constraintdef output.
+func GenerateCreateDomainSQL(targetSchema string, d *schema.Domain) string {
+	if d == nil {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "CREATE DOMAIN %q.%q AS %s", targetSchema, d.Name, d.BaseType)
+	if d.Default != "" {
+		fmt.Fprintf(&b, " DEFAULT %s", d.Default)
+	}
+	if !d.IsNullable {
+		b.WriteString(" NOT NULL")
+	}
+	for _, c := range d.Checks {
+		fmt.Fprintf(&b, " CONSTRAINT %q %s", c.Name, c.Definition)
+	}
+	b.WriteString(";")
+	return b.String()
+}
+
+// GenerateAlterDomainSQL renders ALTER DOMAIN ... ADD CONSTRAINT. Dropping a
+// domain constraint has its own change type and generator.
+func GenerateAlterDomainSQL(targetSchema, domainName string, c *schema.CheckConstraint) string {
+	if c == nil {
+		return ""
+	}
+	return fmt.Sprintf("ALTER DOMAIN %q.%q ADD CONSTRAINT %q %s;", targetSchema, domainName, c.Name, c.Definition)
+}
+
+// GenerateDropDomainConstraintSQL renders ALTER DOMAIN ... DROP CONSTRAINT.
+func GenerateDropDomainConstraintSQL(targetSchema, domainName, constraintName string) string {
+	return fmt.Sprintf("ALTER DOMAIN %q.%q DROP CONSTRAINT %q;", targetSchema, domainName, constraintName)
+}
+
+// GenerateDropDomainSQL renders DROP DOMAIN without CASCADE: domains with
+// dependent columns fail at apply time, which surfaces the dependency instead
+// of silently destroying it.
+func GenerateDropDomainSQL(targetSchema, domainName string) string {
+	return fmt.Sprintf("DROP DOMAIN IF EXISTS %q.%q;", targetSchema, domainName)
+}
+
+// GenerateCreateTriggerSQL returns the canonical CREATE TRIGGER statement
+// produced by pg_get_triggerdef (schema-qualified table references already
+// unmapped by the diff stage).
+func GenerateCreateTriggerSQL(t *schema.Trigger) string {
+	if t == nil {
+		return ""
+	}
+	def := strings.TrimSpace(t.Definition)
+	if def == "" {
+		return ""
+	}
+	if !strings.HasSuffix(def, ";") {
+		def += ";"
+	}
+	return def
+}
+
+// GenerateDropTriggerSQL constructs a DROP TRIGGER statement.
+func GenerateDropTriggerSQL(targetSchema, tableName, triggerName string) string {
+	return fmt.Sprintf("DROP TRIGGER IF EXISTS %q ON %q.%q;", triggerName, targetSchema, tableName)
+}
+
+// GenerateCreateViewSQL constructs a CREATE [OR REPLACE] [MATERIALIZED] VIEW
+// statement from the canonical pg_get_viewdef definition (schema references
+// already unmapped by the diff stage).
+func GenerateCreateViewSQL(targetSchema string, v *schema.View, replace bool) string {
+	if v == nil {
+		return ""
+	}
+	def := strings.TrimSpace(v.Definition)
+	if def == "" {
+		return ""
+	}
+	if !strings.HasSuffix(def, ";") {
+		def += ";"
+	}
+	if v.IsMatView {
+		return fmt.Sprintf("CREATE MATERIALIZED VIEW %q.%q AS %s", targetSchema, v.Name, def)
+	}
+	if replace {
+		return fmt.Sprintf("CREATE OR REPLACE VIEW %q.%q AS %s", targetSchema, v.Name, def)
+	}
+	return fmt.Sprintf("CREATE VIEW %q.%q AS %s", targetSchema, v.Name, def)
+}
+
+// GenerateDropViewSQL constructs a DROP VIEW or DROP MATERIALIZED VIEW statement.
+func GenerateDropViewSQL(targetSchema, viewName string, isMatView bool) string {
+	if isMatView {
+		return fmt.Sprintf("DROP MATERIALIZED VIEW IF EXISTS %q.%q;", targetSchema, viewName)
+	}
+	return fmt.Sprintf("DROP VIEW IF EXISTS %q.%q;", targetSchema, viewName)
+}
+
+// GenerateRefreshMatViewSQL constructs a REFRESH MATERIALIZED VIEW statement.
+func GenerateRefreshMatViewSQL(targetSchema, viewName string) string {
+	return fmt.Sprintf("REFRESH MATERIALIZED VIEW %q.%q;", targetSchema, viewName)
+}
+
+// GenerateCommentSQL renders a COMMENT ON statement for a table or column.
+// An empty comment renders IS NULL (clearing the comment).
+func GenerateCommentSQL(targetSchema, tableName, columnName, comment string) string {
+	escaped := strings.ReplaceAll(comment, "'", "''")
+	if columnName == "" {
+		return fmt.Sprintf("COMMENT ON TABLE %q.%q IS '%s';", targetSchema, tableName, escaped)
+	}
+	return fmt.Sprintf("COMMENT ON COLUMN %q.%q.%q IS '%s';", targetSchema, tableName, columnName, escaped)
+}
+
 // RenderOpts configures DDL rendering behavior such as concurrency and server version-specific syntax.
 type RenderOpts struct {
 	NonConcurrentIndexes bool
@@ -344,6 +553,8 @@ func RenderChangeWithOpts(targetSchema string, c diff.Change, opts RenderOpts) p
 		IsRenameCandidate:  c.IsRenameCandidate,
 		IsGeneratedRewrite: c.GeneratedChanged,
 		UnmanagedDeps:      c.UnmanagedDeps,
+		Replace:            c.Replace,
+		OldComment:         c.OldComment,
 	}
 	if c.Column != nil {
 		step.Column = c.Column.Name
@@ -353,6 +564,83 @@ func RenderChangeWithOpts(targetSchema string, c diff.Change, opts RenderOpts) p
 	}
 
 	switch c.Type {
+	case plan.ChangeCreateExtension:
+		step.SQL = GenerateCreateExtensionSQL(c.Extension)
+	case plan.ChangeEnableRLS, plan.ChangeDisableRLS, plan.ChangeForceRLS, plan.ChangeNoForceRLS:
+		step.SQL = GenerateRLSSQL(effectiveSchema, c.Table, c.Type)
+	case plan.ChangeCreatePolicy:
+		step.SQL = GenerateCreatePolicySQL(effectiveSchema, c.Table, c.Policy)
+	case plan.ChangeDropPolicy:
+		polName := ""
+		if c.Policy != nil {
+			polName = c.Policy.Name
+		}
+		step.SQL = GenerateDropPolicySQL(effectiveSchema, c.Table, polName)
+	case plan.ChangeCreateFunction, plan.ChangeCreateAggregate:
+		step.SQL = GenerateCreateFunctionSQL(c.Routine)
+	case plan.ChangeDropFunction, plan.ChangeDropAggregate:
+		step.SQL = GenerateDropFunctionSQL(effectiveSchema, c.Routine)
+	case plan.ChangeCreateDomain:
+		step.SQL = GenerateCreateDomainSQL(effectiveSchema, c.Domain)
+	case plan.ChangeAlterDomain:
+		step.SQL = GenerateAlterDomainSQL(effectiveSchema, c.Table, c.Check)
+	case plan.ChangeDropDomainConstraint:
+		conName := ""
+		if c.Check != nil {
+			conName = c.Check.Name
+		}
+		step.SQL = GenerateDropDomainConstraintSQL(effectiveSchema, c.Table, conName)
+	case plan.ChangeDropDomain, plan.ChangeDropDomainRetype:
+		step.SQL = GenerateDropDomainSQL(effectiveSchema, c.Table)
+	case plan.ChangeCreateRole:
+		step.SQL = GenerateCreateRoleSQL(c.Table)
+	case plan.ChangeRoleComment:
+		step.SQL = GenerateRoleCommentSQL(c.Table)
+	case plan.ChangeDropRole:
+		step.SQL = GenerateDropRoleSQL(c.Table)
+	case plan.ChangeGrant:
+		step.SQL = GenerateGrantSQL(c.Grant)
+	case plan.ChangeRevoke:
+		step.SQL = GenerateRevokeSQL(c.Grant, c.Grant.Privileges)
+	case plan.ChangeCreatePublication:
+		step.SQL = GenerateCreatePublicationSQL(c.Publication) + "\n" + GeneratePublicationCommentSQL(c.Publication.Name)
+	case plan.ChangeAlterPublication:
+		step.SQL = GenerateAlterPublicationSQL(c.Publication, c.OldPublication)
+	case plan.ChangeDropPublication:
+		step.SQL = GenerateDropPublicationSQL(c.Table)
+	case plan.ChangeCreateEventTrigger:
+		step.SQL = GenerateCreateEventTriggerSQL(c.EventTrigger) + "\n" + GenerateEventTriggerCommentSQL(c.EventTrigger.Name)
+	case plan.ChangeAlterEventTrigger:
+		step.SQL = GenerateAlterEventTriggerEnabledSQL(c.EventTrigger)
+	case plan.ChangeDropEventTrigger:
+		step.SQL = GenerateDropEventTriggerSQL(c.Table)
+	case plan.ChangeCreateTrigger:
+		step.SQL = GenerateCreateTriggerSQL(c.Trigger)
+	case plan.ChangeDropTrigger:
+		trgName := ""
+		if c.Trigger != nil {
+			trgName = c.Trigger.Name
+		}
+		step.SQL = GenerateDropTriggerSQL(effectiveSchema, c.Table, trgName)
+	case plan.ChangeCreateView:
+		step.SQL = GenerateCreateViewSQL(effectiveSchema, c.View, c.Replace)
+	case plan.ChangeDropView:
+		isMat := c.View != nil && c.View.IsMatView
+		step.SQL = GenerateDropViewSQL(effectiveSchema, c.Table, isMat)
+	case plan.ChangeRefreshMatView:
+		step.SQL = GenerateRefreshMatViewSQL(effectiveSchema, c.Table)
+	case plan.ChangeCommentTable:
+		comment := ""
+		if c.TableData != nil {
+			comment = c.TableData.Comment
+		}
+		step.SQL = GenerateCommentSQL(effectiveSchema, c.Table, "", comment)
+	case plan.ChangeCommentColumn:
+		comment := ""
+		if c.Column != nil {
+			comment = c.Column.Comment
+		}
+		step.SQL = GenerateCommentSQL(effectiveSchema, c.Table, step.Column, comment)
 	case plan.ChangeCreateEnum:
 		step.SQL = GenerateCreateEnumSQL(effectiveSchema, c.Enum)
 	case plan.ChangeAlterEnum:

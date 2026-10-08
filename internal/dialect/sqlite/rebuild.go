@@ -26,7 +26,11 @@ func GenerateSQLiteCreateTable(tbl *schema.Table) string {
 	for _, c := range cols {
 		line := fmt.Sprintf("  %q %s", c.Name, c.DataType)
 		if isSinglePK && c.Name == tbl.PrimaryKey.Columns[0] && strings.EqualFold(c.DataType, "INTEGER") {
-			line += " PRIMARY KEY AUTOINCREMENT"
+			if c.Autoincrement {
+				line += " PRIMARY KEY AUTOINCREMENT"
+			} else {
+				line += " PRIMARY KEY"
+			}
 		} else if c.Generated != nil {
 			stored := "STORED"
 			if !c.Generated.Stored {
@@ -54,6 +58,15 @@ func GenerateSQLiteCreateTable(tbl *schema.Table) string {
 
 	for _, fk := range tbl.ForeignKeys {
 		lines = append(lines, "  "+fk.Definition)
+	}
+
+	// CHECK constraints (named and inline) are emitted as table-level
+	// CONSTRAINT lines — semantically identical to inline forms in SQLite and
+	// symmetric with what the inspector parses back out of the stored DDL.
+	checkNames := slices.Collect(maps.Keys(tbl.Checks))
+	slices.Sort(checkNames)
+	for _, name := range checkNames {
+		lines = append(lines, fmt.Sprintf("  CONSTRAINT %q %s", name, tbl.Checks[name].Definition))
 	}
 
 	return fmt.Sprintf("CREATE TABLE %q (\n%s\n);", tbl.Name, strings.Join(lines, ",\n"))
@@ -125,6 +138,28 @@ func GenerateSQLiteRebuildPlan(liveTable, desiredTable *schema.Table, refViews, 
 
 	isDestructive := len(droppedCols) > 0
 	return strings.Join(statements, "\n"), isDestructive
+}
+
+// checksDelta compares live and desired CHECK constraints. It returns the
+// names of added constraints (desired but not live) and removed constraints
+// (live but not desired). Constraints present on both sides with identical
+// definitions are unchanged; differing definitions count as removed+added.
+func checksDelta(live, desired map[string]*schema.CheckConstraint) (added, removed []string) {
+	for name, dChk := range desired {
+		lChk, inLive := live[name]
+		if !inLive || lChk.Definition != dChk.Definition {
+			added = append(added, name)
+		}
+	}
+	for name, lChk := range live {
+		dChk, inDesired := desired[name]
+		if !inDesired || lChk.Definition != dChk.Definition {
+			removed = append(removed, name)
+		}
+	}
+	slices.Sort(added)
+	slices.Sort(removed)
+	return added, removed
 }
 
 // Diff compares live and desired schemas and produces a sequenced list of SQLite steps.
@@ -259,6 +294,18 @@ func Diff(live, desired *schema.Schema, filters scope.Filters) []plan.Step {
 			isDestructive = true
 		}
 
+		// CHECK constraint drift forces a rebuild: SQLite has no ALTER for
+		// CHECK (no NOT VALID/VALIDATE path). Removals and narrowing of
+		// validation are destructive and gated like Postgres DROP_CHECK.
+		checksAdded, checksRemoved := checksDelta(lTable.Checks, dTable.Checks)
+		checksChanged := len(checksAdded) > 0 || len(checksRemoved) > 0
+		if checksChanged && !needsRebuild {
+			needsRebuild = true
+			if len(checksRemoved) > 0 {
+				isDestructive = true
+			}
+		}
+
 		isGeneratedRewrite := false
 		if !needsRebuild {
 			for colName, dCol := range dTable.Columns {
@@ -314,6 +361,12 @@ func Diff(live, desired *schema.Schema, filters scope.Filters) []plan.Step {
 			changeType := plan.ChangeAlterColumn
 			if len(droppedCols) > 0 {
 				changeType = plan.ChangeDropColumn
+			} else if checksChanged && len(checksRemoved) > 0 {
+				// CHECK-only drift with removals: gate the rebuild behind the
+				// check drop policy so it is rejected by default.
+				changeType = plan.ChangeDropCheck
+			} else if checksChanged {
+				changeType = plan.ChangeAddCheck
 			}
 			steps = append(steps, plan.Step{
 				Type:               changeType,

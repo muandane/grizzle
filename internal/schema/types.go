@@ -1,13 +1,68 @@
 package schema
 
-import "regexp"
+import (
+	"regexp"
+	"strings"
+)
 
 // Schema represents the parsed relational structure of a database schema.
 type Schema struct {
-	Name      string                      `json:"name"`
-	Tables    map[string]*Table           `json:"tables"`
-	Enums     map[string]*Enum            `json:"enums"`
-	Unmanaged map[string]*UnmanagedObject `json:"unmanaged,omitempty"`
+	Name       string                      `json:"name"`
+	Tables     map[string]*Table           `json:"tables"`
+	Enums      map[string]*Enum            `json:"enums"`
+	Extensions map[string]*Extension       `json:"extensions,omitempty"`
+	Routines   map[string]*Routine         `json:"routines,omitempty"`
+	Domains    map[string]*Domain          `json:"domains,omitempty"`
+	Views      map[string]*View            `json:"views,omitempty"`
+	Unmanaged  map[string]*UnmanagedObject `json:"unmanaged,omitempty"`
+
+	// SourceSQL is the raw desired SchemaSQL the IR was compiled from. It is
+	// deliberately excluded from JSON serialization and plan hashing (the IR
+	// already hashes canonically); it exists so pure statement-scan lint
+	// rules (e.g. L009) can inspect the original input.
+	SourceSQL string `json:"-"`
+}
+
+// Extension represents a PostgreSQL extension (CREATE EXTENSION).
+type Extension struct {
+	Name    string `json:"name"`
+	Schema  string `json:"schema,omitempty"`
+	Version string `json:"version,omitempty"`
+}
+
+// Routine represents a managed PostgreSQL function or procedure.
+type Routine struct {
+	Name            string `json:"name"`
+	Kind            string `json:"kind"` // FUNCTION or PROCEDURE
+	IdentityArgs    string `json:"identity_args"`
+	ReturnType      string `json:"return_type,omitempty"`
+	Language        string `json:"language,omitempty"`
+	Volatility      string `json:"volatility,omitempty"`
+	SecurityDefiner bool   `json:"security_definer,omitempty"`
+	Definition      string `json:"definition"` // canonical pg_get_functiondef
+}
+
+// RoutineKey returns the map key identifying a routine: its name plus the
+// identity arguments that disambiguate overloads.
+func RoutineKey(name, identityArgs string) string {
+	return name + "(" + strings.TrimSpace(identityArgs) + ")"
+}
+
+// Domain represents a managed PostgreSQL domain (CREATE DOMAIN).
+type Domain struct {
+	Name       string             `json:"name"`
+	BaseType   string             `json:"base_type"`
+	IsNullable bool               `json:"is_nullable"`
+	Default    string             `json:"default,omitempty"`
+	Checks     []*CheckConstraint `json:"checks,omitempty"`
+}
+
+// View represents a managed SQL VIEW or MATERIALIZED VIEW.
+type View struct {
+	Name       string   `json:"name"`
+	IsMatView  bool     `json:"is_matview,omitempty"`
+	Definition string   `json:"definition"` // canonical pg_get_viewdef
+	Columns    []string `json:"columns,omitempty"`
 }
 
 // UnmanagedKind specifies the type of an unmanaged database object.
@@ -78,9 +133,30 @@ type Table struct {
 	Indexes      map[string]*Index           `json:"indexes"`
 	ForeignKeys  map[string]*ForeignKey      `json:"foreign_keys"`
 	Checks       map[string]*CheckConstraint `json:"checks"`
+	Policies     map[string]*Policy          `json:"policies,omitempty"`
+	Triggers     map[string]*Trigger         `json:"triggers,omitempty"`
 	PrimaryKey   *PrimaryKey                 `json:"primary_key"`
 	PartitionKey *PartitionKey               `json:"partition_key,omitempty"`
 	PartitionOf  *PartitionOf                `json:"partition_of,omitempty"`
+	RLSEnabled   bool                        `json:"rls_enabled,omitempty"`
+	RLSForced    bool                        `json:"rls_forced,omitempty"`
+	Comment      string                      `json:"comment,omitempty"`
+}
+
+// Policy represents a PostgreSQL row-level security policy.
+type Policy struct {
+	Name       string   `json:"name"`
+	Cmd        string   `json:"cmd"` // ALL, SELECT, INSERT, UPDATE, DELETE
+	Roles      []string `json:"roles,omitempty"`
+	Using      string   `json:"using,omitempty"`
+	WithCheck  string   `json:"with_check,omitempty"`
+	Permissive bool     `json:"permissive"`
+}
+
+// Trigger represents a managed PostgreSQL trigger attached to a table.
+type Trigger struct {
+	Name       string `json:"name"`
+	Definition string `json:"definition"` // canonical pg_get_triggerdef
 }
 
 // IsPartitioned returns true if the table is a partitioned table.
@@ -109,6 +185,10 @@ type Column struct {
 	IsIdentity   bool             `json:"is_identity,omitempty"`
 	IdentityType string           `json:"identity_type,omitempty"`
 	Generated    *GeneratedColumn `json:"generated,omitempty"`
+	Comment      string           `json:"comment,omitempty"`
+	// Autoincrement is SQLite-specific: true when the column is declared
+	// INTEGER PRIMARY KEY AUTOINCREMENT (distinct from plain INTEGER PRIMARY KEY).
+	Autoincrement bool `json:"autoincrement,omitzero"`
 }
 
 // Index represents a secondary or unique index on a table.

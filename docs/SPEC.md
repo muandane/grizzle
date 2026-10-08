@@ -44,7 +44,9 @@ type Options struct {
     // If empty, Grizzle detects the dialect automatically from the driver type.
     Dialect Dialect
 
-    // SchemaSQL contains the complete DDL representing the desired state.
+    // SchemaSQL contains the complete desired state. PostgreSQL role and
+    // catalog statements may share this file; they bypass shadow compilation
+    // and are merged with the optional side-channel files.
     // Typically embedded at build time with //go:embed schema.sql.
     SchemaSQL string
 
@@ -56,18 +58,36 @@ type Options struct {
     TargetSchemas []string
 
     // ShadowSchema is the temporary schema name used for validation (defaults to "_grizzle_shadow").
+    // Must use the reserved "_grizzle_shadow" prefix, be a valid identifier of at most 63 bytes,
+    // and must not name a target or included schema; violations fail with ErrInvalidOptions.
     ShadowSchema string
 
     // AllowDrop permits all destructive operations when set to true.
     // Defaults to false for zero data loss.
     AllowDrop bool
 
+    // AllowRevoke permits privilege revocation when a RolesSQL grant is
+    // removed. Has no granular override; the REVOKE_PRIVILEGE critical
+    // hazard still requires AcceptHazards.
+    AllowRevoke bool
+
+    // AllowDropRole permits dropping a managed role that left RolesSQL.
+    // Has no granular override; the DROP_ROLE critical hazard still
+    // requires AcceptHazards.
+    AllowDropRole bool
+
     // Granular drop overrides (nil inherits from AllowDrop):
-    AllowDropTable  *bool
-    AllowDropColumn *bool
-    AllowDropIndex  *bool
-    AllowDropFK     *bool
-    AllowDropCheck  *bool
+    AllowDropTable     *bool
+    AllowDropColumn    *bool
+    AllowDropIndex     *bool
+    AllowDropFK        *bool
+    AllowDropCheck     *bool
+    AllowDropExtension *bool
+    AllowDropFunction  *bool
+    AllowDropPolicy    *bool
+    AllowDropTrigger   *bool
+    AllowDropView      *bool
+    AllowDropDomain    *bool
 
     // ExcludeTables defines table names or glob patterns (e.g. "spatial_ref_sys", "asynq_*")
     // that Grizzle will never alter, diff, or drop.
@@ -93,7 +113,9 @@ type Options struct {
     // If 0, Grizzle derives 2-int per-schema advisory locks using (hash32(LockNamespace), hash32(schema)).
     LockID int64
 
-    // LockTimeout sets the maximum duration to wait for acquiring the advisory lock (defaults to 5s).
+    // LockTimeout sets the maximum TOTAL duration to wait for acquiring the advisory
+    // lock across all retry attempts, including backoff (defaults to 5s). The value is
+    // never reset per attempt; it also feeds the per-statement DDL lock_timeout.
     LockTimeout time.Duration
 
     // StatementTimeout sets the maximum duration for any individual DDL statement (defaults to 5m).
@@ -145,6 +167,15 @@ type Options struct {
     // SeedForce re-runs the seed even when the same seed hash was already applied.
     SeedForce bool
 
+    // RolesSQL is an optional PostgreSQL side-channel overlay for
+    // SchemaSQL. Its role/grant entries override duplicate identities
+    // extracted from SchemaSQL. Role statements are never shadow-compiled;
+    // they are statement-scanned, diffed against live pg_authid roles and
+    // object ACLs, and applied after all schema DDL. Only roles stamped with
+    // the grizzle-managed marker comment are ever dropped, and only behind
+    // AllowDropRole. Rejected for SQLite (ErrInvalidOptions).
+    RolesSQL string
+
     // SQLiteRebuildThreshold defines row count threshold above which SQLite table rebuilds chunk data copying by keyset.
     SQLiteRebuildThreshold int
 
@@ -157,7 +188,114 @@ type Options struct {
     // Tracer receives lifecycle spans (sync start/end, step execution, lock wait).
     Tracer Tracer
 }
+```
 
+#### RolesSQL contract (PostgreSQL)
+
+`RolesSQL` is an optional side-channel overlay (CLI: `--roles roles.sql`) for
+the desired role and privilege state. The same role statements may appear in
+`SchemaSQL`; both inputs are statement-scanned and never shadow-compiled.
+When a role or grant identity is present in both inputs, `RolesSQL` is
+authoritative. Schema DDL remains in the shadow-compiled portion of
+`SchemaSQL`.
+
+```sql
+-- roles.sql or SchemaSQL — these role statement forms are accepted:
+CREATE ROLE app_read;                    -- always rendered/managed as NOLOGIN group role
+CREATE USER app_writer WITH NOLOGIN;     -- USER is an alias for CREATE ROLE
+GRANT SELECT, INSERT ON docs TO app_read;
+GRANT ALL ON TABLE docs TO app_read WITH GRANT OPTION;
+GRANT USAGE ON SEQUENCE docs_id_seq TO app_read;
+GRANT CONNECT ON DATABASE app TO app_read;
+GRANT USAGE ON SCHEMA public TO app_read;
+GRANT EXECUTE ON FUNCTION notify_event() TO app_read;
+REVOKE INSERT ON docs FROM app_read;
+```
+
+Semantics:
+
+- Statement scan rejects anything else (`ErrInvalidOptions`) — no silent
+  ignoring. Other `SchemaSQL` statements remain in the shadow-compiled
+  portion rather than being treated as RolesSQL.
+- PR1 rejects `ALTER ROLE/USER`, `DROP ROLE/USER`, password options, and
+  other role-configuration forms explicitly. Role configuration and password
+  management are reserved for PR2.
+- Declared roles are created `NOLOGIN` and stamped with a `grizzle-managed`
+  catalog comment. Only marker-stamped roles absent from the desired state are
+  dropped, and only behind `AllowDropRole` + `DROP_ROLE` (CRITICAL). A managed
+  role that owns cluster objects aborts the sync with an ownership error.
+- Grants are diffed per (object kind, object, grantee): missing → `GRANT`;
+  surplus → `REVOKE` behind `AllowRevoke` + `REVOKE_PRIVILEGE` (CRITICAL);
+  grant-option drift → `GRANT ... WITH GRANT OPTION` / `REVOKE GRANT OPTION FOR ...`.
+- Grants to `PUBLIC` or to roles Grizzle does not manage are never revoked;
+  a desired `GRANT ... TO PUBLIC` emits `GRANT_PUBLIC` (WARNING).
+- `AllowRevoke` / `AllowDropRole` inherit from `AllowDrop` or can be set
+  directly on `Options`; both round-trip through the plan artifact
+  (approval-sensitive). Unqualified `TABLE`/`SEQUENCE` objects resolve
+  against the primary target schema.
+- Role steps sort after all schema DDL; the original `SchemaSQL` and
+  `RolesSQL` strings each participate in `Plan.Hash()` when non-empty.
+  Extracted statements are not hashed a second time. SQLite + non-empty
+  `RolesSQL` is rejected.
+
+#### CatalogSQL contract (PostgreSQL)
+
+`CatalogSQL` is an optional side-channel overlay (CLI: `--catalog catalog.sql`)
+for the desired cluster-catalog state of logical-replication publications and
+DDL event triggers. The same catalog statements may appear in `SchemaSQL`;
+both inputs bypass shadow compilation. When a publication or event-trigger
+name is present in both inputs, `CatalogSQL` is authoritative. Catalog DDL
+cannot run inside the shadow-compile transaction model.
+
+```sql
+-- catalog.sql or SchemaSQL — these catalog statement forms are accepted:
+CREATE PUBLICATION docs_pub FOR TABLE docs, comments;
+CREATE PUBLICATION analytics_pub FOR TABLES IN SCHEMA analytics; -- PostgreSQL 15+
+CREATE PUBLICATION all_pub FOR ALL TABLES;
+CREATE PUBLICATION ins_only WITH (publish = 'insert');           -- defaults to all four
+ALTER PUBLICATION docs_pub ADD TABLE audit;
+DROP PUBLICATION old_pub;
+CREATE EVENT TRIGGER audit_ddl ON ddl_command_end EXECUTE FUNCTION log_ddl();
+CREATE EVENT TRIGGER block_drop ON sql_drop WHEN TAG IN ('DROP TABLE') EXECUTE FUNCTION refuse_ddl();
+ALTER EVENT TRIGGER audit_ddl DISABLE;
+DROP EVENT TRIGGER old_audit;
+```
+
+Semantics:
+
+- Statement scan rejects anything else (`WHEN VALUE IN`, schema DDL —
+  `ErrInvalidOptions`); no silent ignoring. Other `SchemaSQL` statements
+  remain in the shadow-compiled portion rather than being treated as
+  CatalogSQL.
+- `ALTER` statements require a matching publication or event-trigger
+  declaration across the unified file and `CatalogSQL`; a side-channel
+  `CREATE` replaces a same-name unified declaration before its side-channel
+  `ALTER`/`DROP` operations are replayed. Operation-only inputs do not imply
+  drops of unrelated managed catalog objects.
+- Publications are diffed on membership and `publish` flags from
+  `pg_publication` / `pg_publication_rel` / `pg_publication_namespace`:
+  missing → create, drift → `ALTER PUBLICATION`, drop → gated by
+  `AllowDropPublication` + `DROP_PUBLICATION` (CRITICAL). Unqualified
+  `TABLE` names resolve against the primary target schema.
+- Event triggers are diffed on event, tag filter, function, and enabled
+  state from `pg_event_trigger`: definition drift is DROP+CREATE
+  (PostgreSQL has no in-place ALTER for event/tags/function);
+  enabled-only drift renders `ALTER EVENT TRIGGER ENABLE/DISABLE`.
+- Event-trigger functions must exist (managed routines from `SchemaSQL`
+  or live objects); the sync aborts naming the missing function.
+- Drops are narrow: only objects stamped with the `grizzle-managed`
+  catalog comment are considered for dropping (behind
+  `AllowDropEventTrigger` + `DROP_EVENT_TRIGGER`, CRITICAL);
+  operator-created publications and event triggers are never swept.
+- `CREATE EVENT TRIGGER` DDL may require superuser; every plan step
+  touching one emits `EVENT_TRIGGER_SUPERUSER` (WARNING). `FOR ALL
+  TABLES` breadth emits `PUBLICATION_ALL_TABLES` (NOTICE).
+- Catalog steps sort after roles and grants; the original `SchemaSQL` and
+  `CatalogSQL` strings each participate in `Plan.Hash()` when non-empty.
+  Extracted statements are not hashed a second time. SQLite + non-empty
+  `CatalogSQL` is rejected.
+
+```go
 type ApplyOpts struct {
     ExpectedHash  string
     AcceptHazards []HazardCode
@@ -191,9 +329,29 @@ type Plan struct {
     Renames        map[string]string
     ExpandContract bool
     SchemaSQL      string
+
+    // Approval-sensitive: participates in Hash() when non-empty (desired
+    // roles/grants side-channel).
+    RolesSQL string
+
+    // Approval-sensitive: participates in Hash() when non-empty (desired
+    // publications/event-triggers side-channel).
+    CatalogSQL string
+
+    // Approval-sensitive: participates in Hash() because it changes generated SQL.
+    NonConcurrentIndexes bool
+
+    // Operational timeouts persisted for direct Apply. Bounded by
+    // ValidateExecutionFields; excluded from Hash(). Lock identity and
+    // shadow schema names are never persisted — LockID is derived at apply
+    // from trusted target identity, LockNamespace is an ApplyOpts runtime
+    // option, and shadow schemas are generated ephemerally per run.
+    LockTimeout      time.Duration
+    StatementTimeout time.Duration
 }
 
-func (p *Plan) Hash() string
+func (p *Plan) Hash() string // schema(s), scope, renames, expand, policy, NonConcurrentIndexes, SchemaSQL, RolesSQL, CatalogSQL, ordered steps
+func (p *Plan) ValidateExecutionFields() error
 func (p *Plan) Hazards() []Hazard
 func (p *Plan) Additions() int
 func (p *Plan) Modifications() int
@@ -206,10 +364,13 @@ func (p *Plan) String() string
 type HazardLevel string
 
 const (
-    HazardLevelCritical HazardLevel = "CRITICAL" // Data destruction (DROP TABLE, DROP COLUMN, TYPE_NARROW, RENAME_AMBIGUOUS, UNMANAGED_DEPENDENCY)
-    HazardLevelWarning  HazardLevel = "WARNING"  // Execution risk (NOT NULL without DEFAULT, GENERATED_REWRITE, PARTITION_ATTACH_SCAN, PARTITION_PENDING_DETACH)
-    HazardLevelNotice   HazardLevel = "NOTICE"   // Locking or performance impact (INDEX creation/drop, FK drop)
+    HazardLevelCritical HazardLevel = "CRITICAL" // Data destruction (DROP TABLE/COLUMN, DROP_EXTENSION, DROP_POLICY, DROP_FUNCTION, DROP_TRIGGER, DROP_VIEW, DROP_DOMAIN, DROP_ROLE, REVOKE_PRIVILEGE, DROP_PUBLICATION, DROP_EVENT_TRIGGER, TYPE_NARROW, RENAME_AMBIGUOUS, UNMANAGED_DEPENDENCY, GENERATED_REWRITE)
+    HazardLevelWarning  HazardLevel = "WARNING"  // Execution or lockout risk (EXTENSION_PRIVILEGE, GRANT_PUBLIC, EVENT_TRIGGER_SUPERUSER, RLS_ENABLE, SECURITY_DEFINER, PARTITION_ATTACH_SCAN, PARTITION_PENDING_DETACH)
+    HazardLevelNotice   HazardLevel = "NOTICE"   // Locking or performance impact (INDEX creation/drop, FK drop, COMMENT_CLEAR, PUBLICATION_ALL_TABLES)
 )
+
+// ValidateExecutionFields bounds persisted timeouts to [0, 24h].
+// Lock identity and shadow schema names are not carried in the artifact.
 
 type HazardCode string
 
@@ -228,6 +389,22 @@ const (
     HazardGeneratedRewrite       HazardCode = "GENERATED_REWRITE"
     HazardPartitionAttachScan    HazardCode = "PARTITION_ATTACH_SCAN"
     HazardPartitionPendingDetach HazardCode = "PARTITION_PENDING_DETACH"
+    HazardExtensionPrivilege     HazardCode = "EXTENSION_PRIVILEGE"
+    HazardDropExtension          HazardCode = "DROP_EXTENSION"
+    HazardDropPolicy             HazardCode = "DROP_POLICY"
+    HazardRLSEnable              HazardCode = "RLS_ENABLE"
+    HazardDropFunction           HazardCode = "DROP_FUNCTION"
+    HazardSecurityDefiner        HazardCode = "SECURITY_DEFINER"
+    HazardDropTrigger            HazardCode = "DROP_TRIGGER"
+    HazardDropView               HazardCode = "DROP_VIEW"
+    HazardDropDomain             HazardCode = "DROP_DOMAIN"
+    HazardRevokePrivilege        HazardCode = "REVOKE_PRIVILEGE"
+    HazardDropRole               HazardCode = "DROP_ROLE"
+    HazardGrantPublic            HazardCode = "GRANT_PUBLIC"
+    HazardDropPublication        HazardCode = "DROP_PUBLICATION"
+    HazardDropEventTrigger       HazardCode = "DROP_EVENT_TRIGGER"
+    HazardEventTriggerSuperuser  HazardCode = "EVENT_TRIGGER_SUPERUSER"
+    HazardPublicationAllTables   HazardCode = "PUBLICATION_ALL_TABLES"
 )
 
 type Hazard struct {
@@ -261,6 +438,19 @@ type Hazard struct {
 | `ENUM Types` | Yes | `CREATE TYPE ... AS ENUM`, `ALTER TYPE ... ADD VALUE` |
 | `Generated Columns` | Yes | `GENERATED ALWAYS AS (...) STORED`; expression rewrite triggers `GENERATED_REWRITE` hazard |
 | `Native Types` | Yes | UUID, JSONB, Arrays, Timestamps, Numerics |
+| `Extensions` | Yes | Declarative `CREATE EXTENSION` (desired captured by statement scan; installs best-effort in the shadow tx so extension-provided types compile). Creates are never dropped by default (`AllowDropExtension`) and marked irreversible in exports. `EXTENSION_PRIVILEGE` (WARNING) on create |
+| `Row-Level Security` | Yes | `ENABLE/DISABLE/FORCE ROW LEVEL SECURITY` flags diffed per table (`pg_class`); `RLS_ENABLE` (WARNING) because applying can lock out the app role |
+| `RLS Policies` | Yes | Full lifecycle via `pg_policy` (`CREATE POLICY` / DROP+CREATE replace); drops gated by `AllowDropPolicy` + `DROP_POLICY` (CRITICAL) |
+| `COMMENT ON` | Yes | Table/column comments diffed from `obj_description` / `col_description`; set/clear (`IS '…'` / `IS NULL`) is non-destructive; clearing a non-empty live comment emits `COMMENT_CLEAR` (NOTICE); SQLite ignores comments (no catalog support) |
+| `Functions` | Yes | Managed routines diffed on canonical `pg_get_functiondef` output; body drift → `CREATE OR REPLACE FUNCTION`, signature drift → DROP+CREATE; drops gated by `AllowDropFunction` + `DROP_FUNCTION` (CRITICAL); `SECURITY_DEFINER` (WARNING) without explicit `search_path` |
+| `Procedures` | Yes | Managed like functions (`pg_get_functiondef` is canonical for both); body drift → `CREATE OR REPLACE PROCEDURE`; signature drift → DROP+CREATE; drops share the `AllowDropFunction` gate |
+| `Aggregates` | Yes | Reconstructed canonical `CREATE AGGREGATE` from `pg_aggregate` (`SFUNC`/`STYPE`/`FINALFUNC`/`INITCOND`/`PARALLEL`); any drift is DROP+CREATE (no `CREATE OR REPLACE`); ordered-set/hypothetical aggregates (non-default `aggkind`) remain protected |
+| `Domains` | Yes | Managed types diffed from `pg_type` (`typtype='d'`) + `pg_constraint` (`conrelid = 0`); base type/nullability/default drift is DROP+CREATE (no in-place retype); CHECK drift → `ALTER DOMAIN ADD/DROP CONSTRAINT`; drops gated by `AllowDropDomain` + `DROP_DOMAIN` (CRITICAL); no implicit `CASCADE` — dependent columns fail at apply |
+| `Triggers` | Yes | `pg_trigger` + canonical `pg_get_triggerdef`; drift → DROP+CREATE; drops gated by `AllowDropTrigger` + `DROP_TRIGGER` (CRITICAL); surviving managed triggers block dependent column drops via `UNMANAGED_DEPENDENCY` |
+| `Views` & `Materialized Views` | Yes | Canonical `pg_get_viewdef`; append-only column changes replace in place (`CREATE OR REPLACE VIEW`), otherwise DROP+CREATE; matviews always DROP+CREATE plus `REFRESH MATERIALIZED VIEW`; drops gated by `AllowDropView` + `DROP_VIEW` (CRITICAL) |
+| `Roles & Grants` | Yes | Via unified `SchemaSQL` or the `RolesSQL` side-channel overlay (§2.2): managed `NOLOGIN` roles and object grants diffed against `pg_authid` + ACLs (`aclexplode`); duplicate side-channel identities override SchemaSQL; missing → `GRANT`, surplus → `REVOKE` gated by `AllowRevoke` + `REVOKE_PRIVILEGE` (CRITICAL); marker-stamped roles dropped behind `AllowDropRole` + `DROP_ROLE` (CRITICAL) with ownership refusal; grants to `PUBLIC`/unmanaged grantees never revoked; `GRANT ... TO PUBLIC` emits `GRANT_PUBLIC` (WARNING) |
+| `Publications` | Yes | Via unified `SchemaSQL` or the `CatalogSQL` side-channel overlay (§2.2): membership and `publish` flags diffed from `pg_publication` / `pg_publication_rel` / `pg_publication_namespace`; duplicate side-channel names override SchemaSQL; drift → `ALTER PUBLICATION`; drops gated by `AllowDropPublication` + `DROP_PUBLICATION` (CRITICAL), narrow to marker-stamped objects; `FOR ALL TABLES` emits `PUBLICATION_ALL_TABLES` (NOTICE); schema-level publications require PostgreSQL 15+ |
+| `Event Triggers` | Yes | Via unified `SchemaSQL` or the `CatalogSQL` side-channel overlay (§2.2): event/tag/function/enabled state diffed from `pg_event_trigger`; duplicate side-channel names override SchemaSQL; definition drift is DROP+CREATE, enabled-only drift renders `ALTER EVENT TRIGGER ENABLE/DISABLE`; creation refuses missing trigger functions; drops gated by `AllowDropEventTrigger` + `DROP_EVENT_TRIGGER` (CRITICAL), narrow to marker-stamped objects; `EVENT_TRIGGER_SUPERUSER` (WARNING) on any event-trigger step |
 
 ### SQLite
 
@@ -275,21 +465,18 @@ type Hazard struct {
 | `CREATE INDEX` | Yes | Direct `CREATE INDEX` and `CREATE UNIQUE INDEX` |
 | `DROP INDEX` | Yes | Guarded by `AllowDropIndex` |
 | `FOREIGN KEY` | Yes | Validated with `PRAGMA foreign_key_check` |
-| `CHECK Constraint` | No | SQLite CHECK constraints are not introspected or diffed; a table rebuild rewrites the table from the managed IR and does not preserve inline CHECK DDL — declare CHECK-managed tables as Postgres-only or avoid rebuild-triggering changes |
+| `CHECK Constraint` | Yes | Named and inline CHECK constraints are parsed from `sqlite_schema.sql`, emitted as table-level `CONSTRAINT` lines on create/rebuild, and diffed: check drift triggers a 12-step table rebuild; removals are destructive and gated by `AllowDropCheck` + `DROP_CHECK` (no `NOT VALID`/`VALIDATE` path on SQLite) |
 | `Generated Columns` | Yes | `STORED` and `VIRTUAL` supported; rebuild preserves generated definitions |
 
 ### Unmanaged database objects (Detected, Protected, Not Managed)
 
 | Construct | Supported | Policy |
 | :--- | :---: | :--- |
-| `Views` & `Materialized Views` | Protected | Introspected and dependency-graphed; destructive changes blocked via `UNMANAGED_DEPENDENCY` |
-| `Triggers` | Protected | Preserved on managed tables; drop/alter operations on dependencies blocked |
-| `Functions` & `Procedures` | Protected | Introspected with table/column dependencies: `pg_depend` for SQL-standard (`BEGIN ATOMIC`) bodies, conservative source scan for quoted string bodies; destructive alterations on dependents blocked via `UNMANAGED_DEPENDENCY` |
 | `Sequences` (unowned) | Protected | Never dropped or managed |
-| `Domains` | Protected | Introspected and protected |
+| `Window functions` (prokind `w`) | Protected | Never managed; dependency-graphed so drops referencing them stay blocked |
+| Ordered-set / hypothetical aggregates (non-default `aggkind`) | Protected | Outside the reconstructed `CREATE AGGREGATE` surface; never managed |
 
-> [!NOTE]
-> **Roadmap Note**: Declarative view, trigger, and function migrations are intentionally out of scope for automigrations. They are detected and protected from collateral damage, but not altered or dropped. Declarative management of view DDL will be evaluated in future releases.
+Everything outside the tables above that Grizzle cannot fully diff is left untouched. Extension-owned objects (e.g. types installed by `citext`) are excluded from routine management (`pg_proc.deptype = 'e'`).
 
 ## 4. Safety model and invariants
 
@@ -300,13 +487,13 @@ If `AllowDrop` is false (the default), Grizzle refuses to execute any plan conta
 PostgreSQL migrations acquire advisory locks (`pg_advisory_xact_lock` or session lock for concurrent indexes). Grizzle recomputes the diff post-lock to avoid TOCTOU races.
 
 ### Invariant 3: Hazard gating
-Critical hazards (`DROP_TABLE`, `DROP_COLUMN`, `TYPE_NARROW`, `RENAME_AMBIGUOUS`, `UNMANAGED_DEPENDENCY`) fail execution unless accepted via `AcceptHazards`. Operational warnings (`GENERATED_REWRITE`) alert callers to full table rewrites.
+Critical hazards (`DROP_TABLE`, `DROP_COLUMN`, `TYPE_NARROW`, `RENAME_AMBIGUOUS`, `UNMANAGED_DEPENDENCY`, `GENERATED_REWRITE`, `DROP_ROLE`, `REVOKE_PRIVILEGE`, `DROP_PUBLICATION`, `DROP_EVENT_TRIGGER`) fail execution unless accepted via `AcceptHazards`.
 
 ### Invariant 4: Plan/Apply approval hash
-`Plan.Hash()` provides a deterministic digest. `Apply` verifies the post-lock hash against `ExpectedHash`, aborting with `ErrPlanDrift` on mismatch.
+`Plan.Hash()` digests approval-sensitive intent (target schemas, scope, renames, expand/contract, policy, NonConcurrentIndexes, SchemaSQL, RolesSQL, CatalogSQL, ordered steps). `Apply` / `DryRunVerifyPlan` verify against `ExpectedHash`, aborting with `ErrPlanDrift` on mismatch. History is advisory (Model B): DDL commits first; a failed history write returns `ErrHistoryRecord` while leaving schema changes applied.
 
 ### Invariant 5: Timeouts and retry
-`LockTimeout` and `StatementTimeout` protect production availability. PostgreSQL `lock_timeout` conflicts are retried with exponential backoff and randomized jitter.
+`LockTimeout` and `StatementTimeout` protect production availability. `LockTimeout` bounds the **total** advisory-lock acquisition wait across all retry attempts (including backoff); preamble work (hooks, schema setup, session timeout statements) and DDL execution do not consume the budget — each attempt's acquisition timer is armed when acquisition begins. PostgreSQL lock-contention and deadlock failures (SQLSTATE `55P03`, `40P01`) are classified via `exec.IsRetryable` and retried with exponential backoff and randomized jitter; retries halt immediately once any DDL step commits.
 
 ### Invariant 6: Strict scope protection
 `StrictScope` ensures `IncludeTables` is provided, preventing accidental mutations in shared databases.
@@ -321,7 +508,7 @@ Ambiguous column renames are blocked with `RENAME_AMBIGUOUS`; map them explicitl
 The `RENAME_AMBIGUOUS` hazard description and the interactive summary remediation point to `--rename`. See `examples/expand-contract` for a runnable end-to-end flow.
 
 ### Invariant 8: History and drift detection
-Applied plans are audited in `grizzle_history`. `Check()` provides read-only schema drift verification.
+Applied plans are audited in `grizzle_history`. `Check()` provides read-only schema drift verification. A failed success-path history write does not fail the applied migration: it is logged at ERROR and surfaced as a typed non-fatal error (`errors.Is(err, grizzle.ErrHistoryRecord)`); failure-path history write failures are logged and never swallowed.
 
 ## 5. Error taxonomy
 
@@ -343,6 +530,7 @@ var (
     ErrPartitionConversion     = errors.New("grizzle: in-place conversion between regular and partitioned table is unsupported")
     ErrUnsupportedMultiSchema  = errors.New("grizzle: multi-schema configuration is unsupported on SQLite")
     ErrPartitionKeyNotInUnique = errors.New("grizzle: primary key or unique constraint must include all partition key columns")
+    ErrHistoryRecord           = errors.New("grizzle: migration succeeded but history record was not written") // non-fatal
 )
 
 type HazardError struct {
@@ -371,6 +559,8 @@ type DestructiveViolationError struct {
 | `L005` | `WARNING` | CHECK constraint name is not lowercase snake_case |
 | `L006` | `WARNING` | Table declares multiple CHECK constraints with the same normalized expression |
 | `L007` | `INFO` | CHECK constraint uses PostgreSQL's auto-generated name (`table[_column]_check[n]`); prefer an explicit `CONSTRAINT name CHECK` |
+| `L008` | `WARNING` | Table has `ENABLE ROW LEVEL SECURITY` but declares zero policies — every role is locked out |
+| `L009` | `ERROR` | DML statement (`INSERT`/`UPDATE`/`DELETE`/`TRUNCATE`) declared in `SchemaSQL` — it is silently ignored by automigrations; move seed data to `SeedSQL` |
 
 Severity semantics:
 

@@ -718,3 +718,145 @@ func TestSQLite_KeysetBatchCopy_LargeVolume_Checksum(t *testing.T) {
 		t.Errorf("sum(val) checksum mismatch after rebuild: got %d, want %d", postSumVal, preSumVal)
 	}
 }
+
+func TestSQLite_RebuildPreservesAutoincrementSemantics(t *testing.T) {
+	db := getSQLiteDB(t)
+	ctx := t.Context()
+
+	// Plain INTEGER PRIMARY KEY (no AUTOINCREMENT).
+	if err := grizzle.Sync(ctx, db, grizzle.Options{
+		Dialect:   grizzle.DialectSQLite,
+		SchemaSQL: `CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);`,
+	}); err != nil {
+		t.Fatalf("sync v1: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO items (id, name) VALUES (1, 'a'), (5, 'b');`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// Force rebuild via nullability change of a non-PK column.
+	allowCol := true
+	if err := grizzle.Sync(ctx, db, grizzle.Options{
+		Dialect:         grizzle.DialectSQLite,
+		SchemaSQL:       `CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL);`,
+		AllowDropColumn: &allowCol,
+		AcceptHazards:   []grizzle.HazardCode{grizzle.HazardDropColumn},
+	}); err != nil {
+		t.Fatalf("sync rebuild: %v", err)
+	}
+
+	var ddl string
+	if err := db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name='items';`).Scan(&ddl); err != nil {
+		t.Fatalf("ddl: %v", err)
+	}
+	if strings.Contains(strings.ToUpper(ddl), "AUTOINCREMENT") {
+		t.Fatalf("rebuild must not introduce AUTOINCREMENT; ddl=%s", ddl)
+	}
+
+	// Without AUTOINCREMENT, SQLite chooses max(remaining rowid)+1 after a
+	// delete of the high-water mark — not the historical max tracked by
+	// sqlite_sequence. After deleting id=5 (leaving id=1), the next insert
+	// must get 2. AUTOINCREMENT would have advanced to 6.
+	if _, err := db.ExecContext(ctx, `DELETE FROM items WHERE id = 5;`); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO items (name) VALUES ('c');`); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	var newID int64
+	if err := db.QueryRowContext(ctx, `SELECT id FROM items WHERE name='c';`).Scan(&newID); err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	if newID != 2 {
+		t.Fatalf("expected rowid reuse semantics without AUTOINCREMENT (id=2), got %d", newID)
+	}
+}
+
+func TestSQLite_RebuildPreservesAutoincrementFlag(t *testing.T) {
+	db := getSQLiteDB(t)
+	ctx := t.Context()
+
+	if err := grizzle.Sync(ctx, db, grizzle.Options{
+		Dialect:   grizzle.DialectSQLite,
+		SchemaSQL: `CREATE TABLE seq_items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);`,
+	}); err != nil {
+		t.Fatalf("sync v1: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO seq_items (id, name) VALUES (1, 'a'), (5, 'b');`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	allowCol := true
+	if err := grizzle.Sync(ctx, db, grizzle.Options{
+		Dialect:         grizzle.DialectSQLite,
+		SchemaSQL:       `CREATE TABLE seq_items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL);`,
+		AllowDropColumn: &allowCol,
+		AcceptHazards:   []grizzle.HazardCode{grizzle.HazardDropColumn},
+	}); err != nil {
+		t.Fatalf("sync rebuild: %v", err)
+	}
+
+	var ddl string
+	if err := db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name='seq_items';`).Scan(&ddl); err != nil {
+		t.Fatalf("ddl: %v", err)
+	}
+	if !strings.Contains(strings.ToUpper(ddl), "AUTOINCREMENT") {
+		t.Fatalf("rebuild must preserve AUTOINCREMENT; ddl=%s", ddl)
+	}
+
+	// After copying explicit ids 1 and 5 into an AUTOINCREMENT table,
+	// sqlite_sequence high-water is 5. Deleting 5 then inserting must
+	// yield 6 — not reuse 2 the way plain INTEGER PRIMARY KEY would.
+	if _, err := db.ExecContext(ctx, `DELETE FROM seq_items WHERE id = 5;`); err != nil {
+		t.Fatalf("delete max: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO seq_items (name) VALUES ('c');`); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	var newID int64
+	if err := db.QueryRowContext(ctx, `SELECT id FROM seq_items WHERE name='c';`).Scan(&newID); err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	if newID != 6 {
+		t.Fatalf("expected AUTOINCREMENT high-water continuation (id=6), got %d", newID)
+	}
+}
+
+func TestSQLite_WithoutRowID_RebuildAboveThreshold(t *testing.T) {
+	db := getSQLiteDB(t)
+	ctx := t.Context()
+
+	if err := grizzle.Sync(ctx, db, grizzle.Options{
+		Dialect:   grizzle.DialectSQLite,
+		SchemaSQL: `CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID;`,
+	}); err != nil {
+		t.Fatalf("sync v1: %v", err)
+	}
+
+	const n = 50
+	for i := range n {
+		if _, err := db.ExecContext(ctx, `INSERT INTO kv (k, v) VALUES (?, ?);`, fmt.Sprintf("k%d", i), fmt.Sprintf("v%d", i)); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+
+	allowCol := true
+	if err := grizzle.Sync(ctx, db, grizzle.Options{
+		Dialect:                grizzle.DialectSQLite,
+		SchemaSQL:              `CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT NOT NULL) WITHOUT ROWID;`,
+		AllowDropColumn:        &allowCol,
+		AcceptHazards:          []grizzle.HazardCode{grizzle.HazardDropColumn},
+		SQLiteRebuildThreshold: 10,
+		SQLiteRebuildBatchSize: 5,
+	}); err != nil {
+		t.Fatalf("rebuild WITHOUT ROWID: %v", err)
+	}
+
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM kv;`).Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != n {
+		t.Fatalf("row count after WITHOUT ROWID rebuild: got %d want %d", count, n)
+	}
+}

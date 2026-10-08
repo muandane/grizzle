@@ -142,33 +142,50 @@ Supported hazard codes:
 | `RENAME_AMBIGUOUS` | `CRITICAL` | Unmapped column dropped and added with identical type in same table; remediation: map the rename via `Options.Renames` (CLI `--rename old=new`) |
 | `UNMANAGED_DEPENDENCY` | `CRITICAL` | Operation on column or table that an unmanaged object (view, trigger, function) depends on |
 | `NOT_NULL_NO_DEFAULT` | `CRITICAL` | Adding non-null column without default to non-empty table |
-| `GENERATED_REWRITE` | `WARNING` | Generated column expression modified; requires table rewrite on PostgreSQL |
+| `GENERATED_REWRITE` | `CRITICAL` | Generated column expression modified; requires table rewrite on PostgreSQL |
+| `DROP_EXTENSION` | `CRITICAL` | Extension dropped along with objects it owns |
+| `DROP_POLICY` | `CRITICAL` | Row-level security policy dropped |
+| `DROP_FUNCTION` | `CRITICAL` | Function, procedure, or aggregate dropped |
+| `DROP_TRIGGER` | `CRITICAL` | Trigger dropped |
+| `DROP_VIEW` | `CRITICAL` | View or materialized view dropped |
+| `DROP_DOMAIN` | `CRITICAL` | Domain or domain CHECK constraint dropped; dependent columns must be migrated first |
+| `REVOKE_PRIVILEGE` | `CRITICAL` | Privilege revoked from a grantee (access loss); requires `AllowRevoke` |
+| `DROP_ROLE` | `CRITICAL` | Grizzle-managed role dropped (memberships and grants disappear); requires `AllowDropRole`; refused outright if the role owns cluster objects |
+| `DROP_PUBLICATION` | `CRITICAL` | Grizzle-managed publication dropped (subscribers stop receiving changes); requires `AllowDropPublication` |
+| `DROP_EVENT_TRIGGER` | `CRITICAL` | Grizzle-managed event trigger dropped (DDL auditing/enforcement stops firing); requires `AllowDropEventTrigger` |
+| `GRANT_PUBLIC` | `WARNING` | Privileges granted to `PUBLIC` (ambient access for every role) |
+| `EVENT_TRIGGER_SUPERUSER` | `WARNING` | Event-trigger DDL may require superuser or elevated privileges |
+| `PUBLICATION_ALL_TABLES` | `NOTICE` | Publication publishes ALL tables, including future ones |
 | `PARTITION_ATTACH_SCAN` | `WARNING` | Attaching existing standalone table to parent partitioned table requires validation scan under `ACCESS EXCLUSIVE` lock |
 | `PARTITION_PENDING_DETACH` | `WARNING` | Interrupted pending-detach partition state requiring finalization (`FINALIZE`) |
+| `EXTENSION_PRIVILEGE` | `WARNING` | `CREATE EXTENSION` may require superuser or elevated privileges |
+| `RLS_ENABLE` | `WARNING` | Enabling/forcing RLS can lock out roles without matching policies |
+| `SECURITY_DEFINER` | `WARNING` | `SECURITY DEFINER` routine without an explicit `search_path` |
 | `INDEX_BUILD` | `NOTICE` | Index creation table locking or execution load |
 | `DROP_INDEX` | `NOTICE` | Index removal impacting query performance |
 | `DROP_FK` | `NOTICE` | Foreign key constraint removal |
 | `DROP_CHECK` | `NOTICE` | Check constraint removal (relaxes data validation) |
 | `CHECK_VALIDATE_SCAN` | `NOTICE` | `VALIDATE CONSTRAINT` on a check constraint runs a sequential scan under `SHARE UPDATE EXCLUSIVE` |
+| `ALTER_COLUMN` | `NOTICE` | Column type/nullability/default change may require a rewrite or long lock |
+| `COMMENT_CLEAR` | `NOTICE` | Existing non-empty comment is being replaced or cleared |
 
 > [!IMPORTANT]
 > `AllowDrop: false` is a hard safety invariant enforced at the policy gate before hazard evaluation. Setting `AcceptHazards: []HazardCode{HazardDropColumn}` will not bypass a disabled drop policy.
 
 ### Invariant 4b: Unmanaged objects policy — detected, protected, not managed
 
-Production databases frequently contain database objects that Grizzle does not manage declaratively:
-* Standard and materialized views (`CREATE VIEW`, `CREATE MATERIALIZED VIEW`)
-* Table triggers and event triggers (`CREATE TRIGGER`)
-* Functions and stored procedures (`CREATE FUNCTION`, `CREATE PROCEDURE`)
+Most schema constructs declared in `SchemaSQL` are managed declaratively (tables, columns, indexes, enums, CHECK/FK constraints, extensions, RLS + policies, COMMENT ON, functions, procedures, aggregates, domains, triggers, views/matviews). Role/grant and cluster-catalog statements (publications, event triggers) may also live in `SchemaSQL` and are statement-scanned outside shadow compilation; `RolesSQL` and `CatalogSQL` remain authoritative optional overlays. The objects Grizzle deliberately leaves unmanaged are those without a clean shadow-compile or diff story:
+
+* Subscriptions and replication slots (`CREATE SUBSCRIPTION` etc. — cluster-attached replication consumers with side effects beyond any single managed database)
 * Standalone sequences not owned by managed tables
-* Custom user domains (`CREATE DOMAIN`)
+* Window functions (`prokind = 'w'`) and ordered-set/hypothetical aggregates, which fall outside the managed routine surface
+* Extension-owned objects (e.g. types and functions installed by `citext`, `pgcrypto`)
 
 **Grizzle's invariant for unmanaged objects is: Detected, Protected, Not Managed.**
 
 1. **Introspection & Dependency Graphing**: During PostgreSQL schema introspection, Grizzle queries `pg_depend`, `pg_rewrite`, `pg_trigger`, and `pg_proc` to construct a structural dependency graph connecting unmanaged objects to base tables and columns. Function and procedure dependencies are resolved from `pg_depend` for SQL-standard bodies (`BEGIN ATOMIC`, which records exact table and column references); functions declared with a quoted string body (`LANGUAGE sql AS '...'`, PL/pgSQL) record no catalog dependencies, so Grizzle additionally scans their source text for references to managed tables as a conservative heuristic.
-2. **Never Diff-Dropped**: Grizzle never drops or alters unmanaged views, triggers, or functions. They are excluded from diff drop generation.
+2. **Never Diff-Dropped**: Grizzle never drops or alters unmanaged objects. They are excluded from diff drop generation.
 3. **Hazard Gate Protection (`UNMANAGED_DEPENDENCY`)**: If a planned migration step modifies or drops a column or table upon which an unmanaged view, trigger, or function depends, Grizzle flags the step with `HazardUnmanagedDependency` (`CRITICAL`). Execution is blocked unless explicitly accepted via `AcceptHazards`. The hazard description and the interactive plan summary include the affected objects and the remediation (accept the hazard and drop/recreate the unmanaged object outside Grizzle).
-4. **Roadmap Note**: Declarative lifecycle management (diffing, creating, and replacing) of views, triggers, and functions is intentionally omitted from Grizzle automigrations. These database objects carry procedural logic and state dependencies best managed through versioned migration scripts or application code. Support for declarative view migrations will be evaluated in a future major release.
 
 ### Invariant 5: Plan/Apply split with approval hash
 

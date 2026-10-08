@@ -4,10 +4,16 @@ import (
 	"cmp"
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
+	"maps"
+	"os"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/muandane/grizzle/internal/dialect"
@@ -39,6 +45,8 @@ type PostgresExecConfig struct {
 	ShadowSchema         string
 	ShadowSchemas        []string
 	SchemaSQL            string
+	RolesSQL             string
+	CatalogSQL           string
 	LockNamespace        string
 	LockID               int64
 	Filters              scope.Filters
@@ -104,6 +112,9 @@ func localSearchPathSQL(schemas []string) string {
 
 // DiffPostgres computes the diff and renders the sequenced migration steps for PostgreSQL.
 func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig) ([]plan.Step, error) {
+	if _, err := splitSchemaSQL(cfg.SchemaSQL); err != nil {
+		return nil, err
+	}
 	if cfg.Tracer != nil {
 		var diffSpan Span
 		ctx, diffSpan = cfg.Tracer.Start(ctx, "grizzle.diff_plan")
@@ -111,7 +122,9 @@ func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig
 	}
 	var serverVersion int
 	if row := dbtx.QueryRowContext(ctx, "SELECT current_setting('server_version_num')::integer;"); row != nil {
-		_ = row.Scan(&serverVersion)
+		if err := row.Scan(&serverVersion); err != nil {
+			return nil, fmt.Errorf("%w: server version: %w", plan.ErrInspectionFailed, err)
+		}
 	}
 	renderOpts := postgres.RenderOpts{
 		NonConcurrentIndexes: cfg.NonConcurrentIndexes,
@@ -135,13 +148,27 @@ func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig
 		if err != nil {
 			return nil, fmt.Errorf("%w: shadow schema: %w", plan.ErrInspectionFailed, err)
 		}
+		// Desired extensions are declared via CREATE EXTENSION statements,
+		// which do not persist in the rolled-back shadow tx. Parse them
+		// straight from SchemaSQL (authoritative desired set).
+		desired.Extensions = schema.ParseExtensions(cfg.SchemaSQL)
+		maskShadowExtensions(live, []string{shadowSchema})
+		unmapShadowExprs(desired, []string{shadowSchema})
 
 		changes, err := diff.Diff(live, desired, targetSchema, shadowSchema, cfg.Filters)
 		if err != nil {
 			return nil, err
 		}
 		steps := postgres.RenderChangesWithOpts(targetSchema, changes, renderOpts)
-		return steps, nil
+		rolesSteps, err := diffRolesSteps(ctx, dbtx, cfg, serverVersion)
+		if err != nil {
+			return nil, err
+		}
+		catalogSteps, err := diffCatalogSteps(ctx, dbtx, cfg, serverVersion)
+		if err != nil {
+			return nil, err
+		}
+		return append(steps, append(rolesSteps, catalogSteps...)...), nil
 	}
 
 	// Multi-schema diffing
@@ -162,6 +189,18 @@ func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig
 	if err != nil {
 		return nil, fmt.Errorf("%w: shadow schemas: %w", plan.ErrInspectionFailed, err)
 	}
+	// Extensions are database-wide: inject the parsed desired set into the
+	// primary schema only so multi-schema diffs do not duplicate steps.
+	if primary := desiredMap[shadowMap[cfg.primarySchema()]]; primary != nil {
+		primary.Extensions = schema.ParseExtensions(cfg.SchemaSQL)
+	}
+	shadowNames := slices.Collect(maps.Values(shadowMap))
+	for _, live := range liveMap {
+		maskShadowExtensions(live, shadowNames)
+	}
+	for _, desired := range desiredMap {
+		unmapShadowExprs(desired, shadowNames)
+	}
 
 	var allChanges []diff.Change
 	for _, target := range targetSchemas {
@@ -176,7 +215,63 @@ func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig
 	}
 
 	steps := postgres.RenderChangesWithOpts(targetSchemas[0], allChanges, renderOpts)
-	return steps, nil
+	rolesSteps, err := diffRolesSteps(ctx, dbtx, cfg, serverVersion)
+	if err != nil {
+		return nil, err
+	}
+	catalogSteps, err := diffCatalogSteps(ctx, dbtx, cfg, serverVersion)
+	if err != nil {
+		return nil, err
+	}
+	return append(steps, append(rolesSteps, catalogSteps...)...), nil
+}
+
+// maskShadowExtensions removes shadow-installed extensions from a live
+// schema snapshot. The shadow compile best-effort installs CREATE EXTENSION
+// into the shadow namespace inside the rolled-back compile tx; pg_extension
+// is database-wide, so without masking the diff would treat those ephemeral
+// installs as already-satisfied live state.
+func maskShadowExtensions(live *schema.Schema, shadowSchemas []string) {
+	if live == nil || len(live.Extensions) == 0 || len(shadowSchemas) == 0 {
+		return
+	}
+	shadowSet := make(map[string]bool, len(shadowSchemas))
+	for _, s := range shadowSchemas {
+		shadowSet[s] = true
+	}
+	for name, ext := range live.Extensions {
+		if ext != nil && shadowSet[ext.Schema] {
+			delete(live.Extensions, name)
+		}
+	}
+}
+
+// unmapShadowExprs strips ephemeral shadow-schema qualifications from column
+// default and generated expressions. Functions re-installed into the shadow
+// schema (e.g. extension functions captured via WITH SCHEMA rewriting) leave
+// `_grizzle_shadow_<id>.fn(...)` in pg_get_expr output; the shadow schema is
+// unique per run and never exists in the target, so left in place they break
+// rendered DDL and cause permanent drift. Stripping lets the reference
+// resolve through the apply-time search_path.
+func unmapShadowExprs(s *schema.Schema, shadowSchemas []string) {
+	if s == nil || len(shadowSchemas) == 0 {
+		return
+	}
+	for _, t := range s.Tables {
+		for _, c := range t.Columns {
+			for _, shadow := range shadowSchemas {
+				if shadow == "" {
+					continue
+				}
+				c.DefaultValue = strings.ReplaceAll(c.DefaultValue, shadow+".", "")
+				c.DefaultValue = strings.ReplaceAll(c.DefaultValue, `"`+shadow+`".`, "")
+				if c.Generated != nil {
+					c.Generated.Expr = strings.ReplaceAll(c.Generated.Expr, shadow+".", "")
+					c.Generated.Expr = strings.ReplaceAll(c.Generated.Expr, `"`+shadow+`".`, "")
+				}
+			}
+		}
+	}
 }
 
 func inspectPostgresSchema(ctx context.Context, dbtx dialect.DBTX, schema string, tracer Tracer) (*schema.Schema, error) {
@@ -244,13 +339,55 @@ func GroupSteps(steps []plan.Step) []StepGroup {
 	return groups
 }
 
+// lockBudget bounds the TOTAL advisory-lock acquisition wait across retry
+// attempts, including backoff. Only lock waiting consumes the budget:
+// preamble work (hooks, schema setup, session timeout statements) and DDL
+// execution are not lock waits, so each attempt's acquisition timer is armed
+// only when acquisition begins. A slow BeforeSync hook or a retryable DDL
+// lock failure therefore cannot starve a later attempt's acquisition window.
+type lockBudgetTracker struct {
+	budget time.Duration
+	spent  time.Duration
+}
+
+// remaining returns the budget left for the current attempt's acquisition.
+func (t *lockBudgetTracker) remaining() time.Duration {
+	return max(t.budget-t.spent, 0)
+}
+
+// recordWait charges a measured acquisition wait (successful or not) to the
+// budget.
+func (t *lockBudgetTracker) recordWait(d time.Duration) {
+	t.spent += d
+}
+
+// reserve charges a pending backoff interval to the budget, reporting whether
+// the budget could accommodate it; false means the campaign must stop.
+func (t *lockBudgetTracker) reserve(d time.Duration) bool {
+	if t.spent+d >= t.budget {
+		return false
+	}
+	t.spent += d
+	return true
+}
+
 // SyncPostgres synchronizes PostgreSQL with session-level advisory locking, timeouts, and retry logic.
 func SyncPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) error {
 	maxRetries := max(cfg.MaxRetries, 0)
 
+	// LockTimeout bounds the TOTAL advisory-lock acquisition wait across
+	// retries, including backoff. It is deliberately NOT overwritten here:
+	// the same value feeds ApplySessionTimeouts, which sets the DDL
+	// lock_timeout on every attempt.
+	lockBudget := cfg.LockTimeout
+	if lockBudget <= 0 {
+		lockBudget = DefaultLockTimeout
+	}
+	budget := &lockBudgetTracker{budget: lockBudget}
+
 	attempt := 0
 	for {
-		committed, err := syncPostgresOnce(ctx, db, cfg)
+		committed, err := syncPostgresOnce(ctx, db, cfg, budget)
 		if err == nil {
 			if cfg.Backfill != nil && cfg.Filters.ExpandContract {
 				if err := RunBackfill(ctx, db, cfg.TargetSchema, cfg.Filters.Renames, nil, cfg.Backfill, cfg.Logger); err != nil {
@@ -261,12 +398,19 @@ func SyncPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) error
 		}
 
 		// Only retry before any step has committed. After partial progress: abort, require re-plan.
-		if committed > 0 || !IsLockTimeout(err) || attempt >= maxRetries {
+		if committed > 0 || !IsRetryable(err) || attempt >= maxRetries {
 			return err
 		}
 
 		attempt++
 		backoff := ComputeBackoff(attempt, cfg.RandFloat)
+
+		// The budget covers total lock waiting: stop if waiting the backoff
+		// would exhaust it.
+		if !budget.reserve(backoff) {
+			return err
+		}
+
 		if cfg.Logger != nil {
 			cfg.Logger.WarnContext(ctx, "grizzle: lock timeout encountered before progress, retrying migration",
 				"attempt", attempt,
@@ -284,12 +428,18 @@ func SyncPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) error
 	}
 }
 
-func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (int, error) {
+func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig, budget *lockBudgetTracker) (int, error) {
 	start := time.Now()
 	logger := cfg.Logger
 	targetSchemas := cfg.targetSchemas()
 	primarySchema := cfg.primarySchema()
 	isMulti := len(targetSchemas) > 1
+
+	// Ephemeral per-run shadow prefix: never trust a persisted artifact name.
+	// uniqueShadowName keeps concurrent Sync/PlanDiff callers collision-free
+	// within PostgreSQL's 63-byte identifier limit.
+	userShadow := cmp.Or(cfg.ShadowSchema, "_grizzle_shadow")
+	cfg.ShadowSchema = uniqueShadowName(userShadow)
 
 	if logger != nil {
 		logger.InfoContext(ctx, "grizzle: starting schema synchronization", "target_schemas", targetSchemas)
@@ -303,7 +453,11 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 
 	// BeforeSync runs once before any migration steps or locks are executed.
 	if err := callBeforeSync(cfg.BeforeSync, ctx, conn); err != nil {
-		return 0, fmt.Errorf("grizzle: before_sync hook: %w", err)
+		hookErr := fmt.Errorf("grizzle: before_sync hook: %w", err)
+		if logger != nil {
+			logger.ErrorContext(ctx, "grizzle: hook failed", "error", hookErr)
+		}
+		return 0, hookErr
 	}
 
 	for _, s := range targetSchemas {
@@ -316,12 +470,13 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 	// Apply session-level timeouts
 	_ = ApplySessionTimeouts(ctx, conn, cfg.LockTimeout, cfg.StatementTimeout)
 
-	// 1. Acquire session-level advisory lock on dedicated connection
-	lockTimeout := cfg.LockTimeout
-	if lockTimeout <= 0 {
-		lockTimeout = DefaultLockTimeout
-	}
-	lockCtx, cancelLock := context.WithTimeout(ctx, lockTimeout)
+	// 1. Acquire session-level advisory lock on dedicated connection. The
+	// timer is armed HERE, not at wrapper start: the preamble above (hooks,
+	// schema setup, session timeouts) is not a lock wait and must not consume
+	// the acquisition budget. DDL lock_timeout still keeps cfg.LockTimeout
+	// via ApplySessionTimeouts.
+	lockCtx, cancelLock := context.WithTimeout(ctx, budget.remaining())
+	lockStart := time.Now()
 	var lockSpan Span
 	if cfg.Tracer != nil {
 		_, lockSpan = cfg.Tracer.Start(ctx, "grizzle.acquire_lock")
@@ -334,6 +489,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 		acquiredSchemas, err = postgres.AcquireSchemaLocks(lockCtx, conn, lockNs, targetSchemas)
 	}
 	cancelLock()
+	budget.recordWait(time.Since(lockStart))
 	if lockSpan != nil {
 		if err != nil {
 			lockSpan.RecordError(err)
@@ -346,15 +502,13 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 		}
 		return 0, fmt.Errorf("%w: %w", plan.ErrLockAcquisition, err)
 	}
-	defer func() {
+	defer releasePostgresConn(ctx, conn, func(relCtx context.Context) error {
 		if cfg.LockID != 0 {
-			_ = postgres.ReleaseSessionAdvisoryLock(context.Background(), conn, cfg.LockID)
-		} else {
-			lockNs := cmp.Or(cfg.LockNamespace, "grizzle")
-			_ = postgres.ReleaseSchemaLocks(context.Background(), conn, lockNs, acquiredSchemas)
+			return postgres.ReleaseSessionAdvisoryLock(relCtx, conn, cfg.LockID)
 		}
-		_, _ = conn.ExecContext(context.Background(), "RESET search_path; RESET lock_timeout; RESET statement_timeout;")
-	}()
+		lockNs := cmp.Or(cfg.LockNamespace, "grizzle")
+		return postgres.ReleaseSchemaLocks(relCtx, conn, lockNs, acquiredSchemas)
+	})
 
 	if logger != nil {
 		if cfg.LockID != 0 {
@@ -374,6 +528,11 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 
 	_ = ApplyTxTimeouts(ctx, shadowTx, cfg.LockTimeout, cfg.StatementTimeout)
 
+	schemaGroups, err := splitSchemaSQL(cfg.SchemaSQL)
+	if err != nil {
+		return 0, fmt.Errorf("%w: %w", plan.ErrCompilationFailed, err)
+	}
+
 	var shadowSchemas []string
 	if !isMulti {
 		shadowSchema := cfg.ShadowSchema
@@ -386,7 +545,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 			return 0, err
 		}
 
-		if err := postgres.RunShadowDDL(ctx, shadowTx, shadowSchema, primarySchema, cfg.SchemaSQL); err != nil {
+		if err := postgres.RunShadowDDL(ctx, shadowTx, shadowSchema, primarySchema, schemaGroups.ShadowSQL); err != nil {
 			if logger != nil {
 				logger.ErrorContext(ctx, "grizzle: shadow compilation failed", "error", err)
 			}
@@ -402,7 +561,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 			return 0, err
 		}
 
-		if err := postgres.RunMultiShadowDDL(ctx, shadowTx, shadowMap, targetSchemas, cfg.SchemaSQL); err != nil {
+		if err := postgres.RunMultiShadowDDL(ctx, shadowTx, shadowMap, targetSchemas, schemaGroups.ShadowSQL); err != nil {
 			if logger != nil {
 				logger.ErrorContext(ctx, "grizzle: shadow compilation failed", "error", err)
 			}
@@ -430,6 +589,8 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 		Renames:        cfg.Filters.Renames,
 		ExpandContract: cfg.Filters.ExpandContract,
 		SchemaSQL:      cfg.SchemaSQL,
+		RolesSQL:       cfg.RolesSQL,
+		CatalogSQL:     cfg.CatalogSQL,
 	}
 
 	// 4b. Verify expected plan hash if provided (aborts with ErrPlanDrift on mismatch)
@@ -489,6 +650,9 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 	groups := GroupSteps(steps)
 	stepIdx := 0
 	committedSteps := 0
+	// histErr captures a failed success-path history write: reported as a
+	// typed non-fatal error after the migration completes (plan.ErrHistoryRecord).
+	var histErr error
 
 	recordFailureHistory := func(failedStep int, execErr error, isNonTx bool) {
 		status := "failed"
@@ -501,7 +665,9 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 		histConn, err := db.Conn(histCtx)
 		if err == nil {
 			defer func() { _ = histConn.Close() }()
-			_ = history.RecordProgress(histCtx, histConn, "postgres", primarySchema, p, status, failedStep, execErr, time.Since(start))
+			if rErr := history.RecordProgress(histCtx, histConn, "postgres", primarySchema, p, status, failedStep, execErr, time.Since(start)); rErr != nil && logger != nil {
+				logger.WarnContext(histCtx, "grizzle: failed recording failure history", "status", status, "error", rErr)
+			}
 		}
 	}
 
@@ -514,6 +680,9 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 				stepStart := time.Now()
 				if err := callBeforeStep(cfg.BeforeStep, HookContext{Context: ctx, DBTX: conn, Step: s, Index: stepIdx, Total: len(steps), IsNonTx: true}); err != nil {
 					hookErr := fmt.Errorf("before_step hook: %w", err)
+					if logger != nil {
+						logger.ErrorContext(ctx, "grizzle: hook failed", "step_index", stepIdx, "error", hookErr)
+					}
 					// No DDL ran yet; status follows committedSteps only (not isNonTx).
 					recordFailureHistory(stepIdx, hookErr, false)
 					return committedSteps, hookErr
@@ -528,6 +697,9 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 				committedSteps++
 				if err := callAfterStep(cfg.AfterStep, HookContext{Context: ctx, DBTX: conn, Step: s, Index: stepIdx, Total: len(steps), IsNonTx: true}); err != nil {
 					hookErr := fmt.Errorf("after_step hook: %w", err)
+					if logger != nil {
+						logger.ErrorContext(ctx, "grizzle: hook failed", "step_index", stepIdx, "error", hookErr)
+					}
 					recordFailureHistory(stepIdx, hookErr, true)
 					return committedSteps, hookErr
 				}
@@ -537,8 +709,9 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 			}
 			if isLastGroup {
 				if err := history.RecordPlan(ctx, conn, "postgres", primarySchema, p, time.Since(start)); err != nil {
+					histErr = fmt.Errorf("%w: %w", plan.ErrHistoryRecord, err)
 					if logger != nil {
-						logger.WarnContext(ctx, "grizzle: failed recording history on conn", "error", err)
+						logger.ErrorContext(ctx, "grizzle: failed recording history on conn", "error", err)
 					}
 				}
 			}
@@ -557,6 +730,9 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 				if err := callBeforeStep(cfg.BeforeStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: stepIdx, Total: len(steps), IsNonTx: false}); err != nil {
 					_ = tx.Rollback()
 					hookErr := fmt.Errorf("before_step hook: %w", err)
+					if logger != nil {
+						logger.ErrorContext(ctx, "grizzle: hook failed", "step_index", stepIdx, "error", hookErr)
+					}
 					recordFailureHistory(stepIdx, hookErr, false)
 					return committedSteps, hookErr
 				}
@@ -571,6 +747,9 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 				if err := callAfterStep(cfg.AfterStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: stepIdx, Total: len(steps), IsNonTx: false}); err != nil {
 					_ = tx.Rollback()
 					hookErr := fmt.Errorf("after_step hook: %w", err)
+					if logger != nil {
+						logger.ErrorContext(ctx, "grizzle: hook failed", "step_index", stepIdx, "error", hookErr)
+					}
 					recordFailureHistory(stepIdx, hookErr, false)
 					return committedSteps, hookErr
 				}
@@ -579,31 +758,40 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 				}
 			}
 
-			// Record history in same transaction before commit where possible
-			if isLastGroup {
-				if err := history.RecordPlan(ctx, tx, "postgres", primarySchema, p, time.Since(start)); err != nil {
-					if logger != nil {
-						logger.WarnContext(ctx, "grizzle: failed recording history in tx", "error", err)
-					}
-				}
-			}
-
 			if err := tx.Commit(); err != nil {
 				recordFailureHistory(stepIdx, err, false)
 				return committedSteps, fmt.Errorf("grizzle: failed committing step transaction: %w", err)
 			}
 			committedSteps += len(group.Steps)
+			// Model B: history is advisory — recorded after commit on the
+			// dedicated connection so a history failure can never roll back
+			// applied DDL.
+			if isLastGroup {
+				if err := history.RecordPlan(ctx, conn, "postgres", primarySchema, p, time.Since(start)); err != nil {
+					histErr = fmt.Errorf("%w: %w", plan.ErrHistoryRecord, err)
+					if logger != nil {
+						logger.ErrorContext(ctx, "grizzle: failed recording history post-commit", "error", err)
+					}
+				}
+			}
 		}
 	}
 
 	if err := callAfterSync(cfg.AfterSync, ctx, conn); err != nil {
-		return committedSteps, fmt.Errorf("%w: %w", plan.ErrAfterSyncFailed, err)
+		hookErr := fmt.Errorf("%w: %w", plan.ErrAfterSyncFailed, err)
+		if logger != nil {
+			logger.ErrorContext(ctx, "grizzle: hook failed", "error", hookErr)
+		}
+		return committedSteps, hookErr
 	}
 
 	if logger != nil {
 		logger.InfoContext(ctx, "grizzle: synchronization finished successfully", "steps_applied", len(steps), "total_duration", time.Since(start))
 	}
 
+	if histErr != nil {
+		return committedSteps, histErr
+	}
 	return committedSteps, nil
 }
 
@@ -613,6 +801,13 @@ func PlanDiffPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 	primarySchema := cfg.primarySchema()
 	isMulti := len(targetSchemas) > 1
 
+	// Per-call unique shadow name: PlanDiff is a read-only drift check and
+	// must not block behind (or interfere with) a concurrently running Sync
+	// that holds the default shadow schema name. The compile transaction is
+	// always rolled back, so the unique schema cannot leak.
+	userShadowSchema := cmp.Or(cfg.ShadowSchema, "_grizzle_shadow")
+	cfg.ShadowSchema = uniqueShadowName(userShadowSchema)
+
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("grizzle: failed to begin transaction: %w", err)
@@ -620,6 +815,11 @@ func PlanDiffPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 	defer func() { _ = tx.Rollback() }()
 
 	_ = ApplyTxTimeouts(ctx, tx, cfg.LockTimeout, cfg.StatementTimeout)
+
+	schemaGroups, err := splitSchemaSQL(cfg.SchemaSQL)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", plan.ErrCompilationFailed, err)
+	}
 
 	var shadowSchemas []string
 	if !isMulti {
@@ -634,7 +834,7 @@ func PlanDiffPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 		}
 		defer func() { _ = postgres.DropShadowSchema(context.Background(), tx, shadowSchema) }()
 
-		if err := postgres.RunShadowDDL(ctx, tx, shadowSchema, primarySchema, cfg.SchemaSQL); err != nil {
+		if err := postgres.RunShadowDDL(ctx, tx, shadowSchema, primarySchema, schemaGroups.ShadowSQL); err != nil {
 			return nil, fmt.Errorf("%w: %w", plan.ErrCompilationFailed, err)
 		}
 	} else {
@@ -648,7 +848,7 @@ func PlanDiffPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 		}
 		defer func() { _ = postgres.DropShadowSchemas(context.Background(), tx, shadowSchemas) }()
 
-		if err := postgres.RunMultiShadowDDL(ctx, tx, shadowMap, targetSchemas, cfg.SchemaSQL); err != nil {
+		if err := postgres.RunMultiShadowDDL(ctx, tx, shadowMap, targetSchemas, schemaGroups.ShadowSQL); err != nil {
 			return nil, fmt.Errorf("%w: %w", plan.ErrCompilationFailed, err)
 		}
 	}
@@ -659,16 +859,44 @@ func PlanDiffPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 	}
 
 	return &plan.Plan{
-		TargetSchema:   primarySchema,
-		TargetSchemas:  targetSchemas,
-		Steps:          steps,
-		Policy:         cfg.Policy,
-		IncludeTables:  cfg.Filters.Includes,
-		ExcludeTables:  cfg.Filters.Excludes,
-		Renames:        cfg.Filters.Renames,
-		ExpandContract: cfg.Filters.ExpandContract,
-		SchemaSQL:      cfg.SchemaSQL,
+		TargetSchema:         primarySchema,
+		TargetSchemas:        targetSchemas,
+		Steps:                steps,
+		Policy:               cfg.Policy,
+		IncludeTables:        cfg.Filters.Includes,
+		ExcludeTables:        cfg.Filters.Excludes,
+		Renames:              cfg.Filters.Renames,
+		ExpandContract:       cfg.Filters.ExpandContract,
+		SchemaSQL:            cfg.SchemaSQL,
+		RolesSQL:             cfg.RolesSQL,
+		CatalogSQL:           cfg.CatalogSQL,
+		LockTimeout:          cfg.LockTimeout,
+		StatementTimeout:     cfg.StatementTimeout,
+		NonConcurrentIndexes: cfg.NonConcurrentIndexes,
 	}, nil
+}
+
+// planShadowSuffix is a process-local counter ensuring concurrent PlanDiff
+// calls never share a shadow schema name.
+var planShadowSuffix atomic.Uint64
+
+// uniqueShadowName derives a per-call shadow schema name that is unique
+// across concurrent callers while staying inside PostgreSQL's 63-byte
+// identifier limit (NAMEDATALEN). A longer name would be silently truncated
+// by the server, making setup, introspection, and drop disagree on the
+// schema name. The suffix is a short hash of pid, timestamp, and a process
+// counter, so concurrent calls collide with probability ~2^-32 per pair.
+// The result stays a valid SQL identifier.
+func uniqueShadowName(base string) string {
+	h := fnv.New32a()
+	seed := uint64(time.Now().UnixNano()) ^ uint64(os.Getpid())<<32 ^ planShadowSuffix.Add(1)
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], seed)
+	_, _ = h.Write(buf[:])
+	if len(base) > 54 { // reserve room for the 9-char suffix within 63 bytes
+		base = base[:54]
+	}
+	return fmt.Sprintf("%s_%08x", base, h.Sum32())
 }
 
 // SQLiteExecConfig specifies the execution options for SQLite synchronization.
@@ -776,92 +1004,99 @@ func SyncSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) error {
 	// BeforeSync runs once before any migration steps are executed.
 	// SQLite passes the *sql.DB handle because the entire sync is a single transaction.
 	if err := callBeforeSync(cfg.BeforeSync, ctx, db); err != nil {
-		return fmt.Errorf("sqlite: before_sync hook: %w", err)
-	}
-
-	// 5. Execute in transaction
-	_, _ = db.ExecContext(ctx, "PRAGMA foreign_keys = OFF;")
-	defer func() {
-		_, _ = db.ExecContext(ctx, "PRAGMA foreign_keys = ON;")
-	}()
-
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("sqlite: failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	if _, err := tx.ExecContext(ctx, "PRAGMA foreign_keys = OFF;"); err != nil {
-		return fmt.Errorf("sqlite: failed to disable foreign keys: %w", err)
-	}
-
-	for i, s := range steps {
-		stepStart := time.Now()
-		sqlToExec := strings.TrimSpace(s.SQL)
-		if sqlToExec == "" {
-			continue
+		hookErr := fmt.Errorf("sqlite: before_sync hook: %w", err)
+		if logger != nil {
+			logger.ErrorContext(ctx, "grizzle: hook failed", "error", hookErr)
 		}
-		if err := callBeforeStep(cfg.BeforeStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: i + 1, Total: len(steps), IsNonTx: false}); err != nil {
-			_ = tx.Rollback()
-			hookErr := fmt.Errorf("before_step hook: %w", err)
-			histCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = history.RecordProgress(histCtx, db, "sqlite", "", p, "failed", i+1, hookErr, time.Since(start))
-			return hookErr
-		}
-		if err := executeSQLiteStep(ctx, tx, s, cfg); err != nil {
-			_ = tx.Rollback()
-			if logger != nil {
-				logger.ErrorContext(ctx, "sqlite: failed executing step", "step_index", i+1, "sql", sqlToExec, "error", err)
+		return hookErr
+	}
+
+	// 5. Execute in a transaction pinned to a single connection with foreign
+	// keys disabled (per-connection PRAGMA; a no-op inside a transaction).
+	// histErr captures a failed success-path history write; surfaced as a
+	// typed non-fatal error after the transaction commits.
+	var histErr error
+	err = runSQLiteWithForeignKeysOff(ctx, db, func(tx *sql.Tx, conn *sql.Conn) error {
+		for i, s := range steps {
+			stepStart := time.Now()
+			sqlToExec := strings.TrimSpace(s.SQL)
+			if sqlToExec == "" {
+				continue
 			}
-			histCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = history.RecordProgress(histCtx, db, "sqlite", "", p, "failed", i+1, err, time.Since(start))
-			return fmt.Errorf("%w: failed executing [%s]: %w", plan.ErrExecutionFailed, sqlToExec, err)
+			if err := callBeforeStep(cfg.BeforeStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: i + 1, Total: len(steps), IsNonTx: false}); err != nil {
+				_ = tx.Rollback()
+				hookErr := fmt.Errorf("before_step hook: %w", err)
+				if logger != nil {
+					logger.ErrorContext(ctx, "grizzle: hook failed", "step_index", i+1, "error", hookErr)
+				}
+				histCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if rErr := history.RecordProgress(histCtx, conn, "sqlite", "", p, "failed", i+1, hookErr, time.Since(start)); rErr != nil && logger != nil {
+					logger.WarnContext(histCtx, "sqlite: failed recording failure history", "error", rErr)
+				}
+				return hookErr
+			}
+			if err := executeSQLiteStep(ctx, tx, s, cfg); err != nil {
+				_ = tx.Rollback()
+				if logger != nil {
+					logger.ErrorContext(ctx, "sqlite: failed executing step", "step_index", i+1, "sql", sqlToExec, "error", err)
+				}
+				histCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if rErr := history.RecordProgress(histCtx, conn, "sqlite", "", p, "failed", i+1, err, time.Since(start)); rErr != nil && logger != nil {
+					logger.WarnContext(histCtx, "sqlite: failed recording failure history", "error", rErr)
+				}
+				return fmt.Errorf("%w: failed executing [%s]: %w", plan.ErrExecutionFailed, sqlToExec, err)
+			}
+			if err := callAfterStep(cfg.AfterStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: i + 1, Total: len(steps), IsNonTx: false}); err != nil {
+				_ = tx.Rollback()
+				hookErr := fmt.Errorf("after_step hook: %w", err)
+				if logger != nil {
+					logger.ErrorContext(ctx, "grizzle: hook failed", "step_index", i+1, "error", hookErr)
+				}
+				histCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if rErr := history.RecordProgress(histCtx, conn, "sqlite", "", p, "failed", i+1, hookErr, time.Since(start)); rErr != nil && logger != nil {
+					logger.WarnContext(histCtx, "sqlite: failed recording failure history", "error", rErr)
+				}
+				return hookErr
+			}
+			if logger != nil {
+				logger.DebugContext(ctx, "sqlite: executed step", "step_index", i+1, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
+			}
 		}
-		if err := callAfterStep(cfg.AfterStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: i + 1, Total: len(steps), IsNonTx: false}); err != nil {
-			_ = tx.Rollback()
-			hookErr := fmt.Errorf("after_step hook: %w", err)
-			histCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = history.RecordProgress(histCtx, db, "sqlite", "", p, "failed", i+1, hookErr, time.Since(start))
-			return hookErr
-		}
-		if logger != nil {
-			logger.DebugContext(ctx, "sqlite: executed step", "step_index", i+1, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
-		}
-	}
 
-	finalFKRows, err := tx.QueryContext(ctx, "PRAGMA foreign_key_check;")
+		finalFKRows, err := tx.QueryContext(ctx, "PRAGMA foreign_key_check;")
+		if err != nil {
+			return fmt.Errorf("sqlite: foreign key check failed: %w", err)
+		}
+		var fkViolations []string
+		for finalFKRows.Next() {
+			var vTbl, vParent string
+			var vRowID, vFKID int64
+			if err := finalFKRows.Scan(&vTbl, &vRowID, &vParent, &vFKID); err == nil {
+				fkViolations = append(fkViolations, fmt.Sprintf("table %q row %d -> %q", vTbl, vRowID, vParent))
+			}
+		}
+		_ = finalFKRows.Close()
+		if len(fkViolations) > 0 {
+			return fmt.Errorf("sqlite: foreign key constraint violation: %s", strings.Join(fkViolations, "; "))
+		}
+		// Model B: do not record history inside the migration transaction.
+		return nil
+	})
 	if err != nil {
-		return fmt.Errorf("sqlite: foreign key check failed: %w", err)
-	}
-	var fkViolations []string
-	for finalFKRows.Next() {
-		var vTbl, vParent string
-		var vRowID, vFKID int64
-		if err := finalFKRows.Scan(&vTbl, &vRowID, &vParent, &vFKID); err == nil {
-			fkViolations = append(fkViolations, fmt.Sprintf("table %q row %d -> %q", vTbl, vRowID, vParent))
-		}
-	}
-	_ = finalFKRows.Close()
-	if len(fkViolations) > 0 {
-		return fmt.Errorf("sqlite: foreign key constraint violation: %s", strings.Join(fkViolations, "; "))
-	}
-
-	if _, err := tx.ExecContext(ctx, "PRAGMA foreign_keys = ON;"); err != nil {
-		return fmt.Errorf("sqlite: failed to re-enable foreign keys: %w", err)
-	}
-
-	// Record history in same transaction
-	if err := history.RecordPlan(ctx, tx, "sqlite", "", p, time.Since(start)); err != nil {
-		if logger != nil {
-			logger.WarnContext(ctx, "sqlite: failed recording history in tx", "error", err)
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
 		return err
+	}
+	// Model B: history is advisory — recorded after DDL commit.
+	if err := history.RecordPlan(ctx, db, "sqlite", "", p, time.Since(start)); err != nil {
+		histErr = fmt.Errorf("%w: %w", plan.ErrHistoryRecord, err)
+		if logger != nil {
+			logger.ErrorContext(ctx, "sqlite: failed recording history post-commit", "error", err)
+		}
+	}
+	if histErr != nil {
+		return histErr
 	}
 
 	if cfg.Backfill != nil && cfg.Filters.ExpandContract {
@@ -871,7 +1106,11 @@ func SyncSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) error {
 	}
 
 	if err := callAfterSync(cfg.AfterSync, ctx, db); err != nil {
-		return fmt.Errorf("%w: %w", plan.ErrAfterSyncFailed, err)
+		hookErr := fmt.Errorf("%w: %w", plan.ErrAfterSyncFailed, err)
+		if logger != nil {
+			logger.ErrorContext(ctx, "grizzle: hook failed", "error", hookErr)
+		}
+		return hookErr
 	}
 
 	if logger != nil {
@@ -939,10 +1178,21 @@ func ApplyPostgres(ctx context.Context, db *sql.DB, p *plan.Plan, cfg PostgresEx
 	}
 
 	maxRetries := max(cfg.MaxRetries, 0)
+
+	// LockTimeout bounds the TOTAL advisory-lock acquisition wait across
+	// retries, including backoff (see SyncPostgres). cfg.LockTimeout itself
+	// is never overwritten: it still feeds ApplySessionTimeouts for the DDL
+	// lock_timeout on every attempt.
+	lockBudget := cfg.LockTimeout
+	if lockBudget <= 0 {
+		lockBudget = DefaultLockTimeout
+	}
+	budget := &lockBudgetTracker{budget: lockBudget}
+
 	attempt := 0
 
 	for {
-		committed, err := applyPostgresOnce(ctx, db, p, cfg)
+		committed, err := applyPostgresOnce(ctx, db, p, cfg, budget)
 		if err == nil {
 			if cfg.Backfill != nil && p.ExpandContract {
 				if err := RunBackfill(ctx, db, cfg.TargetSchema, p.Renames, nil, cfg.Backfill, cfg.Logger); err != nil {
@@ -953,12 +1203,19 @@ func ApplyPostgres(ctx context.Context, db *sql.DB, p *plan.Plan, cfg PostgresEx
 		}
 
 		// Only retry before any step has committed. After partial progress: abort, require re-plan.
-		if committed > 0 || !IsLockTimeout(err) || attempt >= maxRetries {
+		if committed > 0 || !IsRetryable(err) || attempt >= maxRetries {
 			return err
 		}
 
 		attempt++
 		backoff := ComputeBackoff(attempt, cfg.RandFloat)
+
+		// The budget covers total lock waiting: stop if waiting the backoff
+		// would exhaust it.
+		if !budget.reserve(backoff) {
+			return err
+		}
+
 		if cfg.Logger != nil {
 			cfg.Logger.WarnContext(ctx, "grizzle: lock timeout encountered before progress, retrying plan apply",
 				"attempt", attempt,
@@ -976,7 +1233,7 @@ func ApplyPostgres(ctx context.Context, db *sql.DB, p *plan.Plan, cfg PostgresEx
 	}
 }
 
-func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg PostgresExecConfig) (int, error) {
+func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg PostgresExecConfig, budget *lockBudgetTracker) (int, error) {
 	start := time.Now()
 	logger := cfg.Logger
 	targetSchemas := cfg.targetSchemas()
@@ -994,7 +1251,11 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 
 	// BeforeSync runs once before any migration steps or locks are executed.
 	if err := callBeforeSync(cfg.BeforeSync, ctx, conn); err != nil {
-		return 0, fmt.Errorf("grizzle: before_sync hook: %w", err)
+		hookErr := fmt.Errorf("grizzle: before_sync hook: %w", err)
+		if logger != nil {
+			logger.ErrorContext(ctx, "grizzle: hook failed", "error", hookErr)
+		}
+		return 0, hookErr
 	}
 
 	for _, s := range targetSchemas {
@@ -1007,12 +1268,13 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 	// Apply session-level timeouts
 	_ = ApplySessionTimeouts(ctx, conn, cfg.LockTimeout, cfg.StatementTimeout)
 
-	// Acquire session-level advisory lock on dedicated connection
-	lockTimeout := cfg.LockTimeout
-	if lockTimeout <= 0 {
-		lockTimeout = DefaultLockTimeout
-	}
-	lockCtx, cancelLock := context.WithTimeout(ctx, lockTimeout)
+	// Acquire session-level advisory lock on dedicated connection. The timer
+	// is armed HERE, not at wrapper start: the preamble above (hooks, schema
+	// setup, session timeouts) is not a lock wait and must not consume the
+	// acquisition budget. DDL lock_timeout still keeps cfg.LockTimeout via
+	// ApplySessionTimeouts.
+	lockCtx, cancelLock := context.WithTimeout(ctx, budget.remaining())
+	lockStart := time.Now()
 	var lockSpan Span
 	if cfg.Tracer != nil {
 		_, lockSpan = cfg.Tracer.Start(ctx, "grizzle.acquire_lock")
@@ -1025,6 +1287,7 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 		acquiredSchemas, err = postgres.AcquireSchemaLocks(lockCtx, conn, lockNs, targetSchemas)
 	}
 	cancelLock()
+	budget.recordWait(time.Since(lockStart))
 	if lockSpan != nil {
 		if err != nil {
 			lockSpan.RecordError(err)
@@ -1037,15 +1300,13 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 		}
 		return 0, fmt.Errorf("%w: %w", plan.ErrLockAcquisition, err)
 	}
-	defer func() {
+	defer releasePostgresConn(ctx, conn, func(relCtx context.Context) error {
 		if cfg.LockID != 0 {
-			_ = postgres.ReleaseSessionAdvisoryLock(context.Background(), conn, cfg.LockID)
-		} else {
-			lockNs := cmp.Or(cfg.LockNamespace, "grizzle")
-			_ = postgres.ReleaseSchemaLocks(context.Background(), conn, lockNs, acquiredSchemas)
+			return postgres.ReleaseSessionAdvisoryLock(relCtx, conn, cfg.LockID)
 		}
-		_, _ = conn.ExecContext(context.Background(), "RESET search_path; RESET lock_timeout; RESET statement_timeout;")
-	}()
+		lockNs := cmp.Or(cfg.LockNamespace, "grizzle")
+		return postgres.ReleaseSchemaLocks(relCtx, conn, lockNs, acquiredSchemas)
+	})
 
 	if logger != nil {
 		if cfg.LockID != 0 {
@@ -1062,11 +1323,23 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 		}
 		return 0, nil
 	}
+	var droppedRoles []string
+	for _, step := range p.Steps {
+		if step.Type == plan.ChangeDropRole {
+			droppedRoles = append(droppedRoles, step.Table)
+		}
+	}
+	if err := validateRoleDropSafety(ctx, conn, droppedRoles, targetSchemas, p.Steps); err != nil {
+		return 0, err
+	}
 
 	// Apply DDL statements split into transactional and non-transactional groups
 	groups := GroupSteps(p.Steps)
 	stepIdx := 0
 	committedSteps := 0
+	// histErr captures a failed success-path history write: reported as a
+	// typed non-fatal error after the migration completes (plan.ErrHistoryRecord).
+	var histErr error
 
 	recordFailureHistory := func(failedStep int, execErr error, isNonTx bool) {
 		status := "failed"
@@ -1078,7 +1351,9 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 		histConn, err := db.Conn(histCtx)
 		if err == nil {
 			defer func() { _ = histConn.Close() }()
-			_ = history.RecordProgress(histCtx, histConn, "postgres", primarySchema, p, status, failedStep, execErr, time.Since(start))
+			if rErr := history.RecordProgress(histCtx, histConn, "postgres", primarySchema, p, status, failedStep, execErr, time.Since(start)); rErr != nil && logger != nil {
+				logger.WarnContext(histCtx, "grizzle: failed recording failure history", "status", status, "error", rErr)
+			}
 		}
 	}
 
@@ -1090,6 +1365,9 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 				stepStart := time.Now()
 				if err := callBeforeStep(cfg.BeforeStep, HookContext{Context: ctx, DBTX: conn, Step: s, Index: stepIdx, Total: len(p.Steps), IsNonTx: true}); err != nil {
 					hookErr := fmt.Errorf("before_step hook: %w", err)
+					if logger != nil {
+						logger.ErrorContext(ctx, "grizzle: hook failed", "step_index", stepIdx, "error", hookErr)
+					}
 					// No DDL ran yet; status follows committedSteps only (not isNonTx).
 					recordFailureHistory(stepIdx, hookErr, false)
 					return committedSteps, hookErr
@@ -1104,6 +1382,9 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 				committedSteps++
 				if err := callAfterStep(cfg.AfterStep, HookContext{Context: ctx, DBTX: conn, Step: s, Index: stepIdx, Total: len(p.Steps), IsNonTx: true}); err != nil {
 					hookErr := fmt.Errorf("after_step hook: %w", err)
+					if logger != nil {
+						logger.ErrorContext(ctx, "grizzle: hook failed", "step_index", stepIdx, "error", hookErr)
+					}
 					recordFailureHistory(stepIdx, hookErr, true)
 					return committedSteps, hookErr
 				}
@@ -1113,8 +1394,9 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 			}
 			if isLastGroup {
 				if err := history.RecordPlan(ctx, conn, "postgres", primarySchema, p, time.Since(start)); err != nil {
+					histErr = fmt.Errorf("%w: %w", plan.ErrHistoryRecord, err)
 					if logger != nil {
-						logger.WarnContext(ctx, "grizzle: failed recording history on conn", "error", err)
+						logger.ErrorContext(ctx, "grizzle: failed recording history on conn", "error", err)
 					}
 				}
 			}
@@ -1132,6 +1414,9 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 				if err := callBeforeStep(cfg.BeforeStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: stepIdx, Total: len(p.Steps), IsNonTx: false}); err != nil {
 					_ = tx.Rollback()
 					hookErr := fmt.Errorf("before_step hook: %w", err)
+					if logger != nil {
+						logger.ErrorContext(ctx, "grizzle: hook failed", "step_index", stepIdx, "error", hookErr)
+					}
 					recordFailureHistory(stepIdx, hookErr, false)
 					return committedSteps, hookErr
 				}
@@ -1146,6 +1431,9 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 				if err := callAfterStep(cfg.AfterStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: stepIdx, Total: len(p.Steps), IsNonTx: false}); err != nil {
 					_ = tx.Rollback()
 					hookErr := fmt.Errorf("after_step hook: %w", err)
+					if logger != nil {
+						logger.ErrorContext(ctx, "grizzle: hook failed", "step_index", stepIdx, "error", hookErr)
+					}
 					recordFailureHistory(stepIdx, hookErr, false)
 					return committedSteps, hookErr
 				}
@@ -1154,30 +1442,38 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 				}
 			}
 
-			if isLastGroup {
-				if err := history.RecordPlan(ctx, tx, "postgres", primarySchema, p, time.Since(start)); err != nil {
-					if logger != nil {
-						logger.WarnContext(ctx, "grizzle: failed recording history in tx", "error", err)
-					}
-				}
-			}
-
 			if err := tx.Commit(); err != nil {
 				recordFailureHistory(stepIdx, err, false)
 				return committedSteps, fmt.Errorf("grizzle: failed committing step transaction: %w", err)
 			}
 			committedSteps += len(group.Steps)
+			// Model B: history is advisory — recorded after commit.
+			if isLastGroup {
+				if err := history.RecordPlan(ctx, conn, "postgres", primarySchema, p, time.Since(start)); err != nil {
+					histErr = fmt.Errorf("%w: %w", plan.ErrHistoryRecord, err)
+					if logger != nil {
+						logger.ErrorContext(ctx, "grizzle: failed recording history post-commit", "error", err)
+					}
+				}
+			}
 		}
 	}
 
 	if err := callAfterSync(cfg.AfterSync, ctx, conn); err != nil {
-		return committedSteps, fmt.Errorf("%w: %w", plan.ErrAfterSyncFailed, err)
+		hookErr := fmt.Errorf("%w: %w", plan.ErrAfterSyncFailed, err)
+		if logger != nil {
+			logger.ErrorContext(ctx, "grizzle: hook failed", "error", hookErr)
+		}
+		return committedSteps, hookErr
 	}
 
 	if logger != nil {
 		logger.InfoContext(ctx, "grizzle: plan execution finished successfully", "steps_applied", len(p.Steps), "total_duration", time.Since(start))
 	}
 
+	if histErr != nil {
+		return committedSteps, histErr
+	}
 	return committedSteps, nil
 }
 
@@ -1217,98 +1513,107 @@ func ApplySQLite(ctx context.Context, db *sql.DB, p *plan.Plan, cfg SQLiteExecCo
 
 	// BeforeSync runs once before any migration steps are executed.
 	if err := callBeforeSync(cfg.BeforeSync, ctx, db); err != nil {
-		return fmt.Errorf("sqlite: before_sync hook: %w", err)
-	}
-
-	_, _ = db.ExecContext(ctx, "PRAGMA foreign_keys = OFF;")
-	defer func() {
-		_, _ = db.ExecContext(ctx, "PRAGMA foreign_keys = ON;")
-	}()
-
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("sqlite: failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	// Idempotency: if this plan has already been applied by another process, skip execution.
-	if history.IsApplied(ctx, tx, "sqlite", "", p.Hash()) {
+		hookErr := fmt.Errorf("sqlite: before_sync hook: %w", err)
 		if logger != nil {
-			logger.InfoContext(ctx, "sqlite: plan already applied by another process, skipping", "plan_hash", p.Hash())
+			logger.ErrorContext(ctx, "grizzle: hook failed", "error", hookErr)
 		}
-		return nil
+		return hookErr
 	}
 
-	if _, err := tx.ExecContext(ctx, "PRAGMA foreign_keys = OFF;"); err != nil {
-		return fmt.Errorf("sqlite: failed to disable foreign keys: %w", err)
-	}
-
-	for i, s := range p.Steps {
-		stepStart := time.Now()
-		sqlToExec := strings.TrimSpace(s.SQL)
-		if sqlToExec == "" {
-			continue
-		}
-		if err := callBeforeStep(cfg.BeforeStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: i + 1, Total: len(p.Steps), IsNonTx: false}); err != nil {
-			_ = tx.Rollback()
-			hookErr := fmt.Errorf("before_step hook: %w", err)
-			histCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = history.RecordProgress(histCtx, db, "sqlite", "", p, "failed", i+1, hookErr, time.Since(start))
-			return hookErr
-		}
-		if err := executeSQLiteStep(ctx, tx, s, cfg); err != nil {
-			_ = tx.Rollback()
+	// Execute in a transaction pinned to a single connection with foreign
+	// keys disabled (per-connection PRAGMA; a no-op inside a transaction).
+	// histErr captures a failed success-path history write; surfaced as a
+	// typed non-fatal error after the transaction commits.
+	var histErr error
+	err := runSQLiteWithForeignKeysOff(ctx, db, func(tx *sql.Tx, conn *sql.Conn) error {
+		// Idempotency: if this plan has already been applied by another process, skip execution.
+		if history.IsApplied(ctx, tx, "sqlite", "", p.Hash()) {
 			if logger != nil {
-				logger.ErrorContext(ctx, "sqlite: failed executing step", "step_index", i+1, "sql", sqlToExec, "error", err)
+				logger.InfoContext(ctx, "sqlite: plan already applied by another process, skipping", "plan_hash", p.Hash())
 			}
-			histCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = history.RecordProgress(histCtx, db, "sqlite", "", p, "failed", i+1, err, time.Since(start))
-			return fmt.Errorf("%w: failed executing [%s]: %w", plan.ErrExecutionFailed, sqlToExec, err)
+			return nil
 		}
-		if err := callAfterStep(cfg.AfterStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: i + 1, Total: len(p.Steps), IsNonTx: false}); err != nil {
-			_ = tx.Rollback()
-			hookErr := fmt.Errorf("after_step hook: %w", err)
-			histCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = history.RecordProgress(histCtx, db, "sqlite", "", p, "failed", i+1, hookErr, time.Since(start))
-			return hookErr
-		}
-		if logger != nil {
-			logger.DebugContext(ctx, "sqlite: executed step", "step_index", i+1, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
-		}
-	}
 
-	finalFKRows, err := tx.QueryContext(ctx, "PRAGMA foreign_key_check;")
+		for i, s := range p.Steps {
+			stepStart := time.Now()
+			sqlToExec := strings.TrimSpace(s.SQL)
+			if sqlToExec == "" {
+				continue
+			}
+			if err := callBeforeStep(cfg.BeforeStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: i + 1, Total: len(p.Steps), IsNonTx: false}); err != nil {
+				_ = tx.Rollback()
+				hookErr := fmt.Errorf("before_step hook: %w", err)
+				if logger != nil {
+					logger.ErrorContext(ctx, "grizzle: hook failed", "step_index", i+1, "error", hookErr)
+				}
+				histCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if rErr := history.RecordProgress(histCtx, conn, "sqlite", "", p, "failed", i+1, hookErr, time.Since(start)); rErr != nil && logger != nil {
+					logger.WarnContext(histCtx, "sqlite: failed recording failure history", "error", rErr)
+				}
+				return hookErr
+			}
+			if err := executeSQLiteStep(ctx, tx, s, cfg); err != nil {
+				_ = tx.Rollback()
+				if logger != nil {
+					logger.ErrorContext(ctx, "sqlite: failed executing step", "step_index", i+1, "sql", sqlToExec, "error", err)
+				}
+				histCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if rErr := history.RecordProgress(histCtx, conn, "sqlite", "", p, "failed", i+1, err, time.Since(start)); rErr != nil && logger != nil {
+					logger.WarnContext(histCtx, "sqlite: failed recording failure history", "error", rErr)
+				}
+				return fmt.Errorf("%w: failed executing [%s]: %w", plan.ErrExecutionFailed, sqlToExec, err)
+			}
+			if err := callAfterStep(cfg.AfterStep, HookContext{Context: ctx, DBTX: tx, Step: s, Index: i + 1, Total: len(p.Steps), IsNonTx: false}); err != nil {
+				_ = tx.Rollback()
+				hookErr := fmt.Errorf("after_step hook: %w", err)
+				if logger != nil {
+					logger.ErrorContext(ctx, "grizzle: hook failed", "step_index", i+1, "error", hookErr)
+				}
+				histCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if rErr := history.RecordProgress(histCtx, conn, "sqlite", "", p, "failed", i+1, hookErr, time.Since(start)); rErr != nil && logger != nil {
+					logger.WarnContext(histCtx, "sqlite: failed recording failure history", "error", rErr)
+				}
+				return hookErr
+			}
+			if logger != nil {
+				logger.DebugContext(ctx, "sqlite: executed step", "step_index", i+1, "type", s.Type, "table", s.Table, "duration", time.Since(stepStart))
+			}
+		}
+
+		finalFKRows, err := tx.QueryContext(ctx, "PRAGMA foreign_key_check;")
+		if err != nil {
+			return fmt.Errorf("sqlite: foreign key check failed: %w", err)
+		}
+		var fkViolations []string
+		for finalFKRows.Next() {
+			var vTbl, vParent string
+			var vRowID, vFKID int64
+			if err := finalFKRows.Scan(&vTbl, &vRowID, &vParent, &vFKID); err == nil {
+				fkViolations = append(fkViolations, fmt.Sprintf("table %q row %d -> %q", vTbl, vRowID, vParent))
+			}
+		}
+		_ = finalFKRows.Close()
+		if len(fkViolations) > 0 {
+			return fmt.Errorf("sqlite: foreign key constraint violation: %s", strings.Join(fkViolations, "; "))
+		}
+		// Model B: do not record history inside the migration transaction.
+		return nil
+	})
 	if err != nil {
-		return fmt.Errorf("sqlite: foreign key check failed: %w", err)
-	}
-	var fkViolations []string
-	for finalFKRows.Next() {
-		var vTbl, vParent string
-		var vRowID, vFKID int64
-		if err := finalFKRows.Scan(&vTbl, &vRowID, &vParent, &vFKID); err == nil {
-			fkViolations = append(fkViolations, fmt.Sprintf("table %q row %d -> %q", vTbl, vRowID, vParent))
-		}
-	}
-	_ = finalFKRows.Close()
-	if len(fkViolations) > 0 {
-		return fmt.Errorf("sqlite: foreign key constraint violation: %s", strings.Join(fkViolations, "; "))
-	}
-
-	if _, err := tx.ExecContext(ctx, "PRAGMA foreign_keys = ON;"); err != nil {
-		return fmt.Errorf("sqlite: failed to re-enable foreign keys: %w", err)
-	}
-
-	if err := history.RecordPlan(ctx, tx, "sqlite", "", p, time.Since(start)); err != nil {
-		if logger != nil {
-			logger.WarnContext(ctx, "sqlite: failed recording history in tx", "error", err)
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
 		return err
+	}
+	// Model B: history is advisory — recorded after DDL commit.
+	if err := history.RecordPlan(ctx, db, "sqlite", "", p, time.Since(start)); err != nil {
+		histErr = fmt.Errorf("%w: %w", plan.ErrHistoryRecord, err)
+		if logger != nil {
+			logger.ErrorContext(ctx, "sqlite: failed recording history post-commit", "error", err)
+		}
+	}
+	if histErr != nil {
+		return histErr
 	}
 
 	if cfg.Backfill != nil && p.ExpandContract {
@@ -1318,7 +1623,11 @@ func ApplySQLite(ctx context.Context, db *sql.DB, p *plan.Plan, cfg SQLiteExecCo
 	}
 
 	if err := callAfterSync(cfg.AfterSync, ctx, db); err != nil {
-		return fmt.Errorf("%w: %w", plan.ErrAfterSyncFailed, err)
+		hookErr := fmt.Errorf("%w: %w", plan.ErrAfterSyncFailed, err)
+		if logger != nil {
+			logger.ErrorContext(ctx, "grizzle: hook failed", "error", hookErr)
+		}
+		return hookErr
 	}
 
 	if logger != nil {
@@ -1378,7 +1687,19 @@ func executeSQLiteStepInner(ctx context.Context, tx *sql.Tx, s plan.Step, cfg SQ
 	copyDataPrefix := fmt.Sprintf("INSERT INTO %q", tempTable)
 	idx := strings.Index(s.SQL, copyDataPrefix)
 
-	needsChunked := threshold > 0 && rowCount > int64(threshold) && idx != -1
+	// WITHOUT ROWID tables have no usable rowid for keyset batching.
+	hasRowID := true
+	var probeDDL string
+	if qErr := tx.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name=?;`, s.Table).Scan(&probeDDL); qErr == nil {
+		if strings.Contains(strings.ToUpper(probeDDL), "WITHOUT ROWID") {
+			hasRowID = false
+			if cfg.Logger != nil {
+				cfg.Logger.DebugContext(ctx, "sqlite: skipping rowid keyset copy for WITHOUT ROWID table", "table", s.Table)
+			}
+		}
+	}
+
+	needsChunked := threshold > 0 && rowCount > int64(threshold) && idx != -1 && hasRowID
 
 	if needsChunked {
 		beforeCopy := strings.TrimSpace(s.SQL[:idx])

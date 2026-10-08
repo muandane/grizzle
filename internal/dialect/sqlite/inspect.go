@@ -52,6 +52,12 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX) (*schema.Schema, error) {
 		s.Tables[tblName] = tbl
 		tableDDL := tableSQLMap[tblName]
 
+		// 1b. Parse CHECK constraints (named and inline) from the stored DDL.
+		// SQLite has no PRAGMA for CHECK constraints; sqlite_schema.sql is the
+		// only source. Both sides of the diff (live and in-memory shadow)
+		// parse through this same path, keeping comparisons symmetric.
+		tbl.Checks = parseSQLiteChecks(tblName, tableDDL)
+
 		// 2. Query columns using PRAGMA table_xinfo (includes generated columns and hidden flag)
 		colRows, err := dbtx.QueryContext(ctx, fmt.Sprintf("PRAGMA table_xinfo(%q);", tblName))
 		if err != nil {
@@ -110,6 +116,12 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX) (*schema.Schema, error) {
 			tbl.PrimaryKey = &schema.PrimaryKey{
 				Name:    tblName + "_pkey",
 				Columns: pkCols,
+			}
+			// Preserve INTEGER PRIMARY KEY AUTOINCREMENT vs plain INTEGER PRIMARY KEY.
+			if len(pkCols) == 1 && tableHasSQLiteAutoincrement(tableDDL) {
+				if col := tbl.Columns[pkCols[0]]; col != nil && strings.EqualFold(col.DataType, "INTEGER") {
+					col.Autoincrement = true
+				}
 			}
 		}
 
@@ -275,6 +287,223 @@ func NormalizeType(t string) string {
 // NormalizeDefault standardizes default expressions in SQLite.
 func NormalizeDefault(d string) string {
 	return strings.TrimSpace(d)
+}
+
+var sqliteAutoincrementRe = regexp.MustCompile(`(?i)\bAUTOINCREMENT\b`)
+
+func tableHasSQLiteAutoincrement(tableDDL string) bool {
+	return sqliteAutoincrementRe.MatchString(tableDDL)
+}
+
+// sqliteCheckRe matches a table-level CHECK definition, optionally preceded by
+// a named CONSTRAINT clause. Capture 1 is the constraint name (may be empty
+// for bare CHECK) and capture 2 is the check keyword position anchor.
+var sqliteCheckRe = regexp.MustCompile(`(?i)^(?:CONSTRAINT\s+(?:"([^"]+)"|(\w+))\s+)?CHECK\s*\(`)
+
+var sqliteColumnRe = regexp.MustCompile(`^(?:"([^"]+)"|(\w+))\s`)
+
+// sqliteInlineNameRe matches a trailing inline CONSTRAINT clause
+// ("CONSTRAINT <name>") at the end of a fragment preceding an inline CHECK.
+var sqliteInlineNameRe = regexp.MustCompile(`(?i)CONSTRAINT\s+(?:"([^"]+)"|(\w+))$`)
+
+// parseSQLiteChecks extracts CHECK constraints from a CREATE TABLE statement.
+// Table-level forms (CONSTRAINT <name> CHECK (...) and bare CHECK (...)) and
+// column-level inline forms are captured. Bare and column-level checks are
+// named deterministically (mirroring PostgreSQL auto-naming: column-level
+// "<table>_<column>_check", table-level "<table>_check" with numeric
+// disambiguation), so live and shadow parses of equivalent DDL produce
+// identical constraint keys. Expression text is whitespace-normalized.
+func parseSQLiteChecks(tableName, tableDDL string) map[string]*schema.CheckConstraint {
+	if tableDDL == "" {
+		return nil
+	}
+	body, ok := sqliteTableBody(tableDDL)
+	if !ok {
+		return nil
+	}
+
+	checks := make(map[string]*schema.CheckConstraint)
+	autoSeq := 0
+	for _, part := range splitSQLiteTopLevel(body) {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" {
+			continue
+		}
+
+		// Named or bare table-level CHECK.
+		if m := sqliteCheckRe.FindStringSubmatch(trimmed); m != nil {
+			name := m[1] + m[2]
+			expr, ok := balancedParenExpr(trimmed[strings.Index(trimmed, "("):])
+			if !ok {
+				continue
+			}
+			if name == "" {
+				autoSeq++
+				if autoSeq == 1 {
+					name = tableName + "_check"
+				} else {
+					name = fmt.Sprintf("%s_check%d", tableName, autoSeq)
+				}
+			}
+			checks[name] = &schema.CheckConstraint{
+				Name:       name,
+				TableName:  tableName,
+				Definition: "CHECK (" + normalizeSQLiteCheckExpr(expr) + ")",
+				IsValid:    true,
+			}
+			continue
+		}
+
+		// Column definitions may carry inline CHECKs, with or without a
+		// CONSTRAINT name: "<col> <type> [CONSTRAINT <name>] CHECK (...)".
+		colName := ""
+		if cm := sqliteColumnRe.FindStringSubmatch(trimmed); cm != nil {
+			colName = cm[1] + cm[2]
+		}
+		if colName == "" {
+			continue
+		}
+		eachSQLiteCheckExpr(trimmed, func(expr string, name string) {
+			if name == "" {
+				name = fmt.Sprintf("%s_%s_check", tableName, colName)
+				// Multiple inline checks on one column get numeric disambiguation.
+				for suffix := 2; ; suffix++ {
+					if _, exists := checks[name]; !exists {
+						break
+					}
+					name = fmt.Sprintf("%s_%s_check%d", tableName, colName, suffix)
+				}
+			}
+			checks[name] = &schema.CheckConstraint{
+				Name:       name,
+				TableName:  tableName,
+				Definition: "CHECK (" + normalizeSQLiteCheckExpr(expr) + ")",
+				IsValid:    true,
+			}
+		})
+	}
+	if len(checks) == 0 {
+		return nil
+	}
+	return checks
+}
+
+// normalizeSQLiteCheckExpr collapses whitespace runs to single spaces so
+// formatting differences between renders do not produce diff churn.
+func normalizeSQLiteCheckExpr(expr string) string {
+	return strings.Join(strings.Fields(expr), " ")
+}
+
+// sqliteTableBody returns the text between the outermost parentheses of a
+// CREATE TABLE statement.
+func sqliteTableBody(tableDDL string) (string, bool) {
+	open := strings.IndexByte(tableDDL, '(')
+	if open < 0 {
+		return "", false
+	}
+	rest := tableDDL[open:]
+	expr, ok := balancedParenExpr(rest)
+	if !ok {
+		return "", false
+	}
+	return expr, true
+}
+
+// balancedParenExpr returns the text between the leading '(' and its matching
+// ')' (exclusive), honoring single-quote string literals. Input must start
+// with '('.
+func balancedParenExpr(s string) (string, bool) {
+	if len(s) == 0 || s[0] != '(' {
+		return "", false
+	}
+	count := 0
+	inQuote := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '\'' {
+			inQuote = !inQuote
+			continue
+		}
+		if inQuote {
+			continue
+		}
+		switch c {
+		case '(':
+			count++
+		case ')':
+			count--
+			if count == 0 {
+				return s[1:i], true
+			}
+		}
+	}
+	return "", false
+}
+
+// splitSQLiteTopLevel splits a CREATE TABLE body on commas that are not nested
+// in parentheses or string literals.
+func splitSQLiteTopLevel(body string) []string {
+	var parts []string
+	depth := 0
+	inQuote := false
+	start := 0
+	for i := 0; i < len(body); i++ {
+		c := body[i]
+		if c == '\'' {
+			inQuote = !inQuote
+			continue
+		}
+		if inQuote {
+			continue
+		}
+		switch c {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case ',':
+			if depth == 0 {
+				parts = append(parts, body[start:i])
+				start = i + 1
+			}
+		}
+	}
+	parts = append(parts, body[start:])
+	return parts
+}
+
+// eachSQLiteCheckExpr invokes fn for every inline CHECK (<expr>) expression in
+// a column definition, using a quote-aware balanced-paren scan. A name is
+// reported when the check carries an inline CONSTRAINT clause.
+func eachSQLiteCheckExpr(colDef string, fn func(expr string, name string)) {
+	upper := strings.ToUpper(colDef)
+	for i := 0; ; {
+		idx := strings.Index(upper[i:], "CHECK")
+		if idx < 0 {
+			return
+		}
+		pos := i + idx + len("CHECK")
+		// Skip to the opening paren, allowing whitespace only.
+		for pos < len(colDef) && (colDef[pos] == ' ' || colDef[pos] == '\t' || colDef[pos] == '\n' || colDef[pos] == '\r') {
+			pos++
+		}
+		if pos >= len(colDef) || colDef[pos] != '(' {
+			i += idx + len("CHECK")
+			continue
+		}
+		// An inline CONSTRAINT name may precede the CHECK keyword.
+		before := strings.TrimRight(colDef[i:i+idx], " \t\n\r")
+		name := ""
+		if m := sqliteInlineNameRe.FindStringSubmatch(before); m != nil {
+			name = m[1] + m[2]
+		}
+		expr, ok := balancedParenExpr(colDef[pos:])
+		if !ok {
+			return
+		}
+		fn(expr, name)
+		i = pos + 1
+	}
 }
 
 func extractSQLiteGeneratedExpr(tableSQL, colName string) string {

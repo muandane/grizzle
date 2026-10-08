@@ -14,7 +14,12 @@ import (
 // shadow database and returns the desired schema IR without touching any
 // persistent database.
 func CompileSchemaSQLite(ctx context.Context, schemaSQL string) (*schema.Schema, error) {
-	return sqlite.CompileInShadow(ctx, schemaSQL)
+	s, err := sqlite.CompileInShadow(ctx, schemaSQL)
+	if err != nil {
+		return nil, err
+	}
+	s.SourceSQL = schemaSQL
+	return s, nil
 }
 
 // CompileSchemaPostgres compiles schemaSQL in the shadow schema within a
@@ -22,6 +27,11 @@ func CompileSchemaSQLite(ctx context.Context, schemaSQL string) (*schema.Schema,
 // The shadow schema is created and dropped as part of the transaction, so no
 // durable state is modified.
 func CompileSchemaPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (*schema.Schema, error) {
+	groups, err := splitSchemaSQL(cfg.SchemaSQL)
+	if err != nil {
+		return nil, err
+	}
+
 	primarySchema := cfg.primarySchema()
 	shadowSchema := cfg.ShadowSchema
 	if shadowSchema == "" {
@@ -37,7 +47,7 @@ func CompileSchemaPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConf
 	if err := postgres.SetupShadowSchema(ctx, tx, shadowSchema); err != nil {
 		return nil, err
 	}
-	if err := postgres.RunShadowDDL(ctx, tx, shadowSchema, primarySchema, cfg.SchemaSQL); err != nil {
+	if err := postgres.RunShadowDDL(ctx, tx, shadowSchema, primarySchema, groups.ShadowSQL); err != nil {
 		return nil, err
 	}
 
@@ -49,5 +59,17 @@ func CompileSchemaPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConf
 	for _, t := range s.Tables {
 		t.Schema = primarySchema
 	}
+	// Desired extensions come from statement parsing, not the shadow catalog:
+	// best-effort installs roll back with the tx and may have failed on
+	// privileges, but the declared set is what the user wrote.
+	s.Extensions = schema.ParseExtensions(cfg.SchemaSQL)
+
+	// Shadow-installed functions (e.g. extension functions re-created via
+	// WITH SCHEMA rewriting) qualify expressions with the ephemeral shadow
+	// schema name, which is unique per run. Left in place they break rendered
+	// target DDL and cause permanent drift.
+	unmapShadowExprs(s, []string{shadowSchema})
+
+	s.SourceSQL = cfg.SchemaSQL
 	return s, nil
 }
