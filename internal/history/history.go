@@ -220,7 +220,7 @@ func GetLatest(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName s
 	var errText sql.NullString
 	var seedHash sql.NullString
 	err := dbtx.QueryRowContext(ctx, query).Scan(&rec.ID, &rec.PlanHash, &rec.Status, &failedStep, &errText, &rec.AppliedAt, &rec.DurationMs, &rec.AppliedBy, &rec.StepsJSON, &seedHash)
-	if err == sql.ErrNoRows {
+	if err == sql.ErrNoRows || isTableNotExist(err) {
 		return nil, nil
 	}
 	if err != nil {
@@ -236,6 +236,16 @@ func GetLatest(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName s
 		rec.SeedHash = seedHash.String
 	}
 	return &rec, nil
+}
+
+func isTableNotExist(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "does not exist") ||
+		strings.Contains(msg, "no such table") ||
+		strings.Contains(msg, "42P01")
 }
 
 // List returns all migration records ordered by ID ascending.

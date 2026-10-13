@@ -237,6 +237,15 @@ type Options struct {
 	// Defaults to 10000.
 	SQLiteRebuildBatchSize int
 
+	// AllowResumePartial permits Sync to resume execution after a prior run
+	// ended in "partial" or "failed" status. Defaults to false (fail closed).
+	AllowResumePartial bool
+
+	// ExpectedHash specifies an approved plan hash. When non-empty, Sync
+	// verifies the post-lock live plan hash against this value and aborts
+	// with ErrPlanDrift if they differ.
+	ExpectedHash string
+
 	// Logger accepts a structured logger (*slog.Logger) for migration events.
 	Logger *slog.Logger
 
@@ -400,6 +409,20 @@ func WithSQLiteRebuildBatching(threshold, batchSize int) Option {
 	return func(o *Options) {
 		o.SQLiteRebuildThreshold = threshold
 		o.SQLiteRebuildBatchSize = batchSize
+	}
+}
+
+// WithAllowResumePartial allows Sync to resume after a prior failed or partial migration.
+func WithAllowResumePartial(allow bool) Option {
+	return func(o *Options) {
+		o.AllowResumePartial = allow
+	}
+}
+
+// WithExpectedHash specifies the approved plan hash to verify post-lock during Sync.
+func WithExpectedHash(hash string) Option {
+	return func(o *Options) {
+		o.ExpectedHash = hash
 	}
 }
 

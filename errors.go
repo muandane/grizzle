@@ -64,6 +64,10 @@ var (
 	// grizzle_history record could not be written (non-fatal; detect with
 	// errors.Is).
 	ErrHistoryRecord = plan.ErrHistoryRecord
+
+	// ErrPriorFailureBlocked is returned by Sync when the latest recorded migration
+	// in grizzle_history is in a 'partial' or 'failed' state and AllowResumePartial is false.
+	ErrPriorFailureBlocked = plan.ErrPriorFailureBlocked
 )
 
 // HazardError reports all critical hazards that were not explicitly accepted.

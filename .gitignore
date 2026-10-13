@@ -5,7 +5,7 @@ devenv.local.yaml
 
 # direnv
 .direnv
-
+.agents
 # pre-commit
 .pre-commit-config.yaml
 

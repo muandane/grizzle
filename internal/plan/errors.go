@@ -70,6 +70,10 @@ var (
 	// the sense that the schema changes are committed; callers may treat it
 	// as advisory via errors.Is and re-record or alert.
 	ErrHistoryRecord = errors.New("grizzle: migration succeeded but history record was not written")
+
+	// ErrPriorFailureBlocked is returned by Sync when the latest recorded migration
+	// in grizzle_history is in a 'partial' or 'failed' state and AllowResumePartial is false.
+	ErrPriorFailureBlocked = errors.New("grizzle: schema migration blocked by prior failed or partial migration; resolve previous failure before syncing or enable AllowResumePartial")
 )
 
 // HazardError reports all critical hazards that were not explicitly accepted.

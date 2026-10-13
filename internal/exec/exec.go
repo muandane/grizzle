@@ -51,6 +51,7 @@ type PostgresExecConfig struct {
 	Filters              scope.Filters
 	Policy               plan.DropPolicy
 	AcceptHazards        []plan.HazardCode
+	AllowResumePartial   bool
 	ExpectedHash         string
 	NonConcurrentIndexes bool
 	LockTimeout          time.Duration
@@ -542,9 +543,32 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig, b
 		}
 	}
 
+	// 1b. Gating check: fail closed if latest migration is in partial or failed state
+	latest, err := history.GetLatest(ctx, conn, "postgres", primarySchema)
+	if err != nil {
+		return 0, fmt.Errorf("grizzle: checking migration history: %w", err)
+	}
+	if latest != nil && (latest.Status == "partial" || latest.Status == "failed") {
+		if !cfg.AllowResumePartial {
+			if latest.Error != "" {
+				return 0, fmt.Errorf("%w: previous migration ended in %q status (plan %s, step %d): %s",
+					plan.ErrPriorFailureBlocked, latest.Status, latest.PlanHash, latest.FailedStep, latest.Error)
+			}
+			return 0, fmt.Errorf("%w: previous migration ended in %q status (plan %s, step %d)",
+				plan.ErrPriorFailureBlocked, latest.Status, latest.PlanHash, latest.FailedStep)
+		}
+		if logger != nil {
+			logger.WarnContext(ctx, "grizzle: resuming prior partial/failed migration",
+				"prior_status", latest.Status,
+				"prior_plan", latest.PlanHash,
+				"prior_step", latest.FailedStep,
+			)
+		}
+	}
+
 	// 2. Setup shadow schema and diff schemas inside an isolated transaction
 	shadowStart := time.Now()
-	shadowTx, err := conn.BeginTx(ctx, nil)
+	shadowTx, err := conn.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return 0, fmt.Errorf("grizzle: failed to begin shadow tx: %w", err)
 	}
@@ -685,14 +709,21 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig, b
 		if committedSteps > 0 || isNonTx {
 			status = "partial"
 		}
-		// Write using fresh connection and detached context not cancelled by the failure
+		// Write using detached context not cancelled by the failure
 		histCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		histConn, err := db.Conn(histCtx)
-		if err == nil {
-			defer func() { _ = histConn.Close() }()
-			if rErr := history.RecordProgress(histCtx, histConn, "postgres", primarySchema, p, status, failedStep, execErr, time.Since(start)); rErr != nil && logger != nil {
-				logger.WarnContext(histCtx, "grizzle: failed recording failure history", "status", status, "error", rErr)
+
+		// Primary: use the dedicated connection already held, avoiding pool starvation (MaxOpenConns=1)
+		if rErr := history.RecordProgress(histCtx, conn, "postgres", primarySchema, p, status, failedStep, execErr, time.Since(start)); rErr != nil {
+			if logger != nil {
+				logger.WarnContext(histCtx, "grizzle: failed recording failure history on conn, trying fallback", "status", status, "error", rErr)
+			}
+			// Fallback: only if conn was broken, try pool with a short timeout
+			fbCtx, fbCancel := context.WithTimeout(context.Background(), 1*time.Second)
+			defer fbCancel()
+			if histConn, err := db.Conn(fbCtx); err == nil {
+				defer func() { _ = histConn.Close() }()
+				_ = history.RecordProgress(fbCtx, histConn, "postgres", primarySchema, p, status, failedStep, execErr, time.Since(start))
 			}
 		}
 	}
@@ -749,7 +780,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig, b
 			}
 		} else {
 			// Transactional group executed in transaction on dedicated conn
-			tx, err := conn.BeginTx(ctx, nil)
+			tx, err := conn.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 			if err != nil {
 				return committedSteps, fmt.Errorf("grizzle: failed to begin step transaction: %w", err)
 			}
@@ -850,7 +881,7 @@ func PlanDiffPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfig) (
 	userShadowSchema := cmp.Or(cfg.ShadowSchema, "_grizzle_shadow")
 	cfg.ShadowSchema = uniqueShadowName(userShadowSchema)
 
-	tx, err := db.BeginTx(ctx, nil)
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return nil, fmt.Errorf("grizzle: failed to begin transaction: %w", err)
 	}
@@ -950,6 +981,7 @@ type SQLiteExecConfig struct {
 	Filters              scope.Filters
 	Policy               plan.DropPolicy
 	AcceptHazards        []plan.HazardCode
+	AllowResumePartial   bool
 	ExpectedHash         string
 	Logger               *slog.Logger
 	Tracer               Tracer
@@ -997,7 +1029,28 @@ func SyncSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) error {
 	var histErr error
 
 	run := func(conn *sql.Conn) error {
-		var err error
+		latest, err := history.GetLatest(ctx, conn, "sqlite", "")
+		if err != nil {
+			return fmt.Errorf("sqlite: checking migration history: %w", err)
+		}
+		if latest != nil && (latest.Status == "partial" || latest.Status == "failed") {
+			if !cfg.AllowResumePartial {
+				if latest.Error != "" {
+					return fmt.Errorf("%w: previous migration ended in %q status (plan %s, step %d): %s",
+						plan.ErrPriorFailureBlocked, latest.Status, latest.PlanHash, latest.FailedStep, latest.Error)
+				}
+				return fmt.Errorf("%w: previous migration ended in %q status (plan %s, step %d)",
+					plan.ErrPriorFailureBlocked, latest.Status, latest.PlanHash, latest.FailedStep)
+			}
+			if logger != nil {
+				logger.WarnContext(ctx, "sqlite: resuming prior partial/failed migration",
+					"prior_status", latest.Status,
+					"prior_plan", latest.PlanHash,
+					"prior_step", latest.FailedStep,
+				)
+			}
+		}
+
 		p, err = buildSQLitePlan(ctx, conn, cfg)
 		if err != nil {
 			if logger != nil && errors.Is(err, plan.ErrCompilationFailed) {
@@ -1389,11 +1442,18 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 		}
 		histCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		histConn, err := db.Conn(histCtx)
-		if err == nil {
-			defer func() { _ = histConn.Close() }()
-			if rErr := history.RecordProgress(histCtx, histConn, "postgres", primarySchema, p, status, failedStep, execErr, time.Since(start)); rErr != nil && logger != nil {
-				logger.WarnContext(histCtx, "grizzle: failed recording failure history", "status", status, "error", rErr)
+
+		// Primary: use the dedicated connection already held, avoiding pool starvation (MaxOpenConns=1)
+		if rErr := history.RecordProgress(histCtx, conn, "postgres", primarySchema, p, status, failedStep, execErr, time.Since(start)); rErr != nil {
+			if logger != nil {
+				logger.WarnContext(histCtx, "grizzle: failed recording failure history on conn, trying fallback", "status", status, "error", rErr)
+			}
+			// Fallback: only if conn was broken, try pool with a short timeout
+			fbCtx, fbCancel := context.WithTimeout(context.Background(), 1*time.Second)
+			defer fbCancel()
+			if histConn, err := db.Conn(fbCtx); err == nil {
+				defer func() { _ = histConn.Close() }()
+				_ = history.RecordProgress(fbCtx, histConn, "postgres", primarySchema, p, status, failedStep, execErr, time.Since(start))
 			}
 		}
 	}
@@ -1448,7 +1508,7 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 				}
 			}
 		} else {
-			tx, err := conn.BeginTx(ctx, nil)
+			tx, err := conn.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 			if err != nil {
 				return committedSteps, fmt.Errorf("grizzle: failed to begin step transaction: %w", err)
 			}

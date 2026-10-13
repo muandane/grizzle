@@ -82,7 +82,7 @@ func DryRunVerifyPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConfi
 	// unconditionally rolled back at the end: later groups may depend on
 	// objects created by earlier groups (real apply commits per group, but
 	// the sandbox must keep everything visible until verification ends).
-	tx, err := conn.BeginTx(ctx, nil)
+	tx, err := conn.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return nil, fmt.Errorf("grizzle: failed to begin dry-run transaction: %w", err)
 	}
