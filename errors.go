@@ -68,6 +68,12 @@ var (
 	// ErrPriorFailureBlocked is returned by Sync when the latest recorded migration
 	// in grizzle_history is in a 'partial' or 'failed' state and AllowResumePartial is false.
 	ErrPriorFailureBlocked = plan.ErrPriorFailureBlocked
+
+	// ErrNoFailedMigration is returned by Repair when no partial or failed migration was found to resolve.
+	ErrNoFailedMigration = plan.ErrNoFailedMigration
+
+	// ErrBaselineDrift is returned by Baseline when the live database differs from desired schema and Force is false.
+	ErrBaselineDrift = plan.ErrBaselineDrift
 )
 
 // HazardError reports all critical hazards that were not explicitly accepted.

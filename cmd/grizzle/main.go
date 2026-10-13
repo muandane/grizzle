@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,6 +16,8 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/muandane/grizzle"
+	"github.com/muandane/grizzle/internal/config"
+	"github.com/muandane/grizzle/internal/dialect"
 	_ "modernc.org/sqlite"
 )
 
@@ -112,14 +115,14 @@ func setupLogger(jsonLog bool) {
 }
 
 var (
-	version = "v0.1.0-rc2"
+	version = "v0.1.0-rc4"
 	commit  = "none"
 	date    = "unknown"
 )
 
 func run(args []string) int {
 	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "Usage: grizzle <plan|apply|check|lint|export|seed|init|version> [flags]")
+		fmt.Fprintln(os.Stderr, "Usage: grizzle <plan|apply|check|lint|export|seed|init|history|status|baseline|repair|dump|version> [flags]")
 		return 1
 	}
 
@@ -132,25 +135,31 @@ func run(args []string) int {
 	fs := flag.NewFlagSet(command, flag.ContinueOnError)
 
 	var (
-		dsnFlag      = fs.String("dsn", "", "Database DSN connection string")
-		schemaFile   = fs.String("schema", "schema.sql", "Path to schema SQL file")
-		planFile     = fs.String("plan", "", "Path to plan JSON file")
-		outFile      = fs.String("out", "", "Destination file or directory")
-		formatFlag   = fs.String("format", "sql", "Output/export format: sql, goose, atlas, or github")
-		allowDrop    = fs.Bool("allow-drop", false, "Permit destructive operations")
-		jsonOutput   = fs.Bool("json", false, "Output in JSON format")
-		githubOutput = fs.Bool("github", false, "Emit GitHub Actions workflow annotations")
-		jsonLog      = fs.Bool("json-log", false, "Emit logs in structured JSON format")
-		expectedHash = fs.String("expected-hash", "", "Expected plan approval hash")
-		versionFlag  = fs.String("version", version, "Version string for export headers")
-		templateFlag = fs.String("template", "", "Project template: sqlc, stdlib, or sqlite")
-		dirFlag      = fs.String("dir", ".", "Destination directory for init")
-		forceFlag    = fs.Bool("force", false, "Overwrite existing files during init")
-		failOnWarn   = fs.Bool("fail-on-warning", false, "Fail lint when warnings are reported")
-		dryRunFlag   = fs.Bool("dry-run", false, "Verify planned DDL against live data without persisting changes (apply)")
-		seedFile     = fs.String("seed", "", "Path to seed SQL file (seed)")
-		rolesFile    = fs.String("roles", "", "Path to roles SQL file (plan/apply/check): CREATE ROLE and GRANT statements diffed against live ACLs")
-		catalogFile  = fs.String("catalog", "", "Path to catalog SQL file (plan/apply/check): CREATE PUBLICATION and CREATE EVENT TRIGGER statements diffed against live catalogs")
+		dsnFlag        = fs.String("dsn", "", "Database DSN connection string")
+		schemaFile     = fs.String("schema", "schema.sql", "Path to schema SQL file")
+		planFile       = fs.String("plan", "", "Path to plan JSON file")
+		outFile        = fs.String("out", "", "Destination file or directory")
+		formatFlag     = fs.String("format", "sql", "Output/export format: sql, goose, atlas, or github")
+		allowDrop      = fs.Bool("allow-drop", false, "Permit destructive operations")
+		jsonOutput     = fs.Bool("json", false, "Output in JSON format")
+		githubOutput   = fs.Bool("github", false, "Emit GitHub Actions workflow annotations")
+		jsonLog        = fs.Bool("json-log", false, "Emit logs in structured JSON format")
+		expectedHash   = fs.String("expected-hash", "", "Expected plan approval hash")
+		versionFlag    = fs.String("version", version, "Version string for export headers")
+		templateFlag   = fs.String("template", "", "Project template: sqlc, stdlib, or sqlite")
+		dirFlag        = fs.String("dir", ".", "Destination directory for init")
+		forceFlag      = fs.Bool("force", false, "Overwrite existing files during init, or force baseline")
+		failOnWarn     = fs.Bool("fail-on-warning", false, "Fail lint when warnings are reported")
+		dryRunFlag     = fs.Bool("dry-run", false, "Verify planned DDL against live data without persisting changes (apply)")
+		seedFile       = fs.String("seed", "", "Path to seed SQL file (seed)")
+		rolesFile      = fs.String("roles", "", "Path to roles SQL file (plan/apply/check): CREATE ROLE and GRANT statements diffed against live ACLs")
+		catalogFile    = fs.String("catalog", "", "Path to catalog SQL file (plan/apply/check): CREATE PUBLICATION and CREATE EVENT TRIGGER statements diffed against live catalogs")
+		targetSchema   = fs.String("target-schema", "", "Target database schema name")
+		limitFlag      = fs.Int("limit", 20, "Maximum number of history records to list (history)")
+		noteFlag       = fs.String("note", "", "Operator note for baseline or repair")
+		configFlag     = fs.String("config", "", "Path to grizzle.yaml or grizzle.json configuration file")
+		beforeSyncFlag = fs.String("before-sync", "", "SQL script or file to execute immediately before migration")
+		afterSyncFlag  = fs.String("after-sync", "", "SQL script or file to execute immediately after migration")
 	)
 
 	var hazards hazardFlags
@@ -168,6 +177,52 @@ func run(args []string) int {
 		return 1
 	}
 
+	// Load configuration file if present
+	configFile := config.FindConfigFile(*configFlag)
+	if configFile != "" {
+		cfg, err := config.Load(configFile)
+		if err != nil {
+			slog.Error("loading config file", "path", configFile, "err", err)
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			return 1
+		}
+		if *dsnFlag == "" && cfg.DSN != "" {
+			*dsnFlag = cfg.DSN
+		}
+		if *schemaFile == "schema.sql" && cfg.Schema != "" {
+			*schemaFile = cfg.Schema
+		}
+		if *targetSchema == "" && cfg.TargetSchema != "" {
+			*targetSchema = cfg.TargetSchema
+		}
+		if *rolesFile == "" && cfg.Roles != "" {
+			*rolesFile = cfg.Roles
+		}
+		if *catalogFile == "" && cfg.Catalog != "" {
+			*catalogFile = cfg.Catalog
+		}
+		if *seedFile == "" && cfg.Seed != "" {
+			*seedFile = cfg.Seed
+		}
+		if !*allowDrop && cfg.AllowDrop {
+			*allowDrop = true
+		}
+		if len(hazards) == 0 && len(cfg.AcceptHazards) > 0 {
+			for _, h := range cfg.AcceptHazards {
+				hazards = append(hazards, h)
+			}
+		}
+		if *beforeSyncFlag == "" && cfg.BeforeSync != "" {
+			*beforeSyncFlag = cfg.BeforeSync
+		}
+		if *afterSyncFlag == "" && cfg.AfterSync != "" {
+			*afterSyncFlag = cfg.AfterSync
+		}
+		if !*failOnWarn && cfg.Lint.FailOnWarning {
+			*failOnWarn = true
+		}
+	}
+
 	setupLogger(*jsonLog)
 
 	ctx := context.Background()
@@ -176,6 +231,20 @@ func run(args []string) int {
 	backfillHook, err := resolveBackfillHook(*expandContract, backfill, *backfillFile, *backfillBatch, dsn)
 	if err != nil {
 		slog.Error("invalid backfill flags", "err", err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+
+	beforeHook, err := resolveSyncHook(*beforeSyncFlag)
+	if err != nil {
+		slog.Error("invalid --before-sync hook", "err", err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+
+	afterHook, err := resolveSyncHook(*afterSyncFlag)
+	if err != nil {
+		slog.Error("invalid --after-sync hook", "err", err)
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 1
 	}
@@ -204,7 +273,7 @@ func run(args []string) int {
 		if !ok {
 			return 1
 		}
-		return runApply(ctx, dsn, *planFile, *schemaFile, rolesSQL, catalogSQL, *expectedHash, *allowDrop, hazards, *dryRunFlag, renames, *expandContract, backfillHook)
+		return runApply(ctx, dsn, *planFile, *schemaFile, rolesSQL, catalogSQL, *expectedHash, *allowDrop, hazards, *dryRunFlag, renames, *expandContract, backfillHook, beforeHook, afterHook)
 	case "check":
 		rolesSQL, ok := readRolesFile(*rolesFile)
 		if !ok {
@@ -225,9 +294,19 @@ func run(args []string) int {
 		return runExport(ctx, dsn, *planFile, *schemaFile, *formatFlag, *versionFlag, *outFile, *allowDrop)
 	case "seed":
 		return runSeed(ctx, dsn, *seedFile, *forceFlag)
+	case "history":
+		return runHistory(ctx, dsn, *targetSchema, *limitFlag, *jsonOutput)
+	case "status":
+		return runStatus(ctx, dsn, *schemaFile, *targetSchema, *jsonOutput)
+	case "baseline":
+		return runBaseline(ctx, dsn, *schemaFile, *targetSchema, *noteFlag, *forceFlag)
+	case "repair":
+		return runRepair(ctx, dsn, *targetSchema, *noteFlag)
+	case "dump":
+		return runDump(ctx, dsn, *targetSchema, *outFile)
 	default:
 		slog.Error("unknown command", "command", command)
-		fmt.Fprintf(os.Stderr, "Unknown command: %q. Expected plan, apply, check, lint, export, seed, or init.\n", command)
+		fmt.Fprintf(os.Stderr, "Unknown command: %q. Expected plan, apply, check, lint, export, seed, init, history, status, baseline, repair, or dump.\n", command)
 		return 1
 	}
 }
@@ -362,7 +441,32 @@ func runPlan(ctx context.Context, dsn, schemaFile, rolesSQL, catalogSQL, outFile
 	return 0
 }
 
-func runApply(ctx context.Context, dsn, planFile, schemaFile, rolesSQL, catalogSQL, expectedHash string, allowDrop bool, hazards []string, dryRun bool, renames map[string]string, expandContract bool, backfill grizzle.BackfillFunc) int {
+func resolveSyncHook(scriptOrPath string) (grizzle.SyncHook, error) {
+	if scriptOrPath == "" {
+		return nil, nil
+	}
+	content := scriptOrPath
+	if _, err := os.Stat(filepath.Clean(scriptOrPath)); err == nil { //nolint:gosec // G304: CLI accepts user-provided script file path
+		data, err := os.ReadFile(filepath.Clean(scriptOrPath)) //nolint:gosec // G304: CLI accepts user-provided script file path
+		if err != nil {
+			return nil, fmt.Errorf("reading sync hook file %q: %w", scriptOrPath, err)
+		}
+		content = string(data)
+	}
+	return func(ctx context.Context, dbtx dialect.DBTX) error {
+		_, err := dbtx.ExecContext(ctx, content)
+		return err
+	}, nil
+}
+
+func runApply(ctx context.Context, dsn, planFile, schemaFile, rolesSQL, catalogSQL, expectedHash string, allowDrop bool, hazards []string, dryRun bool, renames map[string]string, expandContract bool, backfill grizzle.BackfillFunc, hooks ...grizzle.SyncHook) int {
+	var beforeSync, afterSync grizzle.SyncHook
+	if len(hooks) > 0 {
+		beforeSync = hooks[0]
+	}
+	if len(hooks) > 1 {
+		afterSync = hooks[1]
+	}
 	db, err := initDB(dsn)
 	if err != nil {
 		return 1
@@ -407,6 +511,8 @@ func runApply(ctx context.Context, dsn, planFile, schemaFile, rolesSQL, catalogS
 		ExpectedHash:  expHash,
 		AcceptHazards: acceptedCodes,
 		Backfill:      backfill,
+		BeforeSync:    beforeSync,
+		AfterSync:     afterSync,
 	}
 
 	if err := grizzle.Apply(ctx, db, p, applyOpts); err != nil {
@@ -531,6 +637,206 @@ func runExport(ctx context.Context, dsn, planFile, schemaFile, format, versionFl
 		}
 		slog.Info("exported migration artifact", "path", targetPath, "format", format)
 		fmt.Printf("Exported: %s\n", targetPath)
+	}
+	return 0
+}
+
+func runHistory(ctx context.Context, dsn, targetSchema string, limit int, jsonOutput bool) int {
+	db, err := initDB(dsn)
+	if err != nil {
+		return 1
+	}
+	defer func() { _ = db.Close() }()
+
+	entries, err := grizzle.ListHistory(ctx, db, grizzle.HistoryOptions{
+		TargetSchema: targetSchema,
+		Limit:        limit,
+		Descending:   true,
+	})
+	if err != nil {
+		slog.Error("listing migration history", "err", err)
+		return 1
+	}
+
+	if jsonOutput {
+		data, err := json.MarshalIndent(entries, "", "  ")
+		if err != nil {
+			slog.Error("serializing history entries to json", "err", err)
+			return 1
+		}
+		fmt.Println(string(data))
+		return 0
+	}
+
+	if len(entries) == 0 {
+		fmt.Println("No migration history found.")
+		return 0
+	}
+
+	fmt.Printf("%-5s %-9s %-16s %-10s %-20s %-12s %s\n", "ID", "STATUS", "PLAN HASH", "DURATION", "APPLIED AT", "APPLIED BY", "NOTE/ERROR")
+	fmt.Println(strings.Repeat("-", 85))
+	for _, e := range entries {
+		hashShort := e.PlanHash
+		if len(hashShort) > 16 {
+			hashShort = hashShort[:16]
+		}
+		dur := fmt.Sprintf("%dms", e.DurationMs)
+		appliedAt := e.AppliedAt.Format("2006-01-02 15:04:05")
+		noteOrErr := e.Error
+		if noteOrErr == "" {
+			noteOrErr = "-"
+		}
+		fmt.Printf("%-5d %-9s %-16s %-10s %-20s %-12s %s\n", e.ID, e.Status, hashShort, dur, appliedAt, e.AppliedBy, noteOrErr)
+	}
+	return 0
+}
+
+func runStatus(ctx context.Context, dsn, schemaFile, targetSchema string, jsonOutput bool) int {
+	db, err := initDB(dsn)
+	if err != nil {
+		return 1
+	}
+	defer func() { _ = db.Close() }()
+
+	var schemaSQL string
+	if schemaFile != "" {
+		if content, err := os.ReadFile(filepath.Clean(schemaFile)); err == nil { //nolint:gosec // G304: CLI accepts user-provided schema file path
+			schemaSQL = string(content)
+		} else if schemaFile != "schema.sql" {
+			slog.Error("reading schema file for status", "path", schemaFile, "err", err)
+			return 1
+		}
+	}
+
+	stat, err := grizzle.Status(ctx, db, grizzle.Options{
+		TargetSchema: targetSchema,
+		SchemaSQL:    schemaSQL,
+	})
+	if err != nil {
+		slog.Error("getting database migration status", "err", err)
+		return 1
+	}
+
+	if jsonOutput {
+		data, err := json.MarshalIndent(stat, "", "  ")
+		if err != nil {
+			slog.Error("serializing status report to json", "err", err)
+			return 1
+		}
+		fmt.Println(string(data))
+		if !stat.InSync {
+			return 1
+		}
+		return 0
+	}
+
+	fmt.Println("Database Status:")
+	fmt.Printf("  Dialect:       %s\n", stat.Dialect)
+	if stat.TargetSchema != "" {
+		fmt.Printf("  Target Schema: %s\n", stat.TargetSchema)
+	}
+	if schemaSQL != "" {
+		if stat.InSync {
+			fmt.Printf("  Sync State:    In Sync (0 pending steps)\n")
+		} else {
+			fmt.Printf("  Sync State:    Drift Detected (%d pending step(s))\n", stat.PendingSteps)
+		}
+	}
+	fmt.Printf("  History:       %d applied, %d partial, %d failed\n", stat.AppliedCount, stat.PartialCount, stat.FailedCount)
+	if stat.Latest != nil {
+		fmt.Printf("  Latest Run:    #%d [%s] (hash: %s, at %s)\n",
+			stat.Latest.ID, stat.Latest.Status, stat.Latest.PlanHash, stat.Latest.AppliedAt.Format("2006-01-02 15:04:05"))
+		if stat.Latest.Error != "" {
+			fmt.Printf("                 Note/Error: %s\n", stat.Latest.Error)
+		}
+	}
+
+	if schemaSQL != "" && !stat.InSync {
+		return 1
+	}
+	return 0
+}
+
+func runBaseline(ctx context.Context, dsn, schemaFile, targetSchema, note string, force bool) int {
+	db, err := initDB(dsn)
+	if err != nil {
+		return 1
+	}
+	defer func() { _ = db.Close() }()
+
+	content, err := os.ReadFile(filepath.Clean(schemaFile)) //nolint:gosec // G304: CLI accepts user-provided schema file path
+	if err != nil {
+		slog.Error("reading schema file for baseline", "path", schemaFile, "err", err)
+		return 1
+	}
+
+	entry, err := grizzle.Baseline(ctx, db, string(content), grizzle.BaselineOptions{
+		TargetSchema: targetSchema,
+		Note:         note,
+		Force:        force,
+	})
+	if err != nil {
+		if errors.Is(err, grizzle.ErrBaselineDrift) {
+			slog.Error("baseline rejected: live database differs from desired schema", "err", err)
+			fmt.Fprintf(os.Stderr, "Error: live database differs from schema file %q; use --force to baseline anyway.\n", schemaFile)
+			return 1
+		}
+		slog.Error("recording baseline failed", "err", err)
+		return 1
+	}
+
+	fmt.Printf("Baseline recorded successfully: entry #%d (hash %s) marked as baseline.\n", entry.ID, entry.PlanHash)
+	return 0
+}
+
+func runRepair(ctx context.Context, dsn, targetSchema, note string) int {
+	db, err := initDB(dsn)
+	if err != nil {
+		return 1
+	}
+	defer func() { _ = db.Close() }()
+
+	entry, err := grizzle.Repair(ctx, db, grizzle.RepairOptions{
+		TargetSchema: targetSchema,
+		Note:         note,
+	})
+	if err != nil {
+		if errors.Is(err, grizzle.ErrNoFailedMigration) {
+			fmt.Println("No failed or partial migrations found to repair.")
+			return 0
+		}
+		slog.Error("repairing migration history failed", "err", err)
+		return 1
+	}
+
+	fmt.Printf("Migration #%d (hash %s) marked as resolved.\n", entry.ID, entry.PlanHash)
+	return 0
+}
+
+func runDump(ctx context.Context, dsn, targetSchema, outFile string) int {
+	db, err := initDB(dsn)
+	if err != nil {
+		return 1
+	}
+	defer func() { _ = db.Close() }()
+
+	ddl, err := grizzle.Dump(ctx, db, grizzle.DumpOptions{
+		TargetSchema: targetSchema,
+	})
+	if err != nil {
+		slog.Error("dumping database schema failed", "err", err)
+		return 1
+	}
+
+	if outFile != "" {
+		if err := os.WriteFile(filepath.Clean(outFile), []byte(ddl), 0600); err != nil { //nolint:gosec // G304: CLI writes to user-specified destination path
+			slog.Error("writing dumped schema file", "path", outFile, "err", err)
+			return 1
+		}
+		slog.Info("schema dumped successfully", "out", outFile)
+		fmt.Printf("Schema dumped to %s\n", outFile)
+	} else {
+		fmt.Print(ddl)
 	}
 	return 0
 }

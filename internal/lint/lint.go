@@ -56,6 +56,9 @@ func Lint(s *schema.Schema, rules ...Rule) []Diagnostic {
 		}
 		diags = append(diags, r.Check(s)...)
 	}
+	if s != nil && s.SourceSQL != "" {
+		diags = FilterSuppressed(s.SourceSQL, diags)
+	}
 	sortDiagnostics(diags)
 	return diags
 }

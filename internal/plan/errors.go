@@ -74,6 +74,13 @@ var (
 	// ErrPriorFailureBlocked is returned by Sync when the latest recorded migration
 	// in grizzle_history is in a 'partial' or 'failed' state and AllowResumePartial is false.
 	ErrPriorFailureBlocked = errors.New("grizzle: schema migration blocked by prior failed or partial migration; resolve previous failure before syncing or enable AllowResumePartial")
+
+	// ErrNoFailedMigration is returned when attempting to resolve or repair a failed migration,
+	// but no prior run is in a partial or failed state.
+	ErrNoFailedMigration = errors.New("grizzle: no partial or failed migration found to resolve")
+
+	// ErrBaselineDrift is returned when baseline is attempted on a database that has unapplied changes against schema.sql and Force is false.
+	ErrBaselineDrift = errors.New("grizzle: baseline refused: live database differs from schema.sql")
 )
 
 // HazardError reports all critical hazards that were not explicitly accepted.

@@ -5,6 +5,21 @@ All notable changes to Grizzle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.1.0-rc4] - 2026-10-13
+
+### Added
+- **Operational Lifecycle & Onboarding Tooling**:
+  - `grizzle status`: Detailed synchronization report and history summary across PostgreSQL and SQLite (in-sync verification, pending steps count, applied/partial/failed counts, latest run details; human-readable and `--json` format).
+  - `grizzle history`: Query recorded migration history (`ListHistory`), with `--limit`, descending sort, and structured `--json` output.
+  - `grizzle baseline`: Baseline pre-existing production databases without running DDL. Validates that the live database matches desired schema before baselining, with `--force` override.
+  - `grizzle repair`: Resolve failed or interrupted migrations (`ResolveLatest`) by marking the record as `resolved` with an operator note, unblocking automated boot synchronization.
+  - `grizzle dump`: Reverse-engineer live database catalogs into clean, canonical DDL SQL for PostgreSQL and SQLite. Excludes internal tables (`grizzle_history`, `sqlite_*`, `_grizzle_*`).
+- **Developer Ergonomics & Configuration**:
+  - `grizzle.yaml` and `grizzle.json`: Zero-dependency configuration file loader with automatic file discovery (`grizzle.yaml`, `.grizzle.yaml`, `grizzle.json`) and CLI flag fallback support.
+  - Inline lint suppression directives: `-- grizzle:lint-ignore <rules>` for statement/table scope, and `-- grizzle:lint-disable <rules>` for global file-level suppression.
+  - CLI pre/post migration hooks: `--before-sync` and `--after-sync` flags accepting SQL files or inline statements.
+  - Mode Presets: `grizzle.Development(schemaSQL)` (allows drops, fast synchronous index creation, allows resuming partial migrations) and `grizzle.Production(schemaSQL)` (zero-data-loss default, online concurrent index creation, fail-closed prior-failure gating).
+
 ## [v0.1.0-rc3] - 2026-10-12
 
 ### Added

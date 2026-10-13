@@ -14,8 +14,10 @@ import (
 	"time"
 
 	"github.com/muandane/grizzle/internal/dialect/postgres"
+	"github.com/muandane/grizzle/internal/dialect/sqlite"
 	"github.com/muandane/grizzle/internal/exec"
 	"github.com/muandane/grizzle/internal/export"
+	"github.com/muandane/grizzle/internal/history"
 	"github.com/muandane/grizzle/internal/lint"
 	"github.com/muandane/grizzle/internal/plan"
 	"github.com/muandane/grizzle/internal/schema"
@@ -1132,4 +1134,305 @@ func LintFormatJSON(w io.Writer, diags []LintDiagnostic) error {
 // LintFormatGitHub renders diagnostics as GitHub Actions annotations.
 func LintFormatGitHub(w io.Writer, diags []LintDiagnostic) error {
 	return lint.FormatGitHub(w, diags)
+}
+
+// HistoryEntry represents a single migration history record from grizzle_history.
+type HistoryEntry struct {
+	ID         int64     `json:"id"`
+	PlanHash   string    `json:"plan_hash"`
+	Status     string    `json:"status"` // applied, partial, failed, baseline, resolved
+	FailedStep int       `json:"failed_step,omitempty"`
+	Error      string    `json:"error,omitempty"`
+	AppliedAt  time.Time `json:"applied_at"`
+	DurationMs int64     `json:"duration_ms"`
+	AppliedBy  string    `json:"applied_by"`
+	StepsJSON  string    `json:"steps,omitempty"`
+	SeedHash   string    `json:"seed_hash,omitempty"`
+}
+
+// HistoryOptions configures retrieval of history records.
+type HistoryOptions struct {
+	TargetSchema string
+	Limit        int
+	Descending   bool
+}
+
+// StatusReport details the current synchronization status between desired schema and the live database.
+type StatusReport struct {
+	Dialect      string        `json:"dialect"`
+	TargetSchema string        `json:"target_schema,omitempty"`
+	InSync       bool          `json:"in_sync"`
+	PendingSteps int           `json:"pending_steps"`
+	AppliedCount int           `json:"applied_count"`
+	PartialCount int           `json:"partial_count"`
+	FailedCount  int           `json:"failed_count"`
+	Latest       *HistoryEntry `json:"latest,omitempty"`
+}
+
+// BaselineOptions configures baselining an existing database.
+type BaselineOptions struct {
+	TargetSchema string
+	Note         string
+	Force        bool // If true, record baseline even if unapplied changes exist
+}
+
+// RepairOptions configures repairing failed/partial migration history.
+type RepairOptions struct {
+	TargetSchema string
+	Note         string
+}
+
+func toHistoryEntry(rec *history.Record) *HistoryEntry {
+	if rec == nil {
+		return nil
+	}
+	return &HistoryEntry{
+		ID:         rec.ID,
+		PlanHash:   rec.PlanHash,
+		Status:     rec.Status,
+		FailedStep: rec.FailedStep,
+		Error:      rec.Error,
+		AppliedAt:  rec.AppliedAt,
+		DurationMs: rec.DurationMs,
+		AppliedBy:  rec.AppliedBy,
+		StepsJSON:  rec.StepsJSON,
+		SeedHash:   rec.SeedHash,
+	}
+}
+
+// ListHistory returns migration history entries recorded in grizzle_history.
+func ListHistory(ctx context.Context, db *sql.DB, opts HistoryOptions) ([]HistoryEntry, error) {
+	if db == nil {
+		return nil, fmt.Errorf("grizzle: database connection is nil")
+	}
+	d, err := detectDialect(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	targetSchema := opts.TargetSchema
+	if targetSchema == "" {
+		if d == DialectSQLite {
+			targetSchema = "main"
+		} else {
+			targetSchema = "public"
+		}
+	}
+
+	records, err := history.ListEntries(ctx, db, string(d), targetSchema, opts.Limit, opts.Descending)
+	if err != nil {
+		return nil, fmt.Errorf("grizzle: list history: %w", err)
+	}
+
+	entries := make([]HistoryEntry, len(records))
+	for i, r := range records {
+		entries[i] = *toHistoryEntry(&r)
+	}
+	return entries, nil
+}
+
+// Status reports the synchronization state and history summary.
+func Status(ctx context.Context, db *sql.DB, opts Options) (*StatusReport, error) {
+	if db == nil {
+		return nil, fmt.Errorf("grizzle: database connection is nil")
+	}
+	optsCopy := opts
+	if optsCopy.Dialect == DialectAuto {
+		d, err := detectDialect(ctx, db)
+		if err != nil {
+			return nil, err
+		}
+		optsCopy.Dialect = d
+	}
+	dialectName := string(optsCopy.Dialect)
+	targetSchema := optsCopy.TargetSchema
+	if targetSchema == "" {
+		if optsCopy.Dialect == DialectSQLite {
+			targetSchema = "main"
+		} else {
+			targetSchema = "public"
+		}
+		optsCopy.TargetSchema = targetSchema
+	}
+
+	applied, partial, failed, err := history.Summary(ctx, db, dialectName, targetSchema)
+	if err != nil {
+		return nil, fmt.Errorf("grizzle: query history summary: %w", err)
+	}
+
+	latestRec, err := history.GetLatest(ctx, db, dialectName, targetSchema)
+	if err != nil {
+		return nil, fmt.Errorf("grizzle: query latest history: %w", err)
+	}
+
+	inSync := true
+	pendingSteps := 0
+	if strings.TrimSpace(optsCopy.SchemaSQL) != "" {
+		diffPlan, err := PlanDiff(ctx, db, optsCopy)
+		if err != nil {
+			return nil, fmt.Errorf("grizzle: check plan diff: %w", err)
+		}
+		pendingSteps = len(diffPlan.Steps)
+		inSync = (pendingSteps == 0)
+	}
+
+	return &StatusReport{
+		Dialect:      dialectName,
+		TargetSchema: targetSchema,
+		InSync:       inSync,
+		PendingSteps: pendingSteps,
+		AppliedCount: applied,
+		PartialCount: partial,
+		FailedCount:  failed,
+		Latest:       toHistoryEntry(latestRec),
+	}, nil
+}
+
+// Baseline marks an existing database as synchronized with the desired schema,
+// inserting a baseline record into grizzle_history without executing DDL.
+// If the database differs from desired schema and opts.Force is false,
+// Baseline returns ErrBaselineDrift.
+func Baseline(ctx context.Context, db *sql.DB, schemaSQL string, opts BaselineOptions) (*HistoryEntry, error) {
+	if db == nil {
+		return nil, fmt.Errorf("grizzle: database connection is nil")
+	}
+	if strings.TrimSpace(schemaSQL) == "" {
+		return nil, ErrEmptySchema
+	}
+	d, err := detectDialect(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	targetSchema := opts.TargetSchema
+	if targetSchema == "" {
+		if d == DialectSQLite {
+			targetSchema = "main"
+		} else {
+			targetSchema = "public"
+		}
+	}
+
+	planOpts := Options{
+		Dialect:      d,
+		SchemaSQL:    schemaSQL,
+		TargetSchema: targetSchema,
+	}
+	diffPlan, err := PlanDiff(ctx, db, planOpts)
+	if err != nil {
+		return nil, fmt.Errorf("grizzle: compute baseline diff: %w", err)
+	}
+
+	if !opts.Force && len(diffPlan.Steps) > 0 {
+		return nil, fmt.Errorf("%w: live database differs by %d steps from desired schema; use Force to baseline anyway", ErrBaselineDrift, len(diffPlan.Steps))
+	}
+
+	rec, err := history.RecordBaseline(ctx, db, string(d), targetSchema, diffPlan.Hash(), opts.Note)
+	if err != nil {
+		return nil, fmt.Errorf("grizzle: record baseline: %w", err)
+	}
+	return toHistoryEntry(rec), nil
+}
+
+// Repair resolves the latest partial or failed migration in grizzle_history,
+// marking it as 'resolved' with an optional operator note.
+// It returns ErrNoFailedMigration if there are no partial or failed migrations.
+func Repair(ctx context.Context, db *sql.DB, opts RepairOptions) (*HistoryEntry, error) {
+	if db == nil {
+		return nil, fmt.Errorf("grizzle: database connection is nil")
+	}
+	d, err := detectDialect(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	targetSchema := opts.TargetSchema
+	if targetSchema == "" {
+		if d == DialectSQLite {
+			targetSchema = "main"
+		} else {
+			targetSchema = "public"
+		}
+	}
+
+	rec, err := history.ResolveLatest(ctx, db, string(d), targetSchema, opts.Note)
+	if err != nil {
+		return nil, err
+	}
+	return toHistoryEntry(rec), nil
+}
+
+// DumpOptions configures schema reverse-engineering / dumping.
+type DumpOptions struct {
+	TargetSchema string
+}
+
+// Dump reverse-engineers the live database schema into canonical DDL SQL.
+func Dump(ctx context.Context, db *sql.DB, opts DumpOptions) (string, error) {
+	if db == nil {
+		return "", fmt.Errorf("grizzle: database connection is nil")
+	}
+	d, err := detectDialect(ctx, db)
+	if err != nil {
+		return "", err
+	}
+	targetSchema := opts.TargetSchema
+	switch d {
+	case DialectSQLite:
+		if targetSchema == "" {
+			targetSchema = "main"
+		}
+		return sqlite.DumpSchema(ctx, db, targetSchema)
+	case DialectPostgres:
+		if targetSchema == "" {
+			targetSchema = "public"
+		}
+		return postgres.DumpSchema(ctx, db, targetSchema)
+	default:
+		return "", fmt.Errorf("grizzle: unsupported dialect %q for dump", d)
+	}
+}
+
+// Development returns an Options preset optimized for local development and CI testing:
+// permits destructive operations, executes index creation synchronously (NonConcurrentIndexes=true),
+// and allows partial migration resumption.
+func Development(schemaSQL string, opts ...Option) Options {
+	allowDrop := true
+	o := Options{
+		SchemaSQL:            schemaSQL,
+		AllowDrop:            true,
+		AllowDropTable:       &allowDrop,
+		AllowDropColumn:      &allowDrop,
+		AllowDropIndex:       &allowDrop,
+		AllowDropFK:          &allowDrop,
+		AllowDropCheck:       &allowDrop,
+		AllowDropExtension:   &allowDrop,
+		AllowResumePartial:   true,
+		NonConcurrentIndexes: true,
+	}
+	for _, opt := range opts {
+		opt(&o)
+	}
+	return o
+}
+
+// Production returns an Options preset configured with strict safety defaults:
+// zero-data-loss policy (AllowDrop=false, AllowRevoke=false), online index builds
+// (NonConcurrentIndexes=false), and fail-closed prior-failure gating.
+func Production(schemaSQL string, opts ...Option) Options {
+	allowDrop := false
+	o := Options{
+		SchemaSQL:            schemaSQL,
+		AllowDrop:            false,
+		AllowDropTable:       &allowDrop,
+		AllowDropColumn:      &allowDrop,
+		AllowDropIndex:       &allowDrop,
+		AllowDropFK:          &allowDrop,
+		AllowDropCheck:       &allowDrop,
+		AllowDropExtension:   &allowDrop,
+		AllowRevoke:          false,
+		AllowResumePartial:   false,
+		NonConcurrentIndexes: false,
+	}
+	for _, opt := range opts {
+		opt(&o)
+	}
+	return o
 }

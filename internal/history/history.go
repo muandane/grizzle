@@ -382,3 +382,259 @@ func RecordSeed(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName,
 		SeedHash:   seedHash,
 	})
 }
+
+// ErrNoFailedMigration indicates no partial or failed migration was found to resolve.
+var ErrNoFailedMigration = plan.ErrNoFailedMigration
+
+// GetByID returns a single history record by its primary key ID.
+func GetByID(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName string, id int64) (*Record, error) {
+	var query string
+	switch dialectName {
+	case "postgres":
+		targetSchema := "public"
+		if schemaName != "" {
+			targetSchema = schemaName
+		}
+		query = fmt.Sprintf(`
+			SELECT id, plan_hash, status, failed_step, error, applied_at, duration_ms, applied_by, steps::text, seed_hash
+			FROM %q.grizzle_history
+			WHERE id = $1;
+		`, targetSchema)
+	case "sqlite":
+		query = `
+			SELECT id, plan_hash, status, failed_step, error, applied_at, duration_ms, applied_by, steps, seed_hash
+			FROM grizzle_history
+			WHERE id = ?;
+		`
+	default:
+		return nil, fmt.Errorf("history: unsupported dialect %q", dialectName)
+	}
+
+	var rec Record
+	var failedStep sql.NullInt64
+	var errText sql.NullString
+	var seedHash sql.NullString
+	err := dbtx.QueryRowContext(ctx, query, id).Scan(&rec.ID, &rec.PlanHash, &rec.Status, &failedStep, &errText, &rec.AppliedAt, &rec.DurationMs, &rec.AppliedBy, &rec.StepsJSON, &seedHash)
+	if err == sql.ErrNoRows || isTableNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("querying grizzle_history by id: %w", err)
+	}
+	if failedStep.Valid {
+		rec.FailedStep = int(failedStep.Int64)
+	}
+	if errText.Valid {
+		rec.Error = errText.String
+	}
+	if seedHash.Valid {
+		rec.SeedHash = seedHash.String
+	}
+	return &rec, nil
+}
+
+// ListEntries returns migration records with configurable order and limit.
+func ListEntries(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName string, limit int, desc bool) ([]Record, error) {
+	order := "ASC"
+	if desc {
+		order = "DESC"
+	}
+	limitClause := ""
+	if limit > 0 {
+		limitClause = fmt.Sprintf(" LIMIT %d", limit)
+	}
+
+	var query string
+	switch dialectName {
+	case "postgres":
+		targetSchema := "public"
+		if schemaName != "" {
+			targetSchema = schemaName
+		}
+		query = fmt.Sprintf(`
+			SELECT id, plan_hash, status, failed_step, error, applied_at, duration_ms, applied_by, steps::text, seed_hash
+			FROM %q.grizzle_history
+			ORDER BY id %s%s;
+		`, targetSchema, order, limitClause)
+	case "sqlite":
+		query = fmt.Sprintf(`
+			SELECT id, plan_hash, status, failed_step, error, applied_at, duration_ms, applied_by, steps, seed_hash
+			FROM grizzle_history
+			ORDER BY id %s%s;
+		`, order, limitClause)
+	default:
+		return nil, fmt.Errorf("history: unsupported dialect %q", dialectName)
+	}
+
+	rows, err := dbtx.QueryContext(ctx, query)
+	if isTableNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("querying grizzle_history: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var records []Record
+	for rows.Next() {
+		var rec Record
+		var failedStep sql.NullInt64
+		var errText sql.NullString
+		var seedHash sql.NullString
+		if err := rows.Scan(&rec.ID, &rec.PlanHash, &rec.Status, &failedStep, &errText, &rec.AppliedAt, &rec.DurationMs, &rec.AppliedBy, &rec.StepsJSON, &seedHash); err != nil {
+			return nil, fmt.Errorf("scanning grizzle_history: %w", err)
+		}
+		if failedStep.Valid {
+			rec.FailedStep = int(failedStep.Int64)
+		}
+		if errText.Valid {
+			rec.Error = errText.String
+		}
+		if seedHash.Valid {
+			rec.SeedHash = seedHash.String
+		}
+		records = append(records, rec)
+	}
+	return records, rows.Err()
+}
+
+// Summary returns counts of applied, partial, and failed migrations.
+func Summary(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName string) (applied int, partial int, failed int, err error) {
+	var query string
+	switch dialectName {
+	case "postgres":
+		targetSchema := "public"
+		if schemaName != "" {
+			targetSchema = schemaName
+		}
+		query = fmt.Sprintf(`
+			SELECT status, count(*)
+			FROM %q.grizzle_history
+			GROUP BY status;
+		`, targetSchema)
+	case "sqlite":
+		query = `
+			SELECT status, count(*)
+			FROM grizzle_history
+			GROUP BY status;
+		`
+	default:
+		return 0, 0, 0, fmt.Errorf("history: unsupported dialect %q", dialectName)
+	}
+
+	rows, err := dbtx.QueryContext(ctx, query)
+	if isTableNotExist(err) {
+		return 0, 0, 0, nil
+	}
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("querying grizzle_history summary: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		var st string
+		var cnt int
+		if err := rows.Scan(&st, &cnt); err != nil {
+			return 0, 0, 0, err
+		}
+		switch st {
+		case "applied", "baseline", "resolved":
+			applied += cnt
+		case "partial":
+			partial += cnt
+		case "failed":
+			failed += cnt
+		}
+	}
+	return applied, partial, failed, rows.Err()
+}
+
+// RecordBaseline writes an initial baseline record with status 'baseline' into grizzle_history.
+func RecordBaseline(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName, planHash, note string) (*Record, error) {
+	if err := EnsureTable(ctx, dbtx, dialectName, schemaName); err != nil {
+		return nil, err
+	}
+	err := Insert(ctx, dbtx, dialectName, schemaName, Record{
+		PlanHash:   planHash,
+		Status:     "baseline",
+		AppliedAt:  time.Now().UTC(),
+		DurationMs: 0,
+		AppliedBy:  CurrentUser(),
+		StepsJSON:  "[]",
+		Error:      note,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return GetLatest(ctx, dbtx, dialectName, schemaName)
+}
+
+// ResolveLatest marks the most recent partial or failed migration record as 'resolved'.
+func ResolveLatest(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName, note string) (*Record, error) {
+	var findQuery string
+	var updateQuery string
+	switch dialectName {
+	case "postgres":
+		targetSchema := "public"
+		if schemaName != "" {
+			targetSchema = schemaName
+		}
+		findQuery = fmt.Sprintf(`
+			SELECT id FROM %q.grizzle_history
+			WHERE status IN ('partial', 'failed')
+			ORDER BY id DESC LIMIT 1;
+		`, targetSchema)
+		updateQuery = fmt.Sprintf(`
+			UPDATE %q.grizzle_history
+			SET status = 'resolved',
+			    error = CASE
+			        WHEN error IS NULL OR error = '' THEN $1
+			        ELSE error || ' [RESOLVED: ' || $1 || ']'
+			    END
+			WHERE id = $2;
+		`, targetSchema)
+	case "sqlite":
+		findQuery = `
+			SELECT id FROM grizzle_history
+			WHERE status IN ('partial', 'failed')
+			ORDER BY id DESC LIMIT 1;
+		`
+		updateQuery = `
+			UPDATE grizzle_history
+			SET status = 'resolved',
+			    error = CASE
+			        WHEN error IS NULL OR error = '' THEN ?
+			        ELSE error || ' [RESOLVED: ' || ? || ']'
+			    END
+			WHERE id = ?;
+		`
+	default:
+		return nil, fmt.Errorf("history: unsupported dialect %q", dialectName)
+	}
+
+	var targetID int64
+	err := dbtx.QueryRowContext(ctx, findQuery).Scan(&targetID)
+	if err == sql.ErrNoRows || isTableNotExist(err) {
+		return nil, ErrNoFailedMigration
+	}
+	if err != nil {
+		return nil, fmt.Errorf("finding unresolved migration: %w", err)
+	}
+
+	resolvedNote := note
+	if resolvedNote == "" {
+		resolvedNote = fmt.Sprintf("manually resolved at %s by %s", time.Now().UTC().Format(time.RFC3339), CurrentUser())
+	}
+
+	switch dialectName {
+	case "postgres":
+		_, err = dbtx.ExecContext(ctx, updateQuery, resolvedNote, targetID)
+	case "sqlite":
+		_, err = dbtx.ExecContext(ctx, updateQuery, resolvedNote, resolvedNote, targetID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("updating resolved migration status: %w", err)
+	}
+
+	return GetByID(ctx, dbtx, dialectName, schemaName, targetID)
+}

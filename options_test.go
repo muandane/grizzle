@@ -284,3 +284,35 @@ func TestOptions_Tracer(t *testing.T) {
 		t.Fatalf("sync failed: %v", err)
 	}
 }
+
+func TestOptions_Presets(t *testing.T) {
+	schemaSQL := "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);"
+
+	dev := grizzle.Development(schemaSQL)
+	if !dev.AllowDrop {
+		t.Errorf("expected dev.AllowDrop = true")
+	}
+	if !dev.AllowResumePartial {
+		t.Errorf("expected dev.AllowResumePartial = true")
+	}
+	if !dev.NonConcurrentIndexes {
+		t.Errorf("expected dev.NonConcurrentIndexes = true")
+	}
+	if dev.SchemaSQL != schemaSQL {
+		t.Errorf("expected dev.SchemaSQL matching")
+	}
+
+	prod := grizzle.Production(schemaSQL)
+	if prod.AllowDrop {
+		t.Errorf("expected prod.AllowDrop = false")
+	}
+	if prod.AllowResumePartial {
+		t.Errorf("expected prod.AllowResumePartial = false")
+	}
+	if prod.NonConcurrentIndexes {
+		t.Errorf("expected prod.NonConcurrentIndexes = false")
+	}
+	if prod.SchemaSQL != schemaSQL {
+		t.Errorf("expected prod.SchemaSQL matching")
+	}
+}

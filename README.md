@@ -87,6 +87,17 @@ grizzle plan --dsn "$DATABASE_URL" --schema schema.sql --out plan.json
 # Apply a generated plan safely
 grizzle apply --dsn "$DATABASE_URL" --plan plan.json
 
+# Inspect migration status and history
+grizzle status --dsn "$DATABASE_URL" --schema schema.sql
+grizzle history --dsn "$DATABASE_URL"
+
+# Reverse engineer an existing database and baseline it
+grizzle dump --dsn "$DATABASE_URL" --out schema.sql
+grizzle baseline --dsn "$DATABASE_URL" --schema schema.sql
+
+# Resolve an interrupted or failed migration
+grizzle repair --dsn "$DATABASE_URL" --note "manually resolved"
+
 # Fail CI if live DB has drifted from schema.sql (exits with code 4)
 grizzle check --dsn "$DATABASE_URL" --schema schema.sql
 
@@ -99,7 +110,7 @@ grizzle export --plan plan.json --format goose --out ./migrations
 | Code | Meaning |
 | --- | --- |
 | `0` | Success / database is in sync |
-| `1` | Connection or execution error |
+| `1` | Connection or execution error (or drift detected in `status`) |
 | `2` | Blocked by an unaccepted hazard (e.g., unexpected DROP) |
 | `3` | Plan hash mismatch (live database changed after plan was generated) |
 | `4` | Schema drift detected (`grizzle check`) |
