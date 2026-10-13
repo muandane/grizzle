@@ -773,9 +773,10 @@ func TestLocking_PgTerminateBackendRecovery(t *testing.T) {
 
 	// 5. Rerun Sync: auto-recovery should drop invalid index and recreate it cleanly
 	err = grizzle.Sync(context.Background(), db, grizzle.Options{
-		Dialect:      grizzle.DialectPostgres,
-		TargetSchema: schema,
-		SchemaSQL:    desiredSQL,
+		Dialect:            grizzle.DialectPostgres,
+		TargetSchema:       schema,
+		SchemaSQL:          desiredSQL,
+		AllowResumePartial: true,
 	})
 	if err != nil {
 		t.Fatalf("rerun Sync after invalid index failed: %v", err)

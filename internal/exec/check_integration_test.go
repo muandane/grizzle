@@ -89,6 +89,7 @@ func TestCheck_ValidateConstraintRunsInSeparateTxAfterCommit(t *testing.T) {
 	}
 
 	// 6. Run sync again: only VALIDATE CONSTRAINT remains, and it succeeds.
+	cfg.AllowResumePartial = true
 	if err := exec.SyncPostgres(context.Background(), db, cfg); err != nil {
 		t.Fatalf("expected SyncPostgres to succeed after repairing data, got: %v", err)
 	}

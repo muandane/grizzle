@@ -161,7 +161,9 @@ func TestDomains_Lifecycle(t *testing.T) {
 	if !sawDropDomain {
 		t.Fatalf("expected DROP_DOMAIN in plan, got %+v", p4.Steps)
 	}
-	if err := exec.SyncPostgres(ctx, db, newCfg(withoutDomain)); err == nil {
+	withoutDomainCfg := newCfg(withoutDomain)
+	withoutDomainCfg.AllowResumePartial = true
+	if err := exec.SyncPostgres(ctx, db, withoutDomainCfg); err == nil {
 		t.Fatalf("drop must fail with default policy (AllowDomain=false)")
 	} else {
 		var dve *plan.DestructiveViolationError
@@ -172,6 +174,7 @@ func TestDomains_Lifecycle(t *testing.T) {
 	allowDrop := newCfg(withoutDomain)
 	allowDrop.Policy = plan.DropPolicy{AllowTable: true, AllowDomain: true}
 	allowDrop.AcceptHazards = []plan.HazardCode{plan.HazardDropTable, plan.HazardDropDomain}
+	allowDrop.AllowResumePartial = true
 	if err := exec.SyncPostgres(ctx, db, allowDrop); err != nil {
 		t.Fatalf("allowed drop sync: %v", err)
 	}
