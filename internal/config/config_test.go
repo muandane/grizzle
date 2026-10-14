@@ -25,6 +25,7 @@ accept_hazards:
   - DROP_TABLE
   - DROP_COLUMN
 lint:
+  profile: "strict"
   fail_on_warning: true
   disabled_rules:
     - L001
@@ -65,6 +66,9 @@ lint:
 	}
 	if len(cfg.AcceptHazards) != 2 || cfg.AcceptHazards[0] != "DROP_TABLE" || cfg.AcceptHazards[1] != "DROP_COLUMN" {
 		t.Errorf("unexpected AcceptHazards: %+v", cfg.AcceptHazards)
+	}
+	if cfg.Lint.Profile != "strict" {
+		t.Errorf("expected Lint.Profile 'strict', got %q", cfg.Lint.Profile)
 	}
 	if !cfg.Lint.FailOnWarning {
 		t.Errorf("expected Lint.FailOnWarning true")

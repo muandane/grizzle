@@ -657,8 +657,20 @@ type DestructiveViolationError struct {
 | `L012` | `ERROR` | Seed DML in `SeedSQL` lacks an `ON CONFLICT` clause or idempotent guard |
 | `L013` | `ERROR` | Schema uses features unsupported on SQLite (e.g. `COMMENT ON`, RLS, or enum types) |
 
+### Strict Profile Rules (`--profile strict`)
+
+The `strict` profile enables standard rules plus high-impact production hygiene checks:
+
+| Rule | Severity | Check |
+| :--- | :--- | :--- |
+| `L014` | `ERROR` | Primary key column uses an unapproved data type; requires `BIGINT`, `INTEGER`, `SMALLINT`, or `UUID` |
+| `L022` | `ERROR` | Table or column name collides with a reserved SQL keyword (e.g. `user`, `order`, `table`) |
+| `L044` | `WARNING` | Boolean column declares no `DEFAULT`; recommend `DEFAULT false` or `DEFAULT true` to prevent tri-state `NULL` |
+| `L047` | `ERROR` | Table declares duplicate indexes covering the exact same columns and access method |
+| `L048` | `WARNING` | Single-column index is redundant because an existing composite index covers the column as its leading prefix |
+
 > [!TIP]
-> For the complete 80+ rule catalog derived from industry database reliability engineering and production PostgreSQL standards (including naming conventions, index hygiene, and type constraints), see [docs/LINTER_SPEC.md](LINTER_SPEC.md).
+> For the complete 80+ rule catalog derived from industry database reliability engineering and production standards, see [docs/LINTER_SPEC.md](LINTER_SPEC.md).
 
 Severity semantics:
 

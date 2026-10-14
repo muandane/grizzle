@@ -9,15 +9,44 @@ import (
 	"path/filepath"
 
 	"github.com/muandane/grizzle"
+	"github.com/muandane/grizzle/internal/config"
 )
 
 // runLint statically lints a schema.sql file. SQLite compilation is fully
 // offline (in-memory shadow); PostgreSQL compilation uses the DSN shadow path.
-func runLint(ctx context.Context, dsn, devURL, schemaFile, format string, failOnWarning bool) int {
+func runLint(ctx context.Context, dsn, devURL, schemaFile, format, profile string, failOnWarning bool, configFile string) int {
 	content, err := os.ReadFile(filepath.Clean(schemaFile)) //nolint:gosec // G304: CLI accepts user-provided schema file path
 	if err != nil {
 		slog.Error("reading schema file", "path", schemaFile, "err", err)
 		return 2
+	}
+
+	if configFile == "" {
+		configFile = config.FindConfigFile("")
+	}
+	var cfg *config.Config
+	if configFile != "" {
+		var err error
+		cfg, err = config.Load(configFile)
+		if err != nil {
+			slog.Warn("loading config file for lint", "path", configFile, "err", err)
+		}
+	}
+	if profile == "" && cfg != nil && cfg.Lint.Profile != "" {
+		profile = cfg.Lint.Profile
+	}
+	if !failOnWarning && cfg != nil && cfg.Lint.FailOnWarning {
+		failOnWarning = true
+	}
+
+	rules, err := grizzle.LintRulesForProfile(profile)
+	if err != nil {
+		slog.Error("resolving lint profile", "err", err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 2
+	}
+	if cfg != nil && len(cfg.Lint.DisabledRules) > 0 {
+		rules = grizzle.FilterLintRules(rules, cfg.Lint.DisabledRules)
 	}
 
 	var db *sql.DB
@@ -47,7 +76,7 @@ func runLint(ctx context.Context, dsn, devURL, schemaFile, format string, failOn
 		return 2
 	}
 
-	diags := grizzle.LintSchema(ir)
+	diags := grizzle.LintSchema(ir, rules...)
 
 	switch format {
 	case "json":
