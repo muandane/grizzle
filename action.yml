@@ -1,6 +1,6 @@
 name: 'Grizzle Action'
 description: 'Fast, deterministic declarative database schema migrations and SQL linting for PostgreSQL and SQLite'
-author: 'ZIne Moualhi'
+author: 'Zine Moualhi'
 
 branding:
   icon: 'database'
@@ -43,6 +43,10 @@ inputs:
     description: 'Fail lint when warnings are reported'
     required: false
     default: 'false'
+  allow-drop:
+    description: 'Permit destructive schema operations'
+    required: false
+    default: 'false'
   format:
     description: 'Output format (github, text, json)'
     required: false
@@ -60,26 +64,95 @@ outputs:
 runs:
   using: 'composite'
   steps:
-    - name: Set up Go
-      uses: actions/setup-go@v7
-      with:
-        go-version: 'stable'
-        cache: false
-
     - name: Install Grizzle
       shell: bash
       run: |
+        set -eo pipefail
+
         if command -v grizzle >/dev/null 2>&1; then
-          echo "Grizzle is already installed: $(grizzle --version || echo 'installed')"
-        else
-          VER="${{ inputs.version }}"
-          if [ "$VER" = "latest" ] || [ -z "$VER" ]; then
-            TARGET="github.com/muandane/grizzle/cmd/grizzle@latest"
-          else
-            TARGET="github.com/muandane/grizzle/cmd/grizzle@${VER}"
+          echo "Grizzle is already installed: $(grizzle version 2>/dev/null || grizzle --version 2>/dev/null || echo 'installed')"
+          exit 0
+        fi
+
+        VER="${{ inputs.version }}"
+        if [ -z "$VER" ] || [ "$VER" = "latest" ]; then
+          # Resolve latest release tag from GitHub API
+          VER=$(curl -sSL -H "Accept: application/vnd.github+json" https://api.github.com/repos/muandane/grizzle/releases/latest | grep '"tag_name":' | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -z "$VER" ]; then
+            VER="v0.2.0"
           fi
-          echo "Installing Grizzle from ${TARGET}..."
-          go install "${TARGET}"
+        fi
+
+        TAG="$VER"
+        if [[ "$TAG" != v* ]]; then
+          TAG="v$TAG"
+        fi
+        CLEAN_VER="${TAG#v}"
+
+        # Detect runner OS
+        OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+        case "$OS" in
+          linux*) OS="linux" ;;
+          darwin*) OS="darwin" ;;
+          msys*|cygwin*|mingw*|windows*) OS="windows" ;;
+          *)
+            echo "Unsupported OS: $OS"
+            exit 1
+            ;;
+        esac
+
+        # Detect runner architecture
+        ARCH="$(uname -m)"
+        case "$ARCH" in
+          x86_64|amd64) ARCH="amd64" ;;
+          arm64|aarch64) ARCH="arm64" ;;
+          *)
+            echo "Unsupported architecture: $ARCH"
+            exit 1
+            ;;
+        esac
+
+        INSTALL_DIR="${RUNNER_TEMP:-/tmp}/grizzle-bin"
+        mkdir -p "$INSTALL_DIR"
+
+        EXT="tar.gz"
+        if [ "$OS" = "windows" ]; then
+          EXT="zip"
+        fi
+
+        TARBALL="grizzle_${CLEAN_VER}_${OS}_${ARCH}.${EXT}"
+        URL="https://github.com/muandane/grizzle/releases/download/${TAG}/${TARBALL}"
+
+        echo "Attempting to download pre-built release ${TAG} from ${URL}..."
+        DOWNLOAD_SUCCESS=false
+        if curl -sSL --fail "$URL" -o "${INSTALL_DIR}/${TARBALL}" 2>/dev/null; then
+          if [ "$EXT" = "zip" ]; then
+            unzip -q "${INSTALL_DIR}/${TARBALL}" -d "$INSTALL_DIR"
+          else
+            tar -xzf "${INSTALL_DIR}/${TARBALL}" -C "$INSTALL_DIR"
+          fi
+          chmod +x "${INSTALL_DIR}/grizzle" 2>/dev/null || true
+          if [ -x "${INSTALL_DIR}/grizzle" ] || [ -x "${INSTALL_DIR}/grizzle.exe" ]; then
+            DOWNLOAD_SUCCESS=true
+          fi
+        fi
+
+        if [ "$DOWNLOAD_SUCCESS" = "true" ]; then
+          echo "$INSTALL_DIR" >> "$GITHUB_PATH"
+          export PATH="$INSTALL_DIR:$PATH"
+          echo "Successfully installed Grizzle ${TAG} to $INSTALL_DIR"
+        else
+          echo "Release binary not available at ${URL}."
+          if command -v go >/dev/null 2>&1; then
+            echo "Falling back to 'go install github.com/muandane/grizzle/cmd/grizzle@${TAG}'..."
+            go install "github.com/muandane/grizzle/cmd/grizzle@${TAG}"
+            GOPATH_BIN="$(go env GOPATH)/bin"
+            echo "$GOPATH_BIN" >> "$GITHUB_PATH"
+            export PATH="$GOPATH_BIN:$PATH"
+          else
+            echo "Error: Release asset not found and Go toolchain is not available for fallback compilation."
+            exit 1
+          fi
         fi
 
     - name: Run Grizzle
@@ -94,6 +167,7 @@ runs:
         PROFILE="${{ inputs.profile }}"
         STRICT="${{ inputs.strict }}"
         FAIL_ON_WARNING="${{ inputs.fail-on-warning }}"
+        ALLOW_DROP="${{ inputs.allow-drop }}"
         FORMAT="${{ inputs.format }}"
         EXTRA="${{ inputs.extra-args }}"
 
@@ -116,6 +190,10 @@ runs:
           ARGS+=(--config "$CONFIG")
         fi
 
+        if [ "$ALLOW_DROP" = "true" ]; then
+          ARGS+=(--allow-drop)
+        fi
+
         if [ "$CMD" = "lint" ]; then
           if [ "$STRICT" = "true" ] || [ "$PROFILE" = "strict" ]; then
             ARGS+=(--profile strict)
@@ -135,7 +213,7 @@ runs:
         fi
 
         if [ -n "$EXTRA" ]; then
-          # Split extra args into array
+          # Split extra args into array preserving flags
           read -ra EXTRA_ARR <<< "$EXTRA"
           ARGS+=("${EXTRA_ARR[@]}")
         fi

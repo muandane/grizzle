@@ -144,7 +144,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Lint declarative schema
         uses: muandane/grizzle@v0.2.0
         with:
@@ -156,7 +156,7 @@ jobs:
   drift-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check for schema drift
         uses: muandane/grizzle@v0.2.0
         with:
