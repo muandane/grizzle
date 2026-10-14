@@ -13,6 +13,79 @@ func tableKey(schemaName, tableName string) string {
 	return tableName
 }
 
+var changeTypePriority = map[ChangeType]int{
+	ChangeDropFK:                10, // 1. Drop old foreign keys first (unlocks referenced tables)
+	ChangeDropCheck:             15, // 1b. Drop obsolete check constraints before redefining them
+	ChangeDropIndex:             20, // 2. Drop obsolete indexes
+	ChangeDetachPartition:       25, // 2b. Detach partitions before modifying or dropping them
+	ChangeDropPolicy:            26, // 2c. Drop policies before recreating
+	ChangeDropTrigger:           27, // 2d. Drop triggers before column/table drops or function replaces
+	ChangeDropAggregate:         28, // 2e'. Drop aggregates before their support functions (pg_depend)
+	ChangeDropDomainRetype:      28, // 2e''. Drop rebuilt domains before the replacement CREATE_DOMAIN
+	ChangeDropCompositeRetype:   28, // 2e'''. Drop rebuilt composite types before recreating
+	ChangeDropRangeRetype:       28, // 2e''''. Drop rebuilt range types before recreating
+	ChangeDropView:              28, // 2e. Drop views before underlying table drops
+	ChangeDropFunction:          29, // 2f. Drop functions after dependents
+	ChangeDropExtension:         29, // 2g. Drop extensions last among early drops
+	ChangeCreateExtension:       5,  // 0. Extensions before enums/tables (provides types)
+	ChangeCreateSequence:        6,  // 0b. Standalone sequences before enums and tables
+	ChangeCreateEnum:            30, // 3. Create new enum types before tables use them
+	ChangeCreateCompositeType:   31, // 3a. Create composite types before range types and tables
+	ChangeCreateRangeType:       32, // 3a'. Create range types before tables
+	ChangeAlterCompositeType:    33, // 3a''. Alter composite types before tables
+	ChangeRenameEnumValue:       34, // 3b. Rename enum values before adding or altering
+	ChangeAlterEnum:             35, // 4. Add new enum values before tables insert/alter
+	ChangeCreateDomain:          36, // 4b. Create domains before tables/columns use them
+	ChangeCreateTable:           40, // 5. Create bare tables (PKs included, FKs deferred; parent tables before partitions)
+	ChangeAttachPartition:       42, // 5a. Attach existing tables to partitioned tables
+	ChangeRenameColumn:          45, // 5b. Rename columns before adding or altering other columns
+	ChangeCreateFunction:        48, // 5c. Functions before triggers/views that call them
+	ChangeCreateAggregate:       49, // 5c'. Aggregates after their support functions (pg_depend)
+	ChangeAddColumn:             50, // 6. Add new columns
+	ChangeAlterColumn:           60, // 7. Modify column types, nullability, defaults
+	ChangeCreateIndex:           70, // 8. Build new indexes
+	ChangeAddFK:                 80, // 9. Add foreign keys (NOT VALID) now that all tables and columns exist
+	ChangeAlterSequence:         81, // 9a. Set sequence ownership after tables and columns exist
+	ChangeAddCheck:              82, // 9b. Add check constraints (NOT VALID) after all tables and columns exist
+	ChangeDropDomainConstraint:  84, // 9c. Drop domain constraints before replacements are added
+	ChangeValidateConstraint:    85, // 10. Validate foreign keys and check constraints
+	ChangeAlterDomain:           87, // 10b'. Alter domains (add constraints) after tables exist
+	ChangeEnableRLS:             86, // 10a. Enable RLS before creating policies
+	ChangeForceRLS:              86,
+	ChangeDisableRLS:            86,
+	ChangeNoForceRLS:            86,
+	ChangeCreatePolicy:          87, // 10b. Policies after RLS enabled
+	ChangeAlterPolicy:           87,
+	ChangeCreateTrigger:         88, // 10c. Triggers after functions and columns
+	ChangeCommentTable:          89, // 10c'. Comments after all objects exist
+	ChangeCommentColumn:         89,
+	ChangeCreateView:            95,  // 10d. Views after tables/functions
+	ChangeRefreshMatView:        96,  // 10e. Refresh matviews after create
+	ChangeDropColumn:            90,  // 11. Drop columns (if allowed)
+	ChangeDropTable:             100, // 12. Drop tables (if allowed)
+	ChangeDropDomain:            101, // 13. Drop domains after dependent tables/columns are gone
+	ChangeDropRangeType:         101, // 13'. Drop range types after dependent tables/columns are gone
+	ChangeDropCompositeType:     101, // 13''. Drop composite types after dependent tables/columns are gone
+	ChangeDropSequence:          102, // 13b. Drop sequences after dependent tables are gone
+	ChangeCreateRole:            119, // 14. Create roles before grants reference them
+	ChangeAlterRole:             120, // 14a. Role attrs/password/config after create
+	ChangeRoleComment:           121, // 14b. Stamp managed-role markers
+	ChangeGrant:                 122, // 15. Grants after all schema objects and roles exist
+	ChangeRevoke:                123, // 16. Revokes after grants (replacement flows)
+	ChangeDropRole:              124, // 17. Drop roles last, after their grants are gone
+	ChangeDropPublication:       129, // 18. Publication replacement/removal before creates
+	ChangeCreatePublication:     130, // 19. Publications after schema objects exist
+	ChangeAlterPublication:      131, // 20. Publication drift after creation
+	ChangeDropSubscription:      132, // 21. Subscription replacement/removal before creates
+	ChangeCreateSubscription:    133, // 22. Subscriptions after publications
+	ChangeAlterSubscription:     134, // 23. Subscription drift after creation
+	ChangeDropReplicationSlot:   135, // 24. Standalone slot drops before creates
+	ChangeCreateReplicationSlot: 136, // 25. Standalone logical slots
+	ChangeDropEventTrigger:      137, // 26. Event-trigger replacement/removal before creates
+	ChangeCreateEventTrigger:    138, // 27. Event triggers last: they fire on subsequent DDL
+	ChangeAlterEventTrigger:     139, // 28. Event-trigger enabled-state drift
+}
+
 // SortSteps applies topological ordering so dependent DDL operations execute in the correct relational sequence.
 // Cross-schema foreign keys and intra-schema foreign keys are topologically sorted:
 // referenced tables precede referencing tables on creation; reverse on drop.
@@ -23,78 +96,6 @@ func tableKey(schemaName, tableName string) string {
 // sorted strongly-connected remainder — never via a comparator that can
 // violate the sort contract.
 func SortSteps(steps []Step) {
-	priority := map[ChangeType]int{
-		ChangeDropFK:                10, // 1. Drop old foreign keys first (unlocks referenced tables)
-		ChangeDropCheck:             15, // 1b. Drop obsolete check constraints before redefining them
-		ChangeDropIndex:             20, // 2. Drop obsolete indexes
-		ChangeDetachPartition:       25, // 2b. Detach partitions before modifying or dropping them
-		ChangeDropPolicy:            26, // 2c. Drop policies before recreating
-		ChangeDropTrigger:           27, // 2d. Drop triggers before column/table drops or function replaces
-		ChangeDropAggregate:         28, // 2e'. Drop aggregates before their support functions (pg_depend)
-		ChangeDropDomainRetype:      28, // 2e''. Drop rebuilt domains before the replacement CREATE_DOMAIN
-		ChangeDropCompositeRetype:   28, // 2e'''. Drop rebuilt composite types before recreating
-		ChangeDropRangeRetype:       28, // 2e''''. Drop rebuilt range types before recreating
-		ChangeDropView:              28, // 2e. Drop views before underlying table drops
-		ChangeDropFunction:          29, // 2f. Drop functions after dependents
-		ChangeDropExtension:         29, // 2g. Drop extensions last among early drops
-		ChangeCreateExtension:       5,  // 0. Extensions before enums/tables (provides types)
-		ChangeCreateSequence:        6,  // 0b. Standalone sequences before enums and tables
-		ChangeCreateEnum:            30, // 3. Create new enum types before tables use them
-		ChangeCreateCompositeType:   31, // 3a. Create composite types before range types and tables
-		ChangeCreateRangeType:       32, // 3a'. Create range types before tables
-		ChangeAlterCompositeType:    33, // 3a''. Alter composite types before tables
-		ChangeRenameEnumValue:       34, // 3b. Rename enum values before adding or altering
-		ChangeAlterEnum:             35, // 4. Add new enum values before tables insert/alter
-		ChangeCreateDomain:          36, // 4b. Create domains before tables/columns use them
-		ChangeCreateTable:           40, // 5. Create bare tables (PKs included, FKs deferred; parent tables before partitions)
-		ChangeAttachPartition:       42, // 5a. Attach existing tables to partitioned tables
-		ChangeRenameColumn:          45, // 5b. Rename columns before adding or altering other columns
-		ChangeCreateFunction:        48, // 5c. Functions before triggers/views that call them
-		ChangeCreateAggregate:       49, // 5c'. Aggregates after their support functions (pg_depend)
-		ChangeAddColumn:             50, // 6. Add new columns
-		ChangeAlterColumn:           60, // 7. Modify column types, nullability, defaults
-		ChangeCreateIndex:           70, // 8. Build new indexes
-		ChangeAddFK:                 80, // 9. Add foreign keys (NOT VALID) now that all tables and columns exist
-		ChangeAlterSequence:         81, // 9a. Set sequence ownership after tables and columns exist
-		ChangeAddCheck:              82, // 9b. Add check constraints (NOT VALID) after all tables and columns exist
-		ChangeDropDomainConstraint:  84, // 9c. Drop domain constraints before replacements are added
-		ChangeValidateConstraint:    85, // 10. Validate foreign keys and check constraints
-		ChangeAlterDomain:           87, // 10b'. Alter domains (add constraints) after tables exist
-		ChangeEnableRLS:             86, // 10a. Enable RLS before creating policies
-		ChangeForceRLS:              86,
-		ChangeDisableRLS:            86,
-		ChangeNoForceRLS:            86,
-		ChangeCreatePolicy:          87, // 10b. Policies after RLS enabled
-		ChangeAlterPolicy:           87,
-		ChangeCreateTrigger:         88, // 10c. Triggers after functions and columns
-		ChangeCommentTable:          89, // 10c'. Comments after all objects exist
-		ChangeCommentColumn:         89,
-		ChangeCreateView:            95,  // 10d. Views after tables/functions
-		ChangeRefreshMatView:        96,  // 10e. Refresh matviews after create
-		ChangeDropColumn:            90,  // 11. Drop columns (if allowed)
-		ChangeDropTable:             100, // 12. Drop tables (if allowed)
-		ChangeDropDomain:            101, // 13. Drop domains after dependent tables/columns are gone
-		ChangeDropRangeType:         101, // 13'. Drop range types after dependent tables/columns are gone
-		ChangeDropCompositeType:     101, // 13''. Drop composite types after dependent tables/columns are gone
-		ChangeDropSequence:          102, // 13b. Drop sequences after dependent tables are gone
-		ChangeCreateRole:            119, // 14. Create roles before grants reference them
-		ChangeAlterRole:             120, // 14a. Role attrs/password/config after create
-		ChangeRoleComment:           121, // 14b. Stamp managed-role markers
-		ChangeGrant:                 122, // 15. Grants after all schema objects and roles exist
-		ChangeRevoke:                123, // 16. Revokes after grants (replacement flows)
-		ChangeDropRole:              124, // 17. Drop roles last, after their grants are gone
-		ChangeDropPublication:       129, // 18. Publication replacement/removal before creates
-		ChangeCreatePublication:     130, // 19. Publications after schema objects exist
-		ChangeAlterPublication:      131, // 20. Publication drift after creation
-		ChangeDropSubscription:      132, // 21. Subscription replacement/removal before creates
-		ChangeCreateSubscription:    133, // 22. Subscriptions after publications
-		ChangeAlterSubscription:     134, // 23. Subscription drift after creation
-		ChangeDropReplicationSlot:   135, // 24. Standalone slot drops before creates
-		ChangeCreateReplicationSlot: 136, // 25. Standalone logical slots
-		ChangeDropEventTrigger:      137, // 26. Event-trigger replacement/removal before creates
-		ChangeCreateEventTrigger:    138, // 27. Event triggers last: they fire on subsequent DDL
-		ChangeAlterEventTrigger:     139, // 28. Event-trigger enabled-state drift
-	}
 
 	// Build relational dependency graph: referencingTable -> referencedTable
 	// deps[A][B] = true means table A depends on table B (A references B)
@@ -145,7 +146,7 @@ func SortSteps(steps []Step) {
 
 	// Phase-stable sort first.
 	slices.SortStableFunc(steps, func(a, b Step) int {
-		pDiff := priority[a.Type] - priority[b.Type]
+		pDiff := changeTypePriority[a.Type] - changeTypePriority[b.Type]
 		if pDiff != 0 {
 			return pDiff
 		}

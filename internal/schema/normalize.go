@@ -196,13 +196,18 @@ func NormalizeExpression(expr string, mappings map[string]string, currentSchema 
 			}
 		}
 
-		t := isTrueRegex.ReplaceAllString(text, "= true")
-		t = isFalseRegex.ReplaceAllString(t, "= false")
-		t = isNotTrueRegex.ReplaceAllString(t, "!= true")
-		t = isNotFalseRegex.ReplaceAllString(t, "!= false")
+		t := text
+		if strings.Contains(text, "IS ") || strings.Contains(text, "is ") || strings.Contains(text, "Is ") || strings.Contains(text, "iS ") {
+			t = isNotTrueRegex.ReplaceAllString(t, "!= true")
+			t = isNotFalseRegex.ReplaceAllString(t, "!= false")
+			t = isTrueRegex.ReplaceAllString(t, "= true")
+			t = isFalseRegex.ReplaceAllString(t, "= false")
+		}
 
-		t = numCastParenRegex.ReplaceAllString(t, "$1")
-		t = colCastParenRegex.ReplaceAllString(t, "$1")
+		if strings.Contains(text, "::") {
+			t = numCastParenRegex.ReplaceAllString(t, "$1")
+			t = colCastParenRegex.ReplaceAllString(t, "$1")
+		}
 
 		words := strings.Fields(t)
 		collapsed := strings.Join(words, " ")

@@ -163,9 +163,9 @@ func NewCopyBackfillHook(d Dialect, batch int) BackfillFunc {
 		defer func() { _ = rows.Close() }()
 
 		var batchRows [][]any
+		scanPtrs := make([]any, len(pkCols))
 		for rows.Next() {
 			rowVals := make([]any, len(pkCols))
-			scanPtrs := make([]any, len(pkCols))
 			for i := range rowVals {
 				scanPtrs[i] = &rowVals[i]
 			}
@@ -455,42 +455,68 @@ func BuildKeysetUpdateSQL(d Dialect, tableRef string, pkCols []string, oldCol, n
 	}
 
 	if len(pkCols) == 1 {
-		placeholders := make([]string, numRows)
+		var b strings.Builder
+		b.Grow(len(tableRef) + len(newCol) + len(oldCol) + len(pkCols[0]) + 40 + numRows*6)
+		b.WriteString("UPDATE ")
+		b.WriteString(tableRef)
+		b.WriteString(" SET ")
+		fmt.Fprintf(&b, "%q = %q", newCol, oldCol)
+		b.WriteString(" WHERE ")
+		fmt.Fprintf(&b, "%q", pkCols[0])
+		b.WriteString(" IN (")
 		for i := range numRows {
+			if i > 0 {
+				b.WriteString(", ")
+			}
 			if d == DialectPostgres {
-				placeholders[i] = "$" + strconv.Itoa(i+1)
+				b.WriteString("$")
+				b.WriteString(strconv.Itoa(i + 1))
 			} else {
-				placeholders[i] = "?"
+				b.WriteString("?")
 			}
 		}
-		return fmt.Sprintf(`UPDATE %s SET %q = %q WHERE %q IN (%s)`,
-			tableRef, newCol, oldCol, pkCols[0], strings.Join(placeholders, ", "))
+		b.WriteString(")")
+		return b.String()
 	}
 
 	// Composite primary key (N >= 2): WHERE (col1, col2) IN ((?, ?), (?, ?), ...)
-	tuples := make([]string, numRows)
+	var b strings.Builder
+	b.Grow(len(tableRef) + len(newCol) + len(oldCol) + 64 + numRows*(len(pkCols)*6+4))
+	b.WriteString("UPDATE ")
+	b.WriteString(tableRef)
+	b.WriteString(" SET ")
+	fmt.Fprintf(&b, "%q = %q", newCol, oldCol)
+	b.WriteString(" WHERE (")
+	for i, c := range pkCols {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "%q", c)
+	}
+	b.WriteString(") IN (")
 	paramIdx := 1
 	for r := range numRows {
-		rowPlaceholders := make([]string, len(pkCols))
+		if r > 0 {
+			b.WriteString(", (")
+		} else {
+			b.WriteString("(")
+		}
 		for c := range pkCols {
+			if c > 0 {
+				b.WriteString(", ")
+			}
 			if d == DialectPostgres {
-				rowPlaceholders[c] = "$" + strconv.Itoa(paramIdx)
+				b.WriteString("$")
+				b.WriteString(strconv.Itoa(paramIdx))
 				paramIdx++
 			} else {
-				rowPlaceholders[c] = "?"
+				b.WriteString("?")
 			}
 		}
-		tuples[r] = fmt.Sprintf("(%s)", strings.Join(rowPlaceholders, ", "))
+		b.WriteString(")")
 	}
-
-	quotedPKs := make([]string, len(pkCols))
-	for i, c := range pkCols {
-		quotedPKs[i] = fmt.Sprintf("%q", c)
-	}
-	pkTuple := strings.Join(quotedPKs, ", ")
-
-	return fmt.Sprintf(`UPDATE %s SET %q = %q WHERE (%s) IN (%s)`,
-		tableRef, newCol, oldCol, pkTuple, strings.Join(tuples, ", "))
+	b.WriteString(")")
+	return b.String()
 }
 
 func quoteTableRef(table string) string {

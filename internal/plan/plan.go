@@ -1,11 +1,13 @@
 package plan
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"maps"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -319,6 +321,7 @@ type Plan struct {
 // alter the hashing format or omit fields without an explicit major version increment.
 func (p *Plan) Hash() string {
 	h := sha256.New()
+	buf := bufio.NewWriterSize(h, 4096)
 
 	includes := slices.Clone(p.IncludeTables)
 	slices.Sort(includes)
@@ -326,7 +329,7 @@ func (p *Plan) Hash() string {
 	slices.Sort(excludes)
 
 	write := func(format string, args ...any) {
-		_, _ = fmt.Fprintf(h, format, args...)
+		_, _ = fmt.Fprintf(buf, format, args...)
 	}
 
 	write("schema:%s\n", p.TargetSchema)
@@ -377,61 +380,102 @@ func (p *Plan) Hash() string {
 		write("catalog_sql:%s\n", schema.RedactSubscriptionConnInfoSQL(p.CatalogSQL))
 	}
 
-	for i, s := range p.Steps {
-		unmStr := ""
-		if len(s.UnmanagedDeps) > 0 {
-			unmStr = "|unmanaged_deps:" + strings.Join(s.UnmanagedDeps, ",")
+	var numBuf [32]byte
+	writeStr := func(s string) {
+		_, _ = buf.WriteString(s)
+	}
+	writeInt := func(n int) {
+		_, _ = buf.Write(strconv.AppendInt(numBuf[:0], int64(n), 10))
+	}
+	writeBool := func(b bool) {
+		if b {
+			_, _ = buf.WriteString("true")
+		} else {
+			_, _ = buf.WriteString("false")
 		}
-		partStr := ""
-		if s.ParentTable != "" {
-			partStr = "|parent:" + s.ParentTable
-		}
-		if s.PartitionBounds != "" {
-			partStr += "|bounds:" + s.PartitionBounds
-		}
-		schemaStr := ""
-		if s.Schema != "" {
-			schemaStr = "|schema:" + s.Schema
-		}
-		pendingStr := ""
-		if s.IsPendingDetach {
-			pendingStr = "|pending_detach:true"
-		}
-		stepMeta := ""
-		if s.IsSignatureChange {
-			stepMeta += "|sig_change:true"
-		}
-		if s.IsDependencyRebuild {
-			stepMeta += "|dep_rebuild:true"
-		}
-		if s.OldEnumValue != "" {
-			stepMeta += "|old_enum:" + s.OldEnumValue
-		}
-		if s.EnumValue != "" {
-			stepMeta += "|enum:" + s.EnumValue
-		}
-		if s.RangeType != nil {
-			stepMeta += "|range_type:true"
-		}
-		if s.CompositeType != nil {
-			stepMeta += "|composite_type:true"
-		}
-		if s.CompositeAttr != "" {
-			stepMeta += "|comp_attr:" + s.CompositeAttr
-		}
-		if s.Sequence != nil {
-			stepMeta += "|seq:true"
-		}
-		if s.OldSequence != nil {
-			stepMeta += "|old_seq:true"
-		}
-		write("step:%d|type:%s|table:%s|sql:%s|destructive:%t|non_tx:%t|not_null:%t|default:%t|narrowed:%t|rebuild:%t|rename_cand:%t|gen_rewrite:%t|old_col:%s%s%s%s%s%s\n",
-			i, s.Type, s.Table, strings.TrimSpace(s.SQL), s.Destructive, s.NonTx,
-			s.ColumnNotNull, s.ColumnHasDefault, s.TypeNarrowed, s.IsTableRebuild,
-			s.IsRenameCandidate, s.IsGeneratedRewrite, s.OldColumn, unmStr, partStr, schemaStr, pendingStr, stepMeta,
-		)
 	}
 
+	for i, s := range p.Steps {
+		writeStr("step:")
+		writeInt(i)
+		writeStr("|type:")
+		writeStr(string(s.Type))
+		writeStr("|table:")
+		writeStr(s.Table)
+		writeStr("|sql:")
+		writeStr(strings.TrimSpace(s.SQL))
+		writeStr("|destructive:")
+		writeBool(s.Destructive)
+		writeStr("|non_tx:")
+		writeBool(s.NonTx)
+		writeStr("|not_null:")
+		writeBool(s.ColumnNotNull)
+		writeStr("|default:")
+		writeBool(s.ColumnHasDefault)
+		writeStr("|narrowed:")
+		writeBool(s.TypeNarrowed)
+		writeStr("|rebuild:")
+		writeBool(s.IsTableRebuild)
+		writeStr("|rename_cand:")
+		writeBool(s.IsRenameCandidate)
+		writeStr("|gen_rewrite:")
+		writeBool(s.IsGeneratedRewrite)
+		writeStr("|old_col:")
+		writeStr(s.OldColumn)
+
+		if len(s.UnmanagedDeps) > 0 {
+			writeStr("|unmanaged_deps:")
+			writeStr(strings.Join(s.UnmanagedDeps, ","))
+		}
+		if s.ParentTable != "" {
+			writeStr("|parent:")
+			writeStr(s.ParentTable)
+		}
+		if s.PartitionBounds != "" {
+			writeStr("|bounds:")
+			writeStr(s.PartitionBounds)
+		}
+		if s.Schema != "" {
+			writeStr("|schema:")
+			writeStr(s.Schema)
+		}
+		if s.IsPendingDetach {
+			writeStr("|pending_detach:true")
+		}
+		if s.IsSignatureChange {
+			writeStr("|sig_change:true")
+		}
+		if s.IsDependencyRebuild {
+			writeStr("|dep_rebuild:true")
+		}
+		if s.OldEnumValue != "" {
+			writeStr("|old_enum:")
+			writeStr(s.OldEnumValue)
+		}
+		if s.EnumValue != "" {
+			writeStr("|enum:")
+			writeStr(s.EnumValue)
+		}
+		if s.RangeType != nil {
+			writeStr("|range_type:true")
+		}
+		if s.CompositeType != nil {
+			writeStr("|composite_type:true")
+		}
+		if s.CompositeAttr != "" {
+			writeStr("|comp_attr:")
+			writeStr(s.CompositeAttr)
+		}
+		if s.Sequence != nil {
+			writeStr("|seq:true")
+		}
+		if s.OldSequence != nil {
+			writeStr("|old_seq:true")
+		}
+		writeStr("\n")
+	}
+
+	_ = buf.Flush()
 	return hex.EncodeToString(h.Sum(nil))
 }
 
