@@ -27,9 +27,9 @@ jobs:
         run: |
           cat << 'EOF' > test_schema.sql
           CREATE TABLE users (
-              id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-              email VARCHAR(255) NOT NULL,
-              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              email TEXT NOT NULL,
+              created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
           );
           CREATE UNIQUE INDEX idx_users_email ON users(email);
           EOF
