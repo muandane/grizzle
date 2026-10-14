@@ -5,7 +5,7 @@ All notable changes to Grizzle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [v0.2.0] - Unreleased
+## [v0.2.0] - 2026-10-14
 
 ### Added
 - **External Dev Database URL for Shadow Compilation** (`--dev-url` / `Options.DevDatabaseURL`):
@@ -36,6 +36,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - Returns `(false, err)` on database connectivity/query failure.
     - Multi-schema support: verifies readiness across all configured target schemas.
   - Zero `Plan.Hash()` impact; 100% backward compatible with existing stored plans.
+- **Nix-Native Test Scenarios & Stress Framework** (`devenv.nix`, `test/scenarios/`):
+  - Parallel developer deployment race condition scenario (`TestScenario_ParallelDeveloperRace`) testing concurrent migrations under advisory locking, validating deterministic `ErrPlanDrift` rejection and zero dirty state.
+  - Connection chaos recovery scenario (`TestScenario_ChaosRecovery`) verifying PostgreSQL transactional rollback and zero orphan table leakage during mid-flight termination.
+  - Lock contention stress scenario (`TestScenario_LockContentionStress`) testing backoff and retry under simulated long-running queries.
+  - Registered commands in `devenv`: `scenario-race`, `scenario-contention`, `scenario-bench`, `scenario-chaos`, and `scenarios`.
+- **Zero-Waste Hot-Path Engine Optimizations**:
+  - Keyset backfill buffer reuse: hoisted scan pointers outside the row cursor loop and built pre-allocated parameter builders, reducing allocations by 53% and boosting throughput to 51,644 rows/sec.
+  - SQLite schema inspection and diff speedup: 13% faster diff generation with zero-allocation substring pre-filters for check constraint scanning and contiguous table slices.
+  - Zero-allocation topological step sorting: added early return and lazy dependency graph allocation for plans with independent DDL operations.
+  - Buffered SHA-256 plan hash streaming: implemented `io.StringWriter` buffering and stack number formatting, eliminating heap escapes while guaranteeing 100% byte-for-byte identical golden digests.
+- **Expanded Declarative SQL Linter Rules & Profiles** (`internal/lint`, `docs/LINTER_SPEC.md`):
+  - Published comprehensive declarative SQL review specification covering 80+ categorized rules across table design, foreign keys, index hygiene, concurrency, and security.
+  - Implemented strict rules: `L014` (`PrimaryKeyTypeAllowlist`), `L022` (`DisallowReservedKeywords`), `L044` (`RequireBooleanDefault`), `L047` (`DisallowDuplicateIndex`), and `L048` (`DisallowRedundantPrefixIndex`).
+  - Added rule profiles (`DefaultRules()`, `StrictRules()`) and CLI configuration filtering via `--strict`, `.grizzle.yaml` `disabled_rules`, and `fail_on` thresholds.
+
+### Removed
+- Pruned 292 lines of obsolete dead code: legacy single-column backfill helpers (`buildCopyBackfillSQL`, `lookupSingleColumnPK`), ad-hoc `cmd/grizzle/devurl.go`, uncalled `FormatGrantKey`, `GenerateAlterSubscriptionApplySQL`, `GenerateValidateFKSQL`, and deprecated `AcquireAdvisoryLock`.
 
 ## [v0.1.0] - 2026-10-13
 

@@ -1,0 +1,51 @@
+name: Test Action
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'action.yml'
+      - '.github/workflows/test-action.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'action.yml'
+      - '.github/workflows/test-action.yml'
+
+jobs:
+  test-action:
+    name: Test Grizzle Action
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Build local grizzle binary
+        run: go build -o /usr/local/bin/grizzle ./cmd/grizzle
+
+      - name: Create test schema
+        run: |
+          cat << 'EOF' > test_schema.sql
+          CREATE TABLE users (
+              id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+              email VARCHAR(255) NOT NULL,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+          );
+          CREATE UNIQUE INDEX idx_users_email ON users(email);
+          EOF
+
+      - name: Test Grizzle Action (lint)
+        uses: ./
+        with:
+          command: lint
+          schema: test_schema.sql
+          strict: true
+          format: github
+
+      - name: Test Grizzle Action (plan on SQLite)
+        uses: ./
+        with:
+          command: plan
+          schema: test_schema.sql
+          dsn: 'sqlite:test.db'
+          format: github

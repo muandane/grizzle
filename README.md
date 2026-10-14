@@ -132,6 +132,39 @@ grizzle export --plan plan.json --format migrate --out ./migrations
 | `3` | Plan hash mismatch (live database changed after plan was generated) |
 | `4` | Schema drift detected (`grizzle check`) |
 
+### GitHub Actions Integration
+
+Use the official Grizzle GitHub Action to lint schemas, detect drift, and preview plans in CI workflows:
+
+```yaml
+name: Schema CI
+on: [pull_request]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint declarative schema
+        uses: muandane/grizzle@v0.2.0
+        with:
+          command: lint
+          schema: schema.sql
+          strict: true
+          format: github
+
+  drift-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for schema drift
+        uses: muandane/grizzle@v0.2.0
+        with:
+          command: check
+          schema: schema.sql
+          dsn: ${{ secrets.STAGING_DATABASE_URL }}
+```
+
 ---
 
 ## Supported Features
@@ -187,7 +220,7 @@ grizzle export --plan plan.json --format migrate --out ./migrations
 * [CONTRIBUTING](CONTRIBUTING.md) — devenv, hooks, PR checklist
 * [CHANGELOG](CHANGELOG.md)
 
-Current tag: **v0.1.0**.
+Current tag: **v0.2.0**.
 
 ## License
 

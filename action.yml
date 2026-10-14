@@ -1,0 +1,148 @@
+name: 'Grizzle Action'
+description: 'Fast, deterministic declarative database schema migrations and SQL linting for PostgreSQL and SQLite'
+author: 'ZIne Moualhi'
+
+branding:
+  icon: 'database'
+  color: 'blue'
+
+inputs:
+  version:
+    description: 'Version of Grizzle to install and run (e.g. v0.2.0, latest)'
+    required: false
+    default: 'v0.2.0'
+  command:
+    description: 'Grizzle command to execute (lint, check, plan, diff, apply, export)'
+    required: false
+    default: 'lint'
+  schema:
+    description: 'Path to the declarative schema.sql file'
+    required: false
+    default: 'schema.sql'
+  dsn:
+    description: 'Target database connection string (DATABASE_URL / POSTGRES_DSN)'
+    required: false
+    default: ''
+  dev-url:
+    description: 'Dev database connection string used for shadow-schema compilation'
+    required: false
+    default: ''
+  config:
+    description: 'Path to .grizzle.yaml configuration file'
+    required: false
+    default: ''
+  profile:
+    description: 'Lint rule profile: standard (default), strict, or all'
+    required: false
+    default: 'standard'
+  strict:
+    description: 'Alias for profile: strict'
+    required: false
+    default: 'false'
+  fail-on-warning:
+    description: 'Fail lint when warnings are reported'
+    required: false
+    default: 'false'
+  format:
+    description: 'Output format (github, text, json)'
+    required: false
+    default: 'github'
+  extra-args:
+    description: 'Extra CLI flags passed directly to grizzle'
+    required: false
+    default: ''
+
+outputs:
+  exit-code:
+    description: 'Exit code returned by Grizzle'
+    value: ${{ steps.run-grizzle.outputs.exit-code }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Go
+      uses: actions/setup-go@v7
+      with:
+        go-version: 'stable'
+        cache: false
+
+    - name: Install Grizzle
+      shell: bash
+      run: |
+        if command -v grizzle >/dev/null 2>&1; then
+          echo "Grizzle is already installed: $(grizzle --version || echo 'installed')"
+        else
+          VER="${{ inputs.version }}"
+          if [ "$VER" = "latest" ] || [ -z "$VER" ]; then
+            TARGET="github.com/muandane/grizzle/cmd/grizzle@latest"
+          else
+            TARGET="github.com/muandane/grizzle/cmd/grizzle@${VER}"
+          fi
+          echo "Installing Grizzle from ${TARGET}..."
+          go install "${TARGET}"
+        fi
+
+    - name: Run Grizzle
+      id: run-grizzle
+      shell: bash
+      run: |
+        CMD="${{ inputs.command }}"
+        SCHEMA="${{ inputs.schema }}"
+        DSN="${{ inputs.dsn }}"
+        DEV_URL="${{ inputs.dev-url }}"
+        CONFIG="${{ inputs.config }}"
+        PROFILE="${{ inputs.profile }}"
+        STRICT="${{ inputs.strict }}"
+        FAIL_ON_WARNING="${{ inputs.fail-on-warning }}"
+        FORMAT="${{ inputs.format }}"
+        EXTRA="${{ inputs.extra-args }}"
+
+        ARGS=()
+        ARGS+=("$CMD")
+
+        if [ -n "$SCHEMA" ] && [ -f "$SCHEMA" ]; then
+          ARGS+=(--schema "$SCHEMA")
+        fi
+
+        if [ -n "$DSN" ]; then
+          ARGS+=(--dsn "$DSN")
+        fi
+
+        if [ -n "$DEV_URL" ]; then
+          ARGS+=(--dev-url "$DEV_URL")
+        fi
+
+        if [ -n "$CONFIG" ] && [ -f "$CONFIG" ]; then
+          ARGS+=(--config "$CONFIG")
+        fi
+
+        if [ "$CMD" = "lint" ]; then
+          if [ "$STRICT" = "true" ] || [ "$PROFILE" = "strict" ]; then
+            ARGS+=(--profile strict)
+          elif [ -n "$PROFILE" ] && [ "$PROFILE" != "standard" ]; then
+            ARGS+=(--profile "$PROFILE")
+          fi
+          if [ "$FAIL_ON_WARNING" = "true" ]; then
+            ARGS+=(--fail-on-warning)
+          fi
+          if [ "$FORMAT" = "github" ]; then
+            ARGS+=(--github)
+          fi
+        elif [ "$CMD" = "plan" ] || [ "$CMD" = "diff" ]; then
+          if [ "$FORMAT" = "github" ]; then
+            ARGS+=(--github)
+          fi
+        fi
+
+        if [ -n "$EXTRA" ]; then
+          # Split extra args into array
+          read -ra EXTRA_ARR <<< "$EXTRA"
+          ARGS+=("${EXTRA_ARR[@]}")
+        fi
+
+        echo "Executing: grizzle ${ARGS[*]}"
+        set +e
+        grizzle "${ARGS[@]}"
+        EXIT_CODE=$?
+        echo "exit-code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+        exit $EXIT_CODE
