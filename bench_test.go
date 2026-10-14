@@ -354,3 +354,22 @@ func BenchmarkSortSteps(b *testing.B) {
 		plan.SortSteps(cloned)
 	}
 }
+
+func BenchmarkSortSteps_NoDependencies(b *testing.B) {
+	b.ReportAllocs()
+	steps := make([]plan.Step, 50)
+	for i := range steps {
+		steps[i] = plan.Step{
+			Type:  plan.ChangeAddColumn,
+			Table: fmt.Sprintf("tbl_%d", i),
+			SQL:   fmt.Sprintf("ALTER TABLE tbl_%d ADD COLUMN col_%d INT;", i, i),
+		}
+	}
+
+	b.ResetTimer()
+	for b.Loop() {
+		cloned := make([]plan.Step, len(steps))
+		copy(cloned, steps)
+		plan.SortSteps(cloned)
+	}
+}

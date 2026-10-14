@@ -57,22 +57,24 @@ func InspectSchema(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*
 	}
 	defer func() { _ = tblRows.Close() }()
 
-	var tableNames []string
-	tableSQLMap := make(map[string]string)
+	type tableEntry struct {
+		name string
+		ddl  string
+	}
+	var tables []tableEntry
 	for tblRows.Next() {
 		var name string
 		var tableSQL sql.NullString
 		if err := tblRows.Scan(&name, &tableSQL); err != nil {
 			return nil, err
 		}
-		tableNames = append(tableNames, name)
-		if tableSQL.Valid {
-			tableSQLMap[name] = tableSQL.String
-		}
+		tables = append(tables, tableEntry{name: name, ddl: tableSQL.String})
 	}
 	_ = tblRows.Close()
 
-	for _, tblName := range tableNames {
+	for _, te := range tables {
+		tblName := te.name
+		tableDDL := te.ddl
 		tbl := &schema.Table{
 			Schema:      schemaName,
 			Name:        tblName,
@@ -81,7 +83,6 @@ func InspectSchema(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*
 			ForeignKeys: make(map[string]*schema.ForeignKey),
 		}
 		s.Tables[tblName] = tbl
-		tableDDL := tableSQLMap[tblName]
 
 		// 1b. Parse CHECK constraints (named and inline) from the stored DDL.
 		// SQLite has no PRAGMA for CHECK constraints; sqlite_schema.sql is the
@@ -367,6 +368,9 @@ func parseSQLiteChecks(tableName, tableDDL string) map[string]*schema.CheckConst
 	for _, part := range splitSQLiteTopLevel(body) {
 		trimmed := strings.TrimSpace(part)
 		if trimmed == "" {
+			continue
+		}
+		if !strings.Contains(trimmed, "CHECK") && !strings.Contains(trimmed, "check") && !strings.Contains(trimmed, "Check") {
 			continue
 		}
 
