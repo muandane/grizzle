@@ -111,8 +111,11 @@ grizzle baseline --dsn "$DATABASE_URL" --schema schema.sql
 # Resolve an interrupted or failed migration
 grizzle repair --dsn "$DATABASE_URL" --note "manually resolved"
 
-# Fail CI if live DB has drifted from schema.sql (exits with code 4)
-grizzle check --dsn "$DATABASE_URL" --schema schema.sql
+# Statically lint schema.sql offline (pure in-memory shadow, no DB connection needed)
+grizzle lint --schema schema.sql
+
+# Run strict linting with GitHub Actions annotations in CI
+grizzle lint --schema schema.sql --profile strict --format github --fail-on-warning
 
 # Convert a plan to Goose or golang-migrate migrations if you need an exit hatch
 grizzle export --plan plan.json --format goose --out ./migrations

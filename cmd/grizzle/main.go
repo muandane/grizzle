@@ -160,6 +160,7 @@ func run(args []string) int {
 		templateFlag     = fs.String("template", "", "Project template: sqlc, stdlib, or sqlite")
 		dirFlag          = fs.String("dir", ".", "Destination directory for init")
 		forceFlag        = fs.Bool("force", false, "Overwrite existing files during init, or force baseline")
+		profileFlag      = fs.String("profile", "", "Lint rule profile: standard (default), strict, or all")
 		failOnWarn       = fs.Bool("fail-on-warning", false, "Fail lint when warnings are reported")
 		dryRunFlag       = fs.Bool("dry-run", false, "Verify planned DDL against live data without persisting changes (apply)")
 		seedFile         = fs.String("seed", "", "Path to seed SQL file (seed)")
@@ -246,6 +247,9 @@ func run(args []string) int {
 		if !*failOnWarn && cfg.Lint.FailOnWarning {
 			*failOnWarn = true
 		}
+		if *profileFlag == "" && cfg.Lint.Profile != "" {
+			*profileFlag = cfg.Lint.Profile
+		}
 	}
 
 	setupLogger(*jsonLog)
@@ -315,7 +319,12 @@ func run(args []string) int {
 		if lintFormat == "sql" {
 			lintFormat = "text"
 		}
-		return runLint(ctx, dsn, devURL, *schemaFile, lintFormat, *failOnWarn)
+		if *githubOutput {
+			lintFormat = "github"
+		} else if *jsonOutput {
+			lintFormat = "json"
+		}
+		return runLint(ctx, dsn, devURL, *schemaFile, lintFormat, *profileFlag, *failOnWarn, configFile)
 	case "export":
 		return runExport(ctx, dsn, devURL, *planFile, *schemaFile, *formatFlag, *versionFlag, *outFile, *allowDrop)
 	case "seed":

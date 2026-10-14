@@ -13,6 +13,7 @@ import (
 
 // LintConfig configures schema lint behavior.
 type LintConfig struct {
+	Profile       string   `json:"profile"`
 	FailOnWarning bool     `json:"fail_on_warning"`
 	DisabledRules []string `json:"disabled_rules"`
 }
@@ -149,7 +150,10 @@ func parseYAML(content string, cfg *Config) error {
 		}
 
 		if currentSection == "lint" {
-			if k == "fail_on_warning" {
+			switch k {
+			case "profile":
+				cfg.Lint.Profile = v
+			case "fail_on_warning":
 				b, _ := strconv.ParseBool(v)
 				cfg.Lint.FailOnWarning = b
 			}

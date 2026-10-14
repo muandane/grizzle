@@ -68,6 +68,15 @@ These rules are currently implemented in Grizzle's [`internal/lint`](../internal
 | `L012` | `ERROR` | **NonIdempotentSeed** | Seed DML in `SeedSQL` lacks an `ON CONFLICT` clause or idempotent guard. |
 | `L013` | `ERROR` | **UnsupportedSQLiteFeature** | Schema attempts to use features unsupported on SQLite (e.g. `COMMENT ON`, RLS, or enum types). |
 
+### Strict Profile Rules (`--profile strict`)
+| Rule ID | Severity | Name | Description |
+| :--- | :--- | :--- | :--- |
+| `L014` | `ERROR` | **PrimaryKeyTypeAllowlist** | Primary key columns must use an allowed integer or UUID data type (`BIGINT`, `INTEGER`, `SMALLINT`, `UUID`). |
+| `L022` | `ERROR` | **DisallowReservedKeyword** | Tables and columns must not use reserved SQL keywords (`user`, `order`, `table`, etc.). |
+| `L044` | `WARNING` | **RequireBooleanDefault** | Boolean columns should declare an explicit `DEFAULT false` or `DEFAULT true` to avoid tri-state `NULL`. |
+| `L047` | `ERROR` | **DisallowDuplicateIndex** | Table must not declare duplicate indexes covering the identical columns, access method, and predicate. |
+| `L048` | `WARNING` | **DisallowRedundantPrefixIndex** | Single-column index is redundant when a composite index covers the column as its leading prefix. |
+
 ---
 
 ## 3. Exhaustive Rule Catalog (`L014`–`L080`)

@@ -1013,6 +1013,17 @@ func DefaultLintRules() []LintRule {
 	return lint.DefaultRules()
 }
 
+// LintRulesForProfile returns the lint rules corresponding to a profile name
+// ("standard", "strict", "all"). An empty name defaults to "standard".
+func LintRulesForProfile(profile string) ([]LintRule, error) {
+	return lint.RulesForProfile(profile)
+}
+
+// FilterLintRules excludes rules whose IDs match any entry in disabledIDs.
+func FilterLintRules(rules []LintRule, disabledIDs []string) []LintRule {
+	return lint.FilterRules(rules, disabledIDs)
+}
+
 // LintHasErrors reports whether any diagnostic has severity ERROR.
 func LintHasErrors(diags []LintDiagnostic) bool {
 	return lint.HasErrors(diags)
