@@ -96,13 +96,19 @@ var changeTypePriority = map[ChangeType]int{
 // sorted strongly-connected remainder — never via a comparator that can
 // violate the sort contract.
 func SortSteps(steps []Step) {
+	if len(steps) <= 1 {
+		return
+	}
 
 	// Build relational dependency graph: referencingTable -> referencedTable
 	// deps[A][B] = true means table A depends on table B (A references B)
-	deps := make(map[string]map[string]bool)
+	var deps map[string]map[string]bool
 	addDep := func(child, parent string) {
 		if child == "" || parent == "" || child == parent {
 			return
+		}
+		if deps == nil {
+			deps = make(map[string]map[string]bool)
 		}
 		if deps[child] == nil {
 			deps[child] = make(map[string]bool)
