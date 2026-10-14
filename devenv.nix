@@ -166,6 +166,36 @@
       echo "Database schema reset successfully."
     '';
 
+    "scenario-race".exec = ''
+      echo "==> Running Parallel Developer Race Simulation..."
+      go test -tags scenario -v -run TestScenario_ParallelDeveloperRace ./test/scenarios/...
+    '';
+
+    "scenario-contention".exec = ''
+      echo "==> Running Lock Contention Stress Test..."
+      go test -tags scenario -v -run TestScenario_LockContentionStress ./test/scenarios/...
+    '';
+
+    "scenario-bench".exec = ''
+      echo "==> Running Keyset Pagination 100k Benchmark..."
+      go test -tags scenario -bench=. -benchmem -run=^$ ./test/scenarios/...
+    '';
+
+    "scenario-chaos".exec = ''
+      echo "==> Running Chaos / Crash Mid-Migration Recovery..."
+      go test -tags scenario -v -run TestScenario_ChaosRecovery ./test/scenarios/...
+    '';
+
+    "scenarios".exec = ''
+      echo "================================================================================"
+      echo "==> Running ALL Nix-Native Grizzle Scenarios & Benchmarks"
+      echo "================================================================================"
+      go test -tags scenario -v -race ./test/scenarios/...
+      echo ""
+      echo "==> Running Keyset Benchmarks..."
+      go test -tags scenario -bench=. -benchmem -run=^$ ./test/scenarios/...
+    '';
+
     "clean".exec = ''
       echo "Cleaning generated SQLite databases, test logs, and build artifacts..."
       find . -type f \( -name "*.db" -o -name "*.db-*" -o -name "*.sqlite" -o -name "*.sqlite-*" -o -name "*.out" -o -name "coverage.txt" -o -name "*.prof" -o -name "*.log" \) -delete
@@ -203,6 +233,11 @@
     echo "  lint            -> golangci-lint both modules"
     echo "  test            -> Unit tests with race detector (both modules)"
     echo "  test-integration-> Integration tests against PostgreSQL (needs devenv up)"
+    echo "  scenarios       -> Run all custom scenarios & benchmarks"
+    echo "  scenario-race   -> Run parallel developer race simulation"
+    echo "  scenario-contention -> Run lock contention stress test"
+    echo "  scenario-bench  -> Run 100k composite PK keyset benchmark"
+    echo "  scenario-chaos  -> Run crash / rollback recovery test"
     echo "  golden-update   -> Regenerate golden plan/export fixtures"
     echo "  ci              -> lint + vet + test + test-integration (full local gate)"
     echo "  db-shell        -> Connect to local test database via psql"
