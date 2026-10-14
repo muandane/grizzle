@@ -179,6 +179,7 @@ grizzle export --plan plan.json --format migrate --out ./migrations
 
 * [SPEC](docs/SPEC.md) — Supported SQL constructs and engine details
 * [SAFETY](docs/SAFETY.md) — Hazards, data safety rules, and drop policies
+* [LINTER](docs/LINTER_SPEC.md) — SQL review rules, naming conventions, and linting catalog
 * [ARCHITECTURE](docs/ARCHITECTURE.md) — Internal planner and execution flow
 * [CONTRIBUTING](CONTRIBUTING.md) — devenv, hooks, PR checklist
 * [CHANGELOG](CHANGELOG.md)
