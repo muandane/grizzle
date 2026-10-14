@@ -235,13 +235,6 @@ func GenerateValidateConstraintSQL(targetSchema, tableName, constraintName strin
 	return fmt.Sprintf("ALTER TABLE %q.%q VALIDATE CONSTRAINT %q;", targetSchema, tableName, constraintName)
 }
 
-// GenerateValidateFKSQL constructs an ALTER TABLE ... VALIDATE CONSTRAINT statement.
-//
-// Deprecated: use GenerateValidateConstraintSQL, which is constraint-kind agnostic.
-func GenerateValidateFKSQL(targetSchema, tableName, fkName string) string {
-	return GenerateValidateConstraintSQL(targetSchema, tableName, fkName)
-}
-
 // GenerateDropFKSQL constructs an ALTER TABLE ... DROP CONSTRAINT statement.
 func GenerateDropFKSQL(targetSchema, tableName, fkName string) string {
 	return fmt.Sprintf("ALTER TABLE %q.%q DROP CONSTRAINT IF EXISTS %q;", targetSchema, tableName, fkName)

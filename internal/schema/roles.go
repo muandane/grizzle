@@ -1086,8 +1086,3 @@ func ValidateRolesSQL(sql string) error {
 	}
 	return nil
 }
-
-// FormatGrantKey is a stable display key for grant records.
-func FormatGrantKey(g *Grant) string {
-	return fmt.Sprintf("%s:%s:%s", g.ObjectKind, g.ObjectName, g.Grantee)
-}

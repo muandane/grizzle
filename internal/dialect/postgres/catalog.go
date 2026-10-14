@@ -619,21 +619,9 @@ func generateCreateSubscriptionSQL(s *schema.Subscription, redact bool) string {
 // SET PUBLICATION drift for one subscription. Connection strings in the
 // returned SQL are redacted.
 func GenerateAlterSubscriptionSQL(want, old *schema.Subscription) string {
-	return generateAlterSubscriptionSQL(want, old, true)
-}
-
-// GenerateAlterSubscriptionApplySQL renders alter SQL with plaintext conninfo.
-func GenerateAlterSubscriptionApplySQL(want, old *schema.Subscription) string {
-	return generateAlterSubscriptionSQL(want, old, false)
-}
-
-func generateAlterSubscriptionSQL(want, old *schema.Subscription, redact bool) string {
 	var out []string
 	if old == nil || want.ConnInfo != old.ConnInfo {
-		conn := want.ConnInfo
-		if redact {
-			conn = schema.PasswordRedacted
-		}
+		conn := schema.PasswordRedacted
 		out = append(out, fmt.Sprintf("ALTER SUBSCRIPTION %s CONNECTION '%s';",
 			quoteIdentifier(want.Name), escapeSQLString(conn)))
 	}
