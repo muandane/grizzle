@@ -4,7 +4,7 @@ go 1.27.1
 
 require (
 	github.com/creack/pty v1.1.24
-	github.com/jackc/pgx/v5 v5.11.0
+	github.com/jackc/pgx/v5 v5.12.0
 	github.com/mattn/go-isatty v0.0.24
 	modernc.org/sqlite v1.61.0
 )
