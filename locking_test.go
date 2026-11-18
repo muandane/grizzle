@@ -5,6 +5,7 @@ package grizzle_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -1097,6 +1098,203 @@ func TestHookPanic_LockReleasedAfterBeforeStepPanic(t *testing.T) {
 	}
 	var released bool
 	_ = testConn.QueryRowContext(context.Background(), "SELECT pg_advisory_unlock($1, $2);", nsKey, schemaKey).Scan(&released)
+}
+
+// TestLocking_HookFailureReleasesAdvisoryLock verifies the advisory lock is
+// released and the dedicated connection is safely handled when an AfterSync
+// or StepHook fails while context cancellation occurs.
+func TestLocking_HookFailureReleasesAdvisoryLock(t *testing.T) {
+	db := testutil.TestDatabase(t)
+
+	schema := fmt.Sprintf("test_hook_fail_rel_%d", time.Now().UnixNano())
+	if _, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema)); err != nil {
+		t.Fatalf("failed creating schema: %v", err)
+	}
+	defer func() { _, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schema)) }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	hookErr := errors.New("after_sync hook simulated failure")
+	err := grizzle.Sync(ctx, db, grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: schema,
+		SchemaSQL:    "CREATE TABLE hook_fail_tbl (id BIGINT PRIMARY KEY);",
+		AfterSync: func(hookCtx context.Context, dbtx dialect.DBTX) error {
+			cancel() // cancel parent context
+			return hookErr
+		},
+	})
+	if err == nil {
+		t.Fatalf("expected error from AfterSync, got nil")
+	}
+	if !errors.Is(err, hookErr) && !strings.Contains(err.Error(), hookErr.Error()) {
+		t.Errorf("expected hook failure in error, got: %v", err)
+	}
+
+	// The advisory lock must be released immediately despite the cancelled context.
+	nsKey := postgres.Hash32("grizzle")
+	schemaKey := postgres.Hash32(schema)
+	testConn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("failed acquiring test conn: %v", err)
+	}
+	defer func() { _ = testConn.Close() }()
+
+	lockCtx, lockCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer lockCancel()
+	if err := postgres.AcquireSessionAdvisoryLock2(lockCtx, testConn, nsKey, schemaKey); err != nil {
+		t.Fatalf("advisory lock not released after hook failure with cancelled context: %v", err)
+	}
+	var released bool
+	_ = testConn.QueryRowContext(context.Background(), "SELECT pg_advisory_unlock($1, $2);", nsKey, schemaKey).Scan(&released)
+}
+
+// TestLocking_HookAbortedTransactionReleasesAdvisoryLock verifies that even if a hook
+// leaves an aborted transaction block on the dedicated connection, the advisory
+// lock is still released and the connection is reset or discarded.
+func TestLocking_HookAbortedTransactionReleasesAdvisoryLock(t *testing.T) {
+	db := testutil.TestDatabase(t)
+
+	schema := fmt.Sprintf("test_hook_abort_rel_%d", time.Now().UnixNano())
+	if _, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema)); err != nil {
+		t.Fatalf("failed creating schema: %v", err)
+	}
+	defer func() { _, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schema)) }()
+
+	err := grizzle.Sync(context.Background(), db, grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: schema,
+		SchemaSQL:    "CREATE TABLE hook_abort_tbl (id BIGINT PRIMARY KEY);",
+		AfterSync: func(hookCtx context.Context, dbtx dialect.DBTX) error {
+			// Deliberately leave the connection in an aborted transaction block
+			_, _ = dbtx.ExecContext(hookCtx, "BEGIN;")
+			_, _ = dbtx.ExecContext(hookCtx, "SELECT 1/0;")
+			return errors.New("aborted transaction hook failure")
+		},
+	})
+	if err == nil {
+		t.Fatalf("expected error from AfterSync, got nil")
+	}
+
+	nsKey := postgres.Hash32("grizzle")
+	schemaKey := postgres.Hash32(schema)
+	testConn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("failed acquiring test conn: %v", err)
+	}
+	defer func() { _ = testConn.Close() }()
+
+	lockCtx, lockCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer lockCancel()
+	if err := postgres.AcquireSessionAdvisoryLock2(lockCtx, testConn, nsKey, schemaKey); err != nil {
+		t.Fatalf("advisory lock not released after aborted transaction hook: %v", err)
+	}
+	var released bool
+	_ = testConn.QueryRowContext(context.Background(), "SELECT pg_advisory_unlock($1, $2);", nsKey, schemaKey).Scan(&released)
+}
+
+// TestLocking_SeedFailureReleasesAdvisoryLock verifies that when SeedPostgres fails or
+// is cancelled, the advisory lock is released.
+func TestLocking_SeedFailureReleasesAdvisoryLock(t *testing.T) {
+	db := testutil.TestDatabase(t)
+
+	schema := fmt.Sprintf("test_seed_fail_rel_%d", time.Now().UnixNano())
+	if _, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema)); err != nil {
+		t.Fatalf("failed creating schema: %v", err)
+	}
+	defer func() { _, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schema)) }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Run Seed with SQL that fails inside the transaction, and cancel the context mid-flight.
+	_ = grizzle.Seed(ctx, db, "INSERT INTO nonexistent_seed_tbl VALUES (1);",
+		grizzle.WithDialect(grizzle.DialectPostgres),
+		grizzle.WithTargetSchema(schema),
+	)
+	cancel()
+
+	nsKey := postgres.Hash32("grizzle")
+	schemaKey := postgres.Hash32(schema)
+	testConn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("failed acquiring test conn: %v", err)
+	}
+	defer func() { _ = testConn.Close() }()
+
+	lockCtx, lockCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer lockCancel()
+	if err := postgres.AcquireSessionAdvisoryLock2(lockCtx, testConn, nsKey, schemaKey); err != nil {
+		t.Fatalf("advisory lock not released after failed Seed: %v", err)
+	}
+	var released bool
+	_ = testConn.QueryRowContext(context.Background(), "SELECT pg_advisory_unlock($1, $2);", nsKey, schemaKey).Scan(&released)
+}
+
+// TestLocking_LockAcquisitionFailureResetsSessionState verifies that when lock
+// acquisition fails, session state (search_path, timeouts) is reset and never
+// leaked back into the database connection pool.
+func TestLocking_LockAcquisitionFailureResetsSessionState(t *testing.T) {
+	connStr := testutil.PostgresDSN()
+	db, err := sql.Open("pgx", connStr)
+	if err != nil {
+		t.Fatalf("failed to open pg: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	// SetMaxOpenConns(1) ensures the same connection is reused from the pool
+	db.SetMaxOpenConns(1)
+
+	schema := fmt.Sprintf("test_lock_fail_reset_%d", time.Now().UnixNano())
+	if _, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %s;", schema)); err != nil {
+		t.Fatalf("failed creating schema: %v", err)
+	}
+	defer func() {
+		dropDB, _ := sql.Open("pgx", connStr)
+		defer func() { _ = dropDB.Close() }()
+		_, _ = dropDB.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", schema))
+	}()
+
+	holderDB, err := sql.Open("pgx", connStr)
+	if err != nil {
+		t.Fatalf("failed to open holder pg: %v", err)
+	}
+	defer func() { _ = holderDB.Close() }()
+
+	holderConn, err := holderDB.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("failed to acquire holder conn: %v", err)
+	}
+	defer func() { _ = holderConn.Close() }()
+
+	nsKey := postgres.Hash32("grizzle")
+	schemaKey := postgres.Hash32(schema)
+	var dummy int
+	if err := holderConn.QueryRowContext(context.Background(), "SELECT 1 FROM pg_advisory_lock($1, $2);", nsKey, schemaKey).Scan(&dummy); err != nil {
+		t.Fatalf("holder failed acquiring pg_advisory_lock: %v", err)
+	}
+	defer func() {
+		var released bool
+		_ = holderConn.QueryRowContext(context.Background(), "SELECT pg_advisory_unlock($1, $2);", nsKey, schemaKey).Scan(&released)
+	}()
+
+	syncErr := grizzle.Sync(context.Background(), db, grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: schema,
+		SchemaSQL:    "CREATE TABLE test_reset_tbl (id BIGINT PRIMARY KEY);",
+		LockTimeout:  100 * time.Millisecond,
+		MaxRetries:   1,
+	})
+	if syncErr == nil {
+		t.Fatalf("expected lock acquisition error, got nil")
+	}
+
+	var currentSearchPath string
+	if err := db.QueryRow("SHOW search_path;").Scan(&currentSearchPath); err != nil {
+		t.Fatalf("failed checking search_path: %v", err)
+	}
+	if strings.Contains(currentSearchPath, schema) {
+		t.Fatalf("search_path was leaked into connection pool after lock acquisition failure: %q", currentSearchPath)
+	}
 }
 
 // TestApply_FallbackUsesNamespaceLocks verifies the direct-apply fallback

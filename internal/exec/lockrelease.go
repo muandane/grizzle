@@ -27,6 +27,10 @@ func releasePostgresConn(ctx context.Context, conn *sql.Conn, release func(conte
 	relCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseLockTimeout)
 	defer cancel()
 
+	// Terminate any open or aborted transaction block so advisory unlock
+	// statements and session resets can execute cleanly.
+	_, _ = conn.ExecContext(relCtx, "ROLLBACK;")
+
 	err := release(relCtx)
 	if err == nil {
 		// Reset session state; on failure the session leaks search_path and

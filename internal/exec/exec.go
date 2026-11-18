@@ -607,6 +607,19 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig, b
 	}
 	defer func() { _ = conn.Close() }()
 
+	var acquiredSchemas []string
+	var lockAcquired bool
+	defer releasePostgresConn(ctx, conn, func(relCtx context.Context) error {
+		if !lockAcquired {
+			return nil
+		}
+		if cfg.LockID != 0 {
+			return postgres.ReleaseSessionAdvisoryLock(relCtx, conn, cfg.LockID)
+		}
+		lockNs := cmp.Or(cfg.LockNamespace, "grizzle")
+		return postgres.ReleaseSchemaLocks(relCtx, conn, lockNs, acquiredSchemas)
+	})
+
 	// BeforeSync runs once before any migration steps or locks are executed.
 	if err := callBeforeSync(cfg.BeforeSync, ctx, conn); err != nil {
 		hookErr := fmt.Errorf("grizzle: before_sync hook: %w", err)
@@ -637,7 +650,6 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig, b
 	if cfg.Tracer != nil {
 		_, lockSpan = cfg.Tracer.Start(ctx, "grizzle.acquire_lock")
 	}
-	var acquiredSchemas []string
 	if cfg.LockID != 0 {
 		err = postgres.AcquireSessionAdvisoryLock(lockCtx, conn, cfg.LockID)
 	} else {
@@ -665,13 +677,7 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig, b
 		}
 		return 0, fmt.Errorf("%w: %w", plan.ErrLockAcquisition, err)
 	}
-	defer releasePostgresConn(ctx, conn, func(relCtx context.Context) error {
-		if cfg.LockID != 0 {
-			return postgres.ReleaseSessionAdvisoryLock(relCtx, conn, cfg.LockID)
-		}
-		lockNs := cmp.Or(cfg.LockNamespace, "grizzle")
-		return postgres.ReleaseSchemaLocks(relCtx, conn, lockNs, acquiredSchemas)
-	})
+	lockAcquired = true
 
 	if logger != nil {
 		if cfg.LockID != 0 {
@@ -1545,6 +1551,19 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 	}
 	defer func() { _ = conn.Close() }()
 
+	var acquiredSchemas []string
+	var lockAcquired bool
+	defer releasePostgresConn(ctx, conn, func(relCtx context.Context) error {
+		if !lockAcquired {
+			return nil
+		}
+		if cfg.LockID != 0 {
+			return postgres.ReleaseSessionAdvisoryLock(relCtx, conn, cfg.LockID)
+		}
+		lockNs := cmp.Or(cfg.LockNamespace, "grizzle")
+		return postgres.ReleaseSchemaLocks(relCtx, conn, lockNs, acquiredSchemas)
+	})
+
 	// BeforeSync runs once before any migration steps or locks are executed.
 	if err := callBeforeSync(cfg.BeforeSync, ctx, conn); err != nil {
 		hookErr := fmt.Errorf("grizzle: before_sync hook: %w", err)
@@ -1575,7 +1594,6 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 	if cfg.Tracer != nil {
 		_, lockSpan = cfg.Tracer.Start(ctx, "grizzle.acquire_lock")
 	}
-	var acquiredSchemas []string
 	if cfg.LockID != 0 {
 		err = postgres.AcquireSessionAdvisoryLock(lockCtx, conn, cfg.LockID)
 	} else {
@@ -1603,13 +1621,7 @@ func applyPostgresOnce(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Postgr
 		}
 		return 0, fmt.Errorf("%w: %w", plan.ErrLockAcquisition, err)
 	}
-	defer releasePostgresConn(ctx, conn, func(relCtx context.Context) error {
-		if cfg.LockID != 0 {
-			return postgres.ReleaseSessionAdvisoryLock(relCtx, conn, cfg.LockID)
-		}
-		lockNs := cmp.Or(cfg.LockNamespace, "grizzle")
-		return postgres.ReleaseSchemaLocks(relCtx, conn, lockNs, acquiredSchemas)
-	})
+	lockAcquired = true
 
 	if logger != nil {
 		if cfg.LockID != 0 {
