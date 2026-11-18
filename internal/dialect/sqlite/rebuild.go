@@ -118,7 +118,7 @@ func GenerateSQLiteCreateTable(tbl *schema.Table) string {
 
 // GenerateSQLiteRebuildPlan generates the standard 12-step atomic table replacement plan,
 // preserving and rebinding referencing views and triggers across table recreation.
-func GenerateSQLiteRebuildPlan(liveTable, desiredTable *schema.Table, refViews, refTriggers []*schema.UnmanagedObject) (string, bool) {
+func GenerateSQLiteRebuildPlan(liveTable, desiredTable *schema.Table, refViews, refTriggers []*schema.UnmanagedObject) (string, bool, []string) {
 	sch := desiredTable.Schema
 	if sch == "" {
 		sch = liveTable.Schema
@@ -130,19 +130,24 @@ func GenerateSQLiteRebuildPlan(liveTable, desiredTable *schema.Table, refViews, 
 	rebuiltTable.Schema = sch
 	createTempSQL := GenerateSQLiteCreateTable(&rebuiltTable)
 
-	var commonCols []string
+	var rawCols []string
 	var droppedCols []string
 	for colName := range liveTable.Columns {
 		if dCol, exists := desiredTable.Columns[colName]; exists {
 			// Generated columns cannot be inserted into in SQLite
 			if dCol.Generated == nil {
-				commonCols = append(commonCols, fmt.Sprintf("%q", colName))
+				rawCols = append(rawCols, colName)
 			}
 		} else {
 			droppedCols = append(droppedCols, colName)
 		}
 	}
-	slices.Sort(commonCols)
+	slices.Sort(rawCols)
+
+	var commonCols []string
+	for _, col := range rawCols {
+		commonCols = append(commonCols, fmt.Sprintf("%q", col))
+	}
 
 	colList := strings.Join(commonCols, ", ")
 	copyDataSQL := fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM %s;",
@@ -187,7 +192,7 @@ func GenerateSQLiteRebuildPlan(liveTable, desiredTable *schema.Table, refViews, 
 	}
 
 	isDestructive := len(droppedCols) > 0
-	return strings.Join(statements, "\n"), isDestructive
+	return strings.Join(statements, "\n"), isDestructive, rawCols
 }
 
 // checksDelta compares live and desired CHECK constraints. It returns the
@@ -425,7 +430,7 @@ func Diff(live, desired *schema.Schema, filters scope.Filters) []plan.Step {
 			slices.SortFunc(refViews, func(a, b *schema.UnmanagedObject) int { return cmp.Compare(a.Name, b.Name) })
 			slices.SortFunc(refTriggers, func(a, b *schema.UnmanagedObject) int { return cmp.Compare(a.Name, b.Name) })
 
-			rebuildSQL, destructive := GenerateSQLiteRebuildPlan(lTable, dTable, refViews, refTriggers)
+			rebuildSQL, destructive, rebuildCols := GenerateSQLiteRebuildPlan(lTable, dTable, refViews, refTriggers)
 			changeType := plan.ChangeAlterColumn
 			if len(droppedCols) > 0 {
 				changeType = plan.ChangeDropColumn
@@ -447,6 +452,7 @@ func Diff(live, desired *schema.Schema, filters scope.Filters) []plan.Step {
 				IsRenameCandidate:  isRenameCandidate,
 				IsGeneratedRewrite: isGeneratedRewrite,
 				OldColumn:          renameCandidateOldCol,
+				Columns:            rebuildCols,
 			})
 
 			for _, idx := range dTable.Indexes {

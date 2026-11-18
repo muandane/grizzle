@@ -2049,7 +2049,6 @@ func executeSQLiteStepInner(ctx context.Context, tx *sql.Tx, s plan.Step, cfg SQ
 			_, _ = tx.ExecContext(ctx, "RELEASE SAVEPOINT grizzle_rebuild;")
 			return fmt.Errorf("malformed copy statement in rebuild SQL")
 		}
-		copyStmt := rest[:semiIdx+1]
 		afterCopy := strings.TrimSpace(rest[semiIdx+1:])
 
 		if beforeCopy != "" {
@@ -2060,17 +2059,21 @@ func executeSQLiteStepInner(ctx context.Context, tx *sql.Tx, s plan.Step, cfg SQ
 			}
 		}
 
-		colStart := strings.Index(copyStmt, "(")
-		colEnd := strings.Index(copyStmt, ")")
-		if colStart != -1 && colEnd != -1 && colEnd > colStart {
-			colList := strings.TrimSpace(copyStmt[colStart+1 : colEnd])
-			if colList != "" {
-				if err := copyDataKeysetChunks(ctx, tx, tempRef, colList, tblRef, batchSize, cfg.Logger); err != nil {
-					_, _ = tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT grizzle_rebuild;")
-					_, _ = tx.ExecContext(ctx, "RELEASE SAVEPOINT grizzle_rebuild;")
-					return err
-				}
-			}
+		if len(s.Columns) == 0 {
+			_, _ = tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT grizzle_rebuild;")
+			_, _ = tx.ExecContext(ctx, "RELEASE SAVEPOINT grizzle_rebuild;")
+			return fmt.Errorf("sqlite: table %q rebuild step requires chunked copying but has empty Columns list", s.Table)
+		}
+
+		quotedCols := make([]string, len(s.Columns))
+		for i, col := range s.Columns {
+			quotedCols[i] = quoteIdent(col)
+		}
+		colList := strings.Join(quotedCols, ", ")
+		if err := copyDataKeysetChunks(ctx, tx, tempRef, colList, tblRef, batchSize, cfg.Logger); err != nil {
+			_, _ = tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT grizzle_rebuild;")
+			_, _ = tx.ExecContext(ctx, "RELEASE SAVEPOINT grizzle_rebuild;")
+			return err
 		}
 
 		if afterCopy != "" {
@@ -2128,6 +2131,15 @@ func quoteSQLiteTable(schemaName, tableName string) string {
 		return fmt.Sprintf("%q", tableName)
 	}
 	return fmt.Sprintf("%q.%q", schemaName, tableName)
+}
+
+// quoteIdent quotes a SQL identifier with double quotes, escaping embedded quotes.
+func quoteIdent(s string) string {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, `"`) && strings.HasSuffix(s, `"`) && len(s) >= 2 {
+		return s
+	}
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
 
 // copyDataKeysetChunks copies rows in batches. tempRef and liveRef must already
