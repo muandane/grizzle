@@ -273,3 +273,42 @@ func TestIsReady_MultiSchema(t *testing.T) {
 		t.Errorf("expected ready=true when all schemas are migrated, got false")
 	}
 }
+
+func TestIsReady_Postgres_NoOpSyncWritesHash(t *testing.T) {
+	db, _ := getPostgresDB(t)
+
+	ctx := context.Background()
+	schema := fmt.Sprintf("ready_noop_%d", time.Now().UnixNano())
+
+	if _, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %q;", schema)); err != nil {
+		t.Fatalf("creating test schema: %v", err)
+	}
+	defer func() {
+		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA %q CASCADE;", schema))
+	}()
+
+	schemaSQL := "CREATE TABLE items (id INT PRIMARY KEY, title TEXT);"
+	if _, err := db.ExecContext(ctx, fmt.Sprintf("CREATE TABLE %q.items (id INT PRIMARY KEY, title TEXT);", schema)); err != nil {
+		t.Fatalf("creating pre-existing table: %v", err)
+	}
+
+	if err := grizzle.Sync(ctx, db, grizzle.Options{
+		Dialect:      grizzle.DialectPostgres,
+		TargetSchema: schema,
+		SchemaSQL:    schemaSQL,
+	}); err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+
+	ready, err := grizzle.IsReady(ctx, db,
+		grizzle.WithDialect(grizzle.DialectPostgres),
+		grizzle.WithTargetSchema(schema),
+		grizzle.WithSchemaSQL(schemaSQL),
+	)
+	if err != nil {
+		t.Fatalf("IsReady failed: %v", err)
+	}
+	if !ready {
+		t.Fatal("expected IsReady true after no-op sync with matching schema")
+	}
+}

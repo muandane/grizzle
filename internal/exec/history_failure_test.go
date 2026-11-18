@@ -30,7 +30,8 @@ func TestSyncSQLite_HistoryWriteFailure_TypedNonFatal(t *testing.T) {
 		duration_ms INTEGER,
 		applied_by TEXT,
 		steps TEXT,
-		seed_hash TEXT
+		seed_hash TEXT,
+		schema_hash TEXT
 	);`); err != nil {
 		t.Fatalf("failed creating poisoned history table: %v", err)
 	}

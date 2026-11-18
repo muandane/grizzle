@@ -187,7 +187,8 @@ func TestSync_HistoryWriteFailure_TypedNonFatal(t *testing.T) {
 		duration_ms INT,
 		applied_by TEXT,
 		steps JSONB,
-		seed_hash VARCHAR(64)
+		seed_hash VARCHAR(64),
+		schema_hash VARCHAR(64)
 	);`, schema)
 	if _, err := db.Exec(histTable); err != nil {
 		t.Fatalf("failed creating poisoned history table: %v", err)
@@ -241,7 +242,8 @@ func TestSync_HistoryWriteFailure_TransactionalDDL(t *testing.T) {
 		duration_ms INT,
 		applied_by TEXT,
 		steps JSONB,
-		seed_hash VARCHAR(64)
+		seed_hash VARCHAR(64),
+		schema_hash VARCHAR(64)
 	);`, schema)
 	if _, err := db.Exec(histTable); err != nil {
 		t.Fatalf("failed creating poisoned history table: %v", err)

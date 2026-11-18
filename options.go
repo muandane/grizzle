@@ -361,6 +361,13 @@ func WithTargetSchemas(schemas ...string) Option {
 	}
 }
 
+// WithSchemaSQL sets the desired schema SQL.
+func WithSchemaSQL(schemaSQL string) Option {
+	return func(o *Options) {
+		o.SchemaSQL = schemaSQL
+	}
+}
+
 // WithTargetSchemaPattern sets a LIKE-style pattern to discover target PostgreSQL schemas
 // dynamically from pg_namespace (e.g. "tenant_%").
 func WithTargetSchemaPattern(pattern string) Option {

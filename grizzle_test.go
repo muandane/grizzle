@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/muandane/grizzle"
+	_ "modernc.org/sqlite"
 )
 
 func TestBuildIdempotentInsert(t *testing.T) {
@@ -168,5 +169,91 @@ func TestCompileSchema_AttachesSeedSQLAndLints(t *testing.T) {
 	}
 	if !l012Found {
 		t.Errorf("expected L012 diagnostic from LintSchema on compiled schema with SeedSQL")
+	}
+}
+
+func TestIsReady_UnmigratedSchemaReportsNotReady(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("opening sqlite: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	schemaV1 := "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);"
+	if err := grizzle.Sync(ctx, db, grizzle.Options{
+		Dialect:   grizzle.DialectSQLite,
+		SchemaSQL: schemaV1,
+	}); err != nil {
+		t.Fatalf("sync v1 failed: %v", err)
+	}
+
+	// Ready for schemaV1
+	readyV1, err := grizzle.IsReady(ctx, db, grizzle.WithDialect(grizzle.DialectSQLite), grizzle.WithSchemaSQL(schemaV1))
+	if err != nil {
+		t.Fatalf("IsReady v1 failed: %v", err)
+	}
+	if !readyV1 {
+		t.Fatal("expected IsReady true for migrated schemaV1")
+	}
+
+	// Schema v2 adds an email column and has NOT been migrated yet.
+	// IsReady must return false because the desired schema has not been applied.
+	schemaV2 := "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT);"
+	readyV2, err := grizzle.IsReady(ctx, db, grizzle.WithDialect(grizzle.DialectSQLite), grizzle.WithSchemaSQL(schemaV2))
+	if err != nil {
+		t.Fatalf("IsReady v2 failed: %v", err)
+	}
+	if readyV2 {
+		t.Fatal("expected IsReady false for unmigrated schemaV2, got true")
+	}
+
+	// Now sync schemaV2
+	if err := grizzle.Sync(ctx, db, grizzle.Options{
+		Dialect:   grizzle.DialectSQLite,
+		SchemaSQL: schemaV2,
+	}); err != nil {
+		t.Fatalf("sync v2 failed: %v", err)
+	}
+
+	// Now ready for schemaV2
+	readyV2After, err := grizzle.IsReady(ctx, db, grizzle.WithDialect(grizzle.DialectSQLite), grizzle.WithSchemaSQL(schemaV2))
+	if err != nil {
+		t.Fatalf("IsReady v2 after sync failed: %v", err)
+	}
+	if !readyV2After {
+		t.Fatal("expected IsReady true for migrated schemaV2")
+	}
+}
+
+func TestIsReady_NoOpSyncWritesHash(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("opening sqlite: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	schemaSQL := "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);"
+	// Create table directly on database without grizzle (simulating pre-existing schema)
+	if _, err := db.ExecContext(ctx, schemaSQL); err != nil {
+		t.Fatalf("creating pre-existing table: %v", err)
+	}
+
+	// First Sync has 0 steps (already in sync).
+	if err := grizzle.Sync(ctx, db, grizzle.Options{
+		Dialect:   grizzle.DialectSQLite,
+		SchemaSQL: schemaSQL,
+	}); err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+
+	// IsReady must return true immediately without inspection because no-op sync wrote the schema_hash.
+	ready, err := grizzle.IsReady(ctx, db, grizzle.WithDialect(grizzle.DialectSQLite), grizzle.WithSchemaSQL(schemaSQL))
+	if err != nil {
+		t.Fatalf("IsReady failed: %v", err)
+	}
+	if !ready {
+		t.Fatal("expected IsReady true after no-op sync with matching schema")
 	}
 }
