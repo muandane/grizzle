@@ -1,6 +1,8 @@
 package schema
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"math"
 	"regexp"
@@ -636,4 +638,15 @@ func NormalizeIdentityArgs(raw string) string {
 		}
 	}
 	return strings.Join(normParts, ", ")
+}
+
+// HashSchemaSQL returns the canonical lowercase hex SHA-256 digest of trimmed schema SQL.
+// Returns an empty string when the trimmed input is empty.
+func HashSchemaSQL(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	h := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(h[:])
 }
