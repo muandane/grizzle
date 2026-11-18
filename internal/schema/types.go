@@ -40,14 +40,15 @@ type Extension struct {
 
 // Routine represents a managed PostgreSQL function or procedure.
 type Routine struct {
-	Name            string `json:"name"`
-	Kind            string `json:"kind"` // FUNCTION or PROCEDURE
-	IdentityArgs    string `json:"identity_args"`
-	ReturnType      string `json:"return_type,omitempty"`
-	Language        string `json:"language,omitempty"`
-	Volatility      string `json:"volatility,omitempty"`
-	SecurityDefiner bool   `json:"security_definer,omitempty"`
-	Definition      string `json:"definition"` // canonical pg_get_functiondef
+	Name            string   `json:"name"`
+	Kind            string   `json:"kind"` // FUNCTION or PROCEDURE
+	IdentityArgs    string   `json:"identity_args"`
+	ReturnType      string   `json:"return_type,omitempty"`
+	Language        string   `json:"language,omitempty"`
+	Volatility      string   `json:"volatility,omitempty"`
+	SecurityDefiner bool     `json:"security_definer,omitempty"`
+	Definition      string   `json:"definition"` // canonical pg_get_functiondef
+	DependsOn       []string `json:"depends_on,omitempty"`
 }
 
 // RoutineKey returns the map key identifying a routine: its name plus the
@@ -112,6 +113,7 @@ type View struct {
 	IsMatView  bool     `json:"is_matview,omitempty"`
 	Definition string   `json:"definition"` // canonical pg_get_viewdef
 	Columns    []string `json:"columns,omitempty"`
+	DependsOn  []string `json:"depends_on,omitempty"`
 }
 
 // UnmanagedKind specifies the type of an unmanaged database object.

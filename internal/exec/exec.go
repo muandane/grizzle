@@ -363,6 +363,28 @@ func unmapShadowExprs(s *schema.Schema, shadowSchemas []string, targetSchemas ..
 		}
 		seq.DataType = schema.NormalizeType(seq.DataType)
 	}
+	for _, v := range s.Views {
+		for i, dep := range v.DependsOn {
+			for _, shadow := range shadowSchemas {
+				if shadow == "" {
+					continue
+				}
+				v.DependsOn[i] = strings.ReplaceAll(dep, shadow+".", "")
+				v.DependsOn[i] = strings.ReplaceAll(v.DependsOn[i], `"`+shadow+`".`, "")
+			}
+		}
+	}
+	for _, r := range s.Routines {
+		for i, dep := range r.DependsOn {
+			for _, shadow := range shadowSchemas {
+				if shadow == "" {
+					continue
+				}
+				r.DependsOn[i] = strings.ReplaceAll(dep, shadow+".", "")
+				r.DependsOn[i] = strings.ReplaceAll(r.DependsOn[i], `"`+shadow+`".`, "")
+			}
+		}
+	}
 }
 
 func inspectPostgresSchema(ctx context.Context, dbtx dialect.DBTX, schema string, tracer Tracer, searchPath ...string) (*schema.Schema, error) {
