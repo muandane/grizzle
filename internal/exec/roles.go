@@ -52,7 +52,11 @@ func diffRolesSteps(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConf
 
 	steps := make([]plan.Step, 0, len(changes))
 	for _, c := range changes {
-		steps = append(steps, postgres.RenderChangeWithOpts(cfg.primarySchema(), c, postgres.RenderOpts{}))
+		step, err := postgres.RenderChangeWithOpts(cfg.primarySchema(), c, postgres.RenderOpts{})
+		if err != nil {
+			return nil, err
+		}
+		steps = append(steps, step)
 	}
 	var droppedRoles []string
 	for _, step := range steps {

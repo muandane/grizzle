@@ -568,9 +568,12 @@ func TestPartition_DetachConcurrently_RenderVariants(t *testing.T) {
 	}
 
 	// 1. PG 14+ without default partition: renders CONCURRENTLY as NonTx
-	step14 := postgres.RenderChangeWithOpts("public", change, postgres.RenderOpts{
+	step14, err := postgres.RenderChangeWithOpts("public", change, postgres.RenderOpts{
 		ServerVersion: 140000,
 	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if !step14.NonTx {
 		t.Errorf("expected NonTx=true for PG14+ DETACH CONCURRENTLY")
 	}
@@ -579,9 +582,12 @@ func TestPartition_DetachConcurrently_RenderVariants(t *testing.T) {
 	}
 
 	// 2. PG 13 (< 14): renders plain DETACH as in-tx (NonTx=false)
-	step13 := postgres.RenderChangeWithOpts("public", change, postgres.RenderOpts{
+	step13, err := postgres.RenderChangeWithOpts("public", change, postgres.RenderOpts{
 		ServerVersion: 130000,
 	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if step13.NonTx {
 		t.Errorf("expected NonTx=false for PG13 DETACH")
 	}
@@ -590,10 +596,13 @@ func TestPartition_DetachConcurrently_RenderVariants(t *testing.T) {
 	}
 
 	// 3. NonConcurrentIndexes=true: falls back to plain DETACH as in-tx
-	stepNonConcurrent := postgres.RenderChangeWithOpts("public", change, postgres.RenderOpts{
+	stepNonConcurrent, err := postgres.RenderChangeWithOpts("public", change, postgres.RenderOpts{
 		ServerVersion:        140000,
 		NonConcurrentIndexes: true,
 	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if stepNonConcurrent.NonTx {
 		t.Errorf("expected NonTx=false when NonConcurrentIndexes=true")
 	}
@@ -604,9 +613,12 @@ func TestPartition_DetachConcurrently_RenderVariants(t *testing.T) {
 	// 4. ParentHasDefault=true: falls back to plain DETACH as in-tx
 	changeWithDefault := change
 	changeWithDefault.ParentHasDefault = true
-	stepDefault := postgres.RenderChangeWithOpts("public", changeWithDefault, postgres.RenderOpts{
+	stepDefault, err := postgres.RenderChangeWithOpts("public", changeWithDefault, postgres.RenderOpts{
 		ServerVersion: 140000,
 	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if stepDefault.NonTx {
 		t.Errorf("expected NonTx=false when ParentHasDefault=true")
 	}
@@ -617,9 +629,12 @@ func TestPartition_DetachConcurrently_RenderVariants(t *testing.T) {
 	// 5. IsPendingDetach=true: renders FINALIZE step as in-tx with hazard
 	changePending := change
 	changePending.IsPendingDetach = true
-	stepPending := postgres.RenderChangeWithOpts("public", changePending, postgres.RenderOpts{
+	stepPending, err := postgres.RenderChangeWithOpts("public", changePending, postgres.RenderOpts{
 		ServerVersion: 140000,
 	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if stepPending.NonTx {
 		t.Errorf("expected NonTx=false for FINALIZE step")
 	}

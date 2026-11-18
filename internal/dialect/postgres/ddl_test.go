@@ -116,7 +116,10 @@ func TestRenderChange_RenameEnumValue(t *testing.T) {
 		EnumValue:    "in_progress",
 	}
 
-	step := postgres.RenderChange("public", c)
+	step, err := postgres.RenderChange("public", c)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	expectedSQL := `ALTER TYPE "public"."status" RENAME VALUE 'pending' TO 'in_progress';`
 	if step.SQL != expectedSQL {
 		t.Errorf("step.SQL = %q, want %q", step.SQL, expectedSQL)
@@ -239,7 +242,10 @@ func TestRenderChange_Sequences(t *testing.T) {
 			Name: "orders_seq",
 		},
 	}
-	createStep := postgres.RenderChange("public", createChange)
+	createStep, err := postgres.RenderChange("public", createChange)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if createStep.SQL != `CREATE SEQUENCE "public"."orders_seq";` {
 		t.Errorf("unexpected create SQL: %q", createStep.SQL)
 	}
@@ -253,8 +259,33 @@ func TestRenderChange_Sequences(t *testing.T) {
 		Table:       "old_seq",
 		Destructive: true,
 	}
-	dropStep := postgres.RenderChange("public", dropChange)
+	dropStep, err := postgres.RenderChange("public", dropChange)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if dropStep.SQL != `DROP SEQUENCE IF EXISTS "public"."old_seq";` {
 		t.Errorf("unexpected drop SQL: %q", dropStep.SQL)
+	}
+}
+
+func TestGeneratePostgresStep_ValidateConstraintMissingPayload(t *testing.T) {
+	c := diff.Change{
+		Type:  plan.ChangeValidateConstraint,
+		Table: "orders",
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("expected error return, but GeneratePostgresStep panicked: %v", r)
+		}
+	}()
+
+	_, err := postgres.GeneratePostgresStep("public", c, postgres.RenderOpts{})
+	if err == nil {
+		t.Fatal("expected error for VALIDATE_CONSTRAINT with missing constraint payload, got nil")
+	}
+	expectedMsg := `grizzle: VALIDATE_CONSTRAINT change on table "orders" has no constraint payload`
+	if err.Error() != expectedMsg {
+		t.Errorf("expected error %q, got %q", expectedMsg, err.Error())
 	}
 }

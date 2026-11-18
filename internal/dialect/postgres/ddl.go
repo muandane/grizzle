@@ -778,13 +778,18 @@ func foreignKeyRefTable(fk *schema.ForeignKey, defaultSchema string) string {
 }
 
 // RenderChange converts a pure diff.Change into an executable plan.Step with PostgreSQL DDL.
-func RenderChange(targetSchema string, c diff.Change, nonConcurrent ...bool) plan.Step {
+func RenderChange(targetSchema string, c diff.Change, nonConcurrent ...bool) (plan.Step, error) {
 	isNonConcurrent := len(nonConcurrent) > 0 && nonConcurrent[0]
 	return RenderChangeWithOpts(targetSchema, c, RenderOpts{NonConcurrentIndexes: isNonConcurrent})
 }
 
+// GeneratePostgresStep converts a pure diff.Change into an executable plan.Step using RenderOpts.
+func GeneratePostgresStep(targetSchema string, c diff.Change, opts RenderOpts) (plan.Step, error) {
+	return RenderChangeWithOpts(targetSchema, c, opts)
+}
+
 // RenderChangeWithOpts converts a pure diff.Change into an executable plan.Step using RenderOpts.
-func RenderChangeWithOpts(targetSchema string, c diff.Change, opts RenderOpts) plan.Step {
+func RenderChangeWithOpts(targetSchema string, c diff.Change, opts RenderOpts) (plan.Step, error) {
 	isNonConcurrent := opts.NonConcurrentIndexes
 	effectiveSchema := cmp.Or(c.Schema, targetSchema)
 
@@ -1010,7 +1015,7 @@ func RenderChangeWithOpts(targetSchema string, c diff.Change, opts RenderOpts) p
 			step.SQL = GenerateValidateConstraintSQL(effectiveSchema, c.Table, c.Check.Name)
 			step.ValidatesCheck = true
 		default:
-			panic(fmt.Sprintf("grizzle: VALIDATE_CONSTRAINT change on table %q has no constraint payload", c.Table))
+			return plan.Step{}, fmt.Errorf("grizzle: VALIDATE_CONSTRAINT change on table %q has no constraint payload", c.Table)
 		}
 	case plan.ChangeDropFK:
 		step.SQL = GenerateDropFKSQL(effectiveSchema, c.Table, c.ForeignKey.Name)
@@ -1032,21 +1037,24 @@ func RenderChangeWithOpts(targetSchema string, c diff.Change, opts RenderOpts) p
 		}
 	}
 
-	return step
+	return step, nil
 }
 
 // RenderChanges converts a list of pure changes into sequenced, topologically ordered plan steps.
-func RenderChanges(targetSchema string, changes []diff.Change, nonConcurrent ...bool) []plan.Step {
+func RenderChanges(targetSchema string, changes []diff.Change, nonConcurrent ...bool) ([]plan.Step, error) {
 	isNonConcurrent := len(nonConcurrent) > 0 && nonConcurrent[0]
 	return RenderChangesWithOpts(targetSchema, changes, RenderOpts{NonConcurrentIndexes: isNonConcurrent})
 }
 
 // RenderChangesWithOpts converts a list of pure changes into sequenced, topologically ordered plan steps using RenderOpts.
-func RenderChangesWithOpts(targetSchema string, changes []diff.Change, opts RenderOpts) []plan.Step {
+func RenderChangesWithOpts(targetSchema string, changes []diff.Change, opts RenderOpts) ([]plan.Step, error) {
 	var steps []plan.Step
 
 	for _, c := range changes {
-		step := RenderChangeWithOpts(targetSchema, c, opts)
+		step, err := RenderChangeWithOpts(targetSchema, c, opts)
+		if err != nil {
+			return nil, err
+		}
 		steps = append(steps, step)
 
 		if c.Type == plan.ChangeAddFK {
@@ -1074,7 +1082,7 @@ func RenderChangesWithOpts(targetSchema string, changes []diff.Change, opts Rend
 	}
 
 	plan.SortSteps(steps)
-	return steps
+	return steps, nil
 }
 
 // Render implements dialect.Dialect for single steps.

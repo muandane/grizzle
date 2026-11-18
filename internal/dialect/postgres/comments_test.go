@@ -72,7 +72,10 @@ func TestRender_ChangeCommentSteps(t *testing.T) {
 			},
 		},
 	}
-	steps := postgres.RenderChanges("public", changes)
+	steps, err := postgres.RenderChanges("public", changes)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if len(steps) != 2 {
 		t.Fatalf("want 2 steps, got %d", len(steps))
 	}
