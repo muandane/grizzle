@@ -932,3 +932,61 @@ func TestSQLite_RebuildStaleTempTableCleanup(t *testing.T) {
 		t.Fatalf("expected 0 leftover temp tables, found %d", tempCount)
 	}
 }
+
+func TestSQLite_RebuildEmptyColumns_FailsClosed(t *testing.T) {
+	db := getSQLiteDB(t)
+	db.SetMaxOpenConns(1)
+	ctx := t.Context()
+
+	initialSchema := `CREATE TABLE data (id INTEGER PRIMARY KEY, val TEXT);`
+	if err := grizzle.Sync(ctx, db, grizzle.Options{
+		Dialect:   grizzle.DialectSQLite,
+		SchemaSQL: initialSchema,
+	}); err != nil {
+		t.Fatalf("initial sync failed: %v", err)
+	}
+
+	for i := 1; i <= 20; i++ {
+		if _, err := db.ExecContext(ctx, "INSERT INTO data (id, val) VALUES (?, ?);", i, fmt.Sprintf("val%d", i)); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+
+	rebuildSQL := `
+CREATE TABLE "_grizzle_new_data" (id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO "_grizzle_new_data" (id, val) SELECT id, val FROM "data";
+DROP TABLE "data";
+ALTER TABLE "_grizzle_new_data" RENAME TO "data";
+`
+	malformedPlan := &grizzle.Plan{
+		Steps: []grizzle.Step{
+			{
+				Type:           grizzle.ChangeAlterColumn,
+				Table:          "data",
+				SQL:            strings.TrimSpace(rebuildSQL),
+				IsTableRebuild: true,
+				Columns:        nil, // empty!
+			},
+		},
+	}
+
+	err := grizzle.Apply(ctx, db, malformedPlan, grizzle.ApplyOpts{
+		SQLiteRebuildThreshold: 10,
+		SQLiteRebuildBatchSize: 5,
+	})
+	if err == nil {
+		t.Fatalf("expected rebuild with empty Columns list to fail closed, got nil")
+	}
+	if !strings.Contains(err.Error(), "requires chunked copying but has empty Columns list") {
+		t.Fatalf("expected empty Columns error, got: %v", err)
+	}
+
+	// Verify the original table and all 20 rows are intact
+	var count int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM data;").Scan(&count); err != nil {
+		t.Fatalf("checking row count after rollback: %v", err)
+	}
+	if count != 20 {
+		t.Fatalf("expected table data intact with 20 rows, got %d", count)
+	}
+}

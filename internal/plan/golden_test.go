@@ -73,3 +73,53 @@ func TestPlanHash_GoldenCorpus(t *testing.T) {
 		})
 	}
 }
+
+func TestPlanHash_ColumnsOmitzeroStability(t *testing.T) {
+	p1 := &plan.Plan{
+		TargetSchema: "main",
+		Steps: []plan.Step{
+			{
+				Type:           plan.ChangeDropColumn,
+				Table:          "users",
+				SQL:            `CREATE TABLE "_grizzle_new_users" ("id" INTEGER PRIMARY KEY, "name" TEXT);`,
+				Destructive:    true,
+				IsTableRebuild: true,
+			},
+		},
+	}
+
+	p2 := &plan.Plan{
+		TargetSchema: "main",
+		Steps: []plan.Step{
+			{
+				Type:           plan.ChangeDropColumn,
+				Table:          "users",
+				SQL:            `CREATE TABLE "_grizzle_new_users" ("id" INTEGER PRIMARY KEY, "name" TEXT);`,
+				Destructive:    true,
+				IsTableRebuild: true,
+				Columns:        []string{},
+			},
+		},
+	}
+
+	if p1.Hash() != p2.Hash() {
+		t.Fatalf("expected nil Columns and empty Columns to produce identical hash: %s != %s", p1.Hash(), p2.Hash())
+	}
+
+	p3 := &plan.Plan{
+		TargetSchema: "main",
+		Steps: []plan.Step{
+			{
+				Type:           plan.ChangeDropColumn,
+				Table:          "users",
+				SQL:            `CREATE TABLE "_grizzle_new_users" ("id" INTEGER PRIMARY KEY, "name" TEXT);`,
+				Destructive:    true,
+				IsTableRebuild: true,
+				Columns:        []string{"id", "name"},
+			},
+		},
+	}
+	if p3.Hash() == p1.Hash() {
+		t.Fatal("expected populated Columns to produce distinct hash")
+	}
+}

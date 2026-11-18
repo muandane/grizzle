@@ -128,6 +128,7 @@ type Step struct {
 	IsRenameCandidate  bool     `json:"is_rename_candidate,omitzero"`
 	IsGeneratedRewrite bool     `json:"is_generated_rewrite,omitzero"`
 	OldColumn          string   `json:"old_column,omitzero"`
+	Columns            []string `json:"columns,omitzero"`
 	UnmanagedDeps      []string `json:"unmanaged_deps,omitzero"`
 
 	// Partitioning metadata
@@ -426,6 +427,10 @@ func (p *Plan) Hash() string {
 		if len(s.UnmanagedDeps) > 0 {
 			writeStr("|unmanaged_deps:")
 			writeStr(strings.Join(s.UnmanagedDeps, ","))
+		}
+		if len(s.Columns) > 0 {
+			writeStr("|columns:")
+			writeStr(strings.Join(s.Columns, ","))
 		}
 		if s.ParentTable != "" {
 			writeStr("|parent:")
