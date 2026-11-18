@@ -1,6 +1,7 @@
 package schema_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/muandane/grizzle/internal/schema"
@@ -275,8 +276,8 @@ func TestNormalizePolicyExpr(t *testing.T) {
 			expected: "role = 'admin'",
 		},
 		{
-			name:     "boolean comparison variations",
-			live:     "(is_active IS TRUE)",
+			name:     "boolean comparison",
+			live:     "(is_active = true)",
 			desired:  "is_active = true",
 			expected: "is_active = true",
 		},
@@ -341,9 +342,9 @@ func TestNormalizeIndexPredicates(t *testing.T) {
 	shadow := "_grizzle_shadow"
 	target := "public"
 
-	// Predicates with boolean operator drift (IS TRUE vs = true)
+	// Predicates with parenthesis and whitespace drift
 	liveIdx := "CREATE INDEX idx_active ON public.users USING btree (created_at) WHERE (active IS TRUE)"
-	shadowIdx := "CREATE INDEX idx_active ON _grizzle_shadow.users (created_at) WHERE active = true"
+	shadowIdx := "CREATE INDEX idx_active ON _grizzle_shadow.users (created_at) WHERE (active IS TRUE)"
 
 	normLive := schema.NormalizeDefinition(liveIdx, shadow, target)
 	normShadow := schema.NormalizeDefinition(shadowIdx, shadow, target)
@@ -361,5 +362,57 @@ func TestNormalizeIndexPredicates(t *testing.T) {
 
 	if normLiveFunc != normShadowFunc {
 		t.Errorf("functional index definitions did not normalize symmetrically:\nlive:   %q\nshadow: %q", normLiveFunc, normShadowFunc)
+	}
+}
+
+func TestNormalize_ThreeValuedLogic(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		forbidden string
+		expected  string
+	}{
+		{
+			name:      "is not true preserved",
+			input:     "val IS NOT TRUE",
+			forbidden: "!= true",
+			expected:  "val IS NOT TRUE",
+		},
+		{
+			name:      "is not false preserved",
+			input:     "val IS NOT FALSE",
+			forbidden: "!= false",
+			expected:  "val IS NOT FALSE",
+		},
+		{
+			name:      "is true preserved",
+			input:     "val IS TRUE",
+			forbidden: "= true",
+			expected:  "val IS TRUE",
+		},
+		{
+			name:      "is false preserved",
+			input:     "val IS FALSE",
+			forbidden: "= false",
+			expected:  "val IS FALSE",
+		},
+		{
+			name:      "mixed case is not true preserved",
+			input:     "val is not true",
+			forbidden: "!= true",
+			expected:  "val is not true",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := schema.NormalizeExpression(tc.input, nil)
+			if strings.Contains(got, tc.forbidden) {
+				t.Fatalf("NormalizeExpression(%q) produced forbidden %q: got %q", tc.input, tc.forbidden, got)
+			}
+			if got != tc.expected {
+				t.Errorf("NormalizeExpression(%q) = %q, expected %q", tc.input, got, tc.expected)
+			}
+		})
 	}
 }

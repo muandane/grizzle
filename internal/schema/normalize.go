@@ -26,12 +26,6 @@ var (
 	// Redundant cast on identifiers in parens: (email)::text or (col)::character varying
 	colCastParenRegex = regexp.MustCompile(`\(([a-zA-Z_][a-zA-Z0-9_]*)\)::(?:text|varchar|character\s+varying|char)(?:\s*\(\s*\d+\s*\))?(?:\[\])?`)
 
-	// Boolean syntax variations: IS TRUE -> = true, IS FALSE -> = false
-	isTrueRegex     = regexp.MustCompile(`(?i)\bIS\s+TRUE\b`)
-	isFalseRegex    = regexp.MustCompile(`(?i)\bIS\s+FALSE\b`)
-	isNotTrueRegex  = regexp.MustCompile(`(?i)\bIS\s+NOT\s+TRUE\b`)
-	isNotFalseRegex = regexp.MustCompile(`(?i)\bIS\s+NOT\s+FALSE\b`)
-
 	// Default index method in Postgres
 	usingBtreeRegex = regexp.MustCompile(`(?i)\s+USING\s+btree\s+`)
 )
@@ -197,13 +191,6 @@ func NormalizeExpression(expr string, mappings map[string]string, currentSchema 
 		}
 
 		t := text
-		if strings.Contains(text, "IS ") || strings.Contains(text, "is ") || strings.Contains(text, "Is ") || strings.Contains(text, "iS ") {
-			t = isNotTrueRegex.ReplaceAllString(t, "!= true")
-			t = isNotFalseRegex.ReplaceAllString(t, "!= false")
-			t = isTrueRegex.ReplaceAllString(t, "= true")
-			t = isFalseRegex.ReplaceAllString(t, "= false")
-		}
-
 		if strings.Contains(text, "::") {
 			t = numCastParenRegex.ReplaceAllString(t, "$1")
 			t = colCastParenRegex.ReplaceAllString(t, "$1")
