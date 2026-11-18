@@ -66,8 +66,9 @@ func DisableStatementTimeout(ctx context.Context, dbtx dialect.DBTX, stmtTimeout
 		return nil, fmt.Errorf("failed disabling session statement_timeout: %w", err)
 	}
 	return func() {
-		// Use a detached context: restore may run on error/cancel exit paths.
-		restoreCtx := context.WithoutCancel(ctx)
+		// Use a detached context bounded by a timeout: restore may run on error/cancel exit paths.
+		restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseLockTimeout)
+		defer cancel()
 		if stmtTimeout > 0 {
 			_, _ = dbtx.ExecContext(restoreCtx, fmt.Sprintf("SET statement_timeout = '%dms';", stmtTimeout.Milliseconds()))
 			return

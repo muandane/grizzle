@@ -75,6 +75,19 @@ func SeedPostgres(ctx context.Context, db *sql.DB, cfg SeedExecConfig, seedSQL s
 	}
 	defer func() { _ = conn.Close() }()
 
+	var acquiredSchemas []string
+	var lockAcquired bool
+	defer releasePostgresConn(ctx, conn, func(relCtx context.Context) error {
+		if !lockAcquired {
+			return nil
+		}
+		if cfg.LockID != 0 {
+			return postgres.ReleaseSessionAdvisoryLock(relCtx, conn, cfg.LockID)
+		}
+		lockNs := cmp.Or(cfg.LockNamespace, "grizzle")
+		return postgres.ReleaseSchemaLocks(relCtx, conn, lockNs, acquiredSchemas)
+	})
+
 	_ = ApplySessionTimeouts(ctx, conn, cfg.LockTimeout, cfg.StatementTimeout)
 
 	// Serialize concurrent seed runs on the same schema.
@@ -83,7 +96,6 @@ func SeedPostgres(ctx context.Context, db *sql.DB, cfg SeedExecConfig, seedSQL s
 		lockTimeout = DefaultLockTimeout
 	}
 	lockCtx, cancelLock := context.WithTimeout(ctx, lockTimeout)
-	var acquiredSchemas []string
 	if cfg.LockID != 0 {
 		err = postgres.AcquireSessionAdvisoryLock(lockCtx, conn, cfg.LockID)
 	} else {
@@ -97,14 +109,7 @@ func SeedPostgres(ctx context.Context, db *sql.DB, cfg SeedExecConfig, seedSQL s
 		}
 		return fmt.Errorf("%w: %w", plan.ErrLockTimeout, err)
 	}
-	defer func() {
-		if cfg.LockID != 0 {
-			_ = postgres.ReleaseSessionAdvisoryLock(context.Background(), conn, cfg.LockID)
-		} else {
-			lockNs := cmp.Or(cfg.LockNamespace, "grizzle")
-			_ = postgres.ReleaseSchemaLocks(context.Background(), conn, lockNs, acquiredSchemas)
-		}
-	}()
+	lockAcquired = true
 
 	targetSchemas := cfg.targetSchemasOr(primarySchema)
 	_, _ = conn.ExecContext(ctx, searchPathSQL(targetSchemas))

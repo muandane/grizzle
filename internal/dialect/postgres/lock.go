@@ -180,9 +180,11 @@ func AcquireSchemaLocks(ctx context.Context, dbtx dialect.DBTX, namespace string
 	for _, s := range sorted {
 		schemaKey := Hash32(s)
 		if err := AcquireSessionAdvisoryLock2(ctx, dbtx, nsKey, schemaKey); err != nil {
-			// Roll back all acquired locks in reverse order
+			// Roll back all acquired locks in reverse order using detached bounded context
+			rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
 			for _, a := range slices.Backward(acquired) {
-				_ = ReleaseSessionAdvisoryLock2(context.Background(), dbtx, nsKey, Hash32(a))
+				_ = ReleaseSessionAdvisoryLock2(rollbackCtx, dbtx, nsKey, Hash32(a))
 			}
 			return nil, err
 		}
