@@ -2,9 +2,7 @@ package history
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -14,6 +12,7 @@ import (
 
 	"github.com/muandane/grizzle/internal/dialect"
 	"github.com/muandane/grizzle/internal/plan"
+	"github.com/muandane/grizzle/internal/schema"
 )
 
 // Record tracks an applied migration plan.
@@ -192,9 +191,8 @@ func RecordProgress(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaN
 	}
 
 	var schemaHash string
-	if p != nil && p.SchemaSQL != "" {
-		h := sha256.Sum256([]byte(strings.TrimSpace(p.SchemaSQL)))
-		schemaHash = hex.EncodeToString(h[:])
+	if p != nil {
+		schemaHash = schema.HashSchemaSQL(p.SchemaSQL)
 	}
 
 	return Insert(ctx, dbtx, dialectName, schemaName, Record{
@@ -596,13 +594,9 @@ func Summary(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName str
 }
 
 // RecordBaseline writes an initial baseline record with status 'baseline' into grizzle_history.
-func RecordBaseline(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName, planHash, note string, schemaHash ...string) (*Record, error) {
+func RecordBaseline(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName, planHash, note, schemaHash string) (*Record, error) {
 	if err := EnsureTable(ctx, dbtx, dialectName, schemaName); err != nil {
 		return nil, err
-	}
-	var sHash string
-	if len(schemaHash) > 0 {
-		sHash = schemaHash[0]
 	}
 	err := Insert(ctx, dbtx, dialectName, schemaName, Record{
 		PlanHash:   planHash,
@@ -612,7 +606,7 @@ func RecordBaseline(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaN
 		AppliedBy:  CurrentUser(),
 		StepsJSON:  "[]",
 		Error:      note,
-		SchemaHash: sHash,
+		SchemaHash: schemaHash,
 	})
 	if err != nil {
 		return nil, err

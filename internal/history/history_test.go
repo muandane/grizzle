@@ -119,7 +119,7 @@ func TestHistory_LifecycleAndResolution(t *testing.T) {
 	}
 
 	// 2. RecordBaseline
-	baseRec, err := history.RecordBaseline(ctx, db, "sqlite", "", "hash_base", "initial baseline")
+	baseRec, err := history.RecordBaseline(ctx, db, "sqlite", "", "hash_base", "initial baseline", "")
 	if err != nil {
 		t.Fatalf("RecordBaseline failed: %v", err)
 	}
