@@ -788,9 +788,75 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string, searchPa
 	}
 	_ = viewRows.Close()
 
-	// 6b. View column dependencies: managed views are folded into column-drop
-	// protection by diff.findSurvivingViewDeps using the canonical view
-	// definition; no unmanaged registration is needed.
+	// 6b. View dependencies via pg_depend. Managed views and materialized views
+	// record their rewrite rule dependencies on referenced relations and functions in pg_depend.
+	// Querying pg_depend directly recovers the DAG without fragile SQL parsing.
+	// Note: PL/pgSQL function bodies are not parsed into pg_depend dependency edges by PostgreSQL,
+	// so function-internal references cannot be ordered through catalog inspection.
+	if len(s.Views) > 0 {
+		viewDepQuery := `
+			SELECT DISTINCT
+				v.relname AS view_name,
+				ref.relname AS ref_name,
+				ref_n.nspname AS ref_schema
+			FROM pg_depend d
+			JOIN pg_rewrite r ON r.oid = d.objid
+			JOIN pg_class v ON v.oid = r.ev_class
+			JOIN pg_class ref ON ref.oid = d.refobjid
+			JOIN pg_namespace n ON n.oid = v.relnamespace
+			JOIN pg_namespace ref_n ON ref_n.oid = ref.relnamespace
+			WHERE d.classid = 'pg_rewrite'::regclass
+			  AND d.refclassid = 'pg_class'::regclass
+			  AND v.relkind IN ('v', 'm')
+			  AND ref.relkind IN ('v', 'm')
+			  AND v.oid != ref.oid
+			  AND n.nspname = $1
+			UNION
+			SELECT DISTINCT
+				v.relname AS view_name,
+				p.proname AS ref_name,
+				pn.nspname AS ref_schema
+			FROM pg_depend d
+			JOIN pg_rewrite r ON r.oid = d.objid
+			JOIN pg_class v ON v.oid = r.ev_class
+			JOIN pg_proc p ON p.oid = d.refobjid
+			JOIN pg_namespace n ON n.oid = v.relnamespace
+			JOIN pg_namespace pn ON pn.oid = p.pronamespace
+			WHERE d.classid = 'pg_rewrite'::regclass
+			  AND d.refclassid = 'pg_proc'::regclass
+			  AND v.relkind IN ('v', 'm')
+			  AND n.nspname = $1
+			  AND pn.nspname NOT IN ('pg_catalog', 'information_schema')
+			ORDER BY view_name, ref_name;
+		`
+		viewDepRows, err := dbtx.QueryContext(ctx, viewDepQuery, schemaName)
+		if err != nil {
+			return nil, fmt.Errorf("inspecting view dependencies in schema %q: %w", schemaName, err)
+		}
+		defer func() { _ = viewDepRows.Close() }()
+
+		for viewDepRows.Next() {
+			var viewName, refName, refSchema string
+			if err := viewDepRows.Scan(&viewName, &refName, &refSchema); err != nil {
+				return nil, fmt.Errorf("scanning view dependency in schema %q: %w", schemaName, err)
+			}
+			if v, ok := s.Views[viewName]; ok {
+				refKey := refSchema + "." + refName
+				v.DependsOn = append(v.DependsOn, refKey)
+			}
+		}
+		if err := viewDepRows.Err(); err != nil {
+			return nil, err
+		}
+		_ = viewDepRows.Close()
+
+		for _, v := range s.Views {
+			if len(v.DependsOn) > 1 {
+				slices.Sort(v.DependsOn)
+				v.DependsOn = slices.Compact(v.DependsOn)
+			}
+		}
+	}
 
 	// 6c. Triggers on managed tables are collected in 2f (Table.Triggers).
 	// Triggers are part of the managed surface as of Phase 1; no unmanaged
@@ -911,6 +977,58 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string, searchPa
 		return nil, err
 	}
 	_ = routineRows.Close()
+
+	// 6d.05 Routine dependencies on custom user types via pg_depend.
+	// Note: PL/pgSQL function bodies are not parsed into pg_depend dependency edges by PostgreSQL,
+	// so function-internal references cannot be ordered through catalog inspection.
+	if len(s.Routines) > 0 {
+		routineDepQuery := `
+			SELECT DISTINCT
+				p.proname AS routine_name,
+				pg_get_function_identity_arguments(p.oid) AS identity_args,
+				t.typname AS ref_name,
+				tn.nspname AS ref_schema
+			FROM pg_depend d
+			JOIN pg_proc p ON p.oid = d.objid
+			JOIN pg_type t ON t.oid = d.refobjid
+			JOIN pg_namespace pn ON pn.oid = p.pronamespace
+			JOIN pg_namespace tn ON tn.oid = t.typnamespace
+			WHERE d.classid = 'pg_proc'::regclass
+			  AND d.refclassid = 'pg_type'::regclass
+			  AND pn.nspname = $1
+			  AND tn.nspname NOT IN ('pg_catalog', 'information_schema')
+			  AND t.typname NOT LIKE '\_%'
+			ORDER BY routine_name, identity_args;
+		`
+		routineDepRows, err := dbtx.QueryContext(ctx, routineDepQuery, schemaName)
+		if err != nil {
+			return nil, fmt.Errorf("inspecting routine dependencies in schema %q: %w", schemaName, err)
+		}
+		defer func() { _ = routineDepRows.Close() }()
+
+		for routineDepRows.Next() {
+			var rName, identityArgs, refName, refSchema string
+			if err := routineDepRows.Scan(&rName, &identityArgs, &refName, &refSchema); err != nil {
+				return nil, fmt.Errorf("scanning routine dependency in schema %q: %w", schemaName, err)
+			}
+			key := schema.RoutineKey(rName, identityArgs)
+			if r, ok := s.Routines[key]; ok {
+				refKey := refSchema + "." + refName
+				r.DependsOn = append(r.DependsOn, refKey)
+			}
+		}
+		if err := routineDepRows.Err(); err != nil {
+			return nil, err
+		}
+		_ = routineDepRows.Close()
+
+		for _, r := range s.Routines {
+			if len(r.DependsOn) > 1 {
+				slices.Sort(r.DependsOn)
+				r.DependsOn = slices.Compact(r.DependsOn)
+			}
+		}
+	}
 
 	// 6d.1 Unmanaged window functions (functions, procedures, and aggregates
 	// are managed above; prokind 'w' is user-defined window functions).

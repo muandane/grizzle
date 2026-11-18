@@ -118,10 +118,14 @@ func SortSteps(steps []Step) {
 
 	for _, s := range steps {
 		childKey := tableKey(s.Schema, s.Table)
-		// 1. From ChangeCreateTable DependsOn
+		// 1. From DependsOn
 		for _, dep := range s.DependsOn {
 			addDep(childKey, dep)
 			addDep(s.Table, dep)
+			if s.Schema != "" && !strings.Contains(dep, ".") {
+				addDep(childKey, s.Schema+"."+dep)
+				addDep(s.Table, s.Schema+"."+dep)
+			}
 		}
 		// 2. From ChangeAddFK RefTable
 		if s.Type == ChangeAddFK && s.RefTable != "" {
@@ -165,9 +169,11 @@ func SortSteps(steps []Step) {
 		return strings.Compare(a.SQL, b.SQL)
 	})
 
-	// Within CREATE_TABLE / DROP_TABLE phases, apply Kahn topological order.
+	// Within CREATE_TABLE / DROP_TABLE and CREATE_VIEW / DROP_VIEW phases, apply Kahn topological order.
 	reorderPhase(steps, ChangeCreateTable, deps, false)
 	reorderPhase(steps, ChangeDropTable, deps, true)
+	reorderPhase(steps, ChangeCreateView, deps, false)
+	reorderPhase(steps, ChangeDropView, deps, true)
 }
 
 // reorderPhase rewrites the contiguous run of steps of the given type in place

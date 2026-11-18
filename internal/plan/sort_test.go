@@ -161,3 +161,48 @@ func TestSortSteps_CycleIsDeterministic(t *testing.T) {
 		t.Errorf("expected cycle remainder a then b (lexical), got %v", first)
 	}
 }
+
+func TestViewDependencies_TopologicalOrder(t *testing.T) {
+	// Scenario: view_a depends on view_b (view_b must be created first).
+	// Alphabetically view_a < view_b, so alphabetical sort would place view_a first.
+	steps := []plan.Step{
+		{
+			Type:      plan.ChangeCreateView,
+			Schema:    "public",
+			Table:     "view_a",
+			DependsOn: []string{"public.view_b"},
+		},
+		{
+			Type:   plan.ChangeCreateView,
+			Schema: "public",
+			Table:  "view_b",
+		},
+	}
+
+	plan.SortSteps(steps)
+
+	if steps[0].Table != "view_b" || steps[1].Table != "view_a" {
+		t.Fatalf("expected view_b before view_a, got %s then %s", steps[0].Table, steps[1].Table)
+	}
+
+	// Drop scenario: referencing view_a must be dropped before referenced view_b.
+	dropSteps := []plan.Step{
+		{
+			Type:   plan.ChangeDropView,
+			Schema: "public",
+			Table:  "view_b",
+		},
+		{
+			Type:      plan.ChangeDropView,
+			Schema:    "public",
+			Table:     "view_a",
+			DependsOn: []string{"public.view_b"},
+		},
+	}
+
+	plan.SortSteps(dropSteps)
+
+	if dropSteps[0].Table != "view_a" || dropSteps[1].Table != "view_b" {
+		t.Fatalf("expected view_a dropped before view_b, got %s then %s", dropSteps[0].Table, dropSteps[1].Table)
+	}
+}

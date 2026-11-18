@@ -840,8 +840,14 @@ func RenderChangeWithOpts(targetSchema string, c diff.Change, opts RenderOpts) (
 		step.SQL = GenerateDropPolicySQL(effectiveSchema, c.Table, polName)
 	case plan.ChangeCreateFunction, plan.ChangeCreateAggregate:
 		step.SQL = GenerateCreateFunctionSQL(c.Routine)
+		if c.Routine != nil && len(c.Routine.DependsOn) > 0 {
+			step.DependsOn = slices.Clone(c.Routine.DependsOn)
+		}
 	case plan.ChangeDropFunction, plan.ChangeDropAggregate:
 		step.SQL = GenerateDropFunctionSQL(effectiveSchema, c.Routine)
+		if c.Routine != nil && len(c.Routine.DependsOn) > 0 {
+			step.DependsOn = slices.Clone(c.Routine.DependsOn)
+		}
 	case plan.ChangeCreateDomain:
 		step.SQL = GenerateCreateDomainSQL(effectiveSchema, c.Domain)
 	case plan.ChangeAlterDomain:
@@ -904,9 +910,15 @@ func RenderChangeWithOpts(targetSchema string, c diff.Change, opts RenderOpts) (
 		step.SQL = GenerateDropTriggerSQL(effectiveSchema, c.Table, trgName)
 	case plan.ChangeCreateView:
 		step.SQL = GenerateCreateViewSQL(effectiveSchema, c.View, c.Replace)
+		if c.View != nil && len(c.View.DependsOn) > 0 {
+			step.DependsOn = slices.Clone(c.View.DependsOn)
+		}
 	case plan.ChangeDropView:
 		isMat := c.View != nil && c.View.IsMatView
 		step.SQL = GenerateDropViewSQL(effectiveSchema, c.Table, isMat)
+		if c.View != nil && len(c.View.DependsOn) > 0 {
+			step.DependsOn = slices.Clone(c.View.DependsOn)
+		}
 	case plan.ChangeRefreshMatView:
 		step.SQL = GenerateRefreshMatViewSQL(effectiveSchema, c.Table)
 	case plan.ChangeCommentTable:
