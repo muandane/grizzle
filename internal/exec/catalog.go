@@ -62,7 +62,11 @@ func diffCatalogSteps(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecCo
 
 	steps := make([]plan.Step, 0, len(changes))
 	for _, c := range changes {
-		steps = append(steps, postgres.RenderChangeWithOpts(cfg.primarySchema(), c, postgres.RenderOpts{}))
+		step, err := postgres.RenderChangeWithOpts(cfg.primarySchema(), c, postgres.RenderOpts{})
+		if err != nil {
+			return nil, err
+		}
+		steps = append(steps, step)
 	}
 	// Catalog steps carry their own priority band (130+, after roles and
 	// grants); sort them among themselves and rely on concatenation for the

@@ -217,7 +217,10 @@ func TestRenderChangeWithOpts_RangeAndCompositeTypes(t *testing.T) {
 			Table:     "int_range",
 			RangeType: r,
 		}
-		step := postgres.RenderChangeWithOpts("public", c, postgres.RenderOpts{})
+		step, err := postgres.RenderChangeWithOpts("public", c, postgres.RenderOpts{})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 		if step.Type != plan.ChangeCreateRangeType {
 			t.Errorf("step.Type = %v, want %v", step.Type, plan.ChangeCreateRangeType)
 		}
@@ -235,7 +238,10 @@ func TestRenderChangeWithOpts_RangeAndCompositeTypes(t *testing.T) {
 			Schema: "public",
 			Table:  "int_range",
 		}
-		step := postgres.RenderChangeWithOpts("public", c, postgres.RenderOpts{})
+		step, err := postgres.RenderChangeWithOpts("public", c, postgres.RenderOpts{})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 		if step.Type != plan.ChangeDropRangeType {
 			t.Errorf("step.Type = %v, want %v", step.Type, plan.ChangeDropRangeType)
 		}
@@ -258,7 +264,10 @@ func TestRenderChangeWithOpts_RangeAndCompositeTypes(t *testing.T) {
 			Table:         "coord",
 			CompositeType: ct,
 		}
-		step := postgres.RenderChangeWithOpts("public", c, postgres.RenderOpts{})
+		step, err := postgres.RenderChangeWithOpts("public", c, postgres.RenderOpts{})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 		if step.Type != plan.ChangeCreateCompositeType {
 			t.Errorf("step.Type = %v, want %v", step.Type, plan.ChangeCreateCompositeType)
 		}
@@ -278,7 +287,10 @@ func TestRenderChangeWithOpts_RangeAndCompositeTypes(t *testing.T) {
 			Table:         "coord",
 			CompositeAttr: attr,
 		}
-		step := postgres.RenderChangeWithOpts("public", c, postgres.RenderOpts{})
+		step, err := postgres.RenderChangeWithOpts("public", c, postgres.RenderOpts{})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 		if step.Type != plan.ChangeAlterCompositeType {
 			t.Errorf("step.Type = %v, want %v", step.Type, plan.ChangeAlterCompositeType)
 		}
@@ -296,7 +308,10 @@ func TestRenderChangeWithOpts_RangeAndCompositeTypes(t *testing.T) {
 			Schema: "public",
 			Table:  "coord",
 		}
-		step := postgres.RenderChangeWithOpts("public", c, postgres.RenderOpts{})
+		step, err := postgres.RenderChangeWithOpts("public", c, postgres.RenderOpts{})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 		if step.Type != plan.ChangeDropCompositeType {
 			t.Errorf("step.Type = %v, want %v", step.Type, plan.ChangeDropCompositeType)
 		}

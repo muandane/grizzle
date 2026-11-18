@@ -109,7 +109,7 @@ func TestGenerateAlterEventTriggerSQL_DefinitionReplacementPreservesDisabled(t *
 }
 
 func TestRenderAlterEventTrigger_OnlyChangesEnabledState(t *testing.T) {
-	step := RenderChange("public", diff.Change{
+	step, err := RenderChange("public", diff.Change{
 		Type: plan.ChangeAlterEventTrigger,
 		EventTrigger: &schema.EventTrigger{
 			Name:    "audit",
@@ -120,6 +120,9 @@ func TestRenderAlterEventTrigger_OnlyChangesEnabledState(t *testing.T) {
 			Enabled: false,
 		},
 	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if step.SQL != `ALTER EVENT TRIGGER "audit" ENABLE;` || step.Destructive {
 		t.Fatalf("enabled-state drift must render a non-destructive ALTER: %+v", step)
 	}

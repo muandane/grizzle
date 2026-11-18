@@ -47,7 +47,11 @@ func diffSchemas(live, desired *schema.Schema, targetSchema, shadowSchema string
 	if err != nil {
 		panic(err)
 	}
-	return postgres.RenderChanges(targetSchema, changes)
+	steps, err := postgres.RenderChanges(targetSchema, changes)
+	if err != nil {
+		panic(err)
+	}
+	return steps
 }
 
 // diffSQLiteSchemas renders SQLite steps for white-box root tests.

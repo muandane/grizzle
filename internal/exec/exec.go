@@ -186,7 +186,10 @@ func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig
 		if err != nil {
 			return nil, err
 		}
-		steps := postgres.RenderChangesWithOpts(targetSchema, changes, renderOpts)
+		steps, err := postgres.RenderChangesWithOpts(targetSchema, changes, renderOpts)
+		if err != nil {
+			return nil, err
+		}
 		rolesSteps, err := diffRolesSteps(ctx, dbtx, cfg, serverVersion)
 		if err != nil {
 			return nil, err
@@ -245,7 +248,10 @@ func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig
 		allChanges = append(allChanges, changes...)
 	}
 
-	steps := postgres.RenderChangesWithOpts(targetSchemas[0], allChanges, renderOpts)
+	steps, err := postgres.RenderChangesWithOpts(targetSchemas[0], allChanges, renderOpts)
+	if err != nil {
+		return nil, err
+	}
 	rolesSteps, err := diffRolesSteps(ctx, dbtx, cfg, serverVersion)
 	if err != nil {
 		return nil, err
