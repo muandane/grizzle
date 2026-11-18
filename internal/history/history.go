@@ -2,7 +2,9 @@ package history
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -27,6 +29,8 @@ type Record struct {
 	StepsJSON  string    `json:"steps_json"`
 	// SeedHash identifies an idempotent seed run (empty for plan records).
 	SeedHash string `json:"seed_hash,omitzero"`
+	// SchemaHash identifies the desired schema SQL hash (sha256).
+	SchemaHash string `json:"schema_hash,omitzero"`
 }
 
 // CurrentUser returns an identifier for the entity executing the migration.
@@ -60,13 +64,16 @@ func EnsureTable(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName
 				applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
 				duration_ms BIGINT NOT NULL,
 				applied_by TEXT NOT NULL,
-				steps JSONB NOT NULL
+				steps JSONB NOT NULL,
+				seed_hash VARCHAR(64),
+				schema_hash VARCHAR(64)
 			);
 			ALTER TABLE %q.grizzle_history ADD COLUMN IF NOT EXISTS status VARCHAR(16) NOT NULL DEFAULT 'applied';
 			ALTER TABLE %q.grizzle_history ADD COLUMN IF NOT EXISTS failed_step INTEGER;
 			ALTER TABLE %q.grizzle_history ADD COLUMN IF NOT EXISTS error TEXT;
 			ALTER TABLE %q.grizzle_history ADD COLUMN IF NOT EXISTS seed_hash VARCHAR(64);
-		`, targetSchema, targetSchema, targetSchema, targetSchema, targetSchema)
+			ALTER TABLE %q.grizzle_history ADD COLUMN IF NOT EXISTS schema_hash VARCHAR(64);
+		`, targetSchema, targetSchema, targetSchema, targetSchema, targetSchema, targetSchema)
 	case "sqlite":
 		ddl = `
 			CREATE TABLE IF NOT EXISTS grizzle_history (
@@ -78,7 +85,9 @@ func EnsureTable(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName
 				applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 				duration_ms INTEGER NOT NULL,
 				applied_by TEXT NOT NULL,
-				steps TEXT NOT NULL
+				steps TEXT NOT NULL,
+				seed_hash TEXT,
+				schema_hash TEXT
 			);
 		`
 	default:
@@ -96,6 +105,7 @@ func EnsureTable(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName
 		_, _ = dbtx.ExecContext(ctx, "ALTER TABLE grizzle_history ADD COLUMN failed_step INTEGER;")
 		_, _ = dbtx.ExecContext(ctx, "ALTER TABLE grizzle_history ADD COLUMN error TEXT;")
 		_, _ = dbtx.ExecContext(ctx, "ALTER TABLE grizzle_history ADD COLUMN seed_hash TEXT;")
+		_, _ = dbtx.ExecContext(ctx, "ALTER TABLE grizzle_history ADD COLUMN schema_hash TEXT;")
 	}
 
 	return nil
@@ -111,13 +121,13 @@ func Insert(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName stri
 			targetSchema = schemaName
 		}
 		query = fmt.Sprintf(`
-			INSERT INTO %q.grizzle_history (plan_hash, status, failed_step, error, applied_at, duration_ms, applied_by, steps, seed_hash)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9);
+			INSERT INTO %q.grizzle_history (plan_hash, status, failed_step, error, applied_at, duration_ms, applied_by, steps, seed_hash, schema_hash)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10);
 		`, targetSchema)
 	case "sqlite":
 		query = `
-			INSERT INTO grizzle_history (plan_hash, status, failed_step, error, applied_at, duration_ms, applied_by, steps, seed_hash)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+			INSERT INTO grizzle_history (plan_hash, status, failed_step, error, applied_at, duration_ms, applied_by, steps, seed_hash, schema_hash)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 		`
 	default:
 		return fmt.Errorf("history: unsupported dialect %q", dialectName)
@@ -145,8 +155,12 @@ func Insert(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName stri
 	if rec.SeedHash != "" {
 		seedHash = sql.NullString{String: rec.SeedHash, Valid: true}
 	}
+	var schemaHash sql.NullString
+	if rec.SchemaHash != "" {
+		schemaHash = sql.NullString{String: rec.SchemaHash, Valid: true}
+	}
 
-	_, err := dbtx.ExecContext(ctx, query, rec.PlanHash, rec.Status, failedStep, errText, rec.AppliedAt, rec.DurationMs, rec.AppliedBy, rec.StepsJSON, seedHash)
+	_, err := dbtx.ExecContext(ctx, query, rec.PlanHash, rec.Status, failedStep, errText, rec.AppliedAt, rec.DurationMs, rec.AppliedBy, rec.StepsJSON, seedHash, schemaHash)
 	if err != nil {
 		return fmt.Errorf("failed writing grizzle_history record: %w", err)
 	}
@@ -177,6 +191,12 @@ func RecordProgress(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaN
 		errMsg, _, _ = strings.Cut(execErr.Error(), "\n")
 	}
 
+	var schemaHash string
+	if p != nil && p.SchemaSQL != "" {
+		h := sha256.Sum256([]byte(strings.TrimSpace(p.SchemaSQL)))
+		schemaHash = hex.EncodeToString(h[:])
+	}
+
 	return Insert(ctx, dbtx, dialectName, schemaName, Record{
 		PlanHash:   p.Hash(),
 		Status:     status,
@@ -186,6 +206,7 @@ func RecordProgress(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaN
 		DurationMs: duration.Milliseconds(),
 		AppliedBy:  CurrentUser(),
 		StepsJSON:  string(stepsJSON),
+		SchemaHash: schemaHash,
 	})
 }
 
@@ -199,14 +220,14 @@ func GetLatest(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName s
 			targetSchema = schemaName
 		}
 		query = fmt.Sprintf(`
-			SELECT id, plan_hash, status, failed_step, error, applied_at, duration_ms, applied_by, steps::text, seed_hash
+			SELECT id, plan_hash, status, failed_step, error, applied_at, duration_ms, applied_by, steps::text, seed_hash, schema_hash
 			FROM %q.grizzle_history
 			ORDER BY id DESC
 			LIMIT 1;
 		`, targetSchema)
 	case "sqlite":
 		query = `
-			SELECT id, plan_hash, status, failed_step, error, applied_at, duration_ms, applied_by, steps, seed_hash
+			SELECT id, plan_hash, status, failed_step, error, applied_at, duration_ms, applied_by, steps, seed_hash, schema_hash
 			FROM grizzle_history
 			ORDER BY id DESC
 			LIMIT 1;
@@ -219,7 +240,17 @@ func GetLatest(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName s
 	var failedStep sql.NullInt64
 	var errText sql.NullString
 	var seedHash sql.NullString
-	err := dbtx.QueryRowContext(ctx, query).Scan(&rec.ID, &rec.PlanHash, &rec.Status, &failedStep, &errText, &rec.AppliedAt, &rec.DurationMs, &rec.AppliedBy, &rec.StepsJSON, &seedHash)
+	var schemaHash sql.NullString
+	err := dbtx.QueryRowContext(ctx, query).Scan(&rec.ID, &rec.PlanHash, &rec.Status, &failedStep, &errText, &rec.AppliedAt, &rec.DurationMs, &rec.AppliedBy, &rec.StepsJSON, &seedHash, &schemaHash)
+	if err != nil && dialectName == "sqlite" && strings.Contains(err.Error(), "no such column: schema_hash") {
+		fallbackQuery := `
+			SELECT id, plan_hash, status, failed_step, error, applied_at, duration_ms, applied_by, steps, seed_hash
+			FROM grizzle_history
+			ORDER BY id DESC
+			LIMIT 1;
+		`
+		err = dbtx.QueryRowContext(ctx, fallbackQuery).Scan(&rec.ID, &rec.PlanHash, &rec.Status, &failedStep, &errText, &rec.AppliedAt, &rec.DurationMs, &rec.AppliedBy, &rec.StepsJSON, &seedHash)
+	}
 	if err == sql.ErrNoRows || isTableNotExist(err) {
 		return nil, nil
 	}
@@ -234,6 +265,9 @@ func GetLatest(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName s
 	}
 	if seedHash.Valid {
 		rec.SeedHash = seedHash.String
+	}
+	if schemaHash.Valid {
+		rec.SchemaHash = schemaHash.String
 	}
 	return &rec, nil
 }
@@ -258,13 +292,13 @@ func List(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName string
 			targetSchema = schemaName
 		}
 		query = fmt.Sprintf(`
-			SELECT id, plan_hash, status, failed_step, error, applied_at, duration_ms, applied_by, steps::text, seed_hash
+			SELECT id, plan_hash, status, failed_step, error, applied_at, duration_ms, applied_by, steps::text, seed_hash, schema_hash
 			FROM %q.grizzle_history
 			ORDER BY id ASC;
 		`, targetSchema)
 	case "sqlite":
 		query = `
-			SELECT id, plan_hash, status, failed_step, error, applied_at, duration_ms, applied_by, steps, seed_hash
+			SELECT id, plan_hash, status, failed_step, error, applied_at, duration_ms, applied_by, steps, seed_hash, schema_hash
 			FROM grizzle_history
 			ORDER BY id ASC;
 		`
@@ -284,7 +318,8 @@ func List(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName string
 		var failedStep sql.NullInt64
 		var errText sql.NullString
 		var seedHash sql.NullString
-		if err := rows.Scan(&rec.ID, &rec.PlanHash, &rec.Status, &failedStep, &errText, &rec.AppliedAt, &rec.DurationMs, &rec.AppliedBy, &rec.StepsJSON, &seedHash); err != nil {
+		var schemaHash sql.NullString
+		if err := rows.Scan(&rec.ID, &rec.PlanHash, &rec.Status, &failedStep, &errText, &rec.AppliedAt, &rec.DurationMs, &rec.AppliedBy, &rec.StepsJSON, &seedHash, &schemaHash); err != nil {
 			return nil, fmt.Errorf("scanning grizzle_history: %w", err)
 		}
 		if failedStep.Valid {
@@ -295,6 +330,9 @@ func List(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName string
 		}
 		if seedHash.Valid {
 			rec.SeedHash = seedHash.String
+		}
+		if schemaHash.Valid {
+			rec.SchemaHash = schemaHash.String
 		}
 		records = append(records, rec)
 	}
@@ -396,13 +434,13 @@ func GetByID(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName str
 			targetSchema = schemaName
 		}
 		query = fmt.Sprintf(`
-			SELECT id, plan_hash, status, failed_step, error, applied_at, duration_ms, applied_by, steps::text, seed_hash
+			SELECT id, plan_hash, status, failed_step, error, applied_at, duration_ms, applied_by, steps::text, seed_hash, schema_hash
 			FROM %q.grizzle_history
 			WHERE id = $1;
 		`, targetSchema)
 	case "sqlite":
 		query = `
-			SELECT id, plan_hash, status, failed_step, error, applied_at, duration_ms, applied_by, steps, seed_hash
+			SELECT id, plan_hash, status, failed_step, error, applied_at, duration_ms, applied_by, steps, seed_hash, schema_hash
 			FROM grizzle_history
 			WHERE id = ?;
 		`
@@ -414,7 +452,8 @@ func GetByID(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName str
 	var failedStep sql.NullInt64
 	var errText sql.NullString
 	var seedHash sql.NullString
-	err := dbtx.QueryRowContext(ctx, query, id).Scan(&rec.ID, &rec.PlanHash, &rec.Status, &failedStep, &errText, &rec.AppliedAt, &rec.DurationMs, &rec.AppliedBy, &rec.StepsJSON, &seedHash)
+	var schemaHash sql.NullString
+	err := dbtx.QueryRowContext(ctx, query, id).Scan(&rec.ID, &rec.PlanHash, &rec.Status, &failedStep, &errText, &rec.AppliedAt, &rec.DurationMs, &rec.AppliedBy, &rec.StepsJSON, &seedHash, &schemaHash)
 	if err == sql.ErrNoRows || isTableNotExist(err) {
 		return nil, nil
 	}
@@ -429,6 +468,9 @@ func GetByID(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName str
 	}
 	if seedHash.Valid {
 		rec.SeedHash = seedHash.String
+	}
+	if schemaHash.Valid {
+		rec.SchemaHash = schemaHash.String
 	}
 	return &rec, nil
 }
@@ -452,13 +494,13 @@ func ListEntries(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName
 			targetSchema = schemaName
 		}
 		query = fmt.Sprintf(`
-			SELECT id, plan_hash, status, failed_step, error, applied_at, duration_ms, applied_by, steps::text, seed_hash
+			SELECT id, plan_hash, status, failed_step, error, applied_at, duration_ms, applied_by, steps::text, seed_hash, schema_hash
 			FROM %q.grizzle_history
 			ORDER BY id %s%s;
 		`, targetSchema, order, limitClause)
 	case "sqlite":
 		query = fmt.Sprintf(`
-			SELECT id, plan_hash, status, failed_step, error, applied_at, duration_ms, applied_by, steps, seed_hash
+			SELECT id, plan_hash, status, failed_step, error, applied_at, duration_ms, applied_by, steps, seed_hash, schema_hash
 			FROM grizzle_history
 			ORDER BY id %s%s;
 		`, order, limitClause)
@@ -481,7 +523,8 @@ func ListEntries(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName
 		var failedStep sql.NullInt64
 		var errText sql.NullString
 		var seedHash sql.NullString
-		if err := rows.Scan(&rec.ID, &rec.PlanHash, &rec.Status, &failedStep, &errText, &rec.AppliedAt, &rec.DurationMs, &rec.AppliedBy, &rec.StepsJSON, &seedHash); err != nil {
+		var schemaHash sql.NullString
+		if err := rows.Scan(&rec.ID, &rec.PlanHash, &rec.Status, &failedStep, &errText, &rec.AppliedAt, &rec.DurationMs, &rec.AppliedBy, &rec.StepsJSON, &seedHash, &schemaHash); err != nil {
 			return nil, fmt.Errorf("scanning grizzle_history: %w", err)
 		}
 		if failedStep.Valid {
@@ -492,6 +535,9 @@ func ListEntries(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName
 		}
 		if seedHash.Valid {
 			rec.SeedHash = seedHash.String
+		}
+		if schemaHash.Valid {
+			rec.SchemaHash = schemaHash.String
 		}
 		records = append(records, rec)
 	}
@@ -550,9 +596,13 @@ func Summary(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName str
 }
 
 // RecordBaseline writes an initial baseline record with status 'baseline' into grizzle_history.
-func RecordBaseline(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName, planHash, note string) (*Record, error) {
+func RecordBaseline(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaName, planHash, note string, schemaHash ...string) (*Record, error) {
 	if err := EnsureTable(ctx, dbtx, dialectName, schemaName); err != nil {
 		return nil, err
+	}
+	var sHash string
+	if len(schemaHash) > 0 {
+		sHash = schemaHash[0]
 	}
 	err := Insert(ctx, dbtx, dialectName, schemaName, Record{
 		PlanHash:   planHash,
@@ -562,6 +612,7 @@ func RecordBaseline(ctx context.Context, dbtx dialect.DBTX, dialectName, schemaN
 		AppliedBy:  CurrentUser(),
 		StepsJSON:  "[]",
 		Error:      note,
+		SchemaHash: sHash,
 	})
 	if err != nil {
 		return nil, err

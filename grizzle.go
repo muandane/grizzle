@@ -3,8 +3,10 @@ package grizzle
 import (
 	"cmp"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -1433,6 +1435,12 @@ func IsReady(ctx context.Context, db *sql.DB, opts ...Option) (bool, error) {
 		targetSchemas = []string{targetSchema}
 	}
 
+	var expectedSchemaHash string
+	if o.SchemaSQL != "" {
+		h := sha256.Sum256([]byte(strings.TrimSpace(o.SchemaSQL)))
+		expectedSchemaHash = hex.EncodeToString(h[:])
+	}
+
 	for _, s := range targetSchemas {
 		latest, err := history.GetLatest(ctx, db, string(o.Dialect), s)
 		if err != nil {
@@ -1443,7 +1451,9 @@ func IsReady(ctx context.Context, db *sql.DB, opts ...Option) (bool, error) {
 		}
 		switch strings.ToLower(strings.TrimSpace(latest.Status)) {
 		case "applied", "baseline":
-			// ready for this schema
+			if expectedSchemaHash != "" && latest.SchemaHash != expectedSchemaHash {
+				return false, nil
+			}
 		default:
 			return false, nil
 		}
@@ -1491,7 +1501,13 @@ func Baseline(ctx context.Context, db *sql.DB, schemaSQL string, opts BaselineOp
 		return nil, fmt.Errorf("%w: live database differs by %d steps from desired schema; use Force to baseline anyway", ErrBaselineDrift, len(diffPlan.Steps))
 	}
 
-	rec, err := history.RecordBaseline(ctx, db, string(d), targetSchema, diffPlan.Hash(), opts.Note)
+	var schemaHash string
+	if schemaSQL != "" {
+		h := sha256.Sum256([]byte(strings.TrimSpace(schemaSQL)))
+		schemaHash = hex.EncodeToString(h[:])
+	}
+
+	rec, err := history.RecordBaseline(ctx, db, string(d), targetSchema, diffPlan.Hash(), opts.Note, schemaHash)
 	if err != nil {
 		return nil, fmt.Errorf("grizzle: record baseline: %w", err)
 	}

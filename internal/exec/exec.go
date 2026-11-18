@@ -3,8 +3,10 @@ package exec
 import (
 	"cmp"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -804,6 +806,13 @@ func syncPostgresOnce(ctx context.Context, db *sql.DB, cfg PostgresExecConfig, b
 		if logger != nil {
 			logger.InfoContext(ctx, "grizzle: schema is already in sync", "duration", time.Since(start))
 		}
+		if !cfg.DryRun && strings.TrimSpace(cfg.SchemaSQL) != "" {
+			h := sha256.Sum256([]byte(strings.TrimSpace(cfg.SchemaSQL)))
+			desiredHash := hex.EncodeToString(h[:])
+			if latest == nil || latest.SchemaHash != desiredHash {
+				_ = history.RecordPlan(ctx, conn, "postgres", primarySchema, p, time.Since(start))
+			}
+		}
 		if cfg.DevDB != nil {
 			_ = postgres.DropShadowSchemas(ctx, cfg.DevDB, shadowSchemas)
 		} else {
@@ -1260,6 +1269,13 @@ func SyncSQLite(ctx context.Context, db *sql.DB, cfg SQLiteExecConfig) (err erro
 		if len(p.Steps) == 0 {
 			if logger != nil {
 				logger.InfoContext(ctx, "sqlite: schema is already in sync", "duration", time.Since(start))
+			}
+			if !cfg.DryRun && strings.TrimSpace(cfg.SchemaSQL) != "" {
+				h := sha256.Sum256([]byte(strings.TrimSpace(cfg.SchemaSQL)))
+				desiredHash := hex.EncodeToString(h[:])
+				if latest == nil || latest.SchemaHash != desiredHash {
+					_ = history.RecordPlan(ctx, conn, "sqlite", cfg.primarySchema(), p, time.Since(start))
+				}
 			}
 			return nil
 		}
