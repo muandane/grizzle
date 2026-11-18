@@ -57,7 +57,7 @@ func RunShadowDDL(ctx context.Context, dbtx dialect.DBTX, shadowSchema, targetSc
 		return err
 	}
 
-	setPathSQL := fmt.Sprintf("SET LOCAL search_path TO %q, %q, public;", shadowSchema, targetSchema)
+	setPathSQL := fmt.Sprintf("SET search_path TO %q, %q, public;", shadowSchema, targetSchema)
 	if _, err := dbtx.ExecContext(ctx, setPathSQL); err != nil {
 		return fmt.Errorf("failed setting search_path to %q: %w", shadowSchema, err)
 	}
@@ -88,9 +88,9 @@ func RunShadowDDL(ctx context.Context, dbtx dialect.DBTX, shadowSchema, targetSc
 		}
 	}
 
-	restorePathSQL := fmt.Sprintf("SET LOCAL search_path TO %q, public;", targetSchema)
+	restorePathSQL := fmt.Sprintf("SET search_path TO %q;", shadowSchema)
 	if _, err := dbtx.ExecContext(ctx, restorePathSQL); err != nil {
-		return fmt.Errorf("failed restoring search_path to %q: %w", targetSchema, err)
+		return fmt.Errorf("failed restoring search_path to %q: %w", shadowSchema, err)
 	}
 
 	return nil
@@ -207,7 +207,7 @@ func RunMultiShadowDDL(ctx context.Context, dbtx dialect.DBTX, shadowMap map[str
 		}
 		targetQuoted = append(targetQuoted, fmt.Sprintf("%q", t))
 	}
-	setPathSQL := fmt.Sprintf("SET LOCAL search_path TO %s, %s, public;", strings.Join(shadowQuoted, ", "), strings.Join(targetQuoted, ", "))
+	setPathSQL := fmt.Sprintf("SET search_path TO %s, %s, public;", strings.Join(shadowQuoted, ", "), strings.Join(targetQuoted, ", "))
 	if _, err := dbtx.ExecContext(ctx, setPathSQL); err != nil {
 		return fmt.Errorf("failed setting multi-schema shadow search_path: %w", err)
 	}
@@ -230,9 +230,9 @@ func RunMultiShadowDDL(ctx context.Context, dbtx dialect.DBTX, shadowMap map[str
 		}
 	}
 
-	restorePathSQL := fmt.Sprintf("SET LOCAL search_path TO %s, public;", strings.Join(targetQuoted, ", "))
+	restorePathSQL := fmt.Sprintf("SET search_path TO %s;", strings.Join(shadowQuoted, ", "))
 	if _, err := dbtx.ExecContext(ctx, restorePathSQL); err != nil {
-		return fmt.Errorf("failed restoring target search_path: %w", err)
+		return fmt.Errorf("failed restoring shadow search_path: %w", err)
 	}
 
 	return nil

@@ -28,15 +28,22 @@ func polCmdName(cmd string) string {
 	}
 }
 
-// pinSearchPath pins search_path to pg_catalog for the remainder of the
-// current transaction so pg_get_*def / pg_get_expr emit fully qualified,
-// search-path-independent definitions. It is a no-op when dbtx is not inside
+// pinSearchPath pins search_path so the inspected schema precedes target schemas, public, and pg_catalog
+// for the remainder of the current transaction so pg_get_*def / pg_get_expr emit clean, unqualified definitions for objects
+// in the active schema, while ensuring catalog and extension types resolve reliably. It is a no-op when dbtx is not inside
 // a transaction (e.g. direct *sql.DB inspection, where the statement-scoped
 // pin is impossible and the session path is whatever the pool provides).
 // Call unpinSearchPath after the pin-affected queries to restore the
 // transaction path.
-func pinSearchPath(ctx context.Context, dbtx dialect.DBTX) {
-	_, _ = dbtx.ExecContext(ctx, "SAVEPOINT grizzle_inspect_pin; SET LOCAL search_path TO pg_catalog;")
+func pinSearchPath(ctx context.Context, dbtx dialect.DBTX, schemaName string, searchPath ...string) {
+	var paths []string
+	paths = append(paths, fmt.Sprintf("%q", schemaName))
+	for _, p := range searchPath {
+		if p != "" && p != schemaName {
+			paths = append(paths, fmt.Sprintf("%q", p))
+		}
+	}
+	_, _ = dbtx.ExecContext(ctx, fmt.Sprintf("SAVEPOINT grizzle_inspect_pin; SET search_path TO %s;", strings.Join(paths, ", ")))
 }
 
 // unpinSearchPath reverts the pinned path (ROLLBACK TO SAVEPOINT undoes the
@@ -46,7 +53,10 @@ func unpinSearchPath(ctx context.Context, dbtx dialect.DBTX) {
 }
 
 // Inspect reads the relational state of the specified schema directly from pg_catalog.
-func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema.Schema, error) {
+func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string, searchPath ...string) (*schema.Schema, error) {
+	pinSearchPath(ctx, dbtx, schemaName, searchPath...)
+	defer unpinSearchPath(ctx, dbtx)
+
 	s := &schema.Schema{
 		Name:           schemaName,
 		Tables:         make(map[string]*schema.Table),
@@ -415,13 +425,7 @@ func Inspect(ctx context.Context, dbtx dialect.DBTX, schemaName string) (*schema
 	}
 	_ = rlsRows.Close()
 
-	// 2e. Inspect row-level security policies. pg_get_expr renders schema
-	// references per the session search_path, so live and shadow inspections
-	// can disagree; pin search_path to pg_catalog for all pg_get_*def-based
-	// queries from here to the end of Inspect (see pinSearchPath).
-	pinSearchPath(ctx, dbtx)
-	defer unpinSearchPath(ctx, dbtx)
-
+	// 2e. Inspect row-level security policies.
 	policyQuery := `
 		SELECT
 			c.relname AS table_name,
@@ -1367,10 +1371,10 @@ func reconstructAggregateDefinition(name, identityArgs, stype, sfunc, finalfunc,
 }
 
 // InspectSchemas reads the relational states across all specified schema names.
-func InspectSchemas(ctx context.Context, dbtx dialect.DBTX, schemaNames []string) (map[string]*schema.Schema, error) {
+func InspectSchemas(ctx context.Context, dbtx dialect.DBTX, schemaNames []string, searchPath ...string) (map[string]*schema.Schema, error) {
 	schemas := make(map[string]*schema.Schema, len(schemaNames))
 	for _, name := range schemaNames {
-		s, err := Inspect(ctx, dbtx, name)
+		s, err := Inspect(ctx, dbtx, name, searchPath...)
 		if err != nil {
 			return nil, err
 		}

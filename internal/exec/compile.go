@@ -131,7 +131,7 @@ func CompileSchemaPostgres(ctx context.Context, db *sql.DB, cfg PostgresExecConf
 	// WITH SCHEMA rewriting) qualify expressions with the ephemeral shadow
 	// schema name, which is unique per run. Left in place they break rendered
 	// target DDL and cause permanent drift.
-	unmapShadowExprs(s, []string{shadowSchema})
+	unmapShadowExprs(s, []string{shadowSchema}, primarySchema)
 
 	s.SourceSQL = cfg.SchemaSQL
 	s.Dialect = "postgres"

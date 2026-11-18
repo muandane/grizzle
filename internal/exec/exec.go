@@ -180,7 +180,7 @@ func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig
 		// straight from SchemaSQL (authoritative desired set).
 		desired.Extensions = schema.ParseExtensions(cfg.SchemaSQL)
 		maskShadowExtensions(live, []string{shadowSchema})
-		unmapShadowExprs(desired, []string{shadowSchema})
+		unmapShadowExprs(desired, []string{shadowSchema}, targetSchema)
 
 		changes, err := diff.Diff(live, desired, targetSchema, shadowSchema, cfg.Filters)
 		if err != nil {
@@ -232,8 +232,10 @@ func DiffPostgres(ctx context.Context, dbtx dialect.DBTX, cfg PostgresExecConfig
 	for _, live := range liveMap {
 		maskShadowExtensions(live, shadowNames)
 	}
-	for _, desired := range desiredMap {
-		unmapShadowExprs(desired, shadowNames)
+	for target, shadow := range shadowMap {
+		if desired := desiredMap[shadow]; desired != nil {
+			unmapShadowExprs(desired, shadowNames, target)
+		}
 	}
 
 	var allChanges []diff.Change
@@ -283,17 +285,19 @@ func maskShadowExtensions(live *schema.Schema, shadowSchemas []string) {
 	}
 }
 
-// unmapShadowExprs strips ephemeral shadow-schema qualifications from column
-// default and generated expressions. Functions re-installed into the shadow
-// schema (e.g. extension functions captured via WITH SCHEMA rewriting) leave
-// `_grizzle_shadow_<id>.fn(...)` in pg_get_expr output; the shadow schema is
-// unique per run and never exists in the target, so left in place they break
-// rendered DDL and cause permanent drift. Stripping lets the reference
-// resolve through the apply-time search_path.
-func unmapShadowExprs(s *schema.Schema, shadowSchemas []string) {
-	if s == nil || len(shadowSchemas) == 0 {
+// unmapShadowExprs strips ephemeral shadow-schema and target-schema qualifications from column
+// default expressions, generated expressions, data types, and dependencies. Functions re-installed
+// into the shadow schema (e.g. extension functions captured via WITH SCHEMA rewriting) leave
+// `_grizzle_shadow_<id>.fn(...)` in pg_get_expr output; the shadow schema is unique per run and
+// never exists in the target, so left in place they break rendered DDL and cause permanent drift.
+// Types formatted by format_type during shadow inspection omit targetSchema from search_path,
+// causing them to be qualified as `targetSchema.<type>` when they belong to targetSchema.
+// Stripping lets the reference resolve through the apply-time search_path.
+func unmapShadowExprs(s *schema.Schema, shadowSchemas []string, targetSchemas ...string) {
+	if s == nil || (len(shadowSchemas) == 0 && len(targetSchemas) == 0) {
 		return
 	}
+	allPrefixes := append(slices.Clone(shadowSchemas), targetSchemas...)
 	for _, t := range s.Tables {
 		for _, c := range t.Columns {
 			for _, shadow := range shadowSchemas {
@@ -307,28 +311,78 @@ func unmapShadowExprs(s *schema.Schema, shadowSchemas []string) {
 					c.Generated.Expr = strings.ReplaceAll(c.Generated.Expr, `"`+shadow+`".`, "")
 				}
 			}
+			for _, prefix := range allPrefixes {
+				if prefix == "" {
+					continue
+				}
+				c.DataType = strings.ReplaceAll(c.DataType, prefix+".", "")
+				c.DataType = strings.ReplaceAll(c.DataType, `"`+prefix+`".`, "")
+			}
+			c.DataType = schema.NormalizeType(c.DataType)
 		}
+	}
+	for _, comp := range s.CompositeTypes {
+		for _, attr := range comp.Attributes {
+			for _, prefix := range allPrefixes {
+				if prefix == "" {
+					continue
+				}
+				attr.DataType = strings.ReplaceAll(attr.DataType, prefix+".", "")
+				attr.DataType = strings.ReplaceAll(attr.DataType, `"`+prefix+`".`, "")
+			}
+			attr.DataType = schema.NormalizeType(attr.DataType)
+		}
+	}
+	for _, dom := range s.Domains {
+		for _, prefix := range allPrefixes {
+			if prefix == "" {
+				continue
+			}
+			dom.BaseType = strings.ReplaceAll(dom.BaseType, prefix+".", "")
+			dom.BaseType = strings.ReplaceAll(dom.BaseType, `"`+prefix+`".`, "")
+		}
+		dom.BaseType = schema.NormalizeType(dom.BaseType)
+	}
+	for _, r := range s.RangeTypes {
+		for _, prefix := range allPrefixes {
+			if prefix == "" {
+				continue
+			}
+			r.Subtype = strings.ReplaceAll(r.Subtype, prefix+".", "")
+			r.Subtype = strings.ReplaceAll(r.Subtype, `"`+prefix+`".`, "")
+		}
+		r.Subtype = schema.NormalizeType(r.Subtype)
+	}
+	for _, seq := range s.Sequences {
+		for _, prefix := range allPrefixes {
+			if prefix == "" {
+				continue
+			}
+			seq.DataType = strings.ReplaceAll(seq.DataType, prefix+".", "")
+			seq.DataType = strings.ReplaceAll(seq.DataType, `"`+prefix+`".`, "")
+		}
+		seq.DataType = schema.NormalizeType(seq.DataType)
 	}
 }
 
-func inspectPostgresSchema(ctx context.Context, dbtx dialect.DBTX, schema string, tracer Tracer) (*schema.Schema, error) {
+func inspectPostgresSchema(ctx context.Context, dbtx dialect.DBTX, schema string, tracer Tracer, searchPath ...string) (*schema.Schema, error) {
 	if tracer != nil {
 		var span Span
 		ctx, span = tracer.Start(ctx, "grizzle.inspect_schema")
 		span.SetAttribute("schema", schema)
 		defer span.End()
 	}
-	return postgres.Inspect(ctx, dbtx, schema)
+	return postgres.Inspect(ctx, dbtx, schema, searchPath...)
 }
 
-func inspectPostgresSchemas(ctx context.Context, dbtx dialect.DBTX, schemas []string, tracer Tracer) (map[string]*schema.Schema, error) {
+func inspectPostgresSchemas(ctx context.Context, dbtx dialect.DBTX, schemas []string, tracer Tracer, searchPath ...string) (map[string]*schema.Schema, error) {
 	if tracer != nil {
 		var span Span
 		ctx, span = tracer.Start(ctx, "grizzle.inspect_schema")
 		span.SetAttribute("schemas", strings.Join(schemas, ","))
 		defer span.End()
 	}
-	return postgres.InspectSchemas(ctx, dbtx, schemas)
+	return postgres.InspectSchemas(ctx, dbtx, schemas, searchPath...)
 }
 
 func execStepWithTracing(ctx context.Context, execer dialect.DBTX, s plan.Step, isNonTx bool, tracer Tracer, roleIR map[string]*schema.Role, subIR map[string]*schema.Subscription) error {
