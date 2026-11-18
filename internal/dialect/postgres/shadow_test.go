@@ -463,7 +463,7 @@ type mockFailingDBTX struct {
 }
 
 func (m *mockFailingDBTX) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
-	if strings.HasPrefix(strings.TrimSpace(query), "SET LOCAL") {
+	if strings.HasPrefix(strings.TrimSpace(query), "SET") {
 		return nil, nil
 	}
 	return nil, m.execErr
