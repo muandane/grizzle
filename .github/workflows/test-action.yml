@@ -16,6 +16,9 @@ jobs:
   test-action:
     name: Test Grizzle Action
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -49,3 +52,21 @@ jobs:
           schema: test_schema.sql
           dsn: 'sqlite:test.db'
           format: github
+
+      - name: Test Grizzle Action (plan with comment disabled)
+        uses: ./
+        with:
+          command: plan
+          schema: test_schema.sql
+          dsn: 'sqlite:test.db'
+          comment: 'false'
+
+      - name: Test Grizzle Action (plan with simulate and PR comment)
+        uses: ./
+        with:
+          command: plan
+          schema: test_schema.sql
+          dsn: 'sqlite:test.db'
+          extra-args: '--simulate'
+          comment: 'true'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
