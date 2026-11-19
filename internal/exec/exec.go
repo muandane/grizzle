@@ -42,6 +42,10 @@ type Metrics interface {
 	RecordMigrationDuration(ctx context.Context, duration time.Duration, dialect string, status string)
 	RecordDriftDetected(ctx context.Context, dialect string, schema string)
 	RecordLockWait(ctx context.Context, duration time.Duration, dialect string)
+}
+
+// SimulationMetrics extends Metrics with simulation duration recording.
+type SimulationMetrics interface {
 	RecordSimulationDuration(ctx context.Context, duration time.Duration, dialect string, status string)
 }
 

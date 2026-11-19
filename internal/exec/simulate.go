@@ -47,7 +47,11 @@ func SimulatePostgresPlan(ctx context.Context, db *sql.DB, p *plan.Plan, cfg Pos
 			} else if res == nil || res.Plan == nil || len(res.Plan.Steps) == 0 {
 				status = "noop"
 			}
-			cfg.Metrics.RecordSimulationDuration(ctx, time.Since(start), "postgres", status)
+			if sm, ok := cfg.Metrics.(SimulationMetrics); ok {
+				sm.RecordSimulationDuration(ctx, time.Since(start), "postgres", status)
+			} else {
+				cfg.Metrics.RecordMigrationDuration(ctx, time.Since(start), "postgres", status)
+			}
 		}
 	}()
 
@@ -201,7 +205,11 @@ func SimulateSQLitePlan(ctx context.Context, db *sql.DB, p *plan.Plan, cfg SQLit
 			} else if res == nil || res.Plan == nil || len(res.Plan.Steps) == 0 {
 				status = "noop"
 			}
-			cfg.Metrics.RecordSimulationDuration(ctx, time.Since(start), "sqlite", status)
+			if sm, ok := cfg.Metrics.(SimulationMetrics); ok {
+				sm.RecordSimulationDuration(ctx, time.Since(start), "sqlite", status)
+			} else {
+				cfg.Metrics.RecordMigrationDuration(ctx, time.Since(start), "sqlite", status)
+			}
 		}
 	}()
 

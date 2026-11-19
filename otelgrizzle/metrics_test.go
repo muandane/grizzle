@@ -74,7 +74,11 @@ CREATE TABLE users (
 
 	// 5. Test manual metric calls (e.g. lock wait, simulation duration)
 	m.RecordLockWait(context.Background(), 25*time.Millisecond, "sqlite")
-	m.RecordSimulationDuration(context.Background(), 50*time.Millisecond, "sqlite", "applied")
+	if sm, ok := m.(interface {
+		RecordSimulationDuration(ctx context.Context, duration time.Duration, dialect string, status string)
+	}); ok {
+		sm.RecordSimulationDuration(context.Background(), 50*time.Millisecond, "sqlite", "applied")
+	}
 
 	// Collect metrics from the reader
 	var rm metricdata.ResourceMetrics
