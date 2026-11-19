@@ -168,7 +168,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Lint declarative schema
-        uses: muandane/grizzle@v0.2.0
+        uses: muandane/grizzle@v0.2.1
         with:
           command: lint
           schema: schema.sql
@@ -180,7 +180,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Preview migration plan and post sticky PR summary
-        uses: muandane/grizzle@v0.2.0
+        uses: muandane/grizzle@v0.2.1
         with:
           command: plan
           schema: schema.sql
@@ -194,7 +194,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Check for schema drift
-        uses: muandane/grizzle@v0.2.0
+        uses: muandane/grizzle@v0.2.1
         with:
           command: check
           schema: schema.sql
@@ -265,7 +265,7 @@ For the full feature matrix, safety guards, and catalog details, see [docs/FEATU
 - [CONTRIBUTING](CONTRIBUTING.md): development setup and contribution guidelines
 - [CHANGELOG](CHANGELOG.md): release notes and version history
 
-Current tag: **v0.2.0**.
+Current tag: **v0.2.1**.
 
 ---
 

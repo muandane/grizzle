@@ -5,6 +5,53 @@ All notable changes to Grizzle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.2.1] - 2026-11-19
+
+### Added
+- **Pre-Flight Migration Simulation Sandbox** (`grizzle simulate` / `grizzle.Simulate`):
+  - Dry-run migration execution sandbox inside isolated transactions (PostgreSQL) or savepoints (SQLite) with mandatory zero-mutation rollback.
+  - Step-level timing profiling and lock hold duration measurement, identifying and reporting operations that exceed `--max-lock-duration`.
+  - Live data constraint validation: validates foreign key and check constraints against actual live table data before applying schema changes.
+  - Machine-readable `--json` simulation report output and integration with `SimulationMetrics`.
+- **Declarative SQL Linter Rule Expansion** (`internal/lint`, `docs/LINTER_SPEC.md`):
+  - `L016` (`TableCommentRequired`): flags missing table documentation comments.
+  - `L032` (`DisallowFloatMoney`): enforces exact decimal or integer types for financial/currency columns (`*amount*`, `*price*`, `*cost*`, etc.) to prevent floating-point rounding errors.
+  - `L033` (`DisallowMultiTenantCascadeDrop`): prevents inadvertent multi-tenant data loss by blocking `ON DELETE CASCADE` across foreign keys in multi-tenant schemas.
+  - `L049` (`DisallowExcessiveIndexWidth`): flags composite indexes spanning more than 5 columns.
+  - `L051` (`DisallowLowCardinalityLeadingIndex`): detects boolean or low-cardinality leading columns in compound indexes.
+- **Interactive Sticky PR Summary in GitHub Action** (`action.yml`):
+  - Posts and updates in-place sticky pull request comments (`<!-- grizzle-action-comment -->`) summarizing migration plans, DDL diffs, simulation timings, and hazard warnings.
+- **Desired Schema Parity Verification in Readiness Probe** (`grizzle.IsReady`, `WithSchemaSQL`):
+  - Records and verifies SHA-256 `schema_hash` in `grizzle_history` during migration and baselining.
+  - `grizzle.IsReady` supports `WithSchemaSQL` to verify that active database state matches container application schema expectations, failing readiness if schema drift is detected.
+- **Topological View Dependency Sorting** (`internal/dialect/postgres/inspect_views.go`):
+  - Queries `pg_depend` and `pg_rewrite` catalogs to resolve view-on-view and view-on-table dependency DAGs.
+  - Automatically sorts `CreateViewStep` and `DropViewStep` operations in topological order, eliminating view creation order errors.
+- **SQLite Table Rebuild Safety & Quoting** (`internal/dialect/sqlite/rebuild.go`):
+  - Explicit column definitions stored directly on `RebuildTableStep`.
+  - Quoted column and table identifiers in chunked copy operations, protecting against SQLite keyword collisions and special characters.
+- **Comprehensive Golden Corpus & Resilience Testing** (`internal/plan/golden_test.go`, `golden_re_diff_test.go`, `failure_path_test.go`):
+  - Pinned golden hashes for `Plan.Hash()` across step types.
+  - Added idempotency suite (`apply-re-diff`) verifying zero remaining steps upon re-diffing.
+  - Chaos failure path tests covering connection drops, context cancellation, and lock timeouts.
+
+### Fixed
+- **Advisory Lock Leak on Hook & Context Cancellation** (`internal/dialect/postgres/lock.go`, `internal/exec/exec.go`):
+  - Released held session advisory locks using detached uncancelled context (`context.WithoutCancel` with 5-second timeout) when hooks or transactions fail or client contexts are cancelled.
+  - Cleaned up session search path and timeouts to prevent connection pool contamination.
+- **Shadow Schema Qualification Leak** (`internal/dialect/postgres/inspect.go`, `shadow.go`):
+  - Preserved shadow search path during inspection, preventing transient shadow schema prefixes (`_grizzle_shadow.`) from leaking into canonical DDL output.
+- **Graceful DDL Constraint Validation Errors**:
+  - Replaced runtime panics during PostgreSQL constraint validation with structured error returns.
+- **Preserved SQL Three-Valued Logic in Expression Normalization**:
+  - Restored proper NULL evaluation semantics by removing incorrect boolean folding during check constraint normalization.
+
+### Refactored
+- **PostgreSQL Inspector & Engine Decomposition**:
+  - Decomposed monolithic PostgreSQL catalog inspector into dedicated packages (`inspect_relations.go`, `inspect_routines.go`, `inspect_types.go`, `inspect_views.go`).
+  - Separated SQLite rebuild and execution logic into `internal/exec/sqlite.go` and `unmap.go`.
+  - Centralized deterministic schema hashing via `internal/schema/normalize.go`.
+
 ## [v0.2.0] - 2026-10-14
 
 ### Added

@@ -8,9 +8,9 @@ branding:
 
 inputs:
   version:
-    description: 'Version of Grizzle to install and run (e.g. v0.2.0, latest)'
+    description: 'Version of Grizzle to install and run (e.g. v0.2.1, latest)'
     required: false
-    default: 'v0.2.0'
+    default: 'v0.2.1'
   command:
     description: 'Grizzle command to execute (lint, check, plan, diff, apply, export)'
     required: false
@@ -87,7 +87,7 @@ runs:
           # Resolve latest release tag from GitHub API
           VER=$(curl -sSL -H "Accept: application/vnd.github+json" https://api.github.com/repos/muandane/grizzle/releases/latest | grep '"tag_name":' | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
           if [ -z "$VER" ]; then
-            VER="v0.2.0"
+            VER="v0.2.1"
           fi
         fi
 
