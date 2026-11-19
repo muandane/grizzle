@@ -375,6 +375,14 @@ func (m *mockMetrics) RecordLockWait(ctx context.Context, d time.Duration, diale
 	}{d, dialect})
 }
 
+func (m *mockMetrics) RecordSimulationDuration(ctx context.Context, d time.Duration, dialect, status string) {
+	m.durations = append(m.durations, struct {
+		duration time.Duration
+		dialect  string
+		status   string
+	}{d, dialect, status})
+}
+
 func TestOptions_Metrics(t *testing.T) {
 	metrics := &mockMetrics{}
 	opts := grizzle.Options{}

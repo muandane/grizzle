@@ -48,7 +48,7 @@ CREATE TABLE legacy_session_store (
 
 ---
 
-## 2. Currently Shipped Built-In Rules (`L001`–`L013`)
+## 2. Currently Shipped Built-In Rules (`L001`–`L013`, `L032`)
 
 These rules are currently implemented in Grizzle's [`internal/lint`](../internal/lint):
 
@@ -67,15 +67,20 @@ These rules are currently implemented in Grizzle's [`internal/lint`](../internal
 | `L011` | `WARNING` | **UnversionedExtension** | `CREATE EXTENSION` does not specify an explicit `VERSION 'x.y'`. |
 | `L012` | `ERROR` | **NonIdempotentSeed** | Seed DML in `SeedSQL` lacks an `ON CONFLICT` clause or idempotent guard. |
 | `L013` | `ERROR` | **UnsupportedSQLiteFeature** | Schema attempts to use features unsupported on SQLite (e.g. `COMMENT ON`, RLS, or enum types). |
+| `L032` | `ERROR` | **DisallowFloatForFinancialData** | Disallows IEEE 754 floating-point types (`FLOAT`, `REAL`, `DOUBLE PRECISION`) for monetary/financial columns; enforce `NUMERIC` or `DECIMAL`. |
 
 ### Strict Profile Rules (`--profile strict`)
 | Rule ID | Severity | Name | Description |
 | :--- | :--- | :--- | :--- |
 | `L014` | `ERROR` | **PrimaryKeyTypeAllowlist** | Primary key columns must use an allowed integer or UUID data type (`BIGINT`, `INTEGER`, `SMALLINT`, `UUID`). |
+| `L016` | `INFO` | **RequireTableComment** | Tables must declare an informative `COMMENT ON TABLE` description for cataloging (skipped on SQLite). |
 | `L022` | `ERROR` | **DisallowReservedKeyword** | Tables and columns must not use reserved SQL keywords (`user`, `order`, `table`, etc.). |
+| `L033` | `WARNING` | **DisallowCascadeDeleteOnMultiTenant** | Disallows `ON DELETE CASCADE` on multi-tenant isolation columns (`tenant_id`, `org_id`, etc.); enforce `ON DELETE RESTRICT`. |
 | `L044` | `WARNING` | **RequireBooleanDefault** | Boolean columns should declare an explicit `DEFAULT false` or `DEFAULT true` to avoid tri-state `NULL`. |
 | `L047` | `ERROR` | **DisallowDuplicateIndex** | Table must not declare duplicate indexes covering the identical columns, access method, and predicate. |
 | `L048` | `WARNING` | **DisallowRedundantPrefixIndex** | Single-column index is redundant when a composite index covers the column as its leading prefix. |
+| `L049` | `WARNING` | **CompositeIndexMaxColumns** | Composite indexes should not exceed 4 columns to avoid index bloat and write degradation. |
+| `L051` | `WARNING` | **DisallowLowCardinalityIndexPrefix** | Composite indexes must not use a low-cardinality boolean column as the leading prefix. |
 
 ---
 
@@ -120,7 +125,7 @@ These rules are currently implemented in Grizzle's [`internal/lint`](../internal
 | :--- | :--- | :--- | :--- | :--- |
 | `L031` | `WARNING` | **DisallowUnboundedVarchar** | `VARCHAR_LENGTH_LIMIT` | Flag `VARCHAR` without an explicit length limit; prefer typed `VARCHAR(n)` or deliberate `TEXT`. |
 | `L032` | `ERROR` | **DisallowFloatForFinancialData** | `DISALLOW_FLOAT_FINANCIAL` | Disallows IEEE 754 floating-point types (`REAL`, `FLOAT4`, `FLOAT8`) for money columns; enforce `NUMERIC` / `DECIMAL`. |
-| `L033` | `WARNING` | **DisallowLargeBlobInOLTP** | `DISALLOW_INLINE_BLOB` | Flags large inline `BYTEA` or binary blobs in OLTP tables; recommend S3/R2 storage with URL references. |
+| `L033` | `WARNING` | **DisallowCascadeDeleteOnMultiTenant** | `DISALLOW_CASCADE_DELETE_MULTI_TENANT` | Flags foreign keys using `ON DELETE CASCADE` on multi-tenant isolation columns (`tenant_id`, `org_id`, etc.); prefer `ON DELETE RESTRICT`. |
 | `L034` | `ERROR` | **DisallowDangerousTypeNarrowing** | `DANGEROUS_TYPE_NARROWING` | Narrowing a column type (e.g. `BIGINT` to `INT`, `VARCHAR(100)` to `VARCHAR(50)`) risks immediate runtime truncation failure. |
 | `L035` | `INFO` | **RequireColumnComment** | `REQUIRE_COLUMN_COMMENT` | Sensitive or non-obvious columns should declare `COMMENT ON COLUMN "tbl"."col" IS '...'`. |
 | `L036` | `ERROR` | **DisallowVolatileDefaultValue** | `DISALLOW_VOLATILE_DEFAULT` | Column defaults must be deterministic; disallow volatile functions like `random()` or non-stable expressions. |
@@ -143,9 +148,9 @@ These rules are currently implemented in Grizzle's [`internal/lint`](../internal
 | `L046` | `WARNING` | **IndexColumnNumberLimit** | `INDEX_COLUMN_LIMIT` | Composite indexes should not exceed 3–4 columns. Long composite indexes bloat the b-tree. |
 | `L047` | `ERROR` | **DisallowDuplicateIndex** | `DISALLOW_DUPLICATE_INDEX` | Disallow declaring two indexes on the same table covering the exact same columns and access method. |
 | `L048` | `WARNING` | **DisallowRedundantPrefixIndex** | `DISALLOW_REDUNDANT_INDEX` | An index on `(a, b)` already accelerates queries on `(a)`; a standalone index on `(a)` is redundant. |
-| `L049` | `WARNING` | **IndexNamingConvention** | `NAMING_INDEX_CONVENTION` | Secondary index names must follow `idx_{table}_{column(s)}`. |
+| `L049` | `WARNING` | **CompositeIndexMaxColumns** | `COMPOSITE_INDEX_MAX_COLUMNS` | Composite indexes should not exceed 4 columns to avoid index bloat and excessive maintenance cost. |
 | `L050` | `WARNING` | **UniqueIndexNamingConvention** | `NAMING_UNIQUE_CONVENTION` | Unique constraint/index names must follow `uk_{table}_{column(s)}` or `uniq_{table}_{column(s)}`. |
-| `L051` | `WARNING` | **DisallowBtreeOnComplexTypes** | `DISALLOW_BTREE_COMPLEX` | Standard B-Tree indexes on `JSONB`, arrays, or geometric types are inefficient; recommend `GIN` or `GiST`. |
+| `L051` | `WARNING` | **DisallowLowCardinalityIndexPrefix** | `DISALLOW_LOW_CARDINALITY_PREFIX` | Flags composite indexes with low-cardinality leading boolean column; reorder higher-cardinality columns first or convert to partial index. |
 | `L052` | `INFO` | **RecommendPartialIndexOnSoftDelete** | `PARTIAL_INDEX_SOFT_DELETE` | For tables with `deleted_at`, unique constraints should be partial: `WHERE deleted_at IS NULL`. |
 | `L053` | `WARNING` | **DisallowLowCardinalityIndex** | `DISALLOW_LOW_CARDINALITY_INDEX` | B-tree index on low-cardinality boolean/status columns will rarely be selected by query planner; use partial index. |
 | `L054` | `WARNING` | **IndexNameLengthLimit** | `INDEX_NAME_LENGTH` | Index names must not exceed 63 characters. |

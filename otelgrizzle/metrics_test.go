@@ -72,8 +72,13 @@ CREATE TABLE users (
 		t.Fatalf("expected DriftError, got nil")
 	}
 
-	// 5. Test manual metric calls (e.g. lock wait)
+	// 5. Test manual metric calls (e.g. lock wait, simulation duration)
 	m.RecordLockWait(context.Background(), 25*time.Millisecond, "sqlite")
+	if sm, ok := m.(interface {
+		RecordSimulationDuration(ctx context.Context, duration time.Duration, dialect string, status string)
+	}); ok {
+		sm.RecordSimulationDuration(context.Background(), 50*time.Millisecond, "sqlite", "applied")
+	}
 
 	// Collect metrics from the reader
 	var rm metricdata.ResourceMetrics
@@ -84,6 +89,7 @@ CREATE TABLE users (
 	foundDuration := false
 	foundDrift := false
 	foundLockWait := false
+	foundSimulation := false
 
 	for _, sm := range rm.ScopeMetrics {
 		for _, metric := range sm.Metrics {
@@ -115,6 +121,15 @@ CREATE TABLE users (
 				if len(h.DataPoints) == 0 {
 					t.Errorf("expected lock_wait data points, got 0")
 				}
+			case "simulation_duration_seconds":
+				foundSimulation = true
+				h, ok := metric.Data.(metricdata.Histogram[float64])
+				if !ok {
+					t.Fatalf("expected Histogram[float64], got %T", metric.Data)
+				}
+				if len(h.DataPoints) == 0 {
+					t.Errorf("expected simulation_duration data points, got 0")
+				}
 			}
 		}
 	}
@@ -127,6 +142,9 @@ CREATE TABLE users (
 	}
 	if !foundLockWait {
 		t.Errorf("metric lock_wait_seconds not found")
+	}
+	if !foundSimulation {
+		t.Errorf("metric simulation_duration_seconds not found")
 	}
 }
 

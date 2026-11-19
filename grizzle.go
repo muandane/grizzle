@@ -1224,6 +1224,186 @@ func DryRunVerify(ctx context.Context, db *sql.DB, opts Options) (*DryRunResult,
 	})
 }
 
+// StepTiming captures execution and lock metrics for a single planned step.
+type StepTiming = exec.StepTiming
+
+// SimulateResult captures the full profile of a simulated migration run.
+type SimulateResult = exec.SimulateResult
+
+// Simulate executes a pre-flight migration simulation sandbox against the target database:
+// the planned DDL runs against real data inside transactions that are unconditionally
+// rolled back, profiling execution duration per step and checking for lock duration threshold
+// violations. Non-transactional steps are skipped and recorded with duration 0.
+func Simulate(ctx context.Context, db *sql.DB, opts Options) (*SimulateResult, error) {
+	if err := prepareOptions(ctx, db, &opts); err != nil {
+		return nil, err
+	}
+
+	policy := resolveDropPolicy(opts)
+	filters := toScopeFilters(opts)
+
+	if opts.Dialect == DialectSQLite {
+		return exec.SimulateSQLite(ctx, db, exec.SQLiteExecConfig{
+			SchemaSQL:            opts.SchemaSQL,
+			TargetSchema:         opts.TargetSchema,
+			TargetSchemas:        opts.TargetSchemas,
+			SQLiteAttach:         opts.SQLiteAttach,
+			Filters:              filters,
+			Policy:               policy,
+			AcceptHazards:        opts.AcceptHazards,
+			Logger:               opts.Logger,
+			Tracer:               opts.Tracer,
+			Metrics:              opts.Metrics,
+			BeforeStep:           opts.BeforeStep,
+			AfterStep:            opts.AfterStep,
+			ExecuteHooksInDryRun: opts.ExecuteHooksInDryRun,
+		}, opts.MaxLockDuration)
+	}
+
+	devDB, cleanupDevDB, err := openDevDB(opts)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanupDevDB()
+
+	return exec.SimulatePostgres(ctx, db, exec.PostgresExecConfig{
+		TargetSchema:         opts.TargetSchema,
+		TargetSchemas:        opts.TargetSchemas,
+		ShadowSchema:         opts.ShadowSchema,
+		SchemaSQL:            opts.SchemaSQL,
+		RolesSQL:             opts.RolesSQL,
+		CatalogSQL:           opts.CatalogSQL,
+		LockNamespace:        opts.LockNamespace,
+		LockID:               opts.LockID,
+		Filters:              filters,
+		Policy:               policy,
+		AcceptHazards:        opts.AcceptHazards,
+		NonConcurrentIndexes: opts.NonConcurrentIndexes,
+		LockTimeout:          opts.LockTimeout,
+		StatementTimeout:     opts.StatementTimeout,
+		MaxRetries:           opts.MaxRetries,
+		RandFloat:            opts.RandFloat,
+		Logger:               opts.Logger,
+		Tracer:               opts.Tracer,
+		Metrics:              opts.Metrics,
+		BeforeStep:           opts.BeforeStep,
+		AfterStep:            opts.AfterStep,
+		DryRunLockTimeout:    opts.DryRunLockTimeout,
+		ExecuteHooksInDryRun: opts.ExecuteHooksInDryRun,
+		DevDB:                devDB,
+	}, opts.MaxLockDuration)
+}
+
+// SimulatePlan performs a pre-flight migration simulation of an approved plan artifact.
+// It verifies the artifact hash against ExpectedHash, honors every plan-carried intent field,
+// and executes the planned DDL in an isolated rollback transaction, timing each step and
+// checking for lock duration threshold violations.
+func SimulatePlan(ctx context.Context, db *sql.DB, p *Plan, opts Options) (*SimulateResult, error) {
+	if p == nil {
+		return nil, fmt.Errorf("grizzle: plan cannot be nil")
+	}
+	if db == nil {
+		return nil, fmt.Errorf("grizzle: database connection is nil")
+	}
+	if opts.ExpectedHash != "" && p.Hash() != opts.ExpectedHash {
+		return nil, fmt.Errorf("%w: plan hash %q does not match expected hash %q", ErrPlanDrift, p.Hash(), opts.ExpectedHash)
+	}
+	if err := p.ValidateExecutionFields(); err != nil {
+		return nil, err
+	}
+
+	if opts.SchemaSQL == "" && p.SchemaSQL != "" {
+		opts.SchemaSQL = p.SchemaSQL
+	}
+	if opts.RolesSQL == "" && p.RolesSQL != "" {
+		opts.RolesSQL = p.RolesSQL
+	}
+	if opts.CatalogSQL == "" && p.CatalogSQL != "" {
+		opts.CatalogSQL = p.CatalogSQL
+	}
+	if opts.TargetSchema == "" && p.TargetSchema != "" {
+		opts.TargetSchema = p.TargetSchema
+	}
+	if len(opts.TargetSchemas) == 0 && len(p.TargetSchemas) > 0 {
+		opts.TargetSchemas = p.TargetSchemas
+	}
+	if len(opts.IncludeTables) == 0 && len(p.IncludeTables) > 0 {
+		opts.IncludeTables = p.IncludeTables
+	}
+	if len(opts.ExcludeTables) == 0 && len(p.ExcludeTables) > 0 {
+		opts.ExcludeTables = p.ExcludeTables
+	}
+
+	if strings.TrimSpace(opts.SchemaSQL) != "" {
+		recomputed, err := PlanDiff(ctx, db, opts)
+		if err != nil {
+			return nil, err
+		}
+		if recomputed.Hash() != p.Hash() {
+			return nil, fmt.Errorf("%w: recomputed plan hash %q does not match approved plan hash %q",
+				ErrPlanDrift, recomputed.Hash(), p.Hash())
+		}
+		return Simulate(ctx, db, opts)
+	}
+
+	if err := prepareOptions(ctx, db, &opts); err != nil {
+		return nil, err
+	}
+	policy := resolveDropPolicy(opts)
+	filters := toScopeFilters(opts)
+
+	if opts.Dialect == DialectSQLite {
+		return exec.SimulateSQLitePlan(ctx, db, p, exec.SQLiteExecConfig{
+			SchemaSQL:            opts.SchemaSQL,
+			TargetSchema:         opts.TargetSchema,
+			TargetSchemas:        opts.TargetSchemas,
+			SQLiteAttach:         opts.SQLiteAttach,
+			Filters:              filters,
+			Policy:               policy,
+			AcceptHazards:        opts.AcceptHazards,
+			Logger:               opts.Logger,
+			Tracer:               opts.Tracer,
+			Metrics:              opts.Metrics,
+			BeforeStep:           opts.BeforeStep,
+			AfterStep:            opts.AfterStep,
+			ExecuteHooksInDryRun: opts.ExecuteHooksInDryRun,
+		}, opts.MaxLockDuration)
+	}
+
+	devDB, cleanupDevDB, err := openDevDB(opts)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanupDevDB()
+
+	return exec.SimulatePostgresPlan(ctx, db, p, exec.PostgresExecConfig{
+		TargetSchema:         opts.TargetSchema,
+		TargetSchemas:        opts.TargetSchemas,
+		ShadowSchema:         opts.ShadowSchema,
+		SchemaSQL:            opts.SchemaSQL,
+		RolesSQL:             opts.RolesSQL,
+		CatalogSQL:           opts.CatalogSQL,
+		LockNamespace:        opts.LockNamespace,
+		LockID:               opts.LockID,
+		Filters:              filters,
+		Policy:               policy,
+		AcceptHazards:        opts.AcceptHazards,
+		NonConcurrentIndexes: opts.NonConcurrentIndexes,
+		LockTimeout:          opts.LockTimeout,
+		StatementTimeout:     opts.StatementTimeout,
+		MaxRetries:           opts.MaxRetries,
+		RandFloat:            opts.RandFloat,
+		Logger:               opts.Logger,
+		Tracer:               opts.Tracer,
+		Metrics:              opts.Metrics,
+		BeforeStep:           opts.BeforeStep,
+		AfterStep:            opts.AfterStep,
+		DryRunLockTimeout:    opts.DryRunLockTimeout,
+		ExecuteHooksInDryRun: opts.ExecuteHooksInDryRun,
+		DevDB:                devDB,
+	}, opts.MaxLockDuration)
+}
+
 // LintFormatText renders diagnostics as human-readable text.
 func LintFormatText(w io.Writer, diags []LintDiagnostic) error {
 	return lint.FormatText(w, diags)

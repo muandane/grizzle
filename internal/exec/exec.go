@@ -44,6 +44,11 @@ type Metrics interface {
 	RecordLockWait(ctx context.Context, duration time.Duration, dialect string)
 }
 
+// SimulationMetrics extends Metrics with simulation duration recording.
+type SimulationMetrics interface {
+	RecordSimulationDuration(ctx context.Context, duration time.Duration, dialect string, status string)
+}
+
 // PostgresExecConfig specifies the execution options for PostgreSQL synchronization.
 type PostgresExecConfig struct {
 	TargetSchema         string

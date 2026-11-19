@@ -6,22 +6,26 @@ import (
 )
 
 const (
-	// ProfileStandard is the default rule profile containing universal correctness rules (L001..L013).
+	// ProfileStandard is the default rule profile containing universal correctness rules (L001..L013, L032).
 	ProfileStandard = "standard"
-	// ProfileStrict enables standard rules plus high-impact production hygiene rules (L014, L022, L044, L047, L048).
+	// ProfileStrict enables standard rules plus high-impact production hygiene rules (L014, L016, L022, L033, L044, L047, L048, L049, L051).
 	ProfileStrict = "strict"
 	// ProfileAll enables all rules implemented in the engine.
 	ProfileAll = "all"
 )
 
-// ExtendedRules returns the additional high-impact rules (L014, L022, L044, L047, L048).
+// ExtendedRules returns the additional high-impact rules (L014, L016, L022, L033, L044, L047, L048, L049, L051).
 func ExtendedRules() []Rule {
 	return []Rule{
 		PrimaryKeyTypeAllowlist{},
+		RequireTableComment{},
 		DisallowReservedKeyword{},
+		DisallowCascadeDeleteOnMultiTenant{},
 		RequireBooleanDefault{},
 		DisallowDuplicateIndex{},
 		DisallowRedundantPrefixIndex{},
+		CompositeIndexMaxColumns{},
+		DisallowLowCardinalityIndexPrefix{},
 	}
 }
 

@@ -11,8 +11,8 @@ func TestRulesForProfile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error for standard profile: %v", err)
 	}
-	if len(std) != 13 {
-		t.Errorf("expected 13 standard rules, got %d", len(std))
+	if len(std) != 14 {
+		t.Errorf("expected 14 standard rules, got %d", len(std))
 	}
 
 	// Blank defaults to standard
@@ -29,8 +29,8 @@ func TestRulesForProfile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error for strict profile: %v", err)
 	}
-	if len(strict) != 18 { // 13 standard + 5 extended
-		t.Errorf("expected 18 strict rules, got %d", len(strict))
+	if len(strict) != 23 { // 14 standard + 9 extended
+		t.Errorf("expected 23 strict rules, got %d", len(strict))
 	}
 
 	// Unknown profile returns error

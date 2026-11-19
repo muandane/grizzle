@@ -1,6 +1,8 @@
 package main
 
 import (
+	"database/sql"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -240,5 +242,59 @@ func TestCLI_FailOnContentionFlag(t *testing.T) {
 	code := run([]string{"apply", "--dsn", "sqlite::memory:", "--schema", schemaFile, "--fail-on-contention"})
 	if code != 1 {
 		t.Fatalf("expected exit 1 for fail-on-contention on SQLite, got %d", code)
+	}
+}
+
+func TestCLI_PlanSimulate(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbFile := filepath.Join(tmpDir, "sim.db")
+	dsn := "sqlite:" + dbFile
+	schemaFile := filepath.Join(tmpDir, "schema.sql")
+	if err := os.WriteFile(schemaFile, []byte("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);"), 0600); err != nil {
+		t.Fatalf("writing schema file: %v", err)
+	}
+
+	// 1. Text table output
+	code := run([]string{"plan", "--dsn", dsn, "--schema", schemaFile, "--simulate"})
+	if code != 0 {
+		t.Fatalf("expected exit 0 for plan --simulate, got %d", code)
+	}
+
+	// 2. JSON output to file
+	jsonOut := filepath.Join(tmpDir, "sim.json")
+	code = run([]string{"plan", "--dsn", dsn, "--schema", schemaFile, "--simulate", "--json", "--out", jsonOut})
+	if code != 0 {
+		t.Fatalf("expected exit 0 for plan --simulate --json --out, got %d", code)
+	}
+	data, err := os.ReadFile(filepath.Clean(jsonOut)) //nolint:gosec // G304: test file read
+	if err != nil {
+		t.Fatalf("reading sim.json: %v", err)
+	}
+	var simMap map[string]any
+	if err := json.Unmarshal(data, &simMap); err != nil {
+		t.Fatalf("unmarshaling sim.json: %v", err)
+	}
+	if _, ok := simMap["step_timings"]; !ok {
+		t.Errorf("expected step_timings in JSON output")
+	}
+
+	// 3. Max lock duration threshold
+	code = run([]string{"plan", "--dsn", dsn, "--schema", schemaFile, "--simulate", "--max-lock-duration", "1ns"})
+	if code != 0 {
+		t.Fatalf("expected exit 0 for plan --simulate with threshold, got %d", code)
+	}
+
+	// 4. Verify zero mutation in the database
+	db, err := sql.Open("sqlite", dbFile)
+	if err != nil {
+		t.Fatalf("opening sqlite: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	var count int
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='users'`).Scan(&count); err != nil {
+		t.Fatalf("querying table: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("table users must not exist after simulation, found %d", count)
 	}
 }

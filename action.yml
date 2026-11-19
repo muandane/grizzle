@@ -51,6 +51,14 @@ inputs:
     description: 'Output format (github, text, json)'
     required: false
     default: 'github'
+  comment:
+    description: 'Post or update sticky plan summary comment on pull requests'
+    required: false
+    default: 'true'
+  github-token:
+    description: 'GitHub token for posting comments'
+    required: false
+    default: ${{ github.token }}
   extra-args:
     description: 'Extra CLI flags passed directly to grizzle'
     required: false
@@ -171,8 +179,13 @@ runs:
         FORMAT="${{ inputs.format }}"
         EXTRA="${{ inputs.extra-args }}"
 
+        EXEC_CMD="$CMD"
+        if [ "$EXEC_CMD" = "diff" ]; then
+          EXEC_CMD="plan"
+        fi
+
         ARGS=()
-        ARGS+=("$CMD")
+        ARGS+=("$EXEC_CMD")
 
         if [ -n "$SCHEMA" ] && [ -f "$SCHEMA" ]; then
           ARGS+=(--schema "$SCHEMA")
@@ -218,9 +231,160 @@ runs:
           ARGS+=("${EXTRA_ARR[@]}")
         fi
 
+        GRIZZLE_OUTPUT="${RUNNER_TEMP:-/tmp}/grizzle_output.txt"
+        GRIZZLE_PLAN_JSON="${RUNNER_TEMP:-/tmp}/grizzle_plan.json"
+        GRIZZLE_SIM_JSON="${RUNNER_TEMP:-/tmp}/grizzle_sim.json"
+
         echo "Executing: grizzle ${ARGS[*]}"
         set +e
-        grizzle "${ARGS[@]}"
-        EXIT_CODE=$?
+        grizzle "${ARGS[@]}" 2>&1 | tee "$GRIZZLE_OUTPUT"
+        EXIT_CODE="${PIPESTATUS[0]}"
         echo "exit-code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+        if [ "$EXIT_CODE" -eq 0 ] && { [ "$CMD" = "plan" ] || [ "$CMD" = "diff" ]; }; then
+          # Capture JSON plan representation for PR comment
+          JSON_PLAN_ARGS=("$EXEC_CMD")
+          if [ -n "$SCHEMA" ] && [ -f "$SCHEMA" ]; then JSON_PLAN_ARGS+=(--schema "$SCHEMA"); fi
+          if [ -n "$DSN" ]; then JSON_PLAN_ARGS+=(--dsn "$DSN"); fi
+          if [ -n "$DEV_URL" ]; then JSON_PLAN_ARGS+=(--dev-url "$DEV_URL"); fi
+          if [ -n "$CONFIG" ] && [ -f "$CONFIG" ]; then JSON_PLAN_ARGS+=(--config "$CONFIG"); fi
+          if [ "$ALLOW_DROP" = "true" ]; then JSON_PLAN_ARGS+=(--allow-drop); fi
+          if [ -n "$EXTRA" ]; then
+            read -ra EXTRA_ARR <<< "$EXTRA"
+            for a in "${EXTRA_ARR[@]}"; do
+              if [ "$a" != "--github" ] && [ "$a" != "--json" ] && [ "$a" != "--simulate" ]; then
+                JSON_PLAN_ARGS+=("$a")
+              fi
+            done
+          fi
+          JSON_PLAN_ARGS+=(--json)
+          grizzle "${JSON_PLAN_ARGS[@]}" > "$GRIZZLE_PLAN_JSON" 2>/dev/null || true
+
+          if [[ "$EXTRA" == *"--simulate"* ]]; then
+            JSON_SIM_ARGS=("$EXEC_CMD")
+            if [ -n "$SCHEMA" ] && [ -f "$SCHEMA" ]; then JSON_SIM_ARGS+=(--schema "$SCHEMA"); fi
+            if [ -n "$DSN" ]; then JSON_SIM_ARGS+=(--dsn "$DSN"); fi
+            if [ -n "$DEV_URL" ]; then JSON_SIM_ARGS+=(--dev-url "$DEV_URL"); fi
+            if [ -n "$CONFIG" ] && [ -f "$CONFIG" ]; then JSON_SIM_ARGS+=(--config "$CONFIG"); fi
+            if [ "$ALLOW_DROP" = "true" ]; then JSON_SIM_ARGS+=(--allow-drop); fi
+            if [ -n "$EXTRA" ]; then
+              read -ra EXTRA_ARR <<< "$EXTRA"
+              for a in "${EXTRA_ARR[@]}"; do
+                if [ "$a" != "--github" ] && [ "$a" != "--json" ]; then
+                  JSON_SIM_ARGS+=("$a")
+                fi
+              done
+            fi
+            JSON_SIM_ARGS+=(--json)
+            grizzle "${JSON_SIM_ARGS[@]}" > "$GRIZZLE_SIM_JSON" 2>/dev/null || true
+          fi
+        fi
+
         exit $EXIT_CODE
+
+    - name: Post PR Plan Summary Comment
+      id: post-pr-comment
+      shell: bash
+      env:
+        COMMENT_ENABLED: ${{ inputs.comment }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        EVENT_NAME: ${{ github.event_name }}
+        PR_NUMBER_INPUT: ${{ github.event.pull_request.number }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        GITHUB_API_URL: ${{ github.api_url }}
+        CMD: ${{ inputs.command }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -eo pipefail
+
+        if [ "$COMMENT_ENABLED" != "true" ]; then
+          echo "Grizzle Action: PR comments disabled (comment: false). Skipping."
+          exit 0
+        fi
+
+        if [ "$EVENT_NAME" != "pull_request" ]; then
+          echo "Grizzle Action: not a pull_request event (event: $EVENT_NAME). Skipping sticky comment."
+          exit 0
+        fi
+
+        if [ "$CMD" != "plan" ] && [ "$CMD" != "diff" ]; then
+          echo "Grizzle Action: command '$CMD' does not generate migration plans. Skipping sticky comment."
+          exit 0
+        fi
+
+        HELPER="${ACTION_PATH:-.}/scripts/format-comment.py"
+
+        PR_NUMBER="$PR_NUMBER_INPUT"
+        if [ -z "$PR_NUMBER" ] && [ -n "$GITHUB_EVENT_PATH" ] && [ -f "$GITHUB_EVENT_PATH" ]; then
+          PR_NUMBER=$(python3 "$HELPER" --pr-number "$GITHUB_EVENT_PATH" 2>/dev/null || true)
+        fi
+
+        if [ -z "$PR_NUMBER" ]; then
+          echo "Grizzle Action: could not determine pull request number. Skipping sticky comment."
+          exit 0
+        fi
+
+        if [ -z "$GITHUB_TOKEN" ]; then
+          echo "::warning::Grizzle Action: github-token is empty. Cannot post PR comment."
+          exit 0
+        fi
+
+        GRIZZLE_PLAN_JSON="${RUNNER_TEMP:-/tmp}/grizzle_plan.json"
+        GRIZZLE_SIM_JSON="${RUNNER_TEMP:-/tmp}/grizzle_sim.json"
+        GRIZZLE_OUTPUT="${RUNNER_TEMP:-/tmp}/grizzle_output.txt"
+        COMMENT_BODY_FILE="${RUNNER_TEMP:-/tmp}/grizzle_comment.md"
+        PAYLOAD_FILE="${RUNNER_TEMP:-/tmp}/grizzle_comment_payload.json"
+
+        if [ ! -f "$GRIZZLE_PLAN_JSON" ] && [ ! -f "$GRIZZLE_OUTPUT" ]; then
+          echo "Grizzle Action: no plan output available to comment. Skipping."
+          exit 0
+        fi
+
+        python3 "$HELPER" \
+          --format \
+          --plan "$GRIZZLE_PLAN_JSON" \
+          --sim "$GRIZZLE_SIM_JSON" \
+          --output "$GRIZZLE_OUTPUT" \
+          --out-md "$COMMENT_BODY_FILE" \
+          --out-payload "$PAYLOAD_FILE"
+
+        API_URL="${GITHUB_API_URL:-https://api.github.com}"
+        REPO="${GITHUB_REPOSITORY}"
+
+        COMMENTS_FILE="${RUNNER_TEMP:-/tmp}/existing_comments.json"
+        HTTP_CODE=$(curl -sSL -w "%{http_code}" -o "$COMMENTS_FILE" \
+          -H "Authorization: Bearer $GITHUB_TOKEN" \
+          -H "Accept: application/vnd.github+json" \
+          "$API_URL/repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" || echo "000")
+
+        if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+          echo "::warning::Grizzle Action: failed to fetch PR comments (HTTP $HTTP_CODE): $(cat "$COMMENTS_FILE" 2>/dev/null)"
+          exit 0
+        fi
+
+        COMMENT_ID=$(python3 "$HELPER" --find-comment "$COMMENTS_FILE" 2>/dev/null || true)
+
+        RESP_FILE="${RUNNER_TEMP:-/tmp}/comment_response.json"
+        if [ -n "$COMMENT_ID" ]; then
+          echo "Grizzle Action: updating existing sticky comment (id: $COMMENT_ID) on PR #$PR_NUMBER..."
+          HTTP_CODE=$(curl -sSL -w "%{http_code}" -o "$RESP_FILE" \
+            -X PATCH \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -d @"$PAYLOAD_FILE" \
+            "$API_URL/repos/$REPO/issues/comments/$COMMENT_ID" || echo "000")
+        else
+          echo "Grizzle Action: posting new sticky comment on PR #$PR_NUMBER..."
+          HTTP_CODE=$(curl -sSL -w "%{http_code}" -o "$RESP_FILE" \
+            -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -d @"$PAYLOAD_FILE" \
+            "$API_URL/repos/$REPO/issues/$PR_NUMBER/comments" || echo "000")
+        fi
+
+        if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+          echo "Grizzle Action: sticky PR comment posted successfully."
+        else
+          echo "::warning::Grizzle Action: failed to post sticky comment on PR #$PR_NUMBER (HTTP $HTTP_CODE): $(cat "$RESP_FILE" 2>/dev/null)"
+        fi

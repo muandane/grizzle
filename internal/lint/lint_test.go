@@ -342,7 +342,7 @@ func TestDefaultRules_AllRuleIDs(t *testing.T) {
 	for _, r := range rules {
 		ids = append(ids, r.ID())
 	}
-	want := []string{"L001", "L002", "L003", "L004", "L005", "L006", "L007", "L008", "L009", "L010", "L011", "L012", "L013"}
+	want := []string{"L001", "L002", "L003", "L004", "L005", "L006", "L007", "L008", "L009", "L010", "L011", "L012", "L013", "L032"}
 	if !slices.Equal(ids, want) {
 		t.Errorf("DefaultRules() IDs = %v, want %v", ids, want)
 	}

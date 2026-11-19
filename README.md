@@ -152,11 +152,15 @@ grizzle export --plan plan.json --format migrate --out ./migrations
 
 ### GitHub Actions Integration
 
-Use the official Grizzle GitHub Action to lint schemas, detect drift, and preview plans in CI workflows:
+Use the official Grizzle GitHub Action to lint schemas, detect drift, and preview plans with interactive pull request sticky comments:
 
 ```yaml
 name: Schema CI
 on: [pull_request]
+
+permissions:
+  contents: read
+  pull-requests: write
 
 jobs:
   lint:
@@ -171,6 +175,20 @@ jobs:
           strict: true
           format: github
 
+  plan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Preview migration plan and post sticky PR summary
+        uses: muandane/grizzle@v0.2.0
+        with:
+          command: plan
+          schema: schema.sql
+          dsn: ${{ secrets.STAGING_DATABASE_URL }}
+          comment: 'true'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          extra-args: '--simulate'
+
   drift-check:
     runs-on: ubuntu-latest
     steps:
@@ -182,6 +200,30 @@ jobs:
           schema: schema.sql
           dsn: ${{ secrets.STAGING_DATABASE_URL }}
 ```
+
+#### Action Inputs
+
+| Input | Description | Default |
+| :--- | :--- | :--- |
+| `command` | Grizzle command to execute (`lint`, `check`, `plan`, `diff`, `apply`, `export`) | `lint` |
+| `schema` | Path to declarative schema SQL file | `schema.sql` |
+| `dsn` | Target database connection string (`DATABASE_URL` / `POSTGRES_DSN`) | `""` |
+| `dev-url` | Dev database URL for shadow-schema compilation | `""` |
+| `profile` | Lint rule profile (`standard`, `strict`, `all`) | `standard` |
+| `strict` | Alias for `profile: strict` | `false` |
+| `fail-on-warning` | Fail lint when warnings are reported | `false` |
+| `allow-drop` | Permit destructive operations | `false` |
+| `comment` | Post or update sticky plan summary comment on pull requests | `true` |
+| `github-token` | GitHub token for posting comments (requires `permissions: pull-requests: write`) | `${{ github.token }}` |
+| `extra-args` | Extra CLI flags passed directly to grizzle (e.g. `--simulate`) | `""` |
+
+#### Interactive PR Sticky Comment
+
+When `comment: true` and `command: plan` (or `diff`) run on a `pull_request` event, the action automatically posts or updates a single sticky summary comment on the pull request containing:
+- Metric badges for planned schema modifications (`🟢 Adds`, `🟡 Alters`, `🔴 Drops`).
+- Collapsible `<details>` block with full planned SQL statements.
+- Migration hazard warnings table (table rewrites, share locks, data loss risks).
+- Pre-flight lock duration profiling and threshold alerts when `--simulate` is enabled.
 
 ---
 
