@@ -202,6 +202,14 @@ type Options struct {
 	// external side effects (webhooks, message publishing, etc.).
 	ExecuteHooksInDryRun bool
 
+	// Simulate enables pre-flight migration simulation sandbox: planned DDL runs
+	// in an isolated rollback transaction, profiling per-step execution and lock hold duration.
+	Simulate bool
+
+	// MaxLockDuration bounds the acceptable duration for holding DDL locks during simulation.
+	// Steps taking longer than this threshold produce warnings in SimulateResult.
+	MaxLockDuration time.Duration
+
 	// SeedSQL contains idempotent data-seed SQL executed after a successful
 	// sync (Sync DDL → AfterSync → Seed). The seed runs in a single
 	// transaction and is skipped when the same seed (by content hash) was
@@ -867,6 +875,20 @@ func WithDryRunLockTimeout(d time.Duration) Option {
 func WithExecuteHooksInDryRun() Option {
 	return func(o *Options) {
 		o.ExecuteHooksInDryRun = true
+	}
+}
+
+// WithSimulate enables or disables pre-flight simulation sandbox.
+func WithSimulate(simulate bool) Option {
+	return func(o *Options) {
+		o.Simulate = simulate
+	}
+}
+
+// WithMaxLockDuration sets the threshold for lock holding warnings during simulation.
+func WithMaxLockDuration(d time.Duration) Option {
+	return func(o *Options) {
+		o.MaxLockDuration = d
 	}
 }
 

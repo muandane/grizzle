@@ -12,9 +12,10 @@ import (
 )
 
 type otelMetrics struct {
-	migrationDuration metric.Float64Histogram
-	driftDetected     metric.Int64Counter
-	lockWait          metric.Float64Histogram
+	migrationDuration  metric.Float64Histogram
+	driftDetected      metric.Int64Counter
+	lockWait           metric.Float64Histogram
+	simulationDuration metric.Float64Histogram
 }
 
 // NewMetrics creates a grizzle.Metrics adapter configured with the provided OpenTelemetry metric.Meter.
@@ -22,6 +23,7 @@ type otelMetrics struct {
 //   - migration_duration_seconds (Float64Histogram): End-to-end migration duration labeled by dialect and status ("applied", "failed", "noop").
 //   - drift_detected (Int64Counter): Total count of detected schema or plan drift events labeled by dialect and schema.
 //   - lock_wait_seconds (Float64Histogram): Time spent acquiring or waiting for database locks in seconds.
+//   - simulation_duration_seconds (Float64Histogram): Duration of migration simulations in seconds labeled by dialect and status.
 func NewMetrics(meter metric.Meter) (grizzle.Metrics, error) {
 	if meter == nil {
 		return nil, fmt.Errorf("otelgrizzle: meter cannot be nil")
@@ -54,10 +56,20 @@ func NewMetrics(meter metric.Meter) (grizzle.Metrics, error) {
 		return nil, fmt.Errorf("otelgrizzle: creating lock_wait_seconds histogram: %w", err)
 	}
 
+	simulationDuration, err := meter.Float64Histogram(
+		"simulation_duration_seconds",
+		metric.WithDescription("Duration of migration simulations in seconds"),
+		metric.WithUnit("s"),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("otelgrizzle: creating simulation_duration_seconds histogram: %w", err)
+	}
+
 	return &otelMetrics{
-		migrationDuration: migrationDuration,
-		driftDetected:     driftDetected,
-		lockWait:          lockWait,
+		migrationDuration:  migrationDuration,
+		driftDetected:      driftDetected,
+		lockWait:           lockWait,
+		simulationDuration: simulationDuration,
 	}, nil
 }
 
@@ -101,4 +113,16 @@ func (m *otelMetrics) RecordLockWait(ctx context.Context, duration time.Duration
 		attribute.String("dialect", dialect),
 	}
 	m.lockWait.Record(ctx, duration.Seconds(), metric.WithAttributes(attrs...))
+}
+
+// RecordSimulationDuration records the end-to-end duration and status of a migration simulation.
+func (m *otelMetrics) RecordSimulationDuration(ctx context.Context, duration time.Duration, dialect string, status string) {
+	if m == nil || m.simulationDuration == nil {
+		return
+	}
+	attrs := []attribute.KeyValue{
+		attribute.String("dialect", dialect),
+		attribute.String("status", status),
+	}
+	m.simulationDuration.Record(ctx, duration.Seconds(), metric.WithAttributes(attrs...))
 }

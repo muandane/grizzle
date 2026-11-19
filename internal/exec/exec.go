@@ -42,6 +42,7 @@ type Metrics interface {
 	RecordMigrationDuration(ctx context.Context, duration time.Duration, dialect string, status string)
 	RecordDriftDetected(ctx context.Context, dialect string, schema string)
 	RecordLockWait(ctx context.Context, duration time.Duration, dialect string)
+	RecordSimulationDuration(ctx context.Context, duration time.Duration, dialect string, status string)
 }
 
 // PostgresExecConfig specifies the execution options for PostgreSQL synchronization.

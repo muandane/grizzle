@@ -8,11 +8,14 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"text/tabwriter"
+	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/muandane/grizzle"
@@ -173,6 +176,8 @@ func run(args []string) int {
 		beforeSyncFlag   = fs.String("before-sync", "", "SQL script or file to execute immediately before migration")
 		afterSyncFlag    = fs.String("after-sync", "", "SQL script or file to execute immediately after migration")
 		failOnContention = fs.Bool("fail-on-contention", false, "Gate migration execution if lock contention is detected on target tables (default: advisory warning)")
+		simulateFlag     = fs.Bool("simulate", false, "Run pre-flight migration simulation in an isolated rollback transaction (plan)")
+		maxLockDuration  = fs.Duration("max-lock-duration", 500*time.Millisecond, "Max lock hold duration threshold before emitting a warning during simulation (plan)")
 	)
 
 	var targetSchemaPattern string
@@ -293,7 +298,7 @@ func run(args []string) int {
 		if !ok {
 			return 1
 		}
-		return runPlan(ctx, dsn, devURL, *schemaFile, rolesSQL, catalogSQL, *outFile, *allowDrop, isJSON, isGitHub, renames, *expandContract, backfillHook, *targetSchema, targetSchemaPattern)
+		return runPlan(ctx, dsn, devURL, *schemaFile, rolesSQL, catalogSQL, *outFile, *allowDrop, isJSON, isGitHub, renames, *expandContract, backfillHook, *targetSchema, targetSchemaPattern, *simulateFlag, *maxLockDuration, hazards)
 	case "apply":
 		rolesSQL, ok := readRolesFile(*rolesFile)
 		if !ok {
@@ -428,7 +433,7 @@ func loadOrComputePlan(ctx context.Context, db *sql.DB, planFile, schemaFile, de
 	return computedPlan, computedPlan.Hash(), nil
 }
 
-func runPlan(ctx context.Context, dsn, devURL, schemaFile, rolesSQL, catalogSQL, outFile string, allowDrop, jsonOutput, githubOutput bool, renames map[string]string, expandContract bool, backfill grizzle.BackfillFunc, targetSchema, targetSchemaPattern string) int {
+func runPlan(ctx context.Context, dsn, devURL, schemaFile, rolesSQL, catalogSQL, outFile string, allowDrop, jsonOutput, githubOutput bool, renames map[string]string, expandContract bool, backfill grizzle.BackfillFunc, targetSchema, targetSchemaPattern string, simulate bool, maxLockDuration time.Duration, hazards []string) int {
 	db, err := initDB(dsn)
 	if err != nil {
 		return 1
@@ -441,6 +446,11 @@ func runPlan(ctx context.Context, dsn, devURL, schemaFile, rolesSQL, catalogSQL,
 		return 1
 	}
 
+	var acceptedCodes []grizzle.HazardCode
+	for _, h := range hazards {
+		acceptedCodes = append(acceptedCodes, grizzle.HazardCode(h))
+	}
+
 	opts := grizzle.Options{
 		SchemaSQL:           string(content),
 		DevDatabaseURL:      devURL,
@@ -449,10 +459,57 @@ func runPlan(ctx context.Context, dsn, devURL, schemaFile, rolesSQL, catalogSQL,
 		RolesSQL:            rolesSQL,
 		CatalogSQL:          catalogSQL,
 		AllowDrop:           allowDrop,
+		AcceptHazards:       acceptedCodes,
 		Renames:             renames,
 		ExpandContract:      expandContract,
 		Backfill:            backfill,
+		Simulate:            simulate,
+		MaxLockDuration:     maxLockDuration,
 	}
+
+	if simulate {
+		simRes, err := grizzle.Simulate(ctx, db, opts)
+		if err != nil {
+			slog.Error("migration simulation failed", "err", err)
+			return 1
+		}
+
+		if jsonOutput {
+			data, err := json.MarshalIndent(simRes, "", "  ")
+			if err != nil {
+				slog.Error("serializing simulation result", "err", err)
+				return 1
+			}
+			if outFile != "" {
+				if err := os.WriteFile(filepath.Clean(outFile), data, 0600); err != nil { //nolint:gosec // G304: CLI accepts user-provided destination path
+					slog.Error("writing simulation result file", "path", outFile, "err", err)
+					return 1
+				}
+				slog.Info("simulation result written successfully", "out", outFile)
+			} else {
+				fmt.Println(string(data))
+			}
+			return 0
+		}
+
+		if outFile != "" {
+			f, err := os.Create(filepath.Clean(outFile)) //nolint:gosec // G304: CLI accepts user-provided destination path
+			if err != nil {
+				slog.Error("creating simulation output file", "path", outFile, "err", err)
+				return 1
+			}
+			defer func() { _ = f.Close() }()
+			formatSimulationTable(f, simRes, maxLockDuration)
+			slog.Info("simulation table written successfully", "out", outFile)
+		} else {
+			formatSimulationTable(os.Stdout, simRes, maxLockDuration)
+		}
+		if simRes != nil && simRes.Plan != nil {
+			fmt.Fprintf(os.Stderr, "Plan Hash: %s\n", simRes.Plan.Hash())
+		}
+		return 0
+	}
+
 	p, err := grizzle.PlanDiff(ctx, db, opts)
 	if err != nil {
 		slog.Error("computing plan diff", "err", err)
@@ -480,6 +537,54 @@ func runPlan(ctx context.Context, dsn, devURL, schemaFile, rolesSQL, catalogSQL,
 		fmt.Fprintf(os.Stderr, "Plan Hash: %s\n", p.Hash())
 	}
 	return 0
+}
+
+func formatSimulationTable(w io.Writer, res *grizzle.SimulateResult, maxLock time.Duration) {
+	if res == nil {
+		return
+	}
+	if len(res.StepTimings) == 0 {
+		_, _ = fmt.Fprintln(w, "Simulation completed: no migration steps to execute (schema is in sync).")
+		return
+	}
+
+	_, _ = fmt.Fprintf(w, "Simulated Migration Plan (%d steps, total: %v):\n\n", len(res.StepTimings), res.TotalDuration.Round(time.Microsecond))
+
+	tw := tabwriter.NewWriter(w, 0, 0, 3, ' ', 0)
+	_, _ = fmt.Fprintln(tw, "STEP\tTYPE\tTARGET\tDURATION\tLOCK STATUS")
+	for i, st := range res.StepTimings {
+		target := st.Step.Table
+		if st.Step.Column != "" {
+			target = fmt.Sprintf("%s.%s", st.Step.Table, st.Step.Column)
+		}
+		if target == "" {
+			target = "-"
+		}
+
+		durStr := st.Duration.Round(time.Microsecond).String()
+		if st.Step.NonTx {
+			durStr = "0s (NonTx)"
+		}
+
+		lockStatus := "OK"
+		if st.Step.NonTx {
+			lockStatus = "SKIPPED"
+		} else if st.ExceededLockMax {
+			lockStatus = "EXCEEDED"
+		}
+
+		_, _ = fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\n", i+1, st.Step.Type, target, durStr, lockStatus)
+	}
+	_ = tw.Flush()
+
+	if len(res.ExceededWarnings) > 0 {
+		_, _ = fmt.Fprintf(w, "\nWarnings (%d threshold violations > %v):\n", len(res.ExceededWarnings), maxLock)
+		for _, warn := range res.ExceededWarnings {
+			_, _ = fmt.Fprintf(w, "  ! %s\n", warn)
+		}
+	} else if maxLock > 0 {
+		_, _ = fmt.Fprintf(w, "\nAll transactional steps held locks within the %v limit.\n", maxLock)
+	}
 }
 
 func resolveSyncHook(scriptOrPath string) (grizzle.SyncHook, error) {
